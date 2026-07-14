@@ -20,7 +20,7 @@ def walk_files(root):
 
 
 def test_e2e_converges_and_never_leaks_holdout(tmp_path):
-    cr = setup_control(tmp_path, FAKE)
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     ws_root = tmp_path / "ws"
 
     proc = subprocess.run(

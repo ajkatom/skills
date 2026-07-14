@@ -32,6 +32,9 @@ class LockError(RuntimeError):
     pass
 
 
+PAUSED = 10
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -72,6 +75,74 @@ class Journal:
             f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+
+def save_state(run_dir, next_iter, feedback, workspace):
+    atomic_write(
+        os.path.join(run_dir, "state.json"),
+        canonical_json({
+            "state_version": "0.1",
+            "next_iter": next_iter,
+            "feedback": feedback,
+            "workspace": workspace,
+            "run_dir": run_dir,
+        }),
+    )
+
+
+def load_state(run_dir):
+    with open(os.path.join(run_dir, "state.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _snapshot_sha256_from_journal(run_dir):
+    path = os.path.join(run_dir, "journal.jsonl")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            e = json.loads(line)
+            if e.get("state") == "SNAPSHOT":
+                return e.get("data", {}).get("snapshot_sha256")
+    return None
+
+
+def latest_paused_run(control_root):
+    runs_dir = os.path.join(control_root, "runs")
+    if not os.path.isdir(runs_dir):
+        return None
+    paused = [
+        os.path.join(runs_dir, name)
+        for name in sorted(os.listdir(runs_dir), reverse=True)
+        if os.path.exists(os.path.join(runs_dir, name, "state.json"))
+    ]
+    return paused[0] if paused else None
+
+
+def write_checkpoint_report(run_dir, iteration, report):
+    passing = sum(1 for r in report["results"] if r["pass"])
+    total = len(report["results"])
+    lines = [
+        f"# Checkpoint — iteration {iteration}",
+        "",
+        f"Passing: **{passing}/{total}**  (twin-observed, cooperative tier — unqualified)",
+        "",
+        "| behavior | scenario | pass | taxonomy | exit |",
+        "|---|---|:--:|---|--:|",
+    ]
+    for r in report["results"]:
+        mark = "✅" if r["pass"] else "❌"
+        tax = r["taxonomy"] or ""
+        code = r["observed"].get("exit_code")
+        lines.append(f"| {r['behavior_id']} | {r['id']} | {mark} | {tax} | {code} |")
+    lines += [
+        "",
+        "Decide: `resume --decision continue` (build again) · edit `spec.md` then "
+        "`resume --decision continue` (adjust) · `resume --decision accept` (stop, "
+        "waived/unverified) · `resume --decision abort`.",
+        "",
+    ]
+    path = os.path.join(run_dir, f"checkpoint_iter_{iteration}.md")
+    atomic_write(path, "\n".join(lines))
+    return path
 
 
 def finalize_manifest(run_dir: str, extra: dict) -> str:
@@ -167,6 +238,7 @@ def run(control_root: str, project_src) -> int:
     except ConfigError as e:
         sys.stderr.write(f"dark-factory: config error: {e}\n")
         return 2
+    cfg["_control_root"] = control_root
 
     try:
         lock = acquire_lock(control_root)
@@ -250,21 +322,31 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
                   file_count=len(manifest["files"]))
     manifest_base["snapshot_sha256"] = snap_hash
 
-    feedback = None
-    converged = False
+    return _run_loop(
+        cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+        adapter, timeout_s, workspace, start_iter=1, feedback=None,
+    )
+
+
+def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+              adapter, timeout_s, workspace, start_iter, feedback):
+
+    def _clear_state():
+        p = os.path.join(run_dir, "state.json")
+        if os.path.exists(p):
+            os.unlink(p)
+
     last_report = None
-    for i in range(1, cfg["max_iterations"] + 1):
+    for i in range(start_iter, cfg["max_iterations"] + 1):
         prompt = compose_prompt(spec_text, feedback)
         prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
         atomic_write(prompt_file, prompt)
         resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s)
         if err or resp.get("status") != "ok":
-            journal.write("ABORTED_BUILD_ERROR", iteration=i,
-                          detail=err or resp.get("detail", ""))
+            journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            _clear_state()
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
-            finalize_manifest(
-                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
-            )
             return 2
         journal.write("BUILD", iteration=i)
 
@@ -272,59 +354,115 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
             report = run_all(scenarios_dir, workspace)
         except OracleError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            finalize_manifest(
-                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
-            )
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            _clear_state()
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
         last_report = report
-        atomic_write(
-            os.path.join(run_dir, f"verifier_report_iter_{i}.json"),
-            canonical_json(report),
-        )
+        atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
         passing = sum(1 for r in report["results"] if r["pass"])
-        journal.write("VERIFY", iteration=i, passing=passing,
-                      total=len(report["results"]))
+        journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
 
         if report["all_pass"]:
             journal.write("CONVERGED", iteration=i)
-            converged = True
-            break
+            finalize_manifest(run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i))
+            _clear_state()
+            print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
+                  f"Workspace: {workspace}  Run: {run_dir}")
+            return 0
 
         feedback = project_feedback(report)
-        atomic_write(
-            os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback)
-        )
+        atomic_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback))
         atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
-        journal.write("FEEDBACK", iteration=i,
-                      failing=[f["behavior_id"] for f in feedback["failures"]])
+        journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
 
-    if converged:
-        journal.write(
-            "COMPLETE_UNQUALIFIED",
-            note="cooperative tier cannot produce a qualified ship-candidate",
-            workspace=workspace,
-        )
-        print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
-              f"Workspace: {workspace}  Run: {run_dir}")
-        finalize_manifest(
-            run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i)
-        )
-        return 0
+        if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
+            write_checkpoint_report(run_dir, i, report)
+            save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace)
+            journal.write("CHECKPOINT", iteration=i,
+                          failing=[f["behavior_id"] for f in feedback["failures"]])
+            print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
+                  f"Review {run_dir}/checkpoint_iter_{i}.md, then "
+                  f"`supervisor.py resume --control-root {cfg.get('_control_root', '<CR>')}`.")
+            return PAUSED
 
-    failing = sorted(
-        {r["behavior_id"] for r in last_report["results"] if not r["pass"]}
-    )
+    failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
     journal.write("CAP_REACHED", failing_behaviors=failing,
                   note="likely spec ambiguity — human decision needed")
+    finalize_manifest(run_dir, dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]))
+    _clear_state()
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
-          f"Still failing: {', '.join(failing)}. Likely spec ambiguity — "
-          f"human decision needed. Run: {run_dir}")
-    finalize_manifest(
-        run_dir,
-        dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]),
-    )
+          f"Still failing: {', '.join(failing)}. Run: {run_dir}")
     return 3
+
+
+def resume(control_root, decision="continue"):
+    control_root = os.path.abspath(control_root)
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    cfg["_control_root"] = control_root
+
+    run_dir = latest_paused_run(control_root)
+    if run_dir is None:
+        sys.stderr.write("dark-factory: no paused run to resume\n")
+        return 2
+
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    try:
+        if not cfg["_qualified"]:
+            sys.stderr.write(
+                "dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
+                "isolation; outcome can never be a qualified ship-candidate.\n"
+            )
+
+        state = load_state(run_dir)
+        journal = Journal(os.path.join(run_dir, "journal.jsonl"))
+        spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
+        scenarios_dir = os.path.join(control_root, "scenarios")
+        adapter = cfg["roles"]["builder"]["adapter"]
+        timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
+        manifest_base = {
+            "invocation": os.path.basename(run_dir),
+            "tier": cfg["assurance"],
+            "qualified": cfg["_qualified"],
+            "config_sha256": cfg["_config_sha256"],
+            "spec_sha256": sha256_str(spec_text),
+            "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
+            "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
+            "snapshot_sha256": _snapshot_sha256_from_journal(run_dir),
+        }
+
+        if decision == "abort":
+            journal.write("ABORTED_BY_HUMAN")
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BY_HUMAN",
+                                            iterations=state["next_iter"] - 1))
+            os.unlink(os.path.join(run_dir, "state.json"))
+            print("dark-factory: ABORTED by human.")
+            return 2
+        if decision == "accept":
+            journal.write("ACCEPTED_BY_HUMAN",
+                          note="human accepted a non-passing build — waived/unverified")
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
+                                            qualified=False,
+                                            iterations=state["next_iter"] - 1))
+            os.unlink(os.path.join(run_dir, "state.json"))
+            print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
+            return 0
+        # decision == "continue"
+        return _run_loop(
+            cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+            adapter, timeout_s, state["workspace"],
+            start_iter=state["next_iter"], feedback=state["feedback"],
+        )
+    finally:
+        release_lock(lock)
 
 
 def main():
@@ -335,11 +473,16 @@ def main():
     p_run.add_argument("--project-src", default=None)
     p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
     p_ver.add_argument("--run-dir", required=True)
+    p_res = sub.add_parser("resume", help="resume a paused run")
+    p_res.add_argument("--control-root", required=True)
+    p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src))
     elif args.cmd == "verify-manifest":
         sys.exit(0 if verify_manifest(args.run_dir) else 4)
+    elif args.cmd == "resume":
+        sys.exit(resume(args.control_root, args.decision))
 
 
 if __name__ == "__main__":
