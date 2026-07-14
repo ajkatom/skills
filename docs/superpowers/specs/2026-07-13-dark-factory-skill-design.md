@@ -1,542 +1,421 @@
-# dark-factory — skill design spec
+# dark-factory — skill design spec (v2, tiered)
 
 **Date:** 2026-07-13
 **Status:** Approved design → ready for implementation planning
 **Repo:** personal `skills` (symlinked into `~/.claude/skills`, like `loop-designer`)
+**History:** v2 consolidates the design around an **assurance dial** after adversarial
+review by Codex (`gpt-5.6-sol`), rounds 1–2 (see `…-review-log.md`). It replaces the
+v1 draft that appended a hardening section (§15) as an override on top of a softer
+`§§1–14` — the "two incompatible architectures" Codex flagged. There is now **one tiered
+architecture**, default `standard`.
 
 ## 1. Summary
 
-`dark-factory` is a **process skill** that wraps any task or plan into a miniature
-"dark factory" run — the [Level 5 operating model](#12-source-grounding) where **no
-human writes or reviews code**: the human writes/approves a spec and evaluates
-outcomes; agents build and review the code behind an information barrier.
+`dark-factory` is a **process skill** that wraps any task/plan into a "dark factory" run
+(StrongDM's Level-5 model): the human writes/approves a spec and evaluates outcomes;
+**agents build and review the code behind an information barrier**. Pipeline:
 
-The skill orchestrates this pipeline:
+> **spec → hidden holdout scenarios + digital twins → isolated builder (spec-only) →
+> verifier runs scenarios in the twin universe → deterministic ID feedback → loop →
+> outcome checkpoint (human evaluates twin-observed results).**
 
-> **spec → hidden holdout scenarios + shared digital twins → isolated builder (spec-only) → verifier runs scenarios in the twin universe → filtered feedback → loop → outcome checkpoint (human evaluates actual results).**
-
-The two non-negotiable requirements (from the user) are baked into the mechanism:
+Two non-negotiable requirements (from the user):
 
 1. **Tests are scenarios** — behavioral acceptance specs, not unit tests of internals.
-2. **The builder cannot see the tests before/while building**, so it cannot influence
-   ("teach to") the build. Enforced by a real information barrier, not an honor-system
-   instruction.
+2. **The builder cannot see the tests** before/while building, so it cannot overfit
+   ("teach to the test"). Enforced by an isolation boundary, not an honor-system note.
+
+Behaviour is set by **two orthogonal dials** (§2): the **autonomy dial** (how far the
+human steps back, L4/L5) and the **assurance dial** (how hardened the isolation is,
+`standard`/`hardened`/`enterprise`). The skill is **self-contained and transferable** —
+no dependency on the user's second brain or any other skill.
 
 ### 1.1 Goals
-
-- Turn a spec into shipped-candidate software via an autonomous build/verify loop the
-  human only *supervises at outcome checkpoints*.
-- Make the acceptance criteria **un-gameable** by hiding them from the builder (an
-  ML-style holdout set).
-- Test end-to-end against a **digital twin** universe, never production.
-- Let the user **assign each role to a different tool/model** (e.g. Claude plans,
-  Codex builds, Gemini tests) — their decision, with principled defaults.
-- Work out of the box with all-Claude; degrade gracefully when other CLIs are absent.
-- **Be transferable.** No hard dependency on any knowledge system — the skill is
-  self-contained; a second-brain wiki or open-brain MCP is an *optional* integration the
-  skill asks about at invocation and uses only if present.
-- **Compose, don't reinvent.** dark-factory is an orchestrator: at each step it may
-  **invoke any other available skill** best suited to the sub-task (spec, build, verify,
-  debug…), falling back to built-in behavior when that skill isn't installed. Skills are
-  an enhancement, never a hard dependency (§3B).
+- Turn a spec into a shipped-*candidate* via an autonomous build/verify loop the human
+  supervises at outcome checkpoints.
+- Make the acceptance criteria **hard to game** by hiding them from the builder and
+  enforcing isolation at build *and* verification time (residual risk stated per tier).
+- Test against a **digital-twin** universe; label results **twin-observed**, never
+  "actual"; require a human-gated real check before "ship-ready."
+- **Pluggable roles across tools/models** (Claude/Codex/Gemini) — the user's decision.
+- **Compose** with other skills when available; fall back to built-in behaviour.
+- **Scale assurance** from a pragmatic single-user default up to enterprise **without a
+  redesign** — the higher tiers are specified and probe-gated, never a cosmetic flag.
 
 ### 1.2 Design provenance (not a runtime dependency)
-
-All from the user's second-brain vault (`~/Projects/ai_projects/second_brain/`),
-ingested 2026-07-13 from the video *"The 5 Levels of AI Coding"* (Nate B Jones,
-citing Dan Shapiro's ladder and StrongDM's factory):
-
-- `wiki/concepts/dark-factory.md` — the two hard mechanisms; brownfield limits.
-- `wiki/concepts/vibe-coding-levels.md` — the L0–L5 maturity ladder (the level dial).
-- `wiki/entities/strongdm.md` — the documented L5 factory; scenarios + twins as the
-  **two co-equal architectural ideas**.
-- `wiki/concepts/verification-loop.md` — "the check must be external to the thing
-  being checked"; scenarios as holdout; pull external ground-truth signal.
-- `wiki/concepts/cross-model-orchestration.md` — the division of labor (strongest
-  reasoner plans, token-efficient model builds, different-vendor critic) and the
-  "bounded iteration / termination rule" discipline.
-- `wiki/concepts/ai-coding-adoption-gap.md` — why the bottleneck moves to spec quality.
-
-These pages informed the *design*; their **concepts are embedded directly into the
-skill's own `references/`**, so the skill is fully self-contained and does **not** read
-this vault at runtime (see §1.3 and §3A). This design doc cites them for provenance only.
+Informed by the user's vault (`~/Projects/ai_projects/second_brain/`), from *"The 5
+Levels of AI Coding"* (Nate B Jones; Dan Shapiro's ladder; StrongDM): `dark-factory.md`,
+`vibe-coding-levels.md`, `strongdm.md`, `verification-loop.md`,
+`cross-model-orchestration.md`, `ai-coding-adoption-gap.md`. Concepts are embedded in the
+skill's own `references/`; the skill does **not** read the vault at runtime.
 
 ### 1.3 Non-goals
+- Not a general test framework (scenarios are acceptance-level, behavioral).
+- Does **not** merge or deploy (human action).
+- Does **not** run unbounded/unattended loops (bounded by iteration + budget caps).
+- Does **not** claim a hardening tier the environment can't substantiate — it probes and
+  **fails closed** (§2.3).
+- Requires **no** external knowledge system or other skill (both optional, §9/§10).
 
-- Not a general-purpose test framework. Scenarios are acceptance-level and behavioral.
-- Does **not** merge or deploy. The accepted candidate is handed back; merging/deploy
-  is a human action (and a gated one).
-- Does **not** run unbounded/unattended cloud loops. Bounded by a hard iteration cap;
-  scheduling/routines remain `loop-designer` / `/schedule` territory.
-- Does **not** claim cryptographic isolation (see [§8](#8-honest-limits-of-isolation)).
-- Does not replace `loop-designer` — it *runs* one specific verify loop; `loop-designer`
-  *designs* loop mixes. They compose.
-- **Requires no external knowledge system.** The user's second brain, Obsidian wiki, or
-  open-brain MCP are *optional* integrations (§3A) detected by asking at invocation —
-  never a prerequisite. The skill ships self-contained so it is shareable with anyone.
+### 1.4 Threat model & trusted computing base (per tier)
+The barrier is only meaningful against a stated adversary. Each assurance tier names
+what it defends and what it does not.
 
-## 2. The pipeline and the information barrier
+| | **standard** | **hardened** | **enterprise** |
+|---|---|---|---|
+| **Setting** | single user, own machine | team / CI, shared runners | multi-tenant / compliance |
+| **Adversary** | an LLM builder that **overfits/drifts or errs** (not actively malicious) | **semi-trusted** code; accidental damage | **actively malicious** builder + insider |
+| **Trusted (TCB)** | host OS, the human, the supervisor, model providers | + container runtime, dependency proxy | **only** supervisor + signing key + broker; providers/registry semi-trusted |
+| **Out of scope** | a builder that *deliberately* exfiltrates; host compromise | provider compromise; kernel escape | side-channels; nation-state; supply-chain of the runtime itself |
 
-Three planes. The whole design turns on **what each plane can see**.
+Raising the tier narrows the TCB and adds enforced mechanisms (§7). The default
+`standard` is honest about its limit: it defends the **overfitting/leak** vector (the
+skill's whole point) and reasonable accident containment — **not** a determined malicious
+builder. That protection needs `hardened`+.
 
-```
-      ┌──────────── CONTROL PLANE (holdout-bearing) ─────────────┐
-YOU → │  spec.md (shared) · config · scenarios/ [HOLDOUT] · twins/ │
-spec  └─────┬──────────────────────┬──────────────────┬──────────┘
-            │ spec + twins          │ scenarios+build  │ ACTUAL
-            ▼ (never scenarios)     ▼                  │ outcomes
-     ┌── BUILD PLANE ──┐    ┌── VERIFY PLANE ──┐        │
-     │ isolated worktree│   │ run scenarios vs │────────┘
-     │ builder = tool X │◄──│ build in twin env│
-     │ spec-only        │   │ → verifier-report│
-     └──────────────────┘   └───────┬──────────┘
-           ▲ filtered behavioral     │ fail
-           │ summary only ───────────┘
-           └─ loop until pass / cap → OUTCOME CHECKPOINT → you evaluate
-```
+## 2. The two dials
 
-### 2.1 Visibility matrix (the core invariant)
+### 2.1 Autonomy dial (from `vibe-coding-levels`)
+The L5 *machinery* (agents write **and** review code) always runs; how far the human
+steps back is the dial:
+- **L4 — product manager (default):** human evaluates twin-observed outcomes at **every
+  iteration checkpoint** and may adjust the spec mid-run.
+- **L5 — lights-off:** the loop runs to convergence/cap untouched; human evaluates
+  **once at the end**.
+- Optional **L4→L5 ramp** as trust builds.
+
+### 2.2 Assurance dial (new)
+`assurance: standard | hardened | enterprise`. Each tier **adds** enforced mechanisms
+(§7) and a narrower TCB (§1.4). `standard` is the default and ships fully in v1;
+`hardened`/`enterprise` are specified and enforced when selected **and** the substrate is
+present.
+
+### 2.3 Cross-rules & fail-closed
+- **L5 requires ≥ `hardened`.** You cannot run lights-off without a real sandbox.
+- At startup the skill runs the selected tier's **denial probes** (§7). If the substrate
+  is missing (no container runtime, no credential broker, no signing key, no network
+  policy), it **fails closed**: it refuses to *claim* the tier and either aborts or — with
+  explicit user consent — **downgrades** to the highest tier the environment supports,
+  logging a loud warning + audit note. A tier is never a cosmetic label.
+
+## 3. The pipeline and the information barrier
+
+Three planes; the design turns on **what each can see**.
+
+### 3.1 Visibility matrix (the core invariant)
 
 | Artifact | Planner | Test authority | Builder | Verifier | Human |
 |---|:--:|:--:|:--:|:--:|:--:|
 | **Spec** | writes | reads | reads | reads | owns/approves |
-| **Digital twins** | | writes | reads (builds against) | reads (runs in) | |
-| **Scenarios (holdout)** | | writes | **✗ HIDDEN** | reads (runs) | reads |
-| **Actual outcomes** | | | **✗ filtered feedback only** | writes | reads |
+| **Contracts + dev stubs** | | writes | reads (builds against) | reads | |
+| **Scenarios + verifier-only twin variants (holdout)** | | writes | **✗ HIDDEN** | reads (runs) | reads |
+| **Twin-observed outcomes** | | | **✗ ID feedback only** | writes | reads |
 
-The ML analogy done properly: the **environment/schema is shared** (twins) so the
-builder can develop and integration-test; the **test set is held out** (scenarios) so
-it cannot overfit. Everything hinges on the builder never receiving `scenarios/` — in
-its context *or* its filesystem.
+The ML analogy done properly: the **contracts/dev-stubs are shared** so the builder can
+develop; the **test set + verifier-only twin variants are held out** (§5.1) so it can't
+overfit. The invariant holds only if the builder never receives the holdout **in context
+or on its filesystem**, *and* the candidate is executed under isolation at **verification**
+time so its code can't read the holdout either (§7.4).
 
-## 3. Roles (pluggable across tools/models)
+## 4. Roles (pluggable) and separation
 
-Four agent roles + the human. Each maps to a tool the user chooses; the skill ships a
-thin **adapter** per tool describing how to invoke it in a working directory and
-capture its output.
+Four agent roles + the human. Each maps to a tool the user chooses via a thin **adapter**
+(§7.8). Every role runs as a **separate process** (not an in-process subagent).
 
-| Role | Responsibility | Default tool | Constraint |
+| Role | Responsibility | Default | Constraint |
 |---|---|---|---|
-| **Planner** | Interviews the human, drafts the detailed spec (Karpathy method: uncover the goal, spec agilely, be precise). Human owns/approves. | Claude (strongest reasoner) | — |
-| **Test authority** | Owns the entire hidden acceptance world: authors **scenarios** (holdout) **and** builds/collects **twins** (shared). | Claude | **must ≠ Builder** (warn/refuse) |
-| **Builder** | Implements from the **spec only** (+ filtered feedback), in the isolated workspace. Never sees scenarios. | Claude subagent | isolated cwd |
-| **Verifier** | Runs the scenarios against the build in a fresh twin universe; writes **actual outcomes**. | Claude | — |
+| **Planner** | interviews the human, drafts the spec (Karpathy: uncover goal, agile, precise) | Claude | — |
+| **Test authority** | owns the hidden acceptance world: **scenarios + twins** (incl. verifier-only variants) | Claude | **≠ Builder**, enforced by distinct principal/session (§7.2), not a name-compare |
+| **Builder** | implements from the **spec + contracts/dev-stubs only**, in the sandbox | Claude (separate process) | never receives holdout |
+| **Verifier** | runs scenarios against the candidate in a fresh twin universe; writes twin-observed outcomes | Claude | separate principal from candidate |
 
-### 3.1 Principled defaults (from `cross-model-orchestration`)
+**Cross-model defaults** (from `cross-model-orchestration`): strongest reasoner plans;
+different-vendor test authority for blind-spot diversity; token-efficient model builds.
+The user's "Claude plans, Codex builds, Gemini tests" is a config edit. **No silent
+fallback** — a substitution needs explicit approval (§7.8).
 
-Defaults are all-Claude (works immediately). The recommended cross-model mapping — and
-the *why* — is documented so the user can opt in:
+## 5. Two verification pillars
 
-- **Planner = strongest reasoner** (Claude) — planning quality gates the whole run.
-- **Test authority = different vendor from Builder** — blind-spot diversity ("a second
-  librarian from a different library") makes the holdout harder to game.
-- **Builder = token-efficient adequate model** (Codex/GPT) — execution burns the most
-  tokens; delegate it to the cheaper capable model.
-- **Verifier = ideally a different vendor from Builder** — independent grader.
+### 5.1 Holdout scenarios (the *what*)
+- **Format & oracle:** authored as behavioral `Given/When/Then` (the human view) that
+  **compile to a deterministic, executable check contract** (§7 — *not* free-form
+  markdown at run time). Checks are **frozen and hashed before building** and
+  **mutation-validated** (known-bad mutants must fail) so traceability can't approve
+  inert tests.
+- **Coverage gate (before any build):** every spec behavior maps to **≥1 dev family and
+  ≥1 final family** (stratified — not a single shared case); critic-reviewed (a different
+  model or the human).
+- **Two-tier holdout:** **dev scenarios** drive feedback; a **sealed final-exam set**
+  runs **once** at the end and is never fed back. **Generators, distributions, variants,
+  and cohort membership are frozen+hashed before building;** only the final **secret
+  seeds** are drawn by the supervisor *after* the artifact is hashed. Dev seeds stay
+  **stable across iterations** (so green→red is a real regression, not input variance).
+- **Storage:** control plane only, outside the build workspace, never mounted to it.
 
-The user's example ("Claude plans, Codex builds, Gemini tests") is exactly this pattern
-and is just a config edit. Cross-model adapters require those CLIs installed; the skill
-detects absence and falls back to Claude with a note.
+### 5.2 Digital twins (the *where*)
+- **What:** behavioral clones of the external services the software touches — a safe,
+  reproducible, prod-free world. Scaled to the task (full clones ↔ a minimal deterministic
+  harness), but always present.
+- **Split visibility:** the builder gets **contracts + developer stubs**; the verifier
+  reserves **hidden variants/fixtures/seeds chosen post-freeze** (§5.1).
+- **Network authority (§7.4):** the candidate reaches only **twin data-plane** endpoints;
+  **observer/control/reset** endpoints are verifier-only; evidence lands in an append-only
+  channel the candidate can't address.
+- **Fidelity, not faith:** results are **twin-observed outcomes** with a per-service
+  **fidelity score + drift evidence + unsupported-behavior inventory**. Indistinguishability
+  from prod is *not* claimed (endpoints/timing/certs differ) — instead there are
+  **detection-resistance tests** and stated residual risk. **Nothing is "ship-ready"
+  without a human-gated real contract/staging check.**
 
-## 3A. Optional knowledge-base integration (wiki / open-brain)
+## 6. The build/verify loop (state machine)
 
-**The skill must be transferable to people who have never set up a second brain**, so it
-is **self-contained by default** — every concept it needs (the two pillars, the barrier,
-the level dial, the roles) lives in its own `references/`, not in any external vault.
+**Ordering is explicit** (fixes the earlier FSM contradiction):
 
-At invocation the skill **asks whether the user has a knowledge base to draw on and
-record to**, and adapts:
+```
+build snapshot → dev checks → mandatory gates (§7.6) → ARTIFACT FREEZE
+   → final-exam once → human staging check → ship-candidate
+```
 
-- **Obsidian / markdown wiki** — the user supplies a path. The skill may *read* relevant
-  concept pages for extra grounding and, **only with per-run confirmation**, *write* a
-  run summary / learnings back.
-- **open-brain / MCP memory DB** — if such an MCP tool is present, the skill may
-  `search` / `search_thoughts` for relevant context and, **with confirmation**,
-  `capture_thought` the outcome.
-- **None (default)** — the skill runs fully self-contained; learnings stay only in the
-  local `.dark-factory/runs/` log.
+- Each iteration runs **dev** scenarios only. A **regression** (green→red on stable dev
+  seeds) blocks a candidate.
+- Mandatory gates run **before freeze**; any **post-freeze failure is terminal** and
+  requires a **new sealed generation** (you cannot legitimately rerun a sealed exam after
+  changing code).
+- **Failed final-exam is terminal** for that artifact; disclosed finals promote to dev and
+  a fresh sealed set is generated.
+- **Infra-error state:** a twin startup race, lost observer event, or runner failure is a
+  **distinct outcome** (not pass/fail). It permits **bounded retries of the identical
+  artifact+env+seed**; inconsistent results **invalidate the run** rather than fail the
+  candidate (so a flake can't sink a valid artifact, and "runs once" stays truthful).
+- **Termination:** full pass, iteration cap (default 5), or budget cap (§6.2). A persistent
+  failure at the cap surfaces as **"likely spec ambiguity — human decision"** (may delegate
+  to `systematic-debugging`), not a bare "failed."
+- **Checkpoints:** per the autonomy dial; the human sees twin-observed outcomes and chooses
+  **accept · adjust spec · continue · abort**. An outcome-derived spec edit **taints** the
+  run — restart with a new scenario generation, fresh sealed set, and reset status history.
 
-Reading is automatic when a base is present; **writing back is always opt-in** (it
-mutates the user's notes). Absence of a wiki/open-brain is never an error and never
-blocks a run. The skill asks once at invocation and records the answer in `config.yml`.
+### 6.1 Feedback (anti-gaming)
+- **`ids` (default):** a **schema-validated, deterministic mapping** from frozen scenario
+  metadata to a **behavior-ID + a fixed error-taxonomy enum**. No LLM in the default
+  channel (a model summariser is itself a leak/injection surface).
+- **`behavioral` / `full`:** richer, model-mediated declassification — **opt-in only**, and
+  using them **taints** the touched scenarios (moved to dev, sealed set rotated). `full`
+  is debugging-only.
 
-## 3B. Skill composition (orchestrate, don't reinvent)
+### 6.2 Budget, alerts, resuming
+- **Admission, not just accounting:** **reserve worst-case cost before each call**; a call
+  that could cross the cap is **rejected at the phase boundary**. For non-authoritative
+  providers, state the **exact single-call overage bound**; per-role/per-adapter budgets.
+- **`billing: api`** (metered): **85% alert**; pause at the **next atomic phase boundary**
+  after the cap; offer **raise-and-resume from the last committed snapshot**, accept, or
+  abort. **`billing: subscription`:** alert-only.
+- **L5 requires a tested notification sink** before enabling (an unattended alert with no
+  delivery channel is useless).
+- **Crash-safety:** persist an `in-flight/unknown-outcome` state **before** dispatch;
+  **never auto-retry** it without provider idempotency/reconciliation or human
+  authorization (else a crash after a provider accepts a call double-charges).
 
-dark-factory is an **orchestrator**: at each step it **prefers to delegate to the best
-available skill**, falling back to built-in logic when that skill isn't installed — so it
-stays standalone and transferable (same principle as KB-optional and CLI-optional). It
-discovers skills from the available-skills list (or `find-skills`) and records which it
-used (feeds the audit trail).
+## 7. Isolation & assurance mechanisms (tier-tagged)
 
-| Step / role | Prefer skill(s) if present | Built-in fallback |
-|---|---|---|
-| Spec (Planner) | `brainstorming`, `grill-me-codex` / `grill-with-docs-codex`, `writing-plans` | Karpathy-style interview |
-| Scenarios + twins (Test authority) | `writing-skills` patterns, project test skills | built-in templates |
-| Build (Builder) | `codex-build` (Codex), `subagent-driven-development` / `executing-plans`, `test-driven-development` | direct subagent build |
-| Verify (Verifier) | `/verify`, `everything-claude-code:e2e`, `code-review` / `security-review` | built-in scenario runner |
-| Stuck loop | `systematic-debugging` | spec-ambiguity escalation (§6) |
-| Cleanup / setup | `/simplify`, `loop-designer`, `/schedule` | inline |
+Each mechanism lists the **minimum tier** at which it is enforced. `standard` is the honest
+baseline; `hardened`/`enterprise` add to it. All tiers are **probe-verified** (§2.3).
 
-Two rules keep composition safe:
+### 7.1 Source & workspace  *(standard)*
+Builder works from an **explicitly-approved, history-free source snapshot** (approved
+dirty/untracked changes included), **hashed**, in a fresh repo **without remotes** — not a
+`git worktree` (a worktree's `.git` links into the parent repo and leaks history/objects).
 
-1. **Delegation respects the barrier.** A skill invoked in the build plane inherits that
-   plane's restricted context — it is never handed, and cannot reach, the holdout
-   scenarios or actual outcomes. So a builder calling `/verify` self-checks only against
-   **shared twins + spec**; real verification stays in the Verifier plane. Delegation
-   never crosses a plane boundary.
-2. **Delegated gated actions still checkpoint.** If a called skill would commit / push /
-   deploy / schedule, dark-factory pauses for the human — delegation never bypasses the
-   outcome checkpoint, the secrets guardrail, or isolation. It **never invokes itself**.
+### 7.2 Sandbox & principals
+- *(standard)* Builder = **separate OS process**, fresh ephemeral `HOME`/config/session,
+  hooks/plugins/MCPs/skill-auto-discovery **off**; only audited skills copied in may run.
+- *(hardened)* Enforced **container/VM** with a **per-role capability profile** (rootless,
+  dropped caps, no docker socket / host PID, read-only rootfs, no stray device
+  nodes/sockets); egress **default-deny**.
+- *(enterprise)* **Per-role immutable capability/mount/network manifests** + seccomp; a
+  single global profile is insufficient — builder, verifier, and test-authority get
+  distinct manifests. **Role separation is enforced by distinct principals**; a
+  holdout-bearing session is never reused as builder, even same-vendor.
+- **Denial tests** (all tiers, scaled): probe mounts, namespaces, sockets, devices, caps,
+  env, process visibility, egress, and read/write ownership; **fail closed**.
 
-**Honest limit:** the orchestrator and Claude subagents can call Claude skills directly;
-cross-model roles (Codex/Gemini) use their own command systems — `codex-build` is the
-bridge for a Codex builder.
+### 7.3 Secrets
+- *(standard)* `.gitignore` **plus** `git check-ignore` + `git ls-files` verification;
+  scoped env; log redaction; secret-scan before/after each phase. Honest limit: does **not**
+  stop a determined malicious builder.
+- *(hardened)* **Brokered short-lived, role-scoped credentials**; raw tokens scrubbed from
+  role env; a **read-only pinned dependency proxy/cache** (no direct registry/DNS).
+- *(enterprise)* **Host-side credential proxy** — raw tokens **never enter any sandbox**;
+  all provider/registry access via an authenticated broker with query-level egress control.
 
-## 4. Two verification pillars
+### 7.4 Verification-time isolation & network authority
+- *(standard)* Candidate executed as a **separate process** with the **scenario store
+  unmounted**; evidence read from twin/observer state, not from anything the candidate
+  writes; all builder-produced text treated as **untrusted data, never instructions**.
+- *(hardened+)* **Authenticated network graph:** candidate → twin **data-plane only**;
+  verifier alone reaches **observer/control**; evidence in an **append-only channel the
+  candidate cannot address**. Vary twin inputs the candidate can't predict.
 
-Neither works alone: scenarios with no environment can't run end-to-end; twins with no
-scenarios have nothing to assert.
+### 7.5 Audit
+- *(standard)* **Local hashed manifest** per run: artifact hashes, role/model/adapter
+  versions, sandbox policy + **denial-probe results**, commands, exit codes, costs,
+  timestamps; seeds/prompts **redacted or referenced by hash**, never inlined raw (holdout
+  leakage).
+- *(hardened)* **Signed, chained** append-only records (supervisor-only key); restricted
+  evidence separated from a redacted export, with a `verify` command.
+- *(enterprise)* **Off-box append-only / remote sink** as the tamper-evidence anchor
+  (a local process that can rewrite the manifest can also recompute an unsigned chain).
 
-### 4.1 Holdout scenarios (the *what*)
+### 7.6 Mandatory security gates  *(standard+, non-negotiable)*
+Because no human reviews the code, these run **independent of scenario pass-rate** and are
+**schema constants, not user-toggled booleans**: **static review, dependency
+provenance/SBOM, secret scanning, license policy, negative security invariants, resource
+limits** — with **pinned tool/policy hashes and deterministic pass criteria**. An isolated
+LLM static reviewer (which reads hostile source and is injection-prone) counts as
+**additional evidence, never the sole blocking oracle**.
 
-- **Format:** behavioral, `Given / When / Then`, one scenario per behavior, in
-  markdown. Assert **observable behavior**, never internal units.
-- **Storage:** control plane only (`.dark-factory/scenarios/`), gitignored so a
-  `git worktree` checkout never contains them. Never copied into the build workspace.
-- **Derivation:** the Test authority writes them from the spec, independently of the
-  builder.
-- **Coverage gate (Gap 1).** A holdout is only as good as its completeness. Before any
-  build, every behavior in the spec must **trace to ≥1 scenario** (the Test authority
-  produces the map), and a **critic — a different model or the human — reviews adequacy**
-  and adds missing edge cases. No build starts until coverage is accepted.
-- **Two-tier holdout (Gap 2).** Scenarios are split at authoring time into **dev
-  scenarios** (drive iteration feedback) and a **sealed final-exam set** — a held-back
-  fraction (`final_exam_fraction`, default 0.3) that is **never fed back** and is run
-  **once at the very end**. Ship-candidate must pass both. This is the ML train/dev/**test**
-  split: without a sealed set, "passing" partly measures overfitting to leaked feedback.
+### 7.7 State machine, concurrency, crash-safety  *(standard)*
+A **locked, journaled FSM** with **immutable per-run snapshots**, atomic writes, an
+**invocation ID**, process-group cancellation, and content **hashes for spec, artifact,
+scenarios, twins, adapter, and phase** — so concurrent invocations/crashes can't verify a
+moving tree, overwrite a generation, double-charge, or resume mismatched artifacts. Control
+state lives **outside Git**.
 
-### 4.2 Digital twins (the *where*)
+### 7.8 Adapter protocol  *(standard)*
+A **versioned JSON adapter protocol**: capability probes, **pinned model/CLI versions**,
+and defined timeout/cancel/usage/report semantics. **No silent fallback** — a substitution
+(e.g. Codex→Claude) needs explicit user approval (it changes role separation + billing).
 
-- **What:** behavioral clones of every external service the software touches (e.g.
-  simulated Okta/Slack/Jira/DB/HTTP APIs), giving a safe, reproducible, prod-free world.
-- **Scaling:** full service clones for integration-heavy tasks; a **minimal
-  deterministic harness/fixtures** for a self-contained/offline task — but a twin layer
-  is **always present** as the reproducible env (it is a first-class pillar, not an
-  optional add-on).
-- **Visibility:** **shared** — the builder develops and self-tests against the twins;
-  the verifier runs the hidden scenarios against the build in a **freshly reset** twin
-  universe to produce actual outcomes.
-- **Detection:** external services are inferred from the spec; the user confirms/edits
-  the list.
+### 7.9 Honest residual risk
+Every tier ships a plain statement of what it does **not** defend (per §1.4). Claims are
+**probe-backed** (a passing denial-probe set), never asserted. Words like "un-gameable" and
+"actual outcomes" are avoided by design.
 
-## 5. The level dial (from `vibe-coding-levels`)
+## 8. Greenfield vs. brownfield
+The skill **detects** which it is and never treats legacy as greenfield. Brownfield runs the
+**incremental path** first (reverse-engineer a spec + holdout suite + twins from the running
+system) and states the reduced guarantees. Note: mutation validation (§5.1) doesn't assume a
+known-good reference — reference implementations are **optional**, harness self-tests +
+injected faults are required.
 
-The skill runs the **Level 5 machinery** (agents write *and* review code). How far the
-human steps back is a dial off Shapiro's ladder:
+## 9. Optional knowledge-base integration
+Self-contained by default. At invocation the skill asks whether the user has a **wiki**
+(path) or **open-brain/MCP** DB; if present it *reads* for grounding and, **opt-in only**,
+*writes* a run summary back. Absence is never an error.
 
-- **Level 4 — developer as product manager (default).** The human evaluates **actual
-  outcomes at every iteration checkpoint** and may adjust the spec mid-run. This matches
-  the user's chosen "orchestrate + outcome checkpoints" behavior.
-- **Level 5 — lights-off.** The loop runs to convergence (or the cap) untouched; the
-  human evaluates outcomes **once at the end**.
-- **Optional L4→L5 ramp:** checkpoint every iteration at first, widen the interval as
-  trust in the spec/twins builds.
+## 10. Skill composition (orchestrate, don't reinvent)
+At each step the skill **prefers an available specialized skill** (`brainstorming`/`grill-me`
+for the spec; `codex-build` for a Codex builder; `/verify`, `e2e`, `security-review` for
+checks; `systematic-debugging` for a stuck loop), else built-in behaviour. **Rules:**
+(1) a skill invoked in the build plane inherits its **restricted context** — copied into the
+sandbox, holdout unreachable; (2) a delegated **gated action** (commit/push/deploy) still
+pauses for the human; (3) no self-recursion. Records which skills ran (audit).
 
-## 6. The build/verify loop and checkpoints
+## 11. Packaging & layout
 
-**Before the loop:** the scenario **coverage gate** (§4.1) must pass — no build starts
-until every spec behavior traces to a scenario and the coverage review is accepted. On
-**any** later spec edit (e.g. at an L4 checkpoint), the Test authority **re-syncs
-scenarios** and re-runs the gate before building again (Gap 4) — a spec change silently
-orphans scenarios otherwise.
-
-Per iteration:
-
-1. **Builder** implements from spec (+ prior `feedback.md`) in the isolated workspace.
-2. **Verifier** runs all scenarios against the build in a fresh twin universe →
-   `runs/run-N/verifier-report.md` with **actual outcomes** (per-scenario pass/fail,
-   observed behavior, artifacts/logs) — never the builder's self-report.
-3. **Track status across iterations (Knob B).** Per-scenario pass/fail is carried
-   run-to-run; a **regression** (green→red) is flagged and blocks a ship-candidate. When
-   all **dev scenarios** pass, run the **sealed final-exam set once** (§4.1) — it must
-   also pass. **Else** → `filter-feedback` produces `runs/run-N/feedback.md` (per the
-   leakage policy) and the loop repeats.
-4. **Checkpoint** per the level dial (L4: after each iteration; L5: at end). The human
-   sees actual outcomes and chooses: **accept · adjust spec · continue · abort.** The
-   **pass threshold** defaults to 100% of dev + 100% of final-exam (`pass_threshold`).
-
-**Termination:** the loop ends on full pass, the hard `max_iterations` cap (default 5,
-echoing the cross-model "bounded iteration / termination rule"), or the budget cap
-(§6.2). Reaching a cap without full pass is a human-evaluated outcome. A **persistent
-failure pattern at the cap is surfaced as "likely spec ambiguity/contradiction — human
-decision needed"** (Gap 4), naming the conflicting behavior — not a bare "failed"; a
-stuck loop may delegate to `systematic-debugging` (§3B).
-
-### 6.1 Failure-feedback (anti-gaming) policy
-
-When a scenario fails, what returns to the builder is **configurable**, default
-**behavioral**:
-
-- **`count`** — only "N of M scenarios still failing." Maximum holdout integrity; risk
-  of slow/stalled convergence.
-- **`behavioral` (default)** — a spec-level description of the wrong observed behavior
-  ("after submitting the reset form, no email arrives"), with the scenario's literal
-  text, inputs, and assertions **stripped**. Preserves the holdout while letting the
-  loop converge (StrongDM-style).
-- **`full`** — the failing scenario verbatim. Fastest convergence but hands the builder
-  the test → overfitting → defeats the holdout. Provided only for completeness/debugging.
-
-`filter-feedback` is a **security-critical** step: it must reliably strip holdout
-content. Implemented as a small deterministic script plus a tightly-constrained model
-call, not free-form summarization.
-
-### 6.2 Budget, alerts, and resuming (Knob A)
-
-Cost is bounded alongside the iteration cap, and the cap is a **human off-ramp, not a
-silent kill**:
-
-- **`billing: api` (metered).** Track estimated tokens/USD. **At 85% of any cap, alert**
-  the user (a warning; the run continues). **At 100%, pause and preserve state**, then
-  offer: **raise the cap and resume from the exact point**, accept the current build, or
-  abort. Nothing is discarded on a budget stop.
-- **`billing: subscription` (flat-rate plan).** A USD cap is meaningless, so dark-factory
-  **only alerts** — usage / iteration / token milestones — and lets the user watch their
-  own plan limits. No enforced $ pause.
-- The **85% alert and 100% pause fire even in L5 lights-off** — a cost overrun is exactly
-  what you don't run past unattended. Runs are **resumable**: state (iteration, per-
-  scenario status, worktree, spend) lives in `runs/run-N/`, so raising a cap continues
-  the same run rather than restarting.
-
-## 7. Greenfield vs. brownfield
-
-The source is explicit that you **cannot dark-factory a legacy/brownfield repo** ("the
-system *is* the specification"). The skill therefore **detects** which it is and never
-pretends legacy is greenfield:
-
-- **Greenfield** (empty/new target) → full pipeline as above.
-- **Brownfield** (existing non-trivial codebase) → runs the **incremental path** first
-  and warns the human: (1) reverse-engineer a spec + scenario/holdout suite from the
-  running system; (2) stand up twins for its external dependencies; (3) only then run
-  new work through the L4/L5 loop alongside the maintained legacy. The skill states the
-  reduced guarantees plainly rather than overclaiming.
-
-## 8. Honest limits of isolation
-
-The barrier's strength depends on the setup, and the skill documents this rather than
-overclaiming:
-
-- **Strong:** cross-vendor builder in its own sandbox (e.g. Codex `--yolo` sandbox), or
-  any builder in a container with filesystem scoping. The builder process never receives
-  the scenarios path.
-- **"Holdout in practice":** same-machine, same-model (Claude subagent) builder. The
-  scenarios are absent from its context and its worktree, but a builder with shell
-  access could in principle traverse the filesystem. Mitigations: gitignored control
-  plane so the worktree lacks it; the scenarios path is never passed; an explicit
-  "operate only within your workspace" instruction. **Not** cryptographically sealed.
-
-This honest framing is itself a deliverable (a `references/isolation.md`).
-
-### 8.1 Builder blast-radius sandbox (Gap 5)
-
-Isolating the *tests* from the builder is not the same as controlling what the autonomous
-builder can *do*. The builder runs in a **scoped sandbox**: filesystem confined to its
-worktree, **network egress default-deny** (allowlist package registries only), no reach
-into the parent repo, other projects, or credentials, plus resource/time caps. Strongest
-via a container or the Codex `--yolo` sandbox; when only a bare worktree is available the
-skill documents the weaker guarantee. Critical for lights-off (L5) and overnight runs.
-
-### 8.2 Adversarial-verifier posture (Gap 3)
-
-The builder is implicitly rewarded for "pass," so the Verifier treats it as adversarial:
-it derives pass/fail **only from observed twin state and externally-observable behavior**
-(e.g. "did the twin email service receive a send with a valid token?"), and treats **all
-builder-produced text — logs, comments, output — as untrusted data, never instructions**
-(guarding against a builder that prints "all passed" or injects the LLM judge). Where
-feasible it **varies twin inputs the builder cannot predict** to catch test-aware
-special-casing.
-
-## 9. Packaging
-
-**Chosen approach: hybrid (C).** Considered alternatives:
-
-- **A. Prose-only** (like `loop-designer`) — simplest, but isolation and feedback
-  filtering would rely on the model doing it correctly every run. Rejected: the barrier
-  must be mechanical.
-- **B. Fully script-backed** — most deterministic, most to build/maintain. Overkill for
-  the judgment-heavy steps (spec interview, scenario authoring, outcome evaluation).
-- **C. Hybrid (selected)** — `SKILL.md` orchestrates; **prose** for judgment steps;
-  **small helper scripts for the deterministic, security-critical steps**: workspace
-  isolation, the feedback filter, and the tool adapters. Best balance of *real*
-  isolation and maintainability.
-
-### 9.1 File layout
-
-Skill (in the repo, symlinked to `~/.claude/skills/dark-factory`):
+**Hybrid** (chosen): `SKILL.md` orchestrates (judgment steps in prose); **helper scripts**
+own the deterministic, security-critical steps — sandbox/probes, snapshot+hash, the
+deterministic ID-feedback projection, the scenario runner, adapters, and the audit writer.
 
 ```
 dark-factory/
-  SKILL.md                     # orchestrator: the workflow below, + guardrails
-  references/
-    scenario-format.md         # Given/When/Then holdout scenario spec + examples
-    digital-twins.md           # twin patterns per service; minimal-harness fallback
-    role-adapters.md           # how each tool fills each role; cross-model defaults
-    isolation.md               # the barrier, worktree mechanics, honest limits
-    brownfield.md              # the incremental path
-    knowledge-base.md          # optional wiki / open-brain integration; self-contained default
-    config-reference.md        # config.yml schema
-    example-run.md             # a full worked walkthrough (like loop-designer)
-  scripts/
-    isolate-workspace.sh       # git worktree + copy spec/twins, exclude scenarios
-    filter-feedback.*          # strip holdout content → behavioral summary
-    run-scenarios.*            # execute scenarios against build in twin env
-    adapters/                  # claude / codex / gemini invocation wrappers
+  SKILL.md
+  references/  threat-model.md · assurance-tiers.md · scenario-oracle.md · digital-twins.md
+               role-adapters.md · isolation.md · secrets.md · audit.md · brownfield.md
+               knowledge-base.md · config-reference.md · example-run.md
+  scripts/     sandbox-*, probe-denial.*, snapshot-source.*, id-feedback.*, run-scenarios.*,
+               audit-write.*, adapters/{claude,codex,gemini}
 ```
 
-Control plane, created per project (gitignored):
+Control plane (outside Git, outside the build workspace): `config.yml`, `spec.md`,
+`contracts/`, `twins/` (+ verifier-only `twins-sealed/`), `scenarios/` (dev + sealed),
+per-run immutable `runs/<invocation-id>/` snapshots + manifest.
 
-```
-.dark-factory/
-  config.yml                   # level, leakage, max_iterations, role→tool map, twins
-  spec.md                      # human-owned spec (SHARED)
-  twins/                       # digital twins (SHARED)
-  scenarios/                   # HOLDOUT — never enters the build workspace
-  runs/run-N/{verifier-report.md, feedback.md, status.md}
-  DARK-FACTORY.md              # manifest / how to drive the run
-```
-
-Build plane: an isolated `git worktree` at a path outside the main tree, containing the
-code + copied-in `spec.md` + `twins/`, and **no** `scenarios/`.
-
-### 9.2 Config schema (sketch)
-
+### 11.1 Config schema (sketch)
 ```yaml
-level: 4                       # 4 = checkpoint each iteration; 5 = lights-off
-leakage: behavioral            # count | behavioral | full
+autonomy: 4                    # 4 = checkpoint each iteration; 5 = lights-off (requires assurance ≥ hardened)
+assurance: standard            # standard | hardened | enterprise (probe-verified, fail-closed)
+feedback: ids                  # ids (default, deterministic) | behavioral | full  (latter two taint)
 max_iterations: 5
-final_exam_fraction: 0.3       # held-back scenarios, run once at end, never fed back
-pass_threshold: 1.0            # fraction of scenarios required (default 100%)
+final_exam_fraction: 0.3       # ≥1 dev family AND ≥1 final family per behavior (stratified)
+# pass is unconditional 100% of dev + final + no-regression (not configurable)
 budget:
-  billing: api                 # api (metered → enforce) | subscription (alert only)
-  max_usd: 20                  # enforced when billing: api
-  max_tokens: 5000000          # enforced when known
-  alert_at: 0.85               # warn at 85% of any cap
-  on_max: pause                # pause + offer raise-and-resume; never a silent kill
+  billing: api                 # api (metered → admission-controlled) | subscription (alert only)
+  per_role_usd: { planner: 2, builder: 15, verifier: 3 }
+  alert_at: 0.85
+  notification_sink: ""        # required before L5
 roles:
   planner:        { tool: claude }
-  test_authority: { tool: claude }            # scenarios + twins; must ≠ builder
-  builder:        { tool: claude, mode: subagent }   # e.g. { tool: codex }
-  verifier:       { tool: claude }            # e.g. { tool: gemini }
-prefer_skills: true            # delegate steps to specialized skills when available (§3B)
-twins:
-  services: []                 # auto-detected from spec; human confirms
-knowledge_base:                # optional; asked at invocation, default none
-  kind: none                   # none | wiki | open-brain
-  path: ""                     # filesystem path when kind: wiki
-  write_back: false            # opt-in; capture learnings/outcomes back to the base
+  test_authority: { tool: claude }     # ≠ builder (enforced by principal, §7.2)
+  builder:        { tool: claude }     # separate process; e.g. { tool: codex }
+  verifier:       { tool: claude }     # e.g. { tool: gemini }
+prefer_skills: true
+knowledge_base:  { kind: none, path: "", write_back: false }
+# security gates are schema constants (§7.6), not toggled here; config may only pin tool/policy versions
 ```
 
-## 10. Workflow the skill follows (one todo per step)
+## 12. Workflow (one todo per step)
+1. **Engage.** Announce + opt-out. Ask: wiki/open-brain? `billing` mode? **`assurance`
+   tier?** Detect greenfield/brownfield; infer twin services.
+2. **Probe.** Run the tier's denial probes; **fail closed** or downgrade-with-consent (§2.3).
+3. **Spec (Planner).** Interview → `spec.md`; human approves.
+4. **Config.** Write/confirm `config.yml` (enforce L5 ⇒ assurance ≥ hardened, and a
+   notification sink).
+5. **Acceptance world (Test authority).** Author **contracts + dev-stubs** (shared) and
+   **scenarios + twin variants** (holdout, dev+final families); compile the executable
+   oracle; **freeze + hash** generators/cohorts. Run the **coverage gate**.
+6. **Isolate.** Snapshot+hash source into the sandboxed workspace (no holdout).
+7. **Loop (§6):** build → dev checks → mandatory gates → freeze → final once → human
+   staging; deterministic ID feedback; budget admission; checkpoints per autonomy dial.
+8. **Outcome checkpoint / hand-off.** Present twin-observed outcomes + fidelity + audit;
+   human evaluates and accepts/adjusts/aborts. Accepted candidate handed back (human merges).
+9. **Record.** Write the per-run audit manifest; opt-in KB capture.
 
-1. **Engage + classify.** Announce dark-factory is engaging (offer opt-out). **Ask
-   whether the user has a wiki or open-brain to draw on and record to (§3A), and whether
-   billing is `api` or `subscription` (§6.2); default to self-contained.** Detect
-   greenfield vs brownfield; infer external services for twins.
-2. **Spec (Planner).** If none, interview the human → `spec.md`; human approves. If a
-   plan/spec exists, load and confirm it.
-3. **Config.** Write/confirm `config.yml`. **Warn if `builder == test_authority`.**
-4. **Acceptance world (Test authority).** Author holdout **scenarios** — split into dev +
-   sealed final-exam (§4.1) — + build/collect **twins**; scenarios stay in the control
-   plane. Run the **coverage gate** (every spec behavior traces to a scenario, critic-
-   reviewed) before any build.
-5. **Isolate.** `isolate-workspace` creates the build worktree with spec + twins, no
-   scenarios, inside a **scoped sandbox** (§8.1).
-6. **Loop** (§6): build → verify (actual outcomes) → filtered feedback → repeat until
-   pass, iteration cap, or budget cap — checkpointing per level, **alerting at 85% and
-   pausing at 100% budget with raise-and-resume** (§6.2). At each step **prefer an
-   available specialized skill** (§3B), else built-in behavior.
-7. **Outcome checkpoint / hand-off.** Present actual outcomes; human evaluates and
-   accepts/adjusts/aborts. Accepted candidate is handed back (human merges).
-8. **Record.** Persist the run log to `.dark-factory/runs/`. **If** a wiki/open-brain was
-   configured (§3A), offer to capture the outcome/learnings there (opt-in).
+## 13. Guardrails
+- **Two non-negotiables:** scenarios are behavioral; builder never receives the holdout
+  (context *or* filesystem) — enforced by isolation, probe-verified.
+- **Tiered, fail-closed:** never claim an assurance tier the environment can't substantiate;
+  L5 ⇒ ≥ hardened.
+- **Adversarial verifier:** pass/fail from observed twin state only; builder text is
+  untrusted; candidate runs as a separate principal with the holdout unmounted.
+- **Deterministic default feedback** (`ids`); richer channels taint.
+- **Mandatory gates + audit** every run, independent of pass-rate; gates are constants.
+- **Secrets scale by tier** (§7.3); raw tokens leave the sandbox only at `standard`, and
+  even there `.gitignore` is verified, not trusted.
+- **No silent fallback; no self-recursion; no auto-retry on unknown-outcome calls.**
+- **Twin-observed, not "actual";** no "ship-ready" without a human-gated real check.
+- **Brownfield honesty;** **stated residual risk** per tier.
 
-## 11. Guardrails
+## 14. Success criteria
+- Builder demonstrably never receives the holdout — verified by **denial probes** at the
+  selected tier (scenario store unreachable from builder *and* from the executing candidate),
+  not by a copy-check.
+- Selecting a higher `assurance` tier **enforces** its mechanisms or **fails closed**;
+  downgrade requires explicit consent + an audit note.
+- Default feedback is a **deterministic ID/taxonomy projection** (no model call); richer
+  channels taint and rotate the sealed set.
+- The oracle is **frozen pre-build and mutation-validated**; the final set runs **once**;
+  the FSM enforces the build→gates→freeze→final→staging order; infra-errors don't fail valid
+  artifacts.
+- Runs **standalone** (no KB, no other skills); cross-model + skill delegation work when
+  present, and a build-plane delegation never receives the holdout.
+- Every run emits an audit manifest with denial-probe results; at `hardened`+ it is signed;
+  at `enterprise` it is off-box.
 
-- **Builder ≠ Test authority** (warn/refuse) — else the holdout is self-authored.
-- **Scenarios never enter** the build workspace or the builder's context; only filtered
-  behavioral feedback crosses the barrier.
-- **Verifier reports actual outcomes** (evidence/artifacts), never the builder's
-  self-report — aligns with `verification-before-completion`.
-- **Twins only** in the loop — never real production, credentials, or data.
-- **Secrets never go public.** API keys/tokens (for cross-model adapters like Codex/
-  Gemini), twin service credentials, and any other secret live in an env file (`.env`),
-  the OS keychain, or a secrets manager — **never** inline in `config.yml`, the spec,
-  scenarios, twins, or run logs, and never committed. Adapters read keys from the ambient
-  environment/keychain (e.g. `OPENAI_API_KEY`), not from the skill's files. Whenever the
-  skill creates or uses a secret-bearing file, it **verifies that file (plus `.env` and
-  `.dark-factory/`) is in `.gitignore` first, adding the entry if missing.**
-- **Bounded iteration** — hard cap; reaching it is a human-evaluated outcome.
-- **Brownfield honesty** — never treat legacy as greenfield; run the incremental path.
-- **Isolation honesty** — document the practical strength of the barrier for the chosen
-  setup; never overclaim a seal.
-- **No external-KB dependency** — a wiki/open-brain is optional (§3A); its absence never
-  blocks a run, and writing back to it is always opt-in.
-- **Adversarial verifier** — pass/fail comes only from observed twin state; all
-  builder-produced text is untrusted data, never instructions (§8.2).
-- **Builder sandbox** — the builder runs filesystem- and network-scoped (§8.1); test
-  isolation is not blast-radius control.
-- **Budget is an off-ramp, not a kill** — alert at 85%, pause at 100% with
-  raise-and-resume; `subscription` billing alerts only (§6.2). Work is never discarded.
-- **Delegation respects the barrier** — a skill invoked in the build plane inherits its
-  restricted context and can never reach the holdout scenarios/outcomes; a delegated
-  gated action (commit/push/deploy/schedule) still pauses for the human; dark-factory
-  never invokes itself (§3B).
-- **No regression shipped** — a candidate that turned a previously-green scenario red is
-  blocked until fixed.
+## 15. Phasing — what v1 ships
+- **v1:** the full **`standard` tier** enforced end-to-end **+ the tier framework, probes,
+  and fail-closed downgrade** + the deterministic oracle/feedback + FSM + audit + mandatory
+  gates + the user's cross-model / skill-composition / KB features.
+- **`hardened` / `enterprise`:** specified here and **enforced when selected and the
+  substrate is present**; their heavier mechanisms (host-side credential proxy, per-role
+  seccomp manifests, signed/off-box audit, network-authority graph, oracle DSL) land as the
+  substrate/adapters are built. Raising the tier later is **config + substrate**, not a
+  redesign.
 
-## 12. Success criteria (for the skill itself)
-
-- Given a greenfield task + approved spec, the skill produces a build whose **actual**
-  scenario outcomes are presented to the human, with the builder **demonstrably** never
-  having received the scenarios (verifiable: the build workspace contains no
-  `scenarios/`; the builder's dispatched context excludes them).
-- Roles are reconfigurable to different tools via `config.yml`; all-Claude works with no
-  extra CLIs; cross-model works when the CLIs are present.
-- The level dial changes checkpoint cadence (L4 per-iteration vs L5 end-only).
-- Failure feedback to the builder honors the leakage policy (default behavioral;
-  holdout content stripped).
-- Brownfield input triggers the incremental path + warning, not a false greenfield run.
-- Runs to completion with **no** wiki/open-brain configured (self-contained); when one is
-  configured, reads it for grounding and writes back only on opt-in.
-- **No build begins until the coverage gate passes**; the sealed final-exam set runs once
-  at the end and is never fed back into the loop.
-- **Budget:** an 85% alert fires and hitting 100% pauses with a working raise-and-resume
-  (state preserved), while `subscription` billing only alerts — no run is discarded.
-- **Skill composition:** runs standalone with no other skills installed; when specialized
-  skills are present it delegates and records which were used, and a build-plane
-  delegation never receives the scenarios.
-
-## 13. Open items to resolve during planning
-
-- Exact adapter contract (stdin/stdout, workdir, timeout) shared by claude/codex/gemini.
-- `filter-feedback` implementation split (deterministic strip vs. constrained model call)
-  and how it is tested (it is itself security-critical).
-- Scenario runner: how scenarios (behavioral markdown) are executed — a lightweight
-  interpreter/harness vs. generated executable checks — while keeping them tool-agnostic.
-- Whether the worked example ships greenfield-only or also a brownfield walkthrough.
-
-## 14. Future levers (post-v1)
-
-Noted, not built in v1 — wire in once the core is proven:
-
-- **Flaky-scenario handling** — retry-N then quarantine a scenario that flips without a
-  code change (cf. the `e2e-runner` agent).
-- **Non-functional requirements as scenarios** — perf budgets, security, a11y must be
-  encoded as scenarios (or gated via `security-review` / perf tooling) or they are
-  invisible under "no human reviews code."
-- **Audit-trail schema** — each run records role→tool→model version, scenario-set hash,
-  twin versions, skills invoked, cost, and pass/fail. For an artifact nobody reviewed,
-  provenance *is* the trust.
-- **Capped/failed-run disposition** — keep the worktree for inspection · discard · or
-  (breaking L5 purity) escalate to human-writes-code. The human chooses at the pause.
-- **Parallel candidates** — explore N builders in parallel worktrees and pick the best by
-  scenario pass-rate (an adversarial-judge variant; cf. `loop-designer`).
+## 16. Open items to resolve during planning
+- Concrete sandbox backends per platform (macOS vs Linux container runtimes) and the exact
+  per-role capability manifests for `hardened`/`enterprise`.
+- The executable-oracle representation (capability-limited DSL vs generated checks) and its
+  fault catalog + mutation-score threshold.
+- Adapter protocol schema (I/O, timeout/cancel/usage) shared by claude/codex/gemini.
+- Credential-broker/proxy choice for `hardened`/`enterprise`.
+- Whether the worked example ships greenfield-only or also brownfield.
