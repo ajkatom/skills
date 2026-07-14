@@ -145,3 +145,29 @@ def test_resume_on_locked_control_root_exits_2(tmp_path):
         assert supervisor.resume(str(cr), "continue") == 2
     finally:
         supervisor.release_lock(lock)
+
+
+def test_resume_emits_cooperative_banner_on_stderr(tmp_path, capsys):
+    cr = setup_control(tmp_path, FAKE)  # pause mode, cooperative tier
+    assert supervisor.run(str(cr), None) == 10
+    capsys.readouterr()  # clear
+    assert supervisor.resume(str(cr), "continue") == 0
+    err = capsys.readouterr().err
+    assert "COOPERATIVE MODE" in err
+
+
+def test_resume_manifest_preserves_snapshot_sha256(tmp_path):
+    # a project-src run yields a non-None snapshot hash that must survive resume
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "seed.txt").write_text("hi", encoding="utf-8")
+    cr = setup_control(tmp_path, FAKE)
+    assert supervisor.run(str(cr), str(src)) == 10       # paused after iter 1
+    assert supervisor.resume(str(cr), "continue") == 0   # converges
+    run_id = os.listdir(cr / "runs")[0]
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    # find the SNAPSHOT journal value and confirm the manifest matches (not None)
+    entries = [json.loads(l) for l in (cr / "runs" / run_id / "journal.jsonl").read_text().splitlines()]
+    snap = next(e["data"]["snapshot_sha256"] for e in entries if e["state"] == "SNAPSHOT")
+    assert snap is not None
+    assert manifest["snapshot_sha256"] == snap

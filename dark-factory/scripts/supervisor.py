@@ -95,6 +95,16 @@ def load_state(run_dir):
         return json.load(f)
 
 
+def _snapshot_sha256_from_journal(run_dir):
+    path = os.path.join(run_dir, "journal.jsonl")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            e = json.loads(line)
+            if e.get("state") == "SNAPSHOT":
+                return e.get("data", {}).get("snapshot_sha256")
+    return None
+
+
 def latest_paused_run(control_root):
     runs_dir = os.path.join(control_root, "runs")
     if not os.path.isdir(runs_dir):
@@ -406,6 +416,12 @@ def resume(control_root, decision="continue"):
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
     try:
+        if not cfg["_qualified"]:
+            sys.stderr.write(
+                "dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
+                "isolation; outcome can never be a qualified ship-candidate.\n"
+            )
+
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"))
         spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
@@ -420,7 +436,7 @@ def resume(control_root, decision="continue"):
             "spec_sha256": sha256_str(spec_text),
             "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
             "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
-            "snapshot_sha256": None,
+            "snapshot_sha256": _snapshot_sha256_from_journal(run_dir),
         }
 
         if decision == "abort":
