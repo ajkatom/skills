@@ -154,3 +154,25 @@ def test_adapter_missing_status_aborts_with_exit_2(tmp_path):
     assert rc == 2
     entries, _ = read_journal(cr)
     assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"
+
+
+def test_bad_project_src_exits_2(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    bad_src = tmp_path / "proj"
+    bad_src.mkdir()
+    (bad_src / "ok.txt").write_text("fine", encoding="utf-8")
+    os.mkfifo(bad_src / "pipe")  # special file -> SnapshotError
+    assert supervisor.run(str(cr), str(bad_src)) == 2
+    entries, _ = read_journal(cr)
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"
+
+
+def test_invalid_scenario_ir_exits_2(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    # clobber one scenario with structurally invalid IR (missing required keys)
+    import json
+    bad = next((cr / "scenarios").glob("*.json"))
+    bad.write_text(json.dumps({"ir_version": "0.1"}), encoding="utf-8")
+    assert supervisor.run(str(cr), None) == 2
+    entries, _ = read_journal(cr)
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"

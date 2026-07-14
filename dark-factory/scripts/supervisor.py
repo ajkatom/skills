@@ -15,8 +15,8 @@ import uuid
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
 from id_feedback import project_feedback
-from run_scenarios import run_all
-from snapshot_source import snapshot
+from run_scenarios import OracleError, run_all
+from snapshot_source import SnapshotError, snapshot
 
 BUILDER_RULES = """## Builder rules
 - You are the BUILDER in a dark-factory run. Implement the specification below
@@ -229,7 +229,17 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
 
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
-        manifest, snap_hash = snapshot(project_src, workspace)
+        try:
+            manifest, snap_hash = snapshot(project_src, workspace)
+        except SnapshotError as e:
+            journal.write("ABORTED_BUILD_ERROR", iteration=0, detail=f"snapshot failed: {e}")
+            finalize_manifest(
+                run_dir,
+                dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
+                     snapshot_sha256=None),
+            )
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
     else:
         os.makedirs(workspace, exist_ok=True)
         manifest, snap_hash = {"manifest_version": "0.1", "files": []}, sha256_str(
@@ -258,7 +268,15 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
             return 2
         journal.write("BUILD", iteration=i)
 
-        report = run_all(scenarios_dir, workspace)
+        try:
+            report = run_all(scenarios_dir, workspace)
+        except OracleError as e:
+            journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
+            finalize_manifest(
+                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
+            )
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
         last_report = report
         atomic_write(
             os.path.join(run_dir, f"verifier_report_iter_{i}.json"),
