@@ -81,3 +81,40 @@ def test_auto_mode_runs_to_convergence_without_pausing(tmp_path):
     entries, _ = read_journal(cr)
     states = [e["state"] for e in entries]
     assert "CHECKPOINT" not in states and "CONVERGED" in states
+
+
+def test_resume_continue_converges(tmp_path):
+    cr = setup_control(tmp_path, FAKE)  # pause mode
+    assert supervisor.run(str(cr), None) == 10          # paused after iter 1
+    assert supervisor.resume(str(cr), "continue") == 0  # iter 2 converges
+    entries, run_id = read_journal(cr)
+    states = [e["state"] for e in entries]
+    assert states.count("BUILD") == 2 and "CONVERGED" in states
+    assert not (cr / "runs" / run_id / "state.json").exists()  # cleared at terminal
+    assert (cr / "runs" / run_id / "manifest.json").exists()
+
+
+def test_resume_abort_exits_2_and_is_terminal(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    assert supervisor.run(str(cr), None) == 10
+    assert supervisor.resume(str(cr), "abort") == 2
+    entries, run_id = read_journal(cr)
+    assert entries[-1]["state"] == "ABORTED_BY_HUMAN"
+    assert not (cr / "runs" / run_id / "state.json").exists()
+
+
+def test_resume_accept_is_waived_and_exits_0(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    assert supervisor.run(str(cr), None) == 10
+    assert supervisor.resume(str(cr), "accept") == 0
+    entries, run_id = read_journal(cr)
+    assert entries[-1]["state"] == "ACCEPTED_BY_HUMAN"
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert manifest["outcome"] == "ACCEPTED_WAIVED"
+    assert manifest["qualified"] is False
+
+
+def test_resume_with_no_paused_run_exits_2(tmp_path):
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    assert supervisor.run(str(cr), None) == 0  # converges, no pause
+    assert supervisor.resume(str(cr), "continue") == 2  # nothing to resume

@@ -386,6 +386,64 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     return 3
 
 
+def resume(control_root, decision="continue"):
+    control_root = os.path.abspath(control_root)
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    cfg["_control_root"] = control_root
+
+    run_dir = latest_paused_run(control_root)
+    if run_dir is None:
+        sys.stderr.write("dark-factory: no paused run to resume\n")
+        return 2
+
+    lock = acquire_lock(control_root)
+    try:
+        state = load_state(run_dir)
+        journal = Journal(os.path.join(run_dir, "journal.jsonl"))
+        spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
+        scenarios_dir = os.path.join(control_root, "scenarios")
+        adapter = cfg["roles"]["builder"]["adapter"]
+        timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
+        manifest_base = {
+            "invocation": os.path.basename(run_dir),
+            "tier": cfg["assurance"],
+            "qualified": cfg["_qualified"],
+            "config_sha256": cfg["_config_sha256"],
+            "spec_sha256": sha256_str(spec_text),
+            "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
+            "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
+            "snapshot_sha256": None,
+        }
+
+        if decision == "abort":
+            journal.write("ABORTED_BY_HUMAN")
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BY_HUMAN",
+                                            iterations=state["next_iter"] - 1))
+            os.unlink(os.path.join(run_dir, "state.json"))
+            print("dark-factory: ABORTED by human.")
+            return 2
+        if decision == "accept":
+            journal.write("ACCEPTED_BY_HUMAN",
+                          note="human accepted a non-passing build — waived/unverified")
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
+                                            iterations=state["next_iter"] - 1))
+            os.unlink(os.path.join(run_dir, "state.json"))
+            print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
+            return 0
+        # decision == "continue"
+        return _run_loop(
+            cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+            adapter, timeout_s, state["workspace"],
+            start_iter=state["next_iter"], feedback=state["feedback"],
+        )
+    finally:
+        release_lock(lock)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="dark-factory supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -394,11 +452,16 @@ def main():
     p_run.add_argument("--project-src", default=None)
     p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
     p_ver.add_argument("--run-dir", required=True)
+    p_res = sub.add_parser("resume", help="resume a paused run")
+    p_res.add_argument("--control-root", required=True)
+    p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src))
     elif args.cmd == "verify-manifest":
         sys.exit(0 if verify_manifest(args.run_dir) else 4)
+    elif args.cmd == "resume":
+        sys.exit(resume(args.control_root, args.decision))
 
 
 if __name__ == "__main__":
