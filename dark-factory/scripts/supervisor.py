@@ -12,6 +12,7 @@ import subprocess
 import sys
 import uuid
 
+import df_sandbox
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
 from id_feedback import project_feedback
@@ -196,7 +197,8 @@ def compose_prompt(spec_text: str, feedback) -> str:
     )
 
 
-def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, timeout_s: int):
+def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, timeout_s: int,
+                   exec_prefix=None):
     req = {
         "adapter_protocol": "0.1",
         "role": role,
@@ -204,9 +206,10 @@ def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, time
         "prompt_file": prompt_file,
         "timeout_s": timeout_s,
     }
+    argv = (list(exec_prefix) if exec_prefix else []) + [adapter]
     try:
         proc = subprocess.run(
-            [adapter], input=json.dumps(req), capture_output=True, text=True,
+            argv, input=json.dumps(req), capture_output=True, text=True,
             timeout=timeout_s + 60,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError) as e:
@@ -231,7 +234,30 @@ def _scenario_set_hash(scenarios_dir: str) -> str:
     return sha256_str(canonical_json(files))
 
 
-def run(control_root: str, project_src) -> int:
+def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
+    if cfg["assurance"] != "standard":
+        return "cooperative", [], None, None
+    backend = df_sandbox.current_backend()
+    name = backend.name if backend is not None else None
+    ok = backend is not None and backend.available() and df_sandbox.probe_denial(
+        backend, control_root, workspace)
+    if ok:
+        return "standard", backend.wrap_prefix(control_root, workspace), name, True
+    if allow_downgrade:
+        journal.write("DOWNGRADE", requested="standard", effective="cooperative",
+                      reason="sandbox unavailable or denial probe failed")
+        sys.stderr.write("dark-factory: standard tier UNavailable/probe failed — "
+                         "DOWNGRADED to cooperative (unqualified) by --allow-downgrade.\n")
+        return "cooperative", [], name, False
+    journal.write("PROBE_FAILED", requested="standard",
+                  reason="sandbox unavailable or denial probe failed")
+    raise df_sandbox.SandboxError(
+        "standard tier requires a working OS sandbox + passing denial probe; "
+        "none available. Fix the sandbox or set assurance=cooperative "
+        "(or pass --allow-downgrade).")
+
+
+def run(control_root: str, project_src, allow_downgrade: bool = False) -> int:
     control_root = os.path.abspath(control_root)
     try:
         cfg = load_config(control_root)
@@ -246,22 +272,16 @@ def run(control_root: str, project_src) -> int:
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
     try:
-        return _run_locked(control_root, project_src, cfg)
+        return _run_locked(control_root, project_src, cfg, allow_downgrade)
     finally:
         release_lock(lock)
 
 
-def _run_locked(control_root: str, project_src, cfg) -> int:
+def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False) -> int:
     invocation = _now().replace(":", "").replace("-", "") + "-" + uuid.uuid4().hex[:8]
     run_dir = os.path.join(control_root, "runs", invocation)
     os.makedirs(run_dir, exist_ok=True)
     journal = Journal(os.path.join(run_dir, "journal.jsonl"))
-
-    if not cfg["_qualified"]:
-        sys.stderr.write(
-            "dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
-            "isolation; outcome can never be a qualified ship-candidate.\n"
-        )
 
     spec_path = os.path.join(control_root, "spec.md")
     if not os.path.exists(spec_path):
@@ -308,7 +328,8 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
             finalize_manifest(
                 run_dir,
                 dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
-                     snapshot_sha256=None),
+                     snapshot_sha256=None, qualified=False,
+                     sandbox_backend=None, denial_probe_passed=False),
             )
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -322,14 +343,29 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
                   file_count=len(manifest["files"]))
     manifest_base["snapshot_sha256"] = snap_hash
 
-    return _run_loop(
-        cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-        adapter, timeout_s, workspace, start_iter=1, feedback=None,
-    )
+    try:
+        eff_tier, exec_prefix, backend_name, probe_passed = resolve_isolation(
+            cfg, control_root, workspace, journal, allow_downgrade)
+    except df_sandbox.SandboxError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    manifest_base["qualified"] = (eff_tier == "standard")
+    manifest_base["sandbox_backend"] = backend_name
+    manifest_base["denial_probe_passed"] = probe_passed
+    manifest_base["_effective_tier"] = eff_tier   # internal; stripped before finalize
+    # cooperative banner only when the EFFECTIVE tier is cooperative:
+    if eff_tier != "standard":
+        sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
+                         "isolation; outcome can never be a qualified ship-candidate.\n")
+    return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+                     adapter, timeout_s, workspace, start_iter=1, feedback=None,
+                     exec_prefix=exec_prefix)
 
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-              adapter, timeout_s, workspace, start_iter, feedback):
+              adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None):
+    exec_prefix = exec_prefix or []
+    mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
 
     def _clear_state():
         p = os.path.join(run_dir, "state.json")
@@ -339,22 +375,34 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     last_report = None
     for i in range(start_iter, cfg["max_iterations"] + 1):
         prompt = compose_prompt(spec_text, feedback)
-        prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
+        # Audit copy on the control plane (barrier tests assert MARKER-absence here).
+        audit_prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
+        atomic_write(audit_prompt_file, prompt)
+        # Working copy the adapter actually reads: under standard tier, control_root
+        # is OS-denied to the wrapped builder, so prompt_file must live in the
+        # workspace instead (readable) or every standard build aborts with
+        # PermissionError. This is barrier-safe: prompt content is compose_prompt's
+        # output (spec + ID/taxonomy feedback only, no scenario content), and the
+        # spec is already present in the workspace as spec.md — no holdout leak.
+        prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
         atomic_write(prompt_file, prompt)
-        resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s)
+        resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
+                                   exec_prefix=exec_prefix)
         if err or resp.get("status") != "ok":
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
-            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
+                                            qualified=False))
             _clear_state()
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
             return 2
         journal.write("BUILD", iteration=i)
 
         try:
-            report = run_all(scenarios_dir, workspace)
+            report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix)
         except OracleError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
+                                            qualified=False))
             _clear_state()
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -365,9 +413,12 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
         if report["all_pass"]:
             journal.write("CONVERGED", iteration=i)
-            finalize_manifest(run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i))
+            eff = manifest_base.get("_effective_tier", "cooperative")
+            outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
+            finalize_manifest(run_dir, dict(mb_clean, outcome=outcome, iterations=i))
             _clear_state()
-            print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
+            print(f"dark-factory: CONVERGED "
+                  f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
                   f"Workspace: {workspace}  Run: {run_dir}")
             return 0
 
@@ -389,14 +440,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
     journal.write("CAP_REACHED", failing_behaviors=failing,
                   note="likely spec ambiguity — human decision needed")
-    finalize_manifest(run_dir, dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]))
+    finalize_manifest(run_dir, dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"],
+                                    qualified=False))
     _clear_state()
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
           f"Still failing: {', '.join(failing)}. Run: {run_dir}")
     return 3
 
 
-def resume(control_root, decision="continue"):
+def resume(control_root, decision="continue", allow_downgrade: bool = False):
     control_root = os.path.abspath(control_root)
     try:
         cfg = load_config(control_root)
@@ -416,12 +468,6 @@ def resume(control_root, decision="continue"):
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
     try:
-        if not cfg["_qualified"]:
-            sys.stderr.write(
-                "dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
-                "isolation; outcome can never be a qualified ship-candidate.\n"
-            )
-
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"))
         spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
@@ -442,7 +488,9 @@ def resume(control_root, decision="continue"):
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")
             finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BY_HUMAN",
-                                            iterations=state["next_iter"] - 1))
+                                            iterations=state["next_iter"] - 1,
+                                            qualified=False,
+                                            sandbox_backend=None, denial_probe_passed=False))
             os.unlink(os.path.join(run_dir, "state.json"))
             print("dark-factory: ABORTED by human.")
             return 2
@@ -451,15 +499,31 @@ def resume(control_root, decision="continue"):
                           note="human accepted a non-passing build — waived/unverified")
             finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
                                             qualified=False,
+                                            sandbox_backend=None, denial_probe_passed=False,
                                             iterations=state["next_iter"] - 1))
             os.unlink(os.path.join(run_dir, "state.json"))
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
             return 0
-        # decision == "continue"
+        # decision == "continue" — isolation cannot be trusted across a pause;
+        # re-probe (and re-wrap) before re-entering the loop.
+        try:
+            eff_tier, exec_prefix, backend_name, probe_passed = resolve_isolation(
+                cfg, control_root, state["workspace"], journal, allow_downgrade)
+        except df_sandbox.SandboxError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        manifest_base["qualified"] = (eff_tier == "standard")
+        manifest_base["sandbox_backend"] = backend_name
+        manifest_base["denial_probe_passed"] = probe_passed
+        manifest_base["_effective_tier"] = eff_tier
+        if eff_tier != "standard":
+            sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
+                             "isolation; outcome can never be a qualified ship-candidate.\n")
         return _run_loop(
             cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             adapter, timeout_s, state["workspace"],
             start_iter=state["next_iter"], feedback=state["feedback"],
+            exec_prefix=exec_prefix,
         )
     finally:
         release_lock(lock)
@@ -471,18 +535,24 @@ def main():
     p_run = sub.add_parser("run", help="execute the build/verify loop")
     p_run.add_argument("--control-root", required=True)
     p_run.add_argument("--project-src", default=None)
+    p_run.add_argument("--allow-downgrade", action="store_true",
+                       help="if standard tier is unavailable/probe fails, downgrade to "
+                            "cooperative (unqualified) instead of failing closed")
     p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
     p_ver.add_argument("--run-dir", required=True)
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
+    p_res.add_argument("--allow-downgrade", action="store_true",
+                       help="if standard tier is unavailable/probe fails on re-probe, "
+                            "downgrade to cooperative (unqualified) instead of failing closed")
     args = ap.parse_args()
     if args.cmd == "run":
-        sys.exit(run(args.control_root, args.project_src))
+        sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
     elif args.cmd == "verify-manifest":
         sys.exit(0 if verify_manifest(args.run_dir) else 4)
     elif args.cmd == "resume":
-        sys.exit(resume(args.control_root, args.decision))
+        sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Deterministic fake builder for tests that ALSO reads its prompt file, the
+way the real scripts/adapters/claude adapter does (open(req["prompt_file"])).
+
+This is the point of the fixture: under the standard tier, prompt_file must be
+readable under the sandbox. If it is not, the open() below raises and the
+exception propagates, causing the adapter to exit nonzero and the run to
+abort — exactly the failure this fixture exists to catch.
+
+Otherwise behaves like fake_builder: without <workdir>/feedback.json writes a
+buggy greet.py ("Hi, <name>!"); with feedback present writes the correct one
+("Hello, <name>!"). Also asserts the prompt actually contains the spec
+("greet.py") — proving it received the real spec-bearing prompt, not some
+placeholder.
+"""
+import json
+import os
+import sys
+
+BUGGY = (
+    "import sys\n"
+    "if len(sys.argv) < 2:\n"
+    "    print(\"usage: greet.py <name>\", file=sys.stderr)\n"
+    "    sys.exit(2)\n"
+    "print(f\"Hi, {sys.argv[1]}!\")\n"
+)
+GOOD = BUGGY.replace("Hi, ", "Hello, ")
+
+
+def main():
+    req = json.load(sys.stdin)
+    # THE POINT: read the prompt file exactly like the real claude adapter does.
+    # If the sandbox denies this read, let the PermissionError propagate — the
+    # adapter should fail loudly, not silently swallow it.
+    with open(req["prompt_file"], encoding="utf-8") as f:
+        prompt = f.read()
+    assert "greet.py" in prompt, "prompt did not contain the real spec"
+
+    wd = req["workdir"]
+    body = GOOD if os.path.exists(os.path.join(wd, "feedback.json")) else BUGGY
+    with open(os.path.join(wd, "greet.py"), "w", encoding="utf-8") as f:
+        f.write(body)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

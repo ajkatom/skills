@@ -102,6 +102,22 @@ def test_crash_taxonomy_when_command_cannot_start(tmp_path):
     assert r["pass"] is False and r["taxonomy"] == "crash"
 
 
+def test_exec_wrapper_is_prepended_to_the_command(tmp_path):
+    d = tmp_path / "scen"
+    sc = write_scenario(d, "a.json")  # runs ["python3", "ok.py"], expects stdout "ok"
+    ws = make_workspace(tmp_path)     # ok.py prints "ok"
+    # env -u FOO is a harmless no-op wrapper that execs the following argv unchanged
+    r = run_scenarios.run_scenario(sc, str(ws), exec_wrapper=["env"])
+    assert r["pass"] is True and r["observed"]["exit_code"] == 0
+
+
+def test_default_no_wrapper_unchanged(tmp_path):
+    d = tmp_path / "scen"
+    sc = write_scenario(d, "a.json")
+    ws = make_workspace(tmp_path)
+    assert run_scenarios.run_scenario(sc, str(ws))["pass"] is True
+
+
 def test_run_all_report_shape(tmp_path):
     d = tmp_path / "scen"
     write_scenario(d, "a.json")
