@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -57,7 +58,8 @@ class TwinSet:
                     os.unlink(ep_file)
                 child_env = dict(os.environ, DF_ENDPOINT_FILE=ep_file)
                 proc = subprocess.Popen(d["launch"], cwd=run_dir, env=child_env,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
                 self._procs.append((proc, d))
                 pending.append((d, ep_file, proc))
         except OSError as e:
@@ -85,18 +87,40 @@ class TwinSet:
         return self.start(defs, run_dir, timeout_s)
 
     def stop(self) -> None:
+        # start_new_session=True (see start()) makes each twin its own
+        # session/process-group leader, so signaling the whole process group
+        # (not just the direct Popen child) reaps grandchildren too -- e.g. a
+        # shell-wrapper twin that backgrounds its own child can't leak it.
         for proc, _ in self._procs:
             try:
-                proc.terminate()
-            except (OSError, ProcessLookupError):
-                pass
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
+                continue
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
         deadline = time.time() + 3
         for proc, _ in self._procs:
             try:
                 while proc.poll() is None and time.time() < deadline:
                     time.sleep(0.02)
                 if proc.poll() is None:
-                    proc.kill()
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        try:
+                            proc.kill()
+                        except (OSError, ProcessLookupError):
+                            pass
                 proc.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 pass

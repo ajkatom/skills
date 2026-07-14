@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# A twin that spawns a grandchild (a background sleeper) and writes a marker
+# with the grandchild PID, then writes its own endpoint and waits. Used to
+# prove process-group reaping kills the grandchild too.
+python3 -c "import time; open('$DF_GRANDCHILD_PIDFILE','w').write(str(__import__('os').getpid())); time.sleep(300)" &
+GC=$!
+echo "$GC" > "$DF_GRANDCHILD_PIDFILE.launcher"
+# write endpoint so the supervisor/df_twins considers us ready
+echo "127.0.0.1:1" > "$DF_ENDPOINT_FILE"
+sleep 300
