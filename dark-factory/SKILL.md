@@ -23,8 +23,21 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
    builder work**, deriving them ONLY from spec.md. Never echo scenario content
    into the main conversation if the same conversation will drive the builder.
 4. **Config.** Write `<control_root>/config.json` per
-   `references/config-reference.md` (builder adapter:
-   `<skill_dir>/scripts/adapters/claude`).
+   `references/config-reference.md`.
+   - **Choose the builder model.** Run
+     `python3 <skill_dir>/scripts/df_adapters.py -c "import df_adapters,json;print(json.dumps(df_adapters.available_builders()))"`
+     (or import `available_builders()`) to see which of claude / codex / gemini
+     are installed. Ask the user which model should BUILD; offer only the available
+     ones. Set `roles.builder.adapter` to `<skill_dir>/scripts/adapters/<name>`.
+     **No silent fallback** — if the chosen model's CLI is absent the run fails
+     closed (`resolve_builder` raises; the run aborts). Verification stays the
+     deterministic scenario runner regardless of builder — dark-factory has no LLM
+     judge to swap.
+   - **Vendor diversity (recommended, not required).** Author the spec and the
+     holdout scenarios with a *different* model/session than the builder (e.g.
+     Claude authors, Codex builds). Different vendors have different blind spots,
+     which hardens the holdout — the "second librarian from a different library."
+     Never author scenarios in the same session that will drive the builder.
    - `assurance`: `cooperative` (works everywhere, unqualified) or `standard` (real OS
      read-denial sandbox → qualified; needs macOS `sandbox-exec` or Linux `bwrap`, and a
      passing startup denial probe). If `standard` can't be honored, the run fails closed
