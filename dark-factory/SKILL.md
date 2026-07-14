@@ -1,6 +1,6 @@
 ---
 name: dark-factory
-description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. M1 walking skeleton: cooperative tier only (honor-system isolation, honestly unqualified).
+description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified) and `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified). Per-iteration human checkpoints (pause/resume) at autonomy 4.
 ---
 
 # dark-factory (M1 walking skeleton)
@@ -25,8 +25,12 @@ explicitly **UNQUALIFIED** and can never claim a probe-proven barrier.
    builder work**, deriving them ONLY from spec.md. Never echo scenario content
    into the main conversation if the same conversation will drive the builder.
 4. **Config.** Write `<control_root>/config.json` per
-   `references/config-reference.md` (assurance MUST be `cooperative` in M1;
-   builder adapter: `<skill_dir>/scripts/adapters/claude`).
+   `references/config-reference.md` (builder adapter:
+   `<skill_dir>/scripts/adapters/claude`).
+   - `assurance`: `cooperative` (works everywhere, unqualified) or `standard` (real OS
+     read-denial sandbox → qualified; needs macOS `sandbox-exec` or Linux `bwrap`, and a
+     passing startup denial probe). If `standard` can't be honored, the run fails closed
+     unless you pass `run --allow-downgrade` (→ cooperative, unqualified).
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
    Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error ·
    **10 = paused at a checkpoint** (autonomy 4 / `checkpoint: pause`).
