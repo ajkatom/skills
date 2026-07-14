@@ -100,3 +100,31 @@ def test_non_dict_roles_builder_raises_config_error(tmp_path):
     write_config(cr, roles={"builder": "oops"})
     with pytest.raises(df_config.ConfigError, match="roles.builder"):
         df_config.load_config(str(cr))
+
+
+def test_checkpoint_defaults_to_pause_at_autonomy_4(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, autonomy=4)  # no explicit checkpoint
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_checkpoint"] == "pause"
+
+
+def test_checkpoint_defaults_to_auto_at_autonomy_5(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, autonomy=5)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_checkpoint"] == "auto"
+
+
+def test_explicit_checkpoint_overrides_default(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, autonomy=4, checkpoint="auto")
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_checkpoint"] == "auto"
+
+
+def test_invalid_checkpoint_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, checkpoint="sometimes")
+    with pytest.raises(df_config.ConfigError, match="checkpoint"):
+        df_config.load_config(str(cr))

@@ -69,7 +69,14 @@ def load_config(control_root: str) -> dict:
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
 
+    checkpoint = raw.get("checkpoint")
+    if checkpoint is None:
+        checkpoint = "pause" if raw.get("autonomy") == 4 else "auto"
+    elif checkpoint not in ("pause", "auto"):
+        raise ConfigError("checkpoint must be 'pause' or 'auto'")
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
+    cfg["_checkpoint"] = checkpoint
     return cfg
