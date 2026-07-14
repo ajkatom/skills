@@ -24,8 +24,13 @@ class _MacOSBackend:
         return shutil.which("sandbox-exec") is not None
 
     def wrap_prefix(self, deny_root, workspace):
-        # Filled in Task 2.
-        raise SandboxError("macOS wrap_prefix not implemented yet")
+        real = os.path.realpath(deny_root)
+        profile = (
+            "(version 1)"
+            "(allow default)"
+            f'(deny file-read* (subpath "{real}"))'
+        )
+        return ["sandbox-exec", "-p", profile]
 
 
 class _LinuxBackend:
