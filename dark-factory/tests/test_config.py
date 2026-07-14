@@ -33,7 +33,7 @@ def test_valid_cooperative_config_loads_and_is_unqualified(tmp_path):
 
 def test_unbacked_tier_is_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="standard")
+    write_config(cr, assurance="hardened")
     with pytest.raises(df_config.ConfigError, match="no conforming backend"):
         df_config.load_config(str(cr))
 
@@ -127,4 +127,19 @@ def test_invalid_checkpoint_rejected(tmp_path):
     cr = tmp_path / "control"
     write_config(cr, checkpoint="sometimes")
     with pytest.raises(df_config.ConfigError, match="checkpoint"):
+        df_config.load_config(str(cr))
+
+
+def test_standard_tier_loads_and_is_qualified(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard")
+    cfg = df_config.load_config(str(cr))
+    assert cfg["assurance"] == "standard"
+    assert cfg["_qualified"] is True
+
+
+def test_hardened_tier_still_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="hardened")
+    with pytest.raises(df_config.ConfigError, match="no conforming backend"):
         df_config.load_config(str(cr))

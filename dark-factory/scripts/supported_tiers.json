@@ -4,7 +4,12 @@
     "cooperative": {
       "qualified": false,
       "backend": "process-v0",
-      "note": "No OS read-denial primitive; isolation is honor-system. Cannot claim probe-proven isolation or produce a qualified ship-candidate. See spec section 2.2."
+      "note": "No OS read-denial; honor-system. Cannot claim probe-proven isolation. Spec 2.2."
+    },
+    "standard": {
+      "qualified": true,
+      "backend": "os-read-denial",
+      "note": "OS read-denial sandbox (macOS sandbox-exec / Linux bwrap). Usable only when the platform backend is available AND the startup denial probe passes; else fail-closed. Spec 7.2."
     }
   }
 }
