@@ -8,3 +8,8 @@ node_modules/
 .env
 .env.*
 !.env.example
+.superpowers/
+
+# Python test harness for dark-factory
+.venv/
+__pycache__/

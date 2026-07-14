@@ -20,3 +20,22 @@ The skill is used live via a symlink:
 ```
 ln -sfn "$PWD/loop-designer" ~/.claude/skills/loop-designer
 ```
+
+## dark-factory
+
+Runs a StrongDM-style "dark factory" loop: you write a spec, an isolated
+builder agent implements it without ever seeing the hidden acceptance
+scenarios, a verifier runs them, and only behavior-ID feedback crosses back
+until convergence. M1 = walking skeleton (cooperative tier, honestly
+unqualified isolation).
+
+- Skill: [`dark-factory/SKILL.md`](dark-factory/SKILL.md)
+- Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md)
+- Adversarial review log: [`docs/superpowers/specs/2026-07-13-dark-factory-review-log.md`](docs/superpowers/specs/2026-07-13-dark-factory-review-log.md)
+- Tests: `.venv/bin/python -m pytest dark-factory/tests -v`
+
+### Install / update
+
+```
+ln -sfn "$PWD/dark-factory" ~/.claude/skills/dark-factory
+```
