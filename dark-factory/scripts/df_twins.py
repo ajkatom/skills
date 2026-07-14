@@ -44,7 +44,7 @@ def load_defs(twins_dir: str) -> list:
 
 class TwinSet:
     def __init__(self):
-        self._procs = []      # list[(subprocess.Popen, def)]
+        self._procs = []      # list[(subprocess.Popen, def, pgid)]
         self.env = {}
 
     def start(self, defs, run_dir: str, timeout_s: int) -> dict:
@@ -60,7 +60,15 @@ class TwinSet:
                 proc = subprocess.Popen(d["launch"], cwd=run_dir, env=child_env,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                         start_new_session=True)
-                self._procs.append((proc, d))
+                # start_new_session=True makes proc the session/process-group
+                # leader, so its pgid == pid at this instant. Capture it NOW,
+                # while the child is definitely alive -- resolving it later at
+                # stop() time via os.getpgid(proc.pid) can raise
+                # ProcessLookupError on macOS if this direct child (e.g. a
+                # shell wrapper) has already exited, which would otherwise
+                # leak any grandchild it backgrounded in the same group.
+                pgid = proc.pid
+                self._procs.append((proc, d, pgid))
                 pending.append((d, ep_file, proc))
         except OSError as e:
             self.stop()
@@ -68,13 +76,18 @@ class TwinSet:
         deadline = time.time() + timeout_s
         for d, ep_file, proc in pending:
             while True:
-                if proc.poll() is not None:
-                    self.stop()
-                    raise TwinError(f"twin {d['name']!r} exited before ready")
+                # Check readiness before liveness: a direct child (e.g. a shell
+                # wrapper) may write the endpoint and then exit immediately
+                # (backgrounding a longer-lived grandchild). That is a valid
+                # ready state, not a failure, so the endpoint file must win the
+                # race against an already-exited direct child.
                 if os.path.exists(ep_file) and os.path.getsize(ep_file) > 0:
                     with open(ep_file, encoding="utf-8") as fh:
                         env_map[d["env_var"]] = fh.read().strip()
                     break
+                if proc.poll() is not None:
+                    self.stop()
+                    raise TwinError(f"twin {d['name']!r} exited before ready")
                 if time.time() > deadline:
                     self.stop()
                     raise TwinError(f"twin {d['name']!r} not ready within {timeout_s}s (timeout)")
@@ -87,14 +100,20 @@ class TwinSet:
         return self.start(defs, run_dir, timeout_s)
 
     def stop(self) -> None:
-        # start_new_session=True (see start()) makes each twin its own
-        # session/process-group leader, so signaling the whole process group
-        # (not just the direct Popen child) reaps grandchildren too -- e.g. a
-        # shell-wrapper twin that backgrounds its own child can't leak it.
-        for proc, _ in self._procs:
-            try:
-                pgid = os.getpgid(proc.pid)
-            except (ProcessLookupError, OSError):
+        # pgid is captured at start() time (see start()), while each child was
+        # definitely alive -- start_new_session=True makes it the process-group
+        # leader, so pgid == pid at launch. Signaling/escalating on that
+        # captured pgid (rather than re-resolving it here via
+        # os.getpgid(proc.pid)) means a direct Popen child (e.g. a shell
+        # wrapper) that has ALREADY exited by the time stop() runs does not
+        # cause any grandchild it backgrounded in the same process group to
+        # leak: os.getpgid() on an exited/zombie pid raises
+        # ProcessLookupError on macOS, which used to fall back to
+        # proc.terminate() -- signaling only the already-dead direct child.
+        for proc, _, pgid in self._procs:
+            if pgid is None:
+                # Defensive fallback only; pgid is always captured at
+                # start() time, so this should not happen in practice.
                 try:
                     proc.terminate()
                 except (OSError, ProcessLookupError):
@@ -102,27 +121,46 @@ class TwinSet:
                 continue
             try:
                 os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        grace_deadline = time.time() + 3
+        for proc, _, pgid in self._procs:
+            # Reap the direct child to clear its zombie, whether it already
+            # exited on its own or just got SIGTERM'd above.
+            try:
+                proc.wait(timeout=max(0.0, grace_deadline - time.time()))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+            if pgid is None:
                 try:
-                    proc.terminate()
+                    proc.kill()
                 except (OSError, ProcessLookupError):
                     pass
-        deadline = time.time() + 3
-        for proc, _ in self._procs:
+                continue
+
             try:
-                while proc.poll() is None and time.time() < deadline:
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        pgid = os.getpgid(proc.pid)
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        try:
-                            proc.kill()
-                        except (OSError, ProcessLookupError):
-                            pass
-                proc.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                # Group is empty (or otherwise gone) -- nothing left to reap,
+                # even if the direct child itself exited earlier.
+                continue
+
+            # Group still has live members (e.g. a backgrounded grandchild
+            # whose leader already exited) -- escalate the whole group.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
+
+            kill_deadline = time.time() + 2
+            while time.time() < kill_deadline:
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, OSError):
+                    break
+                time.sleep(0.02)
+
         self._procs = []
         self.env = {}
