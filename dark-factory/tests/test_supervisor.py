@@ -121,3 +121,36 @@ def test_prompt_contains_spec_and_feedback_but_never_scenarios(tmp_path):
     assert "greet.py" in p1 and MARKER not in p1
     assert "BHV-001" in p2 and MARKER not in p2  # iteration 2 carries ID feedback
     assert "Hello, <name>!" in p1  # spec text is fine — it is SHARED
+
+
+def test_live_pid_lock_is_not_reclaimed(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    cr_lock = cr / ".lock"
+    cr_lock.write_text(str(os.getpid()), encoding="utf-8")  # this process — alive
+    with pytest.raises(supervisor.LockError):
+        supervisor.acquire_lock(str(cr))
+
+
+def test_run_on_locked_control_root_exits_2(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    lock = supervisor.acquire_lock(str(cr))
+    try:
+        assert supervisor.run(str(cr), None) == 2
+    finally:
+        supervisor.release_lock(lock)
+
+
+def test_adapter_missing_status_aborts_with_exit_2(tmp_path):
+    bad_adapter = tmp_path / "bad_adapter.py"
+    bad_adapter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({\"adapter_protocol\": \"0.1\"}))\n",
+        encoding="utf-8",
+    )
+    os.chmod(str(bad_adapter), 0o755)
+    cr = setup_control(tmp_path, str(bad_adapter))
+    rc = supervisor.run(str(cr), None)
+    assert rc == 2
+    entries, _ = read_journal(cr)
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"

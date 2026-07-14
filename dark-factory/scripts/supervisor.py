@@ -44,10 +44,12 @@ def acquire_lock(control_root: str) -> str:
         try:
             pid = int(open(path, encoding="utf-8").read().strip())
             os.kill(pid, 0)  # raises if dead
-        except (ValueError, ProcessLookupError, PermissionError):
+        except (ValueError, ProcessLookupError):
             sys.stderr.write(f"dark-factory: removing stale lock {path}\n")
             os.unlink(path)
             return acquire_lock(control_root)
+        except PermissionError:
+            raise LockError(f"another invocation holds {path} (pid {pid}, live)")
         raise LockError(f"another invocation holds {path} (pid {pid})")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
@@ -128,7 +130,11 @@ def run(control_root: str, project_src) -> int:
         sys.stderr.write(f"dark-factory: config error: {e}\n")
         return 2
 
-    lock = acquire_lock(control_root)
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
     try:
         return _run_locked(control_root, project_src, cfg)
     finally:
@@ -193,7 +199,7 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
         prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
         atomic_write(prompt_file, prompt)
         resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s)
-        if err or resp["status"] != "ok":
+        if err or resp.get("status") != "ok":
             journal.write("ABORTED_BUILD_ERROR", iteration=i,
                           detail=err or resp.get("detail", ""))
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
