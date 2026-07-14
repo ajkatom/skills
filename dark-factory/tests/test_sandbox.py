@@ -121,3 +121,35 @@ def test_probe_cleans_up_canary(tmp_path):
     df_sandbox.probe_denial(_PassthroughBackend(), str(deny_root), str(ws))
     leftovers = [n for n in os.listdir(deny_root) if n.startswith(".probe-canary-")]
     assert leftovers == []
+
+
+class _LaunchFailBackend:
+    """wrap_prefix that makes the wrapped read attempt never run (exits nonzero first)."""
+    name = "launch-fail"
+    def available(self): return True
+    def wrap_prefix(self, deny_root, workspace): return ["false"]
+
+
+class _SandboxErrorBackend:
+    name = "raises"
+    def available(self): return True
+    def wrap_prefix(self, deny_root, workspace):
+        raise df_sandbox.SandboxError("boom")
+
+
+def test_probe_false_when_wrapped_process_never_runs(tmp_path):
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    # A launch failure (empty stdout, nonzero exit) must NOT be mistaken for denial.
+    assert df_sandbox.probe_denial(_LaunchFailBackend(), str(deny_root), str(ws)) is False
+
+
+def test_probe_false_when_wrap_prefix_raises(tmp_path):
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    assert df_sandbox.probe_denial(_SandboxErrorBackend(), str(deny_root), str(ws)) is False
+
+
+def test_probe_false_when_canary_cannot_be_planted(tmp_path):
+    # deny_root does not exist → planting fails → fail closed, no exception.
+    assert df_sandbox.probe_denial(_PassthroughBackend(), "/nonexistent/deny/root/xyz", str(tmp_path)) is False

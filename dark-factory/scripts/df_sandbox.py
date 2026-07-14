@@ -70,8 +70,11 @@ def probe_denial(backend, deny_root, workspace):
     token = "DF-CANARY-" + uuid.uuid4().hex
     canary = os.path.join(deny_root, ".probe-canary-" + uuid.uuid4().hex)
     try:
-        with open(canary, "w", encoding="utf-8") as f:
-            f.write(token)
+        try:
+            with open(canary, "w", encoding="utf-8") as f:
+                f.write(token)
+        except OSError:
+            return False
         try:
             prefix = backend.wrap_prefix(deny_root, workspace)
         except SandboxError:
@@ -88,11 +91,14 @@ def probe_denial(backend, deny_root, workspace):
         try:
             proc = subprocess.run(
                 prefix + [sys.executable, "-c", code, canary],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, errors="replace", timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return token not in proc.stdout
+        # Fail-closed: True only if the wrapped read provably ran AND hit the
+        # denial branch. Vacuous stdout from a launch failure (nonzero exit,
+        # empty/garbage output) must NOT be mistaken for a proven denial.
+        return proc.returncode == 0 and proc.stdout.strip() == "DF-READ-DENIED"
     finally:
         try:
             os.unlink(canary)
