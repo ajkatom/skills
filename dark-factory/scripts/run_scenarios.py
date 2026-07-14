@@ -67,13 +67,14 @@ def _norm(s: str) -> str:
     return s[:-1] if s.endswith("\n") else s
 
 
-def run_scenario(sc: dict, workspace: str) -> dict:
+def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None) -> dict:
     timeout = sc["when"].get("timeout_s", 30)
     observed = {"exit_code": None, "stdout": "", "stderr": ""}
     taxonomy = None
+    command = (list(exec_wrapper) if exec_wrapper else []) + sc["when"]["run"]
     try:
         proc = subprocess.run(
-            sc["when"]["run"],
+            command,
             cwd=workspace,
             capture_output=True,
             text=True,
@@ -110,8 +111,10 @@ def run_scenario(sc: dict, workspace: str) -> dict:
     }
 
 
-def run_all(scenarios_dir: str, workspace: str) -> dict:
-    results = [run_scenario(sc, workspace) for sc in load_scenarios(scenarios_dir)]
+def run_all(scenarios_dir: str, workspace: str, exec_wrapper: list | None = None) -> dict:
+    results = [
+        run_scenario(sc, workspace, exec_wrapper) for sc in load_scenarios(scenarios_dir)
+    ]
     return {
         "report_version": "0.1",
         "results": results,
