@@ -67,11 +67,14 @@ def _norm(s: str) -> str:
     return s[:-1] if s.endswith("\n") else s
 
 
-def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None) -> dict:
+def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None) -> dict:
     timeout = sc["when"].get("timeout_s", 30)
     observed = {"exit_code": None, "stdout": "", "stderr": ""}
     taxonomy = None
     command = (list(exec_wrapper) if exec_wrapper else []) + sc["when"]["run"]
+    env = None
+    if env_extra:
+        env = dict(os.environ, **env_extra)
     try:
         proc = subprocess.run(
             command,
@@ -79,6 +82,7 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None) -> 
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         observed = {
             "exit_code": proc.returncode,
@@ -111,9 +115,9 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None) -> 
     }
 
 
-def run_all(scenarios_dir: str, workspace: str, exec_wrapper: list | None = None) -> dict:
+def run_all(scenarios_dir: str, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None) -> dict:
     results = [
-        run_scenario(sc, workspace, exec_wrapper) for sc in load_scenarios(scenarios_dir)
+        run_scenario(sc, workspace, exec_wrapper, env_extra) for sc in load_scenarios(scenarios_dir)
     ]
     return {
         "report_version": "0.1",
