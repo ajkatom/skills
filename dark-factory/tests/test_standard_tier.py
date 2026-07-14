@@ -8,6 +8,9 @@ import df_sandbox
 import supervisor
 from test_supervisor import FAKE, STUBBORN, setup_control
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+READS_PROMPT = os.path.join(HERE, "fixtures", "fake_builder_reads_prompt")
+
 
 def _std(tmp_path, **kw):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto", **kw)
@@ -107,9 +110,12 @@ def test_standard_snapshot_failure_is_not_qualified(tmp_path):
     assert m["qualified"] is False
 
 
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
 def test_standard_resume_abort_is_not_qualified(tmp_path):
     # decision=="abort" finalizes BEFORE the continue-only resolve_isolation
     # re-probe, so it too inherits raw registry qualified:true unless forced.
+    if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
+        pytest.skip("no OS sandbox primitive")
     cr = setup_control(tmp_path, FAKE)  # default autonomy 4 -> checkpoint pause
     p = cr / "config.json"
     cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
@@ -136,3 +142,27 @@ def test_standard_cap_is_not_qualified(tmp_path):
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "CAP_REACHED"
     assert m["qualified"] is False
+
+
+# --- C1 regression: under standard, the wrapped builder must be able to read
+# ITS OWN PROMPT FILE. The real scripts/adapters/claude adapter does
+# open(req["prompt_file"]); if prompt_file lives under control_root (denied
+# root), that open() hits PermissionError under the sandbox and every standard
+# build aborts (exit 2) — the QUALIFIED outcome is unreachable in production.
+# fake_builder_reads_prompt models that real adapter behavior (it actually
+# opens and reads prompt_file) so this test is RED against the bug and GREEN
+# once the supervisor writes the working prompt copy into the workspace.
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
+def test_standard_prompt_reading_adapter_converges_qualified(tmp_path):
+    if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
+        pytest.skip("no OS sandbox primitive")
+    cr = setup_control(tmp_path, READS_PROMPT, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["qualified"] is True
+    assert m["outcome"] == "COMPLETE_QUALIFIED"

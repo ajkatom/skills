@@ -9,12 +9,14 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import uuid
 
 
 class SandboxError(RuntimeError):
     pass
+
+
+_DENIAL_MARKER = "DF-READ-DENIED"
 
 
 class _MacOSBackend:
@@ -86,7 +88,7 @@ def probe_denial(backend, deny_root, workspace):
             "try:\n"
             "    sys.stdout.write(open(sys.argv[1]).read())\n"
             "except Exception:\n"
-            "    sys.stdout.write('DF-READ-DENIED')\n"
+            f"    sys.stdout.write({_DENIAL_MARKER!r})\n"
         )
         try:
             proc = subprocess.run(
@@ -98,7 +100,7 @@ def probe_denial(backend, deny_root, workspace):
         # Fail-closed: True only if the wrapped read provably ran AND hit the
         # denial branch. Vacuous stdout from a launch failure (nonzero exit,
         # empty/garbage output) must NOT be mistaken for a proven denial.
-        return proc.returncode == 0 and proc.stdout.strip() == "DF-READ-DENIED"
+        return proc.returncode == 0 and proc.stdout.strip() == _DENIAL_MARKER
     finally:
         try:
             os.unlink(canary)

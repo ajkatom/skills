@@ -375,7 +375,16 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     last_report = None
     for i in range(start_iter, cfg["max_iterations"] + 1):
         prompt = compose_prompt(spec_text, feedback)
-        prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
+        # Audit copy on the control plane (barrier tests assert MARKER-absence here).
+        audit_prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
+        atomic_write(audit_prompt_file, prompt)
+        # Working copy the adapter actually reads: under standard tier, control_root
+        # is OS-denied to the wrapped builder, so prompt_file must live in the
+        # workspace instead (readable) or every standard build aborts with
+        # PermissionError. This is barrier-safe: prompt content is compose_prompt's
+        # output (spec + ID/taxonomy feedback only, no scenario content), and the
+        # spec is already present in the workspace as spec.md — no holdout leak.
+        prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
         atomic_write(prompt_file, prompt)
         resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
                                    exec_prefix=exec_prefix)
