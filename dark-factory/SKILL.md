@@ -28,12 +28,17 @@ explicitly **UNQUALIFIED** and can never claim a probe-proven barrier.
    `references/config-reference.md` (assurance MUST be `cooperative` in M1;
    builder adapter: `<skill_dir>/scripts/adapters/claude`).
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
-   Exit 0 = converged (unqualified) · 3 = cap reached (likely spec ambiguity —
-   show the failing behavior IDs and ask the user) · 2 = config/build error.
-6. **Report.** Show the user: outcome, iterations, per-behavior status from the
-   run's `journal.jsonl`, the workspace path, and
-   `supervisor.py verify-manifest --run-dir <run_dir>` output. State plainly
-   that the cooperative tier is unqualified.
+   Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error ·
+   **10 = paused at a checkpoint** (autonomy 4 / `checkpoint: pause`).
+6. **At a checkpoint (exit 10).** Show the user `runs/<id>/checkpoint_iter_N.md` (per-behavior
+   pass/fail — no scenario text). Then, on their decision, run:
+   - **continue** → `supervisor.py resume --control-root <cr> --decision continue`
+   - **adjust spec** → edit `<control_root>/spec.md`, then `resume --decision continue`
+   - **accept** (stop, waived/unverified) → `resume --decision accept`
+   - **abort** → `resume --decision abort`
+   Repeat until exit 0/2/3.
+7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
+   path, and `verify-manifest --run-dir <run_dir>`. State that cooperative tier is unqualified.
 
 ## Hard rules
 
