@@ -15,3 +15,6 @@ Lives at `<control_root>/config.json`. JSON, not YAML: runtime is stdlib-only
 | `roles.builder.adapter` | str | path to a protocol-0.1 adapter executable. Shipped: `scripts/adapters/{claude,codex,gemini}`. The chosen model's CLI must be installed (no silent fallback — an absent CLI aborts the run). |
 | `roles.builder.timeout_s` | int | optional, default 600 |
 | `budget.billing` | str | `"subscription"` (alert-only) in M1; metered admission lands later |
+| `knowledge_base.kind` | str | optional: `none` (default) \| `wiki` \| `open-brain`. Enables optional grounding + opt-in run-summary write-back. |
+| `knowledge_base.path` | str | required existing directory when kind=`wiki`; the run summary is appended to `<path>/dark-factory-runs.md`. |
+| `knowledge_base.write_back` | bool | default false. When true + kind=`wiki`, the supervisor appends a barrier-safe run summary (outcome/tier/qualified/iterations/failing behavior IDs — no scenario text). `open-brain` write-back is done by the Claude session (MCP), not the supervisor. |
