@@ -25,9 +25,8 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
 4. **Config.** Write `<control_root>/config.json` per
    `references/config-reference.md`.
    - **Choose the builder model.** Run
-     `python3 <skill_dir>/scripts/df_adapters.py -c "import df_adapters,json;print(json.dumps(df_adapters.available_builders()))"`
-     (or import `available_builders()`) to see which of claude / codex / gemini
-     are installed. Ask the user which model should BUILD; offer only the available
+     `python3 -c "import sys; sys.path.insert(0,'<skill_dir>/scripts'); import df_adapters, json; print(json.dumps(df_adapters.available_builders()))"`
+     to see which of claude / codex / gemini are installed. Ask the user which model should BUILD; offer only the available
      ones. Set `roles.builder.adapter` to `<skill_dir>/scripts/adapters/<name>`.
      **No silent fallback** — if the chosen model's CLI is absent the run fails
      closed (`resolve_builder` raises; the run aborts). Verification stays the
