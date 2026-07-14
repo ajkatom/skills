@@ -1,0 +1,35 @@
+#!/usr/bin/python3
+"""Deterministic fake builder for tests. Speaks adapter protocol 0.1.
+
+Behavior: without <workdir>/feedback.json writes a buggy greet.py
+("Hi, <name>!"); with feedback present writes the correct one
+("Hello, <name>!"). Models a builder that misreads the spec once,
+then fixes the flagged behavior. Never reads scenarios (cannot — they
+are not reachable from the workspace).
+"""
+import json
+import os
+import sys
+
+BUGGY = (
+    "import sys\n"
+    "if len(sys.argv) < 2:\n"
+    "    print(\"usage: greet.py <name>\", file=sys.stderr)\n"
+    "    sys.exit(2)\n"
+    "print(f\"Hi, {sys.argv[1]}!\")\n"
+)
+GOOD = BUGGY.replace("Hi, ", "Hello, ")
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    body = GOOD if os.path.exists(os.path.join(wd, "feedback.json")) else BUGGY
+    with open(os.path.join(wd, "greet.py"), "w", encoding="utf-8") as f:
+        f.write(body)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()
