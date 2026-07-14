@@ -49,3 +49,13 @@ def test_writeback_failure_does_not_crash_run(tmp_path):
     run_id = os.listdir(cr / "runs")[0]
     journal = (cr / "runs" / run_id / "journal.jsonl").read_text()
     assert "KB_WRITEBACK_ERROR" in journal
+
+
+def test_kb_writeback_tolerates_any_exception(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"; wiki.mkdir()
+    cr = _wiki_cfg(tmp_path, FAKE, wiki)
+    import df_kb
+    monkeypatch.setattr(df_kb, "write_run_summary", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
+    assert supervisor.run(str(cr), None) == 0
+    run_id = os.listdir(cr / "runs")[0]
+    assert "KB_WRITEBACK_ERROR" in (cr / "runs" / run_id / "journal.jsonl").read_text()

@@ -178,7 +178,7 @@ def _kb_writeback(cfg, journal, manifest_dict, failing):
         path = df_kb.write_run_summary(kb, manifest_dict, failing)
         if path:
             journal.write("KB_WRITEBACK", path=path)
-    except (OSError, df_kb.KBLeakError) as e:
+    except Exception as e:
         journal.write("KB_WRITEBACK_ERROR", detail=str(e))
 
 

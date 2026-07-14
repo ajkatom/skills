@@ -22,7 +22,7 @@ def build_summary(manifest: dict, failing_behaviors: list) -> str:
             raise KBLeakError(f"failing_behaviors must be BHV ids only (offending value withheld)")
     failing = ", ".join(sorted(failing_behaviors)) if failing_behaviors else "none"
     return (
-        f"## dark-factory run {manifest.get('finished_ts', '')}\n"
+        f"## dark-factory run {manifest.get('finished_ts') or manifest.get('invocation', '')}\n"
         f"- invocation: `{manifest.get('invocation', '')}`\n"
         f"- outcome: **{manifest.get('outcome', '')}**\n"
         f"- tier: {manifest.get('tier', '')}  qualified: {manifest.get('qualified', '')}\n"

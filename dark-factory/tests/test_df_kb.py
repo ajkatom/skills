@@ -51,3 +51,10 @@ def test_write_run_summary_never_leaks_marker(tmp_path):
     m = manifest(spec_sha256=MARKER, extra_note=f"secret {MARKER}")
     df_kb.write_run_summary(kb, m, ["BHV-001"])
     assert MARKER not in open(wiki / "dark-factory-runs.md", encoding="utf-8").read()
+
+
+def test_build_summary_header_falls_back_to_invocation_when_no_finished_ts():
+    m = {"invocation": "20260714T010101Z-deadbeef", "outcome": "CAP_REACHED",
+         "tier": "standard", "qualified": False, "iterations": 2}  # no finished_ts
+    s = df_kb.build_summary(m, [])
+    assert "## dark-factory run 20260714T010101Z-deadbeef" in s
