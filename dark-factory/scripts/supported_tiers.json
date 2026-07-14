@@ -1,0 +1,10 @@
+{
+  "registry_version": "0.1",
+  "tiers": {
+    "cooperative": {
+      "qualified": false,
+      "backend": "process-v0",
+      "note": "No OS read-denial primitive; isolation is honor-system. Cannot claim probe-proven isolation or produce a qualified ship-candidate. See spec section 2.2."
+    }
+  }
+}

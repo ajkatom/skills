@@ -1,0 +1,79 @@
+import json
+
+import pytest
+
+import df_config
+
+
+def write_config(control_root, **overrides):
+    cfg = {
+        "config_version": "0.1",
+        "autonomy": 4,
+        "assurance": "cooperative",
+        "feedback": "ids",
+        "max_iterations": 5,
+        "workspace_root": str(control_root.parent / "ws"),
+        "roles": {"builder": {"adapter": "/bin/true", "timeout_s": 60}},
+        "budget": {"billing": "subscription"},
+    }
+    cfg.update(overrides)
+    control_root.mkdir(parents=True, exist_ok=True)
+    (control_root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    return cfg
+
+
+def test_valid_cooperative_config_loads_and_is_unqualified(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["assurance"] == "cooperative"
+    assert cfg["_qualified"] is False
+    assert len(cfg["_config_sha256"]) == 64
+
+
+def test_unbacked_tier_is_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard")
+    with pytest.raises(df_config.ConfigError, match="no conforming backend"):
+        df_config.load_config(str(cr))
+
+
+def test_non_ids_feedback_is_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, feedback="behavioral")
+    with pytest.raises(df_config.ConfigError, match="feedback"):
+        df_config.load_config(str(cr))
+
+
+def test_max_iterations_bounds(tmp_path):
+    cr = tmp_path / "control"
+    for bad in (0, 21, "5", None):
+        write_config(cr, max_iterations=bad)
+        with pytest.raises(df_config.ConfigError, match="max_iterations"):
+            df_config.load_config(str(cr))
+
+
+def test_workspace_inside_control_root_is_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, workspace_root=str(cr / "ws"))
+    with pytest.raises(df_config.ConfigError, match="disjoint"):
+        df_config.load_config(str(cr))
+
+
+def test_control_root_inside_workspace_is_rejected(tmp_path):
+    cr = tmp_path / "ws" / "control"
+    write_config(cr, workspace_root=str(tmp_path / "ws"))
+    with pytest.raises(df_config.ConfigError, match="disjoint"):
+        df_config.load_config(str(cr))
+
+
+def test_missing_builder_adapter_is_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, roles={"builder": {}})
+    with pytest.raises(df_config.ConfigError, match="adapter"):
+        df_config.load_config(str(cr))
+
+
+def test_missing_config_file_is_clear(tmp_path):
+    with pytest.raises(df_config.ConfigError, match="missing config"):
+        df_config.load_config(str(tmp_path / "nowhere"))
