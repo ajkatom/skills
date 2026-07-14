@@ -74,6 +74,64 @@ class Journal:
             os.fsync(f.fileno())
 
 
+def save_state(run_dir, next_iter, feedback, workspace):
+    atomic_write(
+        os.path.join(run_dir, "state.json"),
+        canonical_json({
+            "state_version": "0.1",
+            "next_iter": next_iter,
+            "feedback": feedback,
+            "workspace": workspace,
+            "run_dir": run_dir,
+        }),
+    )
+
+
+def load_state(run_dir):
+    with open(os.path.join(run_dir, "state.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def latest_paused_run(control_root):
+    runs_dir = os.path.join(control_root, "runs")
+    if not os.path.isdir(runs_dir):
+        return None
+    paused = [
+        os.path.join(runs_dir, name)
+        for name in sorted(os.listdir(runs_dir), reverse=True)
+        if os.path.exists(os.path.join(runs_dir, name, "state.json"))
+    ]
+    return paused[0] if paused else None
+
+
+def write_checkpoint_report(run_dir, iteration, report):
+    passing = sum(1 for r in report["results"] if r["pass"])
+    total = len(report["results"])
+    lines = [
+        f"# Checkpoint — iteration {iteration}",
+        "",
+        f"Passing: **{passing}/{total}**  (twin-observed, cooperative tier — unqualified)",
+        "",
+        "| behavior | scenario | pass | taxonomy | exit |",
+        "|---|---|:--:|---|--:|",
+    ]
+    for r in report["results"]:
+        mark = "✅" if r["pass"] else "❌"
+        tax = r["taxonomy"] or ""
+        code = r["observed"].get("exit_code")
+        lines.append(f"| {r['behavior_id']} | {r['id']} | {mark} | {tax} | {code} |")
+    lines += [
+        "",
+        "Decide: `resume --decision continue` (build again) · edit `spec.md` then "
+        "`resume --decision continue` (adjust) · `resume --decision accept` (stop, "
+        "waived/unverified) · `resume --decision abort`.",
+        "",
+    ]
+    path = os.path.join(run_dir, f"checkpoint_iter_{iteration}.md")
+    atomic_write(path, "\n".join(lines))
+    return path
+
+
 def finalize_manifest(run_dir: str, extra: dict) -> str:
     """Write manifest.json + manifest.sha256 sidecar.
 
