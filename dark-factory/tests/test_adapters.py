@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE = os.path.join(HERE, "fixtures", "fake_builder")
@@ -66,12 +67,16 @@ def test_fake_builder_usage_error_both_versions(tmp_path):
 
 def test_claude_adapter_reports_error_when_cli_missing(tmp_path):
     req = make_req(tmp_path)
-    env = dict(os.environ, PATH="/nonexistent-bin")
+    # PATH dir that resolves python3 (so the env-shebang works) but has no `claude`.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    os.symlink(sys.executable, bindir / "python3")
+    env = dict(os.environ, PATH=str(bindir))
     proc = subprocess.run(
         [CLAUDE_ADAPTER], input=json.dumps(req),
         capture_output=True, text=True, timeout=30, env=env,
     )
-    assert proc.returncode == 0
+    assert proc.returncode == 0, proc.stderr
     resp = json.loads(proc.stdout)
     assert resp["status"] == "error"
     assert "claude" in resp["detail"]

@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Deterministic fake builder for tests. Speaks adapter protocol 0.1.
 
 Behavior: without <workdir>/feedback.json writes a buggy greet.py
