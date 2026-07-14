@@ -1,3 +1,4 @@
+import os
 import sys
 
 import pytest
@@ -82,3 +83,41 @@ def test_linux_backend_denies_deny_root_read(tmp_path):
     allowed = subprocess.run(pref + ["cat", str(ws / "ok.txt")],
                              capture_output=True, text=True)
     assert allowed.returncode == 0 and "workspace-ok" in allowed.stdout
+
+
+class _PassthroughBackend:
+    """A deliberately broken 'sandbox' that does NOT deny anything — the probe must
+    reject it (return False), proving fail-closed detection."""
+    name = "passthrough-insecure"
+    def available(self):
+        return True
+    def wrap_prefix(self, deny_root, workspace):
+        return []  # no isolation at all
+
+
+def test_probe_rejects_a_passthrough_backend(tmp_path):
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    assert df_sandbox.probe_denial(_PassthroughBackend(), str(deny_root), str(ws)) is False
+
+
+def test_probe_false_for_none_or_unavailable_backend(tmp_path):
+    assert df_sandbox.probe_denial(None, str(tmp_path), str(tmp_path)) is False
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real backend")
+def test_probe_passes_with_the_real_backend(tmp_path):
+    b = df_sandbox.current_backend()
+    if not b.available():
+        pytest.skip("OS sandbox primitive not present")
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    assert df_sandbox.probe_denial(b, str(deny_root), str(ws)) is True
+
+
+def test_probe_cleans_up_canary(tmp_path):
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    df_sandbox.probe_denial(_PassthroughBackend(), str(deny_root), str(ws))
+    leftovers = [n for n in os.listdir(deny_root) if n.startswith(".probe-canary-")]
+    assert leftovers == []
