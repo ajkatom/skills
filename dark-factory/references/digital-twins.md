@@ -10,7 +10,7 @@ Each twin is defined by a JSON file in `<control_root>/twins/<name>.json`.
 |---|---|---|---|
 | `twin_version` | string | Must be `"0.1"` | Required. Future versions may add new fields. |
 | `name` | string | `^[a-z][a-z0-9_]{0,30}$` (lowercase, digits, underscore; max 31 chars) | Unique within a control root. Used to derive the environment variable name. |
-| `launch` | array of strings | Non-empty list of command parts (argv). | The command that starts the twin service (e.g., `["python3", "twins/greeter.py"]`). Run in the run directory with inherited environment plus `DF_ENDPOINT_FILE`. |
+| `launch` | array of strings | Non-empty list of command parts (argv). | The command that starts the twin service. Runs with `cwd = <control_root>/runs/<invocation_id>` (the run dir) and inherited environment plus `DF_ENDPOINT_FILE`. **A relative path resolves against the run dir, not `twins/`** — use an **absolute path** to your twin script (e.g. `["python3", "/abs/path/to/greeter.py"]`). |
 | `env_var` | string | Optional; defaults to `DF_TWIN_<NAME_UPPER>`. Not format-validated — supply a valid environment-variable name. | Environment variable name exposed to the builder and scenario verifier. Defaults to `DF_TWIN_<NAME_UPPER>` (e.g., `greeter` → `DF_TWIN_GREETER`). |
 | `fidelity` | string | Human-readable note. | Describes the mock's honesty level relative to the real service (e.g., `"dev mock, basic HTTPS stub"`, `"async job enqueue only, no scheduler"`, `"read-only, no mutations"`). A human-readable honesty note in the def file (documentation only; not read or surfaced by the supervisor). |
 
@@ -20,7 +20,7 @@ Each twin is defined by a JSON file in `<control_root>/twins/<name>.json`.
 {
   "twin_version": "0.1",
   "name": "greeter",
-  "launch": ["python3", "twins/greeter.py"],
+  "launch": ["python3", "/abs/path/to/greeter.py"],
   "env_var": "DF_TWIN_GREETER",
   "fidelity": "dev mock, HTTP only, no auth"
 }
@@ -154,7 +154,7 @@ if __name__ == "__main__":
 {
   "twin_version": "0.1",
   "name": "greeter",
-  "launch": ["python3", "twins/greeter.py"],
+  "launch": ["python3", "/abs/path/to/greeter.py"],
   "fidelity": "dev mock, HTTP only, no authentication"
 }
 ```
