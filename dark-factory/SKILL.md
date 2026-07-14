@@ -15,6 +15,13 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
 1. **Engage.** Announce the skill; offer opt-out. Ask which directory to use as
    the control root (MUST be outside the project repo and outside any workspace
    tree; suggest `~/.dark-factory/<project-name>`).
+   Also ask (optional, default none): do you have a **knowledge base** to draw on
+   and record to? — a markdown **wiki** (give a directory path) or an **open-brain
+   / MCP** memory. If a wiki: set `knowledge_base` in config.json; on `write_back:
+   true` the supervisor appends a barrier-safe run summary (no scenario text) to
+   `<path>/dark-factory-runs.md`. If open-brain: you (this session) may read it for
+   grounding and, only with the user's OK, `capture_thought` the run outcome — the
+   supervisor does not touch MCP. Absence of a KB is never an error.
 2. **Spec.** Interview the user → write `<control_root>/spec.md`. The user
    approves it. Behaviors should be numbered (BHV-001, BHV-002, …).
 3. **Acceptance world — SEPARATE CONTEXT.** Author the holdout scenarios in
@@ -63,8 +70,28 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
   adapter uses your ambient login.
 - A **cooperative** run is always UNQUALIFIED — say so. A **standard** run is qualified ONLY when its startup denial probe passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value.
 
+## Composing with other skills (control-plane only)
+
+dark-factory's *builder* is an external sandboxed CLI that loads no skills — so
+composition applies only to THIS orchestrating session's own steps, which run
+around the builder, never inside it:
+
+| Step | Prefer, if available | Barrier note |
+|---|---|---|
+| Author the spec (step 2) | `superpowers:brainstorming`, `grill-me-codex`, `writing-plans` | fine — spec is SHARED with the builder |
+| Author scenarios (step 3) | keep manual, in a **separate session** | never delegate this into a builder-driving session |
+| Stuck loop (cap reached, likely spec ambiguity) | `superpowers:systematic-debugging` | operates on spec + behavior IDs only, never scenario internals |
+| Cleanup an accepted artifact | `/simplify`, `code-review` on the workspace | post-acceptance, outside the barrier |
+
+**Honesty:** at `cooperative`/`standard` tiers this is *guidance*, not enforcement —
+these tiers sandbox the builder, not the orchestrator. An **enforced** per-tier skill
+allowlist with content-hash pinning (spec §3B) requires the orchestrator itself to run
+sandboxed, which is a `hardened`/`enterprise` capability (not yet built). Never author
+or reveal holdout scenarios in a session that will also drive the builder.
+
 ## References
 
 - `references/config-reference.md` — config schema
+- `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
 - `references/role-adapters.md` — adapter protocol

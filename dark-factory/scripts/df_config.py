@@ -75,8 +75,27 @@ def load_config(control_root: str) -> dict:
     elif checkpoint not in ("pause", "auto"):
         raise ConfigError("checkpoint must be 'pause' or 'auto'")
 
+    kb_raw = raw.get("knowledge_base", {})
+    if not isinstance(kb_raw, dict):
+        raise ConfigError("knowledge_base must be an object")
+    kb_kind = kb_raw.get("kind", "none")
+    if kb_kind not in ("none", "wiki", "open-brain"):
+        raise ConfigError(
+            f"knowledge_base.kind must be none|wiki|open-brain, got {kb_kind!r}"
+        )
+    kb_write_back = kb_raw.get("write_back", False)
+    if not isinstance(kb_write_back, bool):
+        raise ConfigError("knowledge_base.write_back must be a bool")
+    kb_path = kb_raw.get("path", "")
+    if kb_kind == "wiki":
+        if not kb_path or not os.path.isdir(kb_path):
+            raise ConfigError(
+                f"knowledge_base kind 'wiki' requires 'path' to be an existing directory: {kb_path!r}"
+            )
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
     cfg["_checkpoint"] = checkpoint
+    cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     return cfg
