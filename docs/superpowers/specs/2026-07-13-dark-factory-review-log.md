@@ -193,3 +193,80 @@ VERDICT: REVISE
 ### Claude's response (Round 2)
 
 Codex confirms the hardening closed most *conceptual* holes. The two blocking items — (P0-1) §15 was appended as an override while §§1–14 still describe the old design, and (P0-2) the v1 scope (§15.11) is undecided — are gated on a **human scope decision**. Pausing the loop at Round 2 to get that sign-off before rewriting §§1–14 into ONE coherent architecture; the remaining findings (trust-computing-base table, per-role capability/network manifests, host-side credential proxy, freeze-ordering, signed audit, oracle DSL, budget admission formula, infra-error/idempotency states) are folded in during that rewrite at the chosen ambition level.
+
+## Round 3 — Codex (gpt-5.6-sol, read-only, resumed)
+
+The tier model is substantially cleaner, but `standard` still cannot satisfy its own probe-backed isolation claim, and several upgrade/gating guarantees remain underspecified.
+
+1. **P0 — Standard cannot prove the scenario store is unreachable.** A separate same-user process and ephemeral HOME do not prevent opening arbitrary host paths; “unmounted” has no enforcement meaning without a mount namespace or OS sandbox. Yet success requires denial probes to prove both builder and candidate cannot reach the store. [standard sandbox](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:228), [verification isolation](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:250), [success criterion](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:388)
+
+   **Fix:** Require a minimal OS-enforced read-denial boundary or dedicated UID/ACL for builder and candidate at standard, while reserving containers, egress control, and capability manifests for higher tiers.
+
+2. **P0 — The test authority can leak the holdout through allowed shared artifacts.** It writes both contracts/dev stubs and hidden scenarios/twins, so an erring test-authority model can copy scenario literals, fixtures, or variant quirks into files the builder is explicitly allowed to read; filesystem probes will still pass. [role ownership](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:125), [acceptance-world workflow](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:363)
+
+   **Fix:** Freeze public contracts/stubs in a separate pre-holdout session, make them read-only before scenario authoring, and invalidate/regenerate the holdout after any public-artifact change.
+
+3. **P0 — The TCB table is technically impossible as written.** Enterprise cannot trust “only supervisor + signing key + broker” while executing atop an OS kernel, hypervisor/container runtime, filesystem, and network stack; “insider” is also undefined even though the human can read the holdout and authorize downgrades. [threat-model table](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:60)
+
+   **Fix:** Include unavoidable infrastructure in each TCB and define exactly which insider privileges, humans, providers, and cross-role accounts remain trusted or require split custody.
+
+4. **P0 — Role-separation language exceeds lower-tier enforcement.** The role table and guardrails promise separate principals, but standard provides only separate processes and hardened provides containers; distinct principals are explicitly enterprise-only. [role table](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:120), [tier mechanisms](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:228), [guardrail](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:373)
+
+   **Fix:** Use tier-specific terms consistently—session/process at standard, sandbox principal at hardened, immutable distinct security principal at enterprise—and state the resulting guarantee at each tier.
+
+5. **P0 — The deterministic supervisor is missing from the package.** The supervisor is in the TCB and is supposed to own locks, budgets, journaling, transitions, cancellation, and freeze rules, but packaging gives orchestration to prose in `SKILL.md` and lists only independent helper scripts. [FSM requirement](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:276), [packaging](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:313)
+
+   **Fix:** Add one deterministic supervisor executable as the sole state-changing entry point, with `SKILL.md` acting only as its conversational front end.
+
+6. **P0 — Higher-tier availability is ambiguous.** The plan says hardened/enterprise are enforced whenever substrate exists, but also says their backends “land as” they are built; installed Docker or a signing key does not mean dark-factory has a conforming implementation. Because L5 requires hardened, v1’s L5 availability is consequently unclear. [tier selection](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:87), [phasing](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:404)
+
+   **Fix:** Maintain a versioned `supported_tiers` registry backed by conformance-tested implementations, reject unimplemented tiers regardless of substrate, and state that L5 remains unavailable until a hardened backend ships.
+
+7. **P1 — Probes run too early and only once.** Workflow probes before the scenario store, role sandboxes, mounts, candidate, and network topology exist, so it cannot validate the actual environments whose isolation matters; policy drift later in an L5 run is undetected. [startup probe](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:93), [workflow ordering](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:356)
+
+   **Fix:** Run substrate probes at startup and environment-specific denial probes after every role/candidate environment is assembled, pin their policy hashes, and re-probe at every phase boundary.
+
+8. **P1 — Downgrade is not transactional with autonomy.** Downgrading an L5 request from hardened to standard would leave an invalid dial combination unless autonomy is independently changed; the current downgrade rule mentions only assurance. [cross-rules](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:93)
+
+   **Fix:** Treat downgrade as a new configuration transaction that revalidates autonomy, notification, threat assumptions, and already-created run state before requiring explicit consent.
+
+9. **P1 — The source snapshot can itself cross the barrier.** “History-free snapshot” does not define handling of symlinks, hardlinks, device nodes, sockets, archive traversal, or dereferencing an approved untracked link into the control store. [source snapshot](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:223)
+
+   **Fix:** Build snapshots from an `lstat`-based manifest, reject special files and escaping links, never dereference outside the approved root, and hash the canonical exported content.
+
+10. **P1 — Standard credentials are insufficiently protected against its stated adversary.** An erring LLM can accidentally run `env`, echo a provider token, or pass it to a child process; redaction and post-phase scans detect this only after disclosure. [standard secrets](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:241)
+
+   **Fix:** At standard, keep authentication launcher-scoped and give every model-generated child process an explicit environment allowlist excluding provider credentials, or state that accidental credential disclosure remains in scope and unsupported.
+
+11. **P1 — Twin-variant freezing remains contradictory.** §5.1 freezes variants before building and permits only final seeds post-artifact, while §5.2 says variants and fixtures are chosen post-freeze. [holdout freeze](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:139), [twin visibility](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:155)
+
+   **Fix:** State uniformly that generators, variants, fixtures, distributions, and cohorts freeze before building and only final random seeds are drawn after the artifact hash commits.
+
+12. **P1 — “No redesign” is unsupported by the oracle phasing.** Standard may ship generated checks while enterprise later introduces a capability-limited DSL, but the representation remains an open item; changing it can alter scenario storage, compilers, mutation testing, hashes, and runner APIs. [scaling goal](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:33), [oracle open item](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:414)
+
+   **Fix:** Define a versioned oracle IR and runner conformance contract in v1 so generated-check and enterprise-DSL backends are interchangeable implementations of the same boundary.
+
+13. **P1 — Budget coverage omits expensive actors.** `per_role_usd` excludes the test authority and does not define attribution for delegated skills, security reviewers, oracle compilation, or twin generation; an autonomous CLI may also make multiple calls, defeating a “single-call” bound unless adapters enforce hard ceilings. [budget rule](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:205), [budget config](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:341)
+
+   **Fix:** Budget every model-using role and delegated operation plus a total cap, and require adapters to enforce maximum calls/output tokens per invocation before claiming a bounded overage.
+
+14. **P1 — Crash safety still overclaims charge prevention.** Journaling an unknown outcome prevents automatic redispatch but cannot prove whether the provider charged; §7.7 still says crashes “can’t … double-charge.” [unknown-outcome rule](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:205), [FSM claim](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:276)
+
+   **Fix:** Claim prevention of automatic duplicate dispatch only, and require reconciliation or an explicit potentially-duplicate authorization before leaving `unknown-outcome`.
+
+15. **P1 — Final seeds need recoverable restricted storage.** A hash-only audit reference cannot reproduce an identical-artifact infra retry or resume after a crash unless the raw seed is durably stored somewhere inaccessible to the builder. [infra retry](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:186), [audit policy](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:258)
+
+   **Fix:** Atomically store raw seeds in the restricted immutable control snapshot before execution and put only their hashes in exported audit records.
+
+16. **P1 — “Audited skills” has no enforceable meaning.** Automatically preferring any available skill allows mutable third-party instructions/scripts into builder, verifier, or holdout-authority contexts without a tier-compatibility or capability contract. [skill composition](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:305)
+
+   **Fix:** Require a per-tier skill allowlist with frozen content hashes, declared capabilities, role eligibility, and conformance review before copying any skill into a run.
+
+17. **P1 — Human acceptance can bypass qualification semantics.** Iteration and budget checkpoints offer `accept` before the FSM has passed dev, gates, final, and staging, while workflow later calls the result an “accepted candidate.” [checkpoint choices](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:193), [budget choices](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:209), [handoff](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:369)
+
+   **Fix:** Reserve `ship-candidate` for the fully successful FSM terminal state and label every human override as failed/waived/unverified in both handoff and audit.
+
+VERDICT: REVISE
+### Claude's response (Round 3)
+
+Codex: "the tier model is substantially cleaner." Folded R3's design-level fixes **in place** (no appended section): pre-holdout contract freeze (P0-2), tier-consistent separation terms (P0-4), standard-tier OS read-denial so probes are meaningful (P0-1), deterministic `supervisor` as sole state-changer (P0-5), `supported_tiers` registry + L5-until-hardened (P0-6), TCB unavoidable-infra + insider (P1-3), the §5.1/§5.2 freeze contradiction resolved (P1-11), ship-candidate = FSM-terminal semantics (P1-17), crash 'prevents automatic re-dispatch' not 'no double-charge' (P1-14), credential env-scrub at standard (P1-10), lstat snapshot manifest (P1-9), oracle IR (P1-12), budget-all-roles + adapter ceilings (P1-13), restricted seed storage (P1-15), per-tier skill allowlist (P1-16). Deeper implementation specifics carried to §16 for /writing-plans. **Trajectory: R1 conceptually-broken → R2 two-architectures → R3 implementation-altitude precision — the design has converged.** Pausing the Codex loop at R3 (of 5): remaining points are plan-altitude; recommending /writing-plans.

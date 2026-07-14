@@ -73,6 +73,11 @@ Raising the tier narrows the TCB and adds enforced mechanisms (§7). The default
 skill's whole point) and reasonable accident containment — **not** a determined malicious
 builder. That protection needs `hardened`+.
 
+Every tier's TCB also includes the **unavoidable base** it runs on (kernel, container/OS-
+sandbox runtime, filesystem, network stack) — "trust only the supervisor" means *among
+dark-factory's own components*, not literally. The **human is always trusted** to read the
+holdout and authorize downgrades; `enterprise` may add split-custody for that authority.
+
 ## 2. The two dials
 
 ### 2.1 Autonomy dial (from `vibe-coding-levels`)
@@ -91,12 +96,18 @@ steps back is the dial:
 present.
 
 ### 2.3 Cross-rules & fail-closed
-- **L5 requires ≥ `hardened`.** You cannot run lights-off without a real sandbox.
-- At startup the skill runs the selected tier's **denial probes** (§7). If the substrate
-  is missing (no container runtime, no credential broker, no signing key, no network
-  policy), it **fails closed**: it refuses to *claim* the tier and either aborts or — with
-  explicit user consent — **downgrades** to the highest tier the environment supports,
-  logging a loud warning + audit note. A tier is never a cosmetic label.
+- **L5 requires ≥ `hardened`** — and is **unavailable until a conforming hardened backend
+  ships** (below).
+- **A tier needs both substrate *and* a conforming implementation.** The skill keeps a
+  versioned **`supported_tiers` registry** of conformance-tested backends and **rejects any
+  tier without one**, regardless of whether Docker / a signing key happens to be installed.
+- **Probes run where and when they matter:** substrate probes at startup; **environment-
+  specific denial probes after each role/candidate environment is assembled; and a re-probe
+  at every phase boundary** (policy can drift mid-run). Probe policy hashes are pinned.
+- **Fail closed.** A missing substrate/backend aborts, or — with explicit consent —
+  **downgrades as a new configuration transaction** that revalidates the autonomy dial
+  (e.g. L5→standard is invalid), the notification sink, threat assumptions, and any run
+  state already created. A tier is never a cosmetic label.
 
 ## 3. The pipeline and the information barrier
 
@@ -125,9 +136,15 @@ Four agent roles + the human. Each maps to a tool the user chooses via a thin **
 | Role | Responsibility | Default | Constraint |
 |---|---|---|---|
 | **Planner** | interviews the human, drafts the spec (Karpathy: uncover goal, agile, precise) | Claude | — |
-| **Test authority** | owns the hidden acceptance world: **scenarios + twins** (incl. verifier-only variants) | Claude | **≠ Builder**, enforced by distinct principal/session (§7.2), not a name-compare |
+| **Test authority** | owns the hidden acceptance world: **scenarios + twins** (incl. verifier-only variants) | Claude | **≠ Builder** — separate context per tier (process→sandbox→principal, §7.2), not a name-compare |
 | **Builder** | implements from the **spec + contracts/dev-stubs only**, in the sandbox | Claude (separate process) | never receives holdout |
-| **Verifier** | runs scenarios against the candidate in a fresh twin universe; writes twin-observed outcomes | Claude | separate principal from candidate |
+| **Verifier** | runs scenarios against the candidate in a fresh twin universe; writes twin-observed outcomes | Claude | separate execution context from the candidate (§7.4) |
+
+**Pre-holdout freeze (guards a subtle leak):** the shared **public contracts + dev-stubs are
+authored and frozen read-only in a session *before* the holdout exists**; scenario/twin
+authoring happens after. Any later change to a public artifact **regenerates the holdout** —
+otherwise an erring test-authority model could copy scenario literals into files the builder
+is allowed to read, and filesystem probes would still pass.
 
 **Cross-model defaults** (from `cross-model-orchestration`): strongest reasoner plans;
 different-vendor test authority for blind-spot diversity; token-efficient model builds.
@@ -138,18 +155,22 @@ fallback** — a substitution needs explicit approval (§7.8).
 
 ### 5.1 Holdout scenarios (the *what*)
 - **Format & oracle:** authored as behavioral `Given/When/Then` (the human view) that
-  **compile to a deterministic, executable check contract** (§7 — *not* free-form
-  markdown at run time). Checks are **frozen and hashed before building** and
-  **mutation-validated** (known-bad mutants must fail) so traceability can't approve
-  inert tests.
+  **compile to a deterministic, executable check contract** with a **versioned oracle IR +
+  runner-conformance contract** (so generated-check and a future enterprise DSL are
+  interchangeable backends — the "no redesign" promise). Checks are **frozen and hashed
+  before building** and **mutation-validated** (known-bad mutants must fail; reference
+  implementations optional, harness self-tests + injected faults required) so traceability
+  can't approve inert tests.
 - **Coverage gate (before any build):** every spec behavior maps to **≥1 dev family and
   ≥1 final family** (stratified — not a single shared case); critic-reviewed (a different
   model or the human).
 - **Two-tier holdout:** **dev scenarios** drive feedback; a **sealed final-exam set**
   runs **once** at the end and is never fed back. **Generators, distributions, variants,
   and cohort membership are frozen+hashed before building;** only the final **secret
-  seeds** are drawn by the supervisor *after* the artifact is hashed. Dev seeds stay
-  **stable across iterations** (so green→red is a real regression, not input variance).
+  seeds** are drawn by the supervisor *after* the artifact is hashed and **stored raw in the
+  restricted immutable control snapshot** (only their hashes reach exported audit, so an
+  identical-artifact infra-retry or resume is reproducible without leaking them). Dev seeds
+  stay **stable across iterations** (so green→red is a real regression, not input variance).
 - **Storage:** control plane only, outside the build workspace, never mounted to it.
 
 ### 5.2 Digital twins (the *where*)
@@ -157,7 +178,8 @@ fallback** — a substitution needs explicit approval (§7.8).
   reproducible, prod-free world. Scaled to the task (full clones ↔ a minimal deterministic
   harness), but always present.
 - **Split visibility:** the builder gets **contracts + developer stubs**; the verifier
-  reserves **hidden variants/fixtures/seeds chosen post-freeze** (§5.1).
+  reserves **hidden variants/fixtures** (frozen+hashed *before* build, per §5.1) plus the
+  final **secret seeds** drawn only *after* the artifact hash commits.
 - **Network authority (§7.4):** the candidate reaches only **twin data-plane** endpoints;
   **observer/control/reset** endpoints are verifier-only; evidence lands in an append-only
   channel the candidate can't address.
@@ -213,7 +235,7 @@ build snapshot → dev checks → mandatory gates (§7.6) → ARTIFACT FREEZE
   delivery channel is useless).
 - **Crash-safety:** persist an `in-flight/unknown-outcome` state **before** dispatch;
   **never auto-retry** it without provider idempotency/reconciliation or human
-  authorization (else a crash after a provider accepts a call double-charges).
+  authorization (else a crash after a provider accepts a call risks a duplicate charge).
 
 ## 7. Isolation & assurance mechanisms (tier-tagged)
 
@@ -224,10 +246,17 @@ baseline; `hardened`/`enterprise` add to it. All tiers are **probe-verified** (�
 Builder works from an **explicitly-approved, history-free source snapshot** (approved
 dirty/untracked changes included), **hashed**, in a fresh repo **without remotes** — not a
 `git worktree` (a worktree's `.git` links into the parent repo and leaks history/objects).
+The snapshot is built from an **`lstat`-based manifest that rejects special files
+(devices/sockets) and escaping sym/hardlinks and never dereferences outside the approved
+root**; the canonical exported content is what gets hashed.
 
 ### 7.2 Sandbox & principals
-- *(standard)* Builder = **separate OS process**, fresh ephemeral `HOME`/config/session,
-  hooks/plugins/MCPs/skill-auto-discovery **off**; only audited skills copied in may run.
+- *(standard)* Builder = **separate OS process under a dedicated UID or an OS read-denial
+  primitive** (`sandbox-exec` on macOS, `bwrap`/`unshare` on Linux) so the scenario store is
+  genuinely unreachable and the denial probe is *meaningful*; fresh ephemeral
+  `HOME`/config/session, hooks/plugins/MCPs/skill-auto-discovery **off**; only allowlisted
+  skills copied in may run. If no read-denial primitive exists, the isolation claim
+  **downgrades to best-effort (not probe-proven)** and says so.
 - *(hardened)* Enforced **container/VM** with a **per-role capability profile** (rootless,
   dropped caps, no docker socket / host PID, read-only rootfs, no stray device
   nodes/sockets); egress **default-deny**.
@@ -240,8 +269,10 @@ dirty/untracked changes included), **hashed**, in a fresh repo **without remotes
 
 ### 7.3 Secrets
 - *(standard)* `.gitignore` **plus** `git check-ignore` + `git ls-files` verification;
-  scoped env; log redaction; secret-scan before/after each phase. Honest limit: does **not**
-  stop a determined malicious builder.
+  provider credentials are **launcher-scoped and excluded from the builder's env allowlist**
+  (an erring LLM can `env`/echo a token — prevent, not just detect); log redaction;
+  secret-scan before/after each phase. Honest limit: does **not** stop a determined malicious
+  builder.
 - *(hardened)* **Brokered short-lived, role-scoped credentials**; raw tokens scrubbed from
   role env; a **read-only pinned dependency proxy/cache** (no direct registry/DNS).
 - *(enterprise)* **Host-side credential proxy** — raw tokens **never enter any sandbox**;
@@ -274,11 +305,16 @@ LLM static reviewer (which reads hostile source and is injection-prone) counts a
 **additional evidence, never the sole blocking oracle**.
 
 ### 7.7 State machine, concurrency, crash-safety  *(standard)*
-A **locked, journaled FSM** with **immutable per-run snapshots**, atomic writes, an
-**invocation ID**, process-group cancellation, and content **hashes for spec, artifact,
-scenarios, twins, adapter, and phase** — so concurrent invocations/crashes can't verify a
-moving tree, overwrite a generation, double-charge, or resume mismatched artifacts. Control
-state lives **outside Git**.
+A single **deterministic `supervisor` executable** owns this — the **sole state-changing
+entry point** (`SKILL.md` is only its conversational front end). It runs a **locked,
+journaled FSM** with **immutable per-run snapshots**, atomic writes, an **invocation ID**,
+process-group cancellation, and content **hashes for spec, artifact, scenarios, twins,
+adapter, and phase** — so concurrent invocations/crashes can't verify a moving tree,
+overwrite a generation, redispatch a call, or resume mismatched artifacts. Control state
+lives **outside Git**. A crash after a provider accepted a call is journaled
+**`unknown-outcome`**: the supervisor **prevents automatic re-dispatch** but cannot prove the
+provider didn't charge — leaving that state needs reconciliation or explicit human
+authorization.
 
 ### 7.8 Adapter protocol  *(standard)*
 A **versioned JSON adapter protocol**: capability probes, **pinned model/CLI versions**,
@@ -308,13 +344,18 @@ for the spec; `codex-build` for a Codex builder; `/verify`, `e2e`, `security-rev
 checks; `systematic-debugging` for a stuck loop), else built-in behaviour. **Rules:**
 (1) a skill invoked in the build plane inherits its **restricted context** — copied into the
 sandbox, holdout unreachable; (2) a delegated **gated action** (commit/push/deploy) still
-pauses for the human; (3) no self-recursion. Records which skills ran (audit).
+pauses for the human; (3) no self-recursion. **Only skills on a per-tier allowlist** — frozen content hash,
+declared capabilities, role eligibility, conformance-reviewed — may be copied into a run;
+auto-preferring an arbitrary installed skill is not allowed. Records which skills ran (audit).
 
 ## 11. Packaging & layout
 
-**Hybrid** (chosen): `SKILL.md` orchestrates (judgment steps in prose); **helper scripts**
-own the deterministic, security-critical steps — sandbox/probes, snapshot+hash, the
-deterministic ID-feedback projection, the scenario runner, adapters, and the audit writer.
+**Hybrid** (chosen): a single **deterministic `supervisor` executable** is the sole
+state-changing entry point (owns the FSM, locks, budget admission, journaling, freeze rules,
+cancellation); `SKILL.md` is its **conversational front end** (judgment steps in prose); the
+**helper scripts** it invokes own the deterministic, security-critical steps — sandbox/probes,
+snapshot+hash, the deterministic ID-feedback projection, the scenario runner, adapters, and
+the audit writer.
 
 ```
 dark-factory/
@@ -322,8 +363,8 @@ dark-factory/
   references/  threat-model.md · assurance-tiers.md · scenario-oracle.md · digital-twins.md
                role-adapters.md · isolation.md · secrets.md · audit.md · brownfield.md
                knowledge-base.md · config-reference.md · example-run.md
-  scripts/     sandbox-*, probe-denial.*, snapshot-source.*, id-feedback.*, run-scenarios.*,
-               audit-write.*, adapters/{claude,codex,gemini}
+  scripts/     supervisor (sole state-changer), sandbox-*, probe-denial.*, snapshot-source.*,
+               id-feedback.*, run-scenarios.*, audit-write.*, adapters/{claude,codex,gemini}
 ```
 
 Control plane (outside Git, outside the build workspace): `config.yml`, `spec.md`,
@@ -340,7 +381,9 @@ final_exam_fraction: 0.3       # ≥1 dev family AND ≥1 final family per behav
 # pass is unconditional 100% of dev + final + no-regression (not configurable)
 budget:
   billing: api                 # api (metered → admission-controlled) | subscription (alert only)
-  per_role_usd: { planner: 2, builder: 15, verifier: 3 }
+  per_role_usd: { planner: 2, test_authority: 3, builder: 15, verifier: 3, delegated: 2 }
+  total_usd: 25                # hard total cap across all roles + delegated ops
+  max_calls_per_invocation: 40 # adapters enforce a hard call/token ceiling (bounds overage)
   alert_at: 0.85
   notification_sink: ""        # required before L5
 roles:
@@ -367,7 +410,10 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 7. **Loop (§6):** build → dev checks → mandatory gates → freeze → final once → human
    staging; deterministic ID feedback; budget admission; checkpoints per autonomy dial.
 8. **Outcome checkpoint / hand-off.** Present twin-observed outcomes + fidelity + audit;
-   human evaluates and accepts/adjusts/aborts. Accepted candidate handed back (human merges).
+   human evaluates. **`ship-candidate` is reserved for the successful FSM terminal state**
+   (dev + gates + freeze + final + staging all passed); a human `accept` before that is
+   recorded as **waived/unverified** in hand-off and audit, never qualified. Handed back
+   (human merges).
 9. **Record.** Write the per-run audit manifest; opt-in KB capture.
 
 ## 13. Guardrails
@@ -376,7 +422,10 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 - **Tiered, fail-closed:** never claim an assurance tier the environment can't substantiate;
   L5 ⇒ ≥ hardened.
 - **Adversarial verifier:** pass/fail from observed twin state only; builder text is
-  untrusted; candidate runs as a separate principal with the holdout unmounted.
+  untrusted; candidate runs in a **separate execution context** (per tier, §7.2/§7.4) with
+  the holdout unreachable.
+- **`ship-candidate` = FSM terminal only** — a human override before dev+gates+freeze+final+
+  staging is logged as waived/unverified, never qualified.
 - **Deterministic default feedback** (`ids`); richer channels taint.
 - **Mandatory gates + audit** every run, independent of pass-rate; gates are constants.
 - **Secrets scale by tier** (§7.3); raw tokens leave the sandbox only at `standard`, and
@@ -388,9 +437,12 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 ## 14. Success criteria
 - Builder demonstrably never receives the holdout — verified by **denial probes** at the
   selected tier (scenario store unreachable from builder *and* from the executing candidate),
-  not by a copy-check.
+  not by a copy-check; at `standard` this requires the OS read-denial primitive (§7.2), else
+  the claim is explicitly best-effort.
 - Selecting a higher `assurance` tier **enforces** its mechanisms or **fails closed**;
-  downgrade requires explicit consent + an audit note.
+  downgrade requires explicit consent + an audit note. A tier without a conforming backend in
+  `supported_tiers` is rejected even with the substrate present; **L5 is unavailable until a
+  hardened backend ships**.
 - Default feedback is a **deterministic ID/taxonomy projection** (no model call); richer
   channels taint and rotate the sealed set.
 - The oracle is **frozen pre-build and mutation-validated**; the final set runs **once**;
@@ -405,11 +457,12 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 - **v1:** the full **`standard` tier** enforced end-to-end **+ the tier framework, probes,
   and fail-closed downgrade** + the deterministic oracle/feedback + FSM + audit + mandatory
   gates + the user's cross-model / skill-composition / KB features.
-- **`hardened` / `enterprise`:** specified here and **enforced when selected and the
-  substrate is present**; their heavier mechanisms (host-side credential proxy, per-role
-  seccomp manifests, signed/off-box audit, network-authority graph, oracle DSL) land as the
-  substrate/adapters are built. Raising the tier later is **config + substrate**, not a
-  redesign.
+- **`hardened` / `enterprise`:** specified here and **enforced when selected and both the
+  substrate and a conforming backend (`supported_tiers`) are present**; until a hardened
+  backend ships, **L5 is unavailable**. Their heavier mechanisms (host-side credential proxy,
+  per-role seccomp manifests, signed/off-box audit, network-authority graph, oracle DSL) land
+  as the backends are built. Raising the tier later is **config + substrate + backend**, not
+  a redesign.
 
 ## 16. Open items to resolve during planning
 - Concrete sandbox backends per platform (macOS vs Linux container runtimes) and the exact
@@ -419,3 +472,8 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 - Adapter protocol schema (I/O, timeout/cancel/usage) shared by claude/codex/gemini.
 - Credential-broker/proxy choice for `hardened`/`enterprise`.
 - Whether the worked example ships greenfield-only or also brownfield.
+- **(From Codex R3, for the plan):** the versioned oracle IR + runner-conformance schema; the
+  `lstat` snapshot manifest rules; the per-tier **skill allowlist** format (content hash +
+  capabilities + role eligibility); exact per-role/adapter budget ceilings + delegated-op
+  attribution; the restricted raw-seed store layout; the transactional-downgrade revalidation
+  set; and the `standard` OS read-denial primitive per platform.
