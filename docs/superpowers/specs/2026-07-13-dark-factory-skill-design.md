@@ -260,7 +260,8 @@ build snapshot → dev checks → mandatory gates (§7.6) → ARTIFACT FREEZE
 ## 7. Isolation & assurance mechanisms (tier-tagged)
 
 Each mechanism lists the **minimum tier** at which it is enforced. `standard` is the honest
-baseline; `hardened`/`enterprise` add to it. All tiers are **probe-verified** (§2.3).
+baseline; `hardened`/`enterprise` add to it. **All qualified tiers
+(`standard`/`hardened`/`enterprise`) are probe-verified** (§2.3); `cooperative` is not.
 
 ### 7.1 Source & workspace  *(standard)*
 Builder works from an **explicitly-approved, history-free source snapshot** (approved
@@ -400,7 +401,7 @@ per-run immutable `runs/<invocation-id>/` snapshots + manifest.
 ### 11.1 Config schema (sketch)
 ```yaml
 autonomy: 4                    # 4 = checkpoint each iteration; 5 = lights-off (requires assurance ≥ hardened)
-assurance: standard            # cooperative | standard | hardened | enterprise (probe-verified, fail-closed)
+assurance: standard            # cooperative (unqualified, not probe-verified) | standard | hardened | enterprise (probe-verified, fail-closed)
 feedback: ids                  # ids (default, deterministic) | behavioral | full  (latter two taint)
 max_iterations: 5
 final_exam_fraction: 0.3       # ≥1 dev family AND ≥1 final family per behavior (stratified)

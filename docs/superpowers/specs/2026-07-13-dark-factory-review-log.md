@@ -338,3 +338,26 @@ VERDICT: REVISE
 Codex: "Round 4 closes the prior architectural blockers. Three residual design issues remain." All 3 folded (I agree with each; no counter-position): (P0) the denial boundary now covers the **entire holdout-bearing control root** — scenarios, sealed twins, raw seeds, verifier outcomes, role transcripts — not just `scenarios/`; the builder/candidate get only hashed allowlisted exports. (P1) `cooperative` is reclassified **outside** the probe-verified tier ordering + `supported_tiers` (structurally `qualified: false`). (P1) the enterprise **adversarial insider** is defined as a builder-side operator without control-plane/sign-off/broker/signing-key authority, with the human sign-off authority solely in the TCB.
 
 **Outcome:** hit MAX_ROUNDS=5 at VERDICT:REVISE, but findings converged **18 -> 18 -> 17 -> 9 -> 3**, all 3 final points were valid and folded, and there are **no open disagreements** between Claude and Codex. Not a false 'approved' and not a real deadlock — a converged plan with every surfaced point addressed. Ready for human sign-off.
+
+## Round 6 — Codex (gpt-5.6-sol, read-only, resumed) — CONFIRMATION
+
+(Run one past MAX_ROUNDS at the user's request to confirm the R5 fold.)
+
+Yes—the three Round 5 residuals are substantively resolved:
+
+- The denial boundary now covers every holdout-bearing control artifact and permits only verified exports. [§7.2](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:273)
+- Cooperative is explicitly unqualified and excluded from `supported_tiers`. [§2.2](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:98)
+- Enterprise now defines the adversarial insider’s privileges and keeps human sign-off in the TCB. [§1.4](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:76)
+
+One non-blocking wording cleanup remains: §7 says “all tiers” are probe-verified and the config comment groups cooperative with probe-verified tiers, despite cooperative being outside that ordering. [§7](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:260), [config](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:400)
+
+**Fix:** Replace “all tiers” with “all qualified tiers (`standard`/`hardened`/`enterprise`)” and annotate cooperative separately in the config comment.
+
+No material design-level blockers remain; the unresolved schemas and platform mechanics appropriately belong in implementation planning.
+
+VERDICT: APPROVED
+### Claude's response (Round 6) — CONVERGED
+
+**VERDICT: APPROVED.** All three R5 residuals confirmed resolved. The single non-blocking wording cleanup Codex noted (the 'all tiers are probe-verified' line + the config comment should exclude `cooperative`) is folded: §7 now reads 'all qualified tiers (standard/hardened/enterprise)' and the config annotates `cooperative` as unqualified/not-probe-verified. Codex: "No material design-level blockers remain; the unresolved schemas and platform mechanics appropriately belong in implementation planning."
+
+**Final:** 6 rounds, findings 18 -> 18 -> 17 -> 9 -> 3 -> APPROVED. Design converged and signed off by the cross-model critic. Remaining detail is implementation-plan altitude (§16).
