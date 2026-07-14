@@ -400,7 +400,11 @@ def resume(control_root, decision="continue"):
         sys.stderr.write("dark-factory: no paused run to resume\n")
         return 2
 
-    lock = acquire_lock(control_root)
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
     try:
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"))
@@ -430,6 +434,7 @@ def resume(control_root, decision="continue"):
             journal.write("ACCEPTED_BY_HUMAN",
                           note="human accepted a non-passing build — waived/unverified")
             finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
+                                            qualified=False,
                                             iterations=state["next_iter"] - 1))
             os.unlink(os.path.join(run_dir, "state.json"))
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")

@@ -118,3 +118,30 @@ def test_resume_with_no_paused_run_exits_2(tmp_path):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     assert supervisor.run(str(cr), None) == 0  # converges, no pause
     assert supervisor.resume(str(cr), "continue") == 2  # nothing to resume
+
+
+def test_resume_accept_forces_qualified_false_even_for_qualified_tier(tmp_path, monkeypatch):
+    cr = setup_control(tmp_path, FAKE)  # pause mode
+    assert supervisor.run(str(cr), None) == 10
+    # Simulate a future qualified tier: force load_config to report _qualified True.
+    real_load = supervisor.load_config
+    def fake_load(control_root):
+        cfg = real_load(control_root)
+        cfg["_qualified"] = True
+        return cfg
+    monkeypatch.setattr(supervisor, "load_config", fake_load)
+    assert supervisor.resume(str(cr), "accept") == 0
+    run_id = os.listdir(cr / "runs")[0]
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert manifest["outcome"] == "ACCEPTED_WAIVED"
+    assert manifest["qualified"] is False   # forced, not inherited
+
+
+def test_resume_on_locked_control_root_exits_2(tmp_path):
+    cr = setup_control(tmp_path, FAKE)
+    assert supervisor.run(str(cr), None) == 10   # paused; run() released its lock on return
+    lock = supervisor.acquire_lock(str(cr))       # hold the lock
+    try:
+        assert supervisor.resume(str(cr), "continue") == 2
+    finally:
+        supervisor.release_lock(lock)
