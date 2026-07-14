@@ -10,7 +10,6 @@ import glob
 import json
 import os
 import re
-import signal
 import subprocess
 import time
 
@@ -51,15 +50,19 @@ class TwinSet:
         twdir = os.path.join(run_dir, "twins")
         os.makedirs(twdir, exist_ok=True)
         env_map, pending = {}, []
-        for d in defs:
-            ep_file = os.path.join(twdir, d["name"] + ".endpoint")
-            if os.path.exists(ep_file):
-                os.unlink(ep_file)
-            child_env = dict(os.environ, DF_ENDPOINT_FILE=ep_file)
-            proc = subprocess.Popen(d["launch"], cwd=run_dir, env=child_env,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._procs.append((proc, d))
-            pending.append((d, ep_file, proc))
+        try:
+            for d in defs:
+                ep_file = os.path.join(twdir, d["name"] + ".endpoint")
+                if os.path.exists(ep_file):
+                    os.unlink(ep_file)
+                child_env = dict(os.environ, DF_ENDPOINT_FILE=ep_file)
+                proc = subprocess.Popen(d["launch"], cwd=run_dir, env=child_env,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._procs.append((proc, d))
+                pending.append((d, ep_file, proc))
+        except OSError as e:
+            self.stop()
+            raise TwinError(f"failed to launch twin: {e}")
         deadline = time.time() + timeout_s
         for d, ep_file, proc in pending:
             while True:
@@ -67,7 +70,8 @@ class TwinSet:
                     self.stop()
                     raise TwinError(f"twin {d['name']!r} exited before ready")
                 if os.path.exists(ep_file) and os.path.getsize(ep_file) > 0:
-                    env_map[d["env_var"]] = open(ep_file, encoding="utf-8").read().strip()
+                    with open(ep_file, encoding="utf-8") as fh:
+                        env_map[d["env_var"]] = fh.read().strip()
                     break
                 if time.time() > deadline:
                     self.stop()

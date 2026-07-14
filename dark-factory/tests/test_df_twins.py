@@ -84,3 +84,17 @@ def test_start_times_out_when_endpoint_never_written(tmp_path):
             ts.start(df_twins.load_defs(str(tmp_path / "twins")), str(run_dir), 1)
     finally:
         ts.stop()
+
+
+def test_launch_failure_mid_batch_reaps_and_raises(tmp_path):
+    td = tmp_path / "twins"; td.mkdir()
+    # twin 'a' launches fine (the greeter); twin 'z' has a bogus command
+    (td / "a.json").write_text(json.dumps({"twin_version":"0.1","name":"a","launch":["python3", GREETER]}), encoding="utf-8")
+    (td / "z.json").write_text(json.dumps({"twin_version":"0.1","name":"z","launch":["this-command-does-not-exist-xyz"]}), encoding="utf-8")
+    run_dir = tmp_path / "run"; run_dir.mkdir()
+    ts = df_twins.TwinSet()
+    with pytest.raises(df_twins.TwinError):
+        ts.start(df_twins.load_defs(str(td)), str(run_dir), 20)
+    # engine self-cleaned: no tracked procs remain alive
+    assert all(p.poll() is not None for p, _ in ts._procs) or ts._procs == []
+    ts.stop()  # idempotent, safe
