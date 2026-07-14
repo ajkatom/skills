@@ -12,6 +12,7 @@ import subprocess
 import sys
 import uuid
 
+import df_kb
 import df_sandbox
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
@@ -163,6 +164,22 @@ def finalize_manifest(run_dir: str, extra: dict) -> str:
     digest = sha256_str(text)
     atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
     return digest
+
+
+def _kb_writeback(cfg, journal, manifest_dict, failing):
+    """Opt-in KB write-back after a terminal manifest is finalized.
+
+    Side-effect only: never raises, never affects control flow or exit codes.
+    """
+    kb = cfg.get("_kb", {"kind": "none"})
+    if kb.get("kind") != "wiki" or not kb.get("write_back"):
+        return
+    try:
+        path = df_kb.write_run_summary(kb, manifest_dict, failing)
+        if path:
+            journal.write("KB_WRITEBACK", path=path)
+    except (OSError, df_kb.KBLeakError) as e:
+        journal.write("KB_WRITEBACK_ERROR", detail=str(e))
 
 
 def verify_manifest(run_dir: str) -> bool:
@@ -325,12 +342,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             manifest, snap_hash = snapshot(project_src, workspace)
         except SnapshotError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=0, detail=f"snapshot failed: {e}")
-            finalize_manifest(
-                run_dir,
-                dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
-                     snapshot_sha256=None, qualified=False,
-                     sandbox_backend=None, denial_probe_passed=False),
-            )
+            mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
+                      snapshot_sha256=None, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False)
+            finalize_manifest(run_dir, mf)
+            _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
     else:
@@ -390,9 +406,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                    exec_prefix=exec_prefix)
         if err or resp.get("status") != "ok":
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
-            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
-                                            qualified=False))
+            mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+            finalize_manifest(run_dir, mf)
             _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
             return 2
         journal.write("BUILD", iteration=i)
@@ -401,9 +418,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix)
         except OracleError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
-                                            qualified=False))
+            mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+            finalize_manifest(run_dir, mf)
             _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
         last_report = report
@@ -415,8 +433,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             journal.write("CONVERGED", iteration=i)
             eff = manifest_base.get("_effective_tier", "cooperative")
             outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
-            finalize_manifest(run_dir, dict(mb_clean, outcome=outcome, iterations=i))
+            mf = dict(mb_clean, outcome=outcome, iterations=i)
+            finalize_manifest(run_dir, mf)
             _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
             print(f"dark-factory: CONVERGED "
                   f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
                   f"Workspace: {workspace}  Run: {run_dir}")
@@ -440,9 +460,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
     journal.write("CAP_REACHED", failing_behaviors=failing,
                   note="likely spec ambiguity — human decision needed")
-    finalize_manifest(run_dir, dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"],
-                                    qualified=False))
+    mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False)
+    finalize_manifest(run_dir, mf)
     _clear_state()
+    _kb_writeback(cfg, journal, mf, failing)
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
           f"Still failing: {', '.join(failing)}. Run: {run_dir}")
     return 3
@@ -487,21 +508,25 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
 
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")
-            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BY_HUMAN",
-                                            iterations=state["next_iter"] - 1,
-                                            qualified=False,
-                                            sandbox_backend=None, denial_probe_passed=False))
+            mf = dict(manifest_base, outcome="ABORTED_BY_HUMAN",
+                      iterations=state["next_iter"] - 1,
+                      qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False)
+            finalize_manifest(run_dir, mf)
             os.unlink(os.path.join(run_dir, "state.json"))
+            _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ABORTED by human.")
             return 2
         if decision == "accept":
             journal.write("ACCEPTED_BY_HUMAN",
                           note="human accepted a non-passing build — waived/unverified")
-            finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
-                                            qualified=False,
-                                            sandbox_backend=None, denial_probe_passed=False,
-                                            iterations=state["next_iter"] - 1))
+            mf = dict(manifest_base, outcome="ACCEPTED_WAIVED",
+                      qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False,
+                      iterations=state["next_iter"] - 1)
+            finalize_manifest(run_dir, mf)
             os.unlink(os.path.join(run_dir, "state.json"))
+            _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
             return 0
         # decision == "continue" — isolation cannot be trusted across a pause;
