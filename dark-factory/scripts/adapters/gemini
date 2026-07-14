@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Gemini builder adapter, protocol 0.1. Invokes the Gemini CLI headless with
+cwd = the build workspace. --yolo auto-approves file edits so the model can
+write the build; --prompt is the non-interactive form. The model sees only the
+prompt file content (spec + ID feedback) and the workspace directory."""
+import json
+import shutil
+import subprocess
+import sys
+
+
+def respond(status, detail=""):
+    print(json.dumps({"adapter_protocol": "0.1", "status": status,
+                      "detail": detail, "usage": {"known": False}}))
+
+
+def main():
+    req = json.load(sys.stdin)
+    with open(req["prompt_file"], encoding="utf-8") as f:
+        prompt = f.read()
+    if shutil.which("gemini") is None:
+        respond("error", "gemini CLI not found on PATH")
+        return
+    try:
+        proc = subprocess.run(
+            ["gemini", "--yolo", "--prompt", prompt],
+            cwd=req["workdir"],
+            timeout=req.get("timeout_s", 600),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        respond("error", "gemini CLI timed out")
+        return
+    if proc.returncode != 0:
+        respond("error", (proc.stderr or proc.stdout)[-2000:])
+        return
+    respond("ok")
+
+
+if __name__ == "__main__":
+    main()
