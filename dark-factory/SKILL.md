@@ -48,6 +48,7 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      read-denial sandbox → qualified; needs macOS `sandbox-exec` or Linux `bwrap`, and a
      passing startup denial probe). If `standard` can't be honored, the run fails closed
      unless you pass `run --allow-downgrade` (→ cooperative, unqualified).
+4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each scenario for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
    Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error ·
    **10 = paused at a checkpoint** (autonomy 4 / `checkpoint: pause`).
@@ -92,6 +93,7 @@ or reveal holdout scenarios in a session that will also drive the builder.
 ## References
 
 - `references/config-reference.md` — config schema
+- `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
 - `references/role-adapters.md` — adapter protocol
