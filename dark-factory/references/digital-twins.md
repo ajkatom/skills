@@ -11,8 +11,8 @@ Each twin is defined by a JSON file in `<control_root>/twins/<name>.json`.
 | `twin_version` | string | Must be `"0.1"` | Required. Future versions may add new fields. |
 | `name` | string | `^[a-z][a-z0-9_]{0,30}$` (lowercase, digits, underscore; max 31 chars) | Unique within a control root. Used to derive the environment variable name. |
 | `launch` | array of strings | Non-empty list of command parts (argv). | The command that starts the twin service (e.g., `["python3", "twins/greeter.py"]`). Run in the run directory with inherited environment plus `DF_ENDPOINT_FILE`. |
-| `env_var` | string | Any valid shell variable name. Optional. | Environment variable name exposed to the builder and scenario verifier. Defaults to `DF_TWIN_<NAME_UPPER>` (e.g., `greeter` → `DF_TWIN_GREETER`). |
-| `fidelity` | string | Human-readable note. | Describes the mock's honesty level relative to the real service (e.g., `"dev mock, basic HTTPS stub"`, `"async job enqueue only, no scheduler"`, `"read-only, no mutations"`). Surfaced in run reports. |
+| `env_var` | string | Optional; defaults to `DF_TWIN_<NAME_UPPER>`. Not format-validated — supply a valid environment-variable name. | Environment variable name exposed to the builder and scenario verifier. Defaults to `DF_TWIN_<NAME_UPPER>` (e.g., `greeter` → `DF_TWIN_GREETER`). |
+| `fidelity` | string | Human-readable note. | Describes the mock's honesty level relative to the real service (e.g., `"dev mock, basic HTTPS stub"`, `"async job enqueue only, no scheduler"`, `"read-only, no mutations"`). A human-readable honesty note in the def file (documentation only; not read or surfaced by the supervisor). |
 
 ### Example Twin Definition
 
@@ -49,7 +49,7 @@ The supervisor orchestrates twin lifecycle:
 
 2. **Builder development.** The builder runs with all twin endpoints exposed as environment variables (e.g., `DF_TWIN_GREETER=127.0.0.1:8080`). The builder's code can call out to the twins via localhost.
 
-3. **Reset before each verify.** Before each verification scenario runs, the supervisor **terminates and restarts** all twins from scratch. This ensures deterministic, repeatable verification: each scenario verifies against a fresh twin state (no accumulated side effects from prior scenarios).
+3. **Reset before each verify pass.** Before each verify pass (loop iteration) runs, the supervisor **terminates and restarts** all twins from scratch. This ensures deterministic, repeatable verification: the supervisor resets all twins to a fresh state once before the whole scenario suite for that iteration runs, then each scenario verifies against that fresh instance. (Scenarios within a single verify pass share the reset instance; per-scenario reset is not provided.)
 
 4. **Scenario verification.** Each scenario's `when.run` commands run with the twin endpoints in their environment, same as the builder.
 
