@@ -328,7 +328,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             finalize_manifest(
                 run_dir,
                 dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
-                     snapshot_sha256=None),
+                     snapshot_sha256=None, qualified=False,
+                     sandbox_backend=None, denial_probe_passed=False),
             )
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -380,7 +381,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                    exec_prefix=exec_prefix)
         if err or resp.get("status") != "ok":
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
-            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
+                                            qualified=False))
             _clear_state()
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
             return 2
@@ -390,7 +392,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix)
         except OracleError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            finalize_manifest(run_dir, dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i,
+                                            qualified=False))
             _clear_state()
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -428,7 +431,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
     journal.write("CAP_REACHED", failing_behaviors=failing,
                   note="likely spec ambiguity — human decision needed")
-    finalize_manifest(run_dir, dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"]))
+    finalize_manifest(run_dir, dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"],
+                                    qualified=False))
     _clear_state()
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
           f"Still failing: {', '.join(failing)}. Run: {run_dir}")
@@ -475,7 +479,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")
             finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BY_HUMAN",
-                                            iterations=state["next_iter"] - 1))
+                                            iterations=state["next_iter"] - 1,
+                                            qualified=False,
+                                            sandbox_backend=None, denial_probe_passed=False))
             os.unlink(os.path.join(run_dir, "state.json"))
             print("dark-factory: ABORTED by human.")
             return 2
@@ -484,6 +490,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                           note="human accepted a non-passing build — waived/unverified")
             finalize_manifest(run_dir, dict(manifest_base, outcome="ACCEPTED_WAIVED",
                                             qualified=False,
+                                            sandbox_backend=None, denial_probe_passed=False,
                                             iterations=state["next_iter"] - 1))
             os.unlink(os.path.join(run_dir, "state.json"))
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")

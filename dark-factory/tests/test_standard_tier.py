@@ -6,7 +6,7 @@ import pytest
 
 import df_sandbox
 import supervisor
-from test_supervisor import FAKE, setup_control
+from test_supervisor import FAKE, STUBBORN, setup_control
 
 
 def _std(tmp_path, **kw):
@@ -81,3 +81,58 @@ def test_standard_resume_stays_qualified_and_reprobes(tmp_path):
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "COMPLETE_QUALIFIED" and m["qualified"] is True
     assert m["denial_probe_passed"] is True
+
+
+# --- M2b-7 regression: qualified:true must never leak onto a non-converged
+# standard-tier terminal. Standard registers qualified:true in the tier
+# registry, so every finalize_manifest call that inherits manifest_base
+# without an explicit override is a false-qualification bug. These pin the
+# three non-converged terminals reachable without disabling the sandbox.
+
+def test_standard_snapshot_failure_is_not_qualified(tmp_path):
+    # SnapshotError abort happens BEFORE isolation is resolved (resolve_isolation
+    # runs after the snapshot block), so manifest_base still carries the raw
+    # registry qualified:true for standard. The finalize site must force False.
+    cr = _std(tmp_path)
+    src = tmp_path / "badsrc"
+    src.mkdir()
+    real = src / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    os.symlink(real, src / "link.txt")  # snapshot_source rejects symlinks
+    rc = supervisor.run(str(cr), str(src))
+    assert rc == 2
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["outcome"] == "ABORTED_BUILD_ERROR"
+    assert m["qualified"] is False
+
+
+def test_standard_resume_abort_is_not_qualified(tmp_path):
+    # decision=="abort" finalizes BEFORE the continue-only resolve_isolation
+    # re-probe, so it too inherits raw registry qualified:true unless forced.
+    cr = setup_control(tmp_path, FAKE)  # default autonomy 4 -> checkpoint pause
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    assert supervisor.run(str(cr), None) == 10  # paused at iteration 1
+    assert supervisor.resume(str(cr), "abort") == 2
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["outcome"] == "ABORTED_BY_HUMAN"
+    assert m["qualified"] is False
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
+def test_standard_cap_is_not_qualified(tmp_path):
+    # CAP_REACHED means the loop never converged, even though isolation WAS
+    # resolved+probed successfully — qualified must still be forced False.
+    if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
+        pytest.skip("no OS sandbox primitive")
+    cr = setup_control(tmp_path, STUBBORN, max_iterations=2, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    rc = supervisor.run(str(cr), None)
+    assert rc == 3
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["outcome"] == "CAP_REACHED"
+    assert m["qualified"] is False
