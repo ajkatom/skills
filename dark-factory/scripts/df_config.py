@@ -107,10 +107,28 @@ def load_config(control_root: str) -> dict:
         if not os.path.isdir(tdir) or not [n for n in os.listdir(tdir) if n.endswith(".json")]:
             raise ConfigError("twins.enabled is true but no twins/*.json definitions found")
 
+    audit_raw = raw.get("audit", {})
+    if not isinstance(audit_raw, dict):
+        raise ConfigError("audit must be a JSON object")
+    audit_signing = audit_raw.get("signing", False)
+    if not isinstance(audit_signing, bool):
+        raise ConfigError("audit.signing must be a bool")
+    audit_key_path = audit_raw.get("key_path", "")
+    if audit_signing:
+        if not audit_key_path:
+            audit_key_path = os.path.expanduser("~/.dark-factory/audit.key")
+        key_dir = os.path.dirname(os.path.abspath(audit_key_path))
+        if not _disjoint(key_dir, control_root) or not _disjoint(key_dir, ws):
+            raise ConfigError(
+                "audit.key_path must live outside both the control root and "
+                "workspace_root (the signing key must never be reachable by a run)"
+            )
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
     cfg["_checkpoint"] = checkpoint
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
+    cfg["_audit"] = {"signing": audit_signing, "key_path": audit_key_path if audit_signing else ""}
     return cfg
