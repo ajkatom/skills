@@ -77,3 +77,26 @@ def test_missing_builder_adapter_is_rejected(tmp_path):
 def test_missing_config_file_is_clear(tmp_path):
     with pytest.raises(df_config.ConfigError, match="missing config"):
         df_config.load_config(str(tmp_path / "nowhere"))
+
+
+def test_malformed_json_raises_config_error(tmp_path):
+    cr = tmp_path / "control"
+    cr.mkdir(parents=True, exist_ok=True)
+    (cr / "config.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(df_config.ConfigError, match="invalid JSON"):
+        df_config.load_config(str(cr))
+
+
+def test_non_object_config_raises_config_error(tmp_path):
+    cr = tmp_path / "control"
+    cr.mkdir(parents=True, exist_ok=True)
+    (cr / "config.json").write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    with pytest.raises(df_config.ConfigError, match="must be a JSON object"):
+        df_config.load_config(str(cr))
+
+
+def test_non_dict_roles_builder_raises_config_error(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, roles={"builder": "oops"})
+    with pytest.raises(df_config.ConfigError, match="roles.builder"):
+        df_config.load_config(str(cr))

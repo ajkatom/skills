@@ -28,7 +28,15 @@ def load_config(control_root: str) -> dict:
     if not os.path.exists(path):
         raise ConfigError(f"missing config: {path}")
     with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
+        try:
+            raw = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"invalid JSON in {path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"config must be a JSON object, got {type(raw).__name__}"
+        )
 
     tiers = load_supported_tiers()["tiers"]
     tier = raw.get("assurance")
@@ -51,7 +59,13 @@ def load_config(control_root: str) -> dict:
     if not _disjoint(ws, control_root):
         raise ConfigError("workspace_root must be disjoint from the control root")
 
-    adapter = raw.get("roles", {}).get("builder", {}).get("adapter")
+    roles = raw.get("roles", {})
+    if not isinstance(roles, dict):
+        raise ConfigError("roles must be a JSON object")
+    builder = roles.get("builder", {})
+    if not isinstance(builder, dict):
+        raise ConfigError("roles.builder must be a JSON object")
+    adapter = builder.get("adapter")
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
 
