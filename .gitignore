@@ -1,2 +1,10 @@
 .DS_Store
 node_modules/
+
+# Local Claude Code settings (machine-specific — do not share)
+.claude/settings.local.json
+
+# Secrets — never commit (see dark-factory secrets guardrail)
+.env
+.env.*
+!.env.example
