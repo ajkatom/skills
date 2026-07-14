@@ -52,3 +52,33 @@ def test_macos_backend_denies_deny_root_read_but_allows_workspace(tmp_path):
     # reading the workspace file must SUCCEED under the same sandbox
     allowed = subprocess.run(pref + ["cat", str(ws_file)], capture_output=True, text=True)
     assert allowed.returncode == 0 and "workspace-ok" in allowed.stdout
+
+
+def test_linux_wrap_prefix_construction():
+    # Runs on any OS: verify the argv shape without executing bwrap.
+    b = df_sandbox.BACKENDS["linux"]
+    pref = b.wrap_prefix("/ctrl", "/ws")
+    assert pref[0] == "bwrap"
+    assert "--tmpfs" in pref and "/ctrl" in pref          # deny_root masked
+    assert "--bind" in pref and "/ws" in pref             # workspace writable
+    assert "--chdir" in pref
+    assert pref[-1] == "--"                                # command follows
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="linux bwrap")
+def test_linux_backend_denies_deny_root_read(tmp_path):
+    b = df_sandbox.current_backend()
+    if not b.available():
+        pytest.skip("bwrap not present")
+    deny_root = tmp_path / "control"; deny_root.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    (deny_root / "scenarios.json").write_text("TOP-SECRET-HOLDOUT", encoding="utf-8")
+    (ws / "ok.txt").write_text("workspace-ok", encoding="utf-8")
+    pref = b.wrap_prefix(str(deny_root), str(ws))
+    import subprocess
+    denied = subprocess.run(pref + ["cat", str(deny_root / "scenarios.json")],
+                            capture_output=True, text=True)
+    assert "TOP-SECRET-HOLDOUT" not in denied.stdout
+    allowed = subprocess.run(pref + ["cat", str(ws / "ok.txt")],
+                             capture_output=True, text=True)
+    assert allowed.returncode == 0 and "workspace-ok" in allowed.stdout

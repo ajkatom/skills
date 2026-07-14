@@ -40,8 +40,19 @@ class _LinuxBackend:
         return shutil.which("bwrap") is not None
 
     def wrap_prefix(self, deny_root, workspace):
-        # Filled in Task 3.
-        raise SandboxError("linux wrap_prefix not implemented yet")
+        real_deny = os.path.realpath(deny_root)
+        real_ws = os.path.realpath(workspace)
+        return [
+            "bwrap",
+            "--ro-bind", "/", "/",       # whole fs read-only baseline
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", real_deny,        # mask the control root → contents unreadable
+            "--bind", real_ws, real_ws,  # workspace read-write
+            "--chdir", real_ws,
+            "--die-with-parent",
+            "--",
+        ]
 
 
 BACKENDS = {"darwin": _MacOSBackend(), "linux": _LinuxBackend()}
