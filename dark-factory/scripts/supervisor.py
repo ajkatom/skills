@@ -32,6 +32,9 @@ class LockError(RuntimeError):
     pass
 
 
+PAUSED = 10
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -225,6 +228,7 @@ def run(control_root: str, project_src) -> int:
     except ConfigError as e:
         sys.stderr.write(f"dark-factory: config error: {e}\n")
         return 2
+    cfg["_control_root"] = control_root
 
     try:
         lock = acquire_lock(control_root)
@@ -308,21 +312,31 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
                   file_count=len(manifest["files"]))
     manifest_base["snapshot_sha256"] = snap_hash
 
-    feedback = None
-    converged = False
+    return _run_loop(
+        cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+        adapter, timeout_s, workspace, start_iter=1, feedback=None,
+    )
+
+
+def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+              adapter, timeout_s, workspace, start_iter, feedback):
+
+    def _clear_state():
+        p = os.path.join(run_dir, "state.json")
+        if os.path.exists(p):
+            os.unlink(p)
+
     last_report = None
-    for i in range(1, cfg["max_iterations"] + 1):
+    for i in range(start_iter, cfg["max_iterations"] + 1):
         prompt = compose_prompt(spec_text, feedback)
         prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
         atomic_write(prompt_file, prompt)
         resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s)
         if err or resp.get("status") != "ok":
-            journal.write("ABORTED_BUILD_ERROR", iteration=i,
-                          detail=err or resp.get("detail", ""))
+            journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            _clear_state()
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
-            finalize_manifest(
-                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
-            )
             return 2
         journal.write("BUILD", iteration=i)
 
@@ -330,58 +344,45 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
             report = run_all(scenarios_dir, workspace)
         except OracleError as e:
             journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            finalize_manifest(
-                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
-            )
+            finalize_manifest(run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i))
+            _clear_state()
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
         last_report = report
-        atomic_write(
-            os.path.join(run_dir, f"verifier_report_iter_{i}.json"),
-            canonical_json(report),
-        )
+        atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
         passing = sum(1 for r in report["results"] if r["pass"])
-        journal.write("VERIFY", iteration=i, passing=passing,
-                      total=len(report["results"]))
+        journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
 
         if report["all_pass"]:
             journal.write("CONVERGED", iteration=i)
-            converged = True
-            break
+            finalize_manifest(run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i))
+            _clear_state()
+            print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
+                  f"Workspace: {workspace}  Run: {run_dir}")
+            return 0
 
         feedback = project_feedback(report)
-        atomic_write(
-            os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback)
-        )
+        atomic_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback))
         atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
-        journal.write("FEEDBACK", iteration=i,
-                      failing=[f["behavior_id"] for f in feedback["failures"]])
+        journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
 
-    if converged:
-        journal.write(
-            "COMPLETE_UNQUALIFIED",
-            note="cooperative tier cannot produce a qualified ship-candidate",
-            workspace=workspace,
-        )
-        print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
-              f"Workspace: {workspace}  Run: {run_dir}")
-        finalize_manifest(
-            run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i)
-        )
-        return 0
+        if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
+            write_checkpoint_report(run_dir, i, report)
+            save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace)
+            journal.write("CHECKPOINT", iteration=i,
+                          failing=[f["behavior_id"] for f in feedback["failures"]])
+            print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
+                  f"Review {run_dir}/checkpoint_iter_{i}.md, then "
+                  f"`supervisor.py resume --control-root {cfg.get('_control_root', '<CR>')}`.")
+            return PAUSED
 
-    failing = sorted(
-        {r["behavior_id"] for r in last_report["results"] if not r["pass"]}
-    )
+    failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
     journal.write("CAP_REACHED", failing_behaviors=failing,
                   note="likely spec ambiguity — human decision needed")
+    finalize_manifest(run_dir, dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]))
+    _clear_state()
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
-          f"Still failing: {', '.join(failing)}. Likely spec ambiguity — "
-          f"human decision needed. Run: {run_dir}")
-    finalize_manifest(
-        run_dir,
-        dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]),
-    )
+          f"Still failing: {', '.join(failing)}. Run: {run_dir}")
     return 3
 
 

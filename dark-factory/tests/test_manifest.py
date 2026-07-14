@@ -12,7 +12,7 @@ SUP = os.path.join(
 
 
 def run_and_get_run_dir(tmp_path):
-    cr = setup_control(tmp_path, FAKE)
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     assert supervisor.run(str(cr), None) == 0
     run_id = os.listdir(cr / "runs")[0]
     return str(cr / "runs" / run_id)

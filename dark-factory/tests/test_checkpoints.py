@@ -4,6 +4,7 @@ import os
 import pytest
 
 import supervisor
+from test_supervisor import FAKE, setup_control, read_journal
 
 SAMPLE_REPORT = {
     "report_version": "0.1",
@@ -55,3 +56,28 @@ def test_checkpoint_report_has_ids_and_results_no_scenario_text(tmp_path):
     assert "1/2" in text  # passing summary
     # observed exit codes are fine for the (trusted) human; raw stdout bodies are not echoed
     assert "stdout" not in text
+
+
+def test_pause_mode_stops_after_first_iteration_with_exit_10(tmp_path):
+    cr = setup_control(tmp_path, FAKE)  # FAKE builds buggy first, fixes after feedback
+    # setup_control defaults autonomy 4 → checkpoint pause
+    rc = supervisor.run(str(cr), None)
+    assert rc == 10
+    entries, run_id = read_journal(cr)
+    states = [e["state"] for e in entries]
+    assert states.count("BUILD") == 1  # paused after iteration 1
+    assert "CHECKPOINT" in states
+    assert "CONVERGED" not in states
+    run_dir = cr / "runs" / run_id
+    assert (run_dir / "state.json").exists()
+    assert (run_dir / "checkpoint_iter_1.md").exists()
+    assert not (run_dir / "manifest.json").exists()  # pause is non-terminal
+
+
+def test_auto_mode_runs_to_convergence_without_pausing(tmp_path):
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    entries, _ = read_journal(cr)
+    states = [e["state"] for e in entries]
+    assert "CHECKPOINT" not in states and "CONVERGED" in states

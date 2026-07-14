@@ -25,16 +25,19 @@ def scenario(sid, bid, run, then, title):
     }
 
 
-def setup_control(tmp_path, adapter, max_iterations=5):
+def setup_control(tmp_path, adapter, max_iterations=5, checkpoint=None):
     cr = tmp_path / "control"
     (cr / "scenarios").mkdir(parents=True)
-    (cr / "config.json").write_text(json.dumps({
+    config = {
         "config_version": "0.1", "autonomy": 4, "assurance": "cooperative",
         "feedback": "ids", "max_iterations": max_iterations,
         "workspace_root": str(tmp_path / "ws"),
         "roles": {"builder": {"adapter": adapter, "timeout_s": 30}},
         "budget": {"billing": "subscription"},
-    }), encoding="utf-8")
+    }
+    if checkpoint is not None:
+        config["checkpoint"] = checkpoint
+    (cr / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (cr / "spec.md").write_text(TOY_SPEC, encoding="utf-8")
     scs = [
         scenario("BHV-001-S1", "BHV-001", ["python3", "greet.py", "World"],
@@ -60,19 +63,19 @@ def read_journal(cr):
 
 
 def test_converging_run_exits_zero_and_journals(tmp_path):
-    cr = setup_control(tmp_path, FAKE)
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     rc = supervisor.run(str(cr), None)
     assert rc == 0
     entries, _ = read_journal(cr)
     states = [e["state"] for e in entries]
     assert states[0] == "INIT" and states[1] == "SNAPSHOT"
-    assert "CONVERGED" in states and states[-1] == "COMPLETE_UNQUALIFIED"
+    assert "CONVERGED" in states and states[-1] == "CONVERGED"
     # two iterations: buggy then fixed
     assert states.count("BUILD") == 2 and states.count("FEEDBACK") == 1
 
 
 def test_stubborn_run_hits_cap_with_exit_3(tmp_path):
-    cr = setup_control(tmp_path, STUBBORN, max_iterations=2)
+    cr = setup_control(tmp_path, STUBBORN, max_iterations=2, checkpoint="auto")
     rc = supervisor.run(str(cr), None)
     assert rc == 3
     entries, _ = read_journal(cr)
@@ -112,7 +115,7 @@ def test_adapter_hard_failure_aborts_with_exit_2(tmp_path):
 
 
 def test_prompt_contains_spec_and_feedback_but_never_scenarios(tmp_path):
-    cr = setup_control(tmp_path, FAKE)
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     supervisor.run(str(cr), None)
     _, run_id = read_journal(cr)
     run_dir = cr / "runs" / run_id
