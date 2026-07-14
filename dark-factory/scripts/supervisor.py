@@ -74,6 +74,44 @@ class Journal:
             os.fsync(f.fileno())
 
 
+def finalize_manifest(run_dir: str, extra: dict) -> str:
+    """Write manifest.json + manifest.sha256 sidecar.
+
+    HONESTY (spec 7.5, cooperative/standard tier): a local process that can
+    rewrite both files can defeat this. It detects accidental edits and
+    casual tampering only; a signed chain / off-box anchor is hardened+.
+    """
+    journal_path = os.path.join(run_dir, "journal.jsonl")
+    manifest = dict(extra)
+    manifest["manifest_version"] = "0.1"
+    manifest["journal_sha256"] = sha256_file(journal_path)
+    manifest["finished_ts"] = _now()
+    text = canonical_json(manifest)
+    atomic_write(os.path.join(run_dir, "manifest.json"), text)
+    digest = sha256_str(text)
+    atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
+    return digest
+
+
+def verify_manifest(run_dir: str) -> bool:
+    mp = os.path.join(run_dir, "manifest.json")
+    sp = os.path.join(run_dir, "manifest.sha256")
+    jp = os.path.join(run_dir, "journal.jsonl")
+    if not (os.path.exists(mp) and os.path.exists(sp) and os.path.exists(jp)):
+        print("TAMPERED (missing manifest, sidecar, or journal)")
+        return False
+    text = open(mp, encoding="utf-8").read()
+    if sha256_str(text) != open(sp, encoding="utf-8").read().strip():
+        print("TAMPERED (manifest.json does not match manifest.sha256)")
+        return False
+    manifest = json.loads(text)
+    if sha256_file(jp) != manifest.get("journal_sha256"):
+        print("TAMPERED (journal.jsonl does not match manifest)")
+        return False
+    print("OK")
+    return True
+
+
 def compose_prompt(spec_text: str, feedback) -> str:
     fb_block = (
         json.dumps(feedback, indent=2, sort_keys=True)
@@ -179,6 +217,16 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
         adapter_sha256=sha256_file(adapter) if os.path.exists(adapter) else None,
     )
 
+    manifest_base = {
+        "invocation": invocation,
+        "tier": cfg["assurance"],
+        "qualified": cfg["_qualified"],
+        "config_sha256": cfg["_config_sha256"],
+        "spec_sha256": sha256_str(spec_text),
+        "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
+        "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
+    }
+
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
         manifest, snap_hash = snapshot(project_src, workspace)
@@ -190,6 +238,7 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
     atomic_write(os.path.join(workspace, "spec.md"), spec_text)
     journal.write("SNAPSHOT", workspace=workspace, snapshot_sha256=snap_hash,
                   file_count=len(manifest["files"]))
+    manifest_base["snapshot_sha256"] = snap_hash
 
     feedback = None
     converged = False
@@ -203,6 +252,9 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
             journal.write("ABORTED_BUILD_ERROR", iteration=i,
                           detail=err or resp.get("detail", ""))
             sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
+            finalize_manifest(
+                run_dir, dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=i)
+            )
             return 2
         journal.write("BUILD", iteration=i)
 
@@ -237,6 +289,9 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
         )
         print(f"dark-factory: CONVERGED (unqualified, cooperative tier). "
               f"Workspace: {workspace}  Run: {run_dir}")
+        finalize_manifest(
+            run_dir, dict(manifest_base, outcome="COMPLETE_UNQUALIFIED", iterations=i)
+        )
         return 0
 
     failing = sorted(
@@ -247,6 +302,10 @@ def _run_locked(control_root: str, project_src, cfg) -> int:
     print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
           f"Still failing: {', '.join(failing)}. Likely spec ambiguity — "
           f"human decision needed. Run: {run_dir}")
+    finalize_manifest(
+        run_dir,
+        dict(manifest_base, outcome="CAP_REACHED", iterations=cfg["max_iterations"]),
+    )
     return 3
 
 
@@ -256,9 +315,13 @@ def main():
     p_run = sub.add_parser("run", help="execute the build/verify loop")
     p_run.add_argument("--control-root", required=True)
     p_run.add_argument("--project-src", default=None)
+    p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
+    p_ver.add_argument("--run-dir", required=True)
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src))
+    elif args.cmd == "verify-manifest":
+        sys.exit(0 if verify_manifest(args.run_dir) else 4)
 
 
 if __name__ == "__main__":
