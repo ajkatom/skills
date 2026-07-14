@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Codex builder adapter, protocol 0.1. Invokes `codex exec` headless with
+cwd = the build workspace. dark-factory provides the OS sandbox itself (the
+standard tier wraps this adapter), so Codex's own sandbox is disabled and the
+git-repo check is skipped. No -m pin (uses the user's ~/.codex default; pinning
+-codex variants breaks ChatGPT-account auth). The model sees only the prompt
+file content (spec + ID feedback) and the workspace directory."""
+import json
+import shutil
+import subprocess
+import sys
+
+
+def respond(status, detail=""):
+    print(json.dumps({"adapter_protocol": "0.1", "status": status,
+                      "detail": detail, "usage": {"known": False}}))
+
+
+def main():
+    req = json.load(sys.stdin)
+    with open(req["prompt_file"], encoding="utf-8") as f:
+        prompt = f.read()
+    if shutil.which("codex") is None:
+        respond("error", "codex CLI not found on PATH")
+        return
+    try:
+        proc = subprocess.run(
+            ["codex", "exec", "--sandbox", "danger-full-access",
+             "--skip-git-repo-check", prompt],
+            cwd=req["workdir"],
+            timeout=req.get("timeout_s", 600),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        respond("error", "codex CLI timed out")
+        return
+    if proc.returncode != 0:
+        respond("error", (proc.stderr or proc.stdout)[-2000:])
+        return
+    respond("ok")
+
+
+if __name__ == "__main__":
+    main()

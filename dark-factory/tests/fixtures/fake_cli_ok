@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Records argv to $DF_ARGV_OUT (if set) and exits 0. A stand-in for a
+model CLI so adapter tests don't require the real tool."""
+import os
+import sys
+
+out = os.environ.get("DF_ARGV_OUT")
+if out:
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(sys.argv[1:]))
+sys.exit(0)
