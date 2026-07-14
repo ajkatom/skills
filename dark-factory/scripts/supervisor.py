@@ -14,6 +14,7 @@ import uuid
 
 import df_kb
 import df_sandbox
+import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
 from id_feedback import project_feedback
@@ -215,7 +216,7 @@ def compose_prompt(spec_text: str, feedback) -> str:
 
 
 def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, timeout_s: int,
-                   exec_prefix=None):
+                   exec_prefix=None, env_extra=None):
     req = {
         "adapter_protocol": "0.1",
         "role": role,
@@ -224,10 +225,11 @@ def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, time
         "timeout_s": timeout_s,
     }
     argv = (list(exec_prefix) if exec_prefix else []) + [adapter]
+    env = dict(os.environ, **env_extra) if env_extra else None
     try:
         proc = subprocess.run(
             argv, input=json.dumps(req), capture_output=True, text=True,
-            timeout=timeout_s + 60,
+            timeout=timeout_s + 60, env=env,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError) as e:
         return None, f"adapter spawn failed: {e}"
@@ -388,85 +390,133 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         if os.path.exists(p):
             os.unlink(p)
 
-    last_report = None
-    for i in range(start_iter, cfg["max_iterations"] + 1):
-        prompt = compose_prompt(spec_text, feedback)
-        # Audit copy on the control plane (barrier tests assert MARKER-absence here).
-        audit_prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
-        atomic_write(audit_prompt_file, prompt)
-        # Working copy the adapter actually reads: under standard tier, control_root
-        # is OS-denied to the wrapped builder, so prompt_file must live in the
-        # workspace instead (readable) or every standard build aborts with
-        # PermissionError. This is barrier-safe: prompt content is compose_prompt's
-        # output (spec + ID/taxonomy feedback only, no scenario content), and the
-        # spec is already present in the workspace as spec.md — no holdout leak.
-        prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
-        atomic_write(prompt_file, prompt)
-        resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                   exec_prefix=exec_prefix)
-        if err or resp.get("status") != "ok":
-            journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
-            mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
-            finalize_manifest(run_dir, mf)
-            _clear_state()
-            _kb_writeback(cfg, journal, mf, [])
-            sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
-            return 2
-        journal.write("BUILD", iteration=i)
+    def _twin_error_abort(iteration, e):
+        journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
+        mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False)
+        finalize_manifest(run_dir, mf)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, [])
+        sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
+        return 2
 
-        try:
-            report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix)
-        except OracleError as e:
-            journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-            mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
-            finalize_manifest(run_dir, mf)
-            _clear_state()
-            _kb_writeback(cfg, journal, mf, [])
-            sys.stderr.write(f"dark-factory: {e}\n")
-            return 2
-        last_report = report
-        atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
-        passing = sum(1 for r in report["results"] if r["pass"])
-        journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
+    twins_enabled = cfg["_twins"]["enabled"]
+    ts = df_twins.TwinSet() if twins_enabled else None
+    # Twins are SHARED/dev (not holdout): reaping them is non-negotiable — this
+    # try/finally must wrap the WHOLE loop so every terminal (return) and any
+    # exception still stops the twin processes. No orphans, ever.
+    try:
+        twin_defs = None
+        twin_timeout = None
+        twins_started = False
+        if twins_enabled:
+            control_root = cfg["_control_root"]
+            twin_timeout = cfg["_twins"]["startup_timeout_s"]
+            try:
+                twin_defs = df_twins.load_defs(os.path.join(control_root, "twins"))
+            except df_twins.TwinError as e:
+                return _twin_error_abort(start_iter, e)
 
-        if report["all_pass"]:
-            journal.write("CONVERGED", iteration=i)
-            eff = manifest_base.get("_effective_tier", "cooperative")
-            outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
-            mf = dict(mb_clean, outcome=outcome, iterations=i)
-            finalize_manifest(run_dir, mf)
-            _clear_state()
-            _kb_writeback(cfg, journal, mf, [])
-            print(f"dark-factory: CONVERGED "
-                  f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
-                  f"Workspace: {workspace}  Run: {run_dir}")
-            return 0
+        last_report = None
+        for i in range(start_iter, cfg["max_iterations"] + 1):
+            build_env_extra = None
+            if twins_enabled:
+                if not twins_started:
+                    try:
+                        build_env_extra = ts.start(twin_defs, run_dir, twin_timeout)
+                        twins_started = True
+                    except df_twins.TwinError as e:
+                        return _twin_error_abort(i, e)
+                else:
+                    build_env_extra = ts.env
 
-        feedback = project_feedback(report)
-        atomic_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback))
-        atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
-        journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
+            prompt = compose_prompt(spec_text, feedback)
+            # Audit copy on the control plane (barrier tests assert MARKER-absence here).
+            audit_prompt_file = os.path.join(run_dir, f"prompt_iter_{i}.md")
+            atomic_write(audit_prompt_file, prompt)
+            # Working copy the adapter actually reads: under standard tier, control_root
+            # is OS-denied to the wrapped builder, so prompt_file must live in the
+            # workspace instead (readable) or every standard build aborts with
+            # PermissionError. This is barrier-safe: prompt content is compose_prompt's
+            # output (spec + ID/taxonomy feedback only, no scenario content), and the
+            # spec is already present in the workspace as spec.md — no holdout leak.
+            prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
+            atomic_write(prompt_file, prompt)
+            resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
+                                       exec_prefix=exec_prefix, env_extra=build_env_extra)
+            if err or resp.get("status") != "ok":
+                journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
+                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+                finalize_manifest(run_dir, mf)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
+                return 2
+            journal.write("BUILD", iteration=i)
 
-        if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
-            write_checkpoint_report(run_dir, i, report)
-            save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace)
-            journal.write("CHECKPOINT", iteration=i,
-                          failing=[f["behavior_id"] for f in feedback["failures"]])
-            print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
-                  f"Review {run_dir}/checkpoint_iter_{i}.md, then "
-                  f"`supervisor.py resume --control-root {cfg.get('_control_root', '<CR>')}`.")
-            return PAUSED
+            verify_env_extra = None
+            if twins_enabled:
+                try:
+                    verify_env_extra = ts.reset(twin_defs, run_dir, twin_timeout)
+                except df_twins.TwinError as e:
+                    return _twin_error_abort(i, e)
 
-    failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
-    journal.write("CAP_REACHED", failing_behaviors=failing,
-                  note="likely spec ambiguity — human decision needed")
-    mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False)
-    finalize_manifest(run_dir, mf)
-    _clear_state()
-    _kb_writeback(cfg, journal, mf, failing)
-    print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
-          f"Still failing: {', '.join(failing)}. Run: {run_dir}")
-    return 3
+            try:
+                report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
+                                  env_extra=verify_env_extra)
+            except OracleError as e:
+                journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
+                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+                finalize_manifest(run_dir, mf)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                sys.stderr.write(f"dark-factory: {e}\n")
+                return 2
+            last_report = report
+            atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
+            passing = sum(1 for r in report["results"] if r["pass"])
+            journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
+
+            if report["all_pass"]:
+                journal.write("CONVERGED", iteration=i)
+                eff = manifest_base.get("_effective_tier", "cooperative")
+                outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
+                mf = dict(mb_clean, outcome=outcome, iterations=i)
+                finalize_manifest(run_dir, mf)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                print(f"dark-factory: CONVERGED "
+                      f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
+                      f"Workspace: {workspace}  Run: {run_dir}")
+                return 0
+
+            feedback = project_feedback(report)
+            atomic_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback))
+            atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
+            journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
+
+            if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
+                write_checkpoint_report(run_dir, i, report)
+                save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace)
+                journal.write("CHECKPOINT", iteration=i,
+                              failing=[f["behavior_id"] for f in feedback["failures"]])
+                print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
+                      f"Review {run_dir}/checkpoint_iter_{i}.md, then "
+                      f"`supervisor.py resume --control-root {cfg.get('_control_root', '<CR>')}`.")
+                return PAUSED
+
+        failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
+        journal.write("CAP_REACHED", failing_behaviors=failing,
+                      note="likely spec ambiguity — human decision needed")
+        mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False)
+        finalize_manifest(run_dir, mf)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, failing)
+        print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
+              f"Still failing: {', '.join(failing)}. Run: {run_dir}")
+        return 3
+    finally:
+        if ts is not None:
+            ts.stop()
 
 
 def resume(control_root, decision="continue", allow_downgrade: bool = False):
