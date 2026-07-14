@@ -270,3 +270,48 @@ VERDICT: REVISE
 ### Claude's response (Round 3)
 
 Codex: "the tier model is substantially cleaner." Folded R3's design-level fixes **in place** (no appended section): pre-holdout contract freeze (P0-2), tier-consistent separation terms (P0-4), standard-tier OS read-denial so probes are meaningful (P0-1), deterministic `supervisor` as sole state-changer (P0-5), `supported_tiers` registry + L5-until-hardened (P0-6), TCB unavoidable-infra + insider (P1-3), the §5.1/§5.2 freeze contradiction resolved (P1-11), ship-candidate = FSM-terminal semantics (P1-17), crash 'prevents automatic re-dispatch' not 'no double-charge' (P1-14), credential env-scrub at standard (P1-10), lstat snapshot manifest (P1-9), oracle IR (P1-12), budget-all-roles + adapter ceilings (P1-13), restricted seed storage (P1-15), per-tier skill allowlist (P1-16). Deeper implementation specifics carried to §16 for /writing-plans. **Trajectory: R1 conceptually-broken → R2 two-architectures → R3 implementation-altitude precision — the design has converged.** Pausing the Codex loop at R3 (of 5): remaining points are plan-altitude; recommending /writing-plans.
+
+## Round 4 — Codex (gpt-5.6-sol, read-only, resumed)
+
+The design is now close, and I am not treating enterprise controls as requirements for standard. The remaining issues are tier-claim and lifecycle contradictions, not implementation-schema details.
+
+1. **P0 — “Best-effort standard” contradicts fail-closed tiering.** Standard requires an OS read-denial primitive, but if none exists it retains the standard path while merely downgrading the claim to best-effort; that conflicts with the non-negotiable barrier, the `supported_tiers` registry, and “never claim a tier the environment cannot substantiate.” [standard isolation](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:253), [success criterion](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:437)
+
+   **Fix:** Either abort when standard read denial is unavailable or introduce an explicitly lower `cooperative/best_effort` mode that cannot claim probe-proven isolation or produce a qualified ship-candidate.
+
+2. **P0 — Standard verification does not inherit standard filesystem enforcement.** §7.2 applies the UID/read-denial primitive specifically to the builder, while §7.4 gives the candidate only a separate process and says the store is “unmounted,” which is not meaningful outside a mount namespace; success nevertheless requires candidate denial too. [builder boundary](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:253), [candidate boundary](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:281)
+
+   **Fix:** Apply the standard UID/OS read-denial policy independently to both the builder agent and every executing candidate process.
+
+3. **P0 — Network-authority claims are still tier-inconsistent.** §5.2 unconditionally says the candidate can reach only twin data-plane endpoints and cannot address observer evidence, but authenticated enforcement begins only at hardened+, so standard cannot make that absolute claim. [global twin claim](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:183), [tiered enforcement](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:281)
+
+   **Fix:** Describe standard as logical endpoint separation with residual reachability risk, or require basic observer authentication at standard while reserving enforced network topology for hardened+.
+
+4. **P1 — The normative workflow still collapses the pre-holdout freeze.** The role section correctly requires public artifacts to freeze before holdout creation, but workflow step 5 again tells one test-authority step to author public and hidden artifacts together. [pre-holdout rule](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:143), [workflow](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:399)
+
+   **Fix:** Split workflow step 5 into public-authoring/freeze and fresh holdout-authoring phases, with the supervisor revoking public-write capability between them.
+
+5. **P1 — Critical public-boundary artifacts are missing from FSM hashes.** The journal hashes spec, artifact, scenarios, twins, adapter, and phase, but omits contracts/dev stubs, oracle IR, cohort manifest, gate policies, and skill allowlist—the exact inputs whose mutation can invalidate isolation or results. [FSM hashes](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:307)
+
+   **Fix:** Include every shared/public artifact and every executable policy or extension in the immutable run-input manifest and invalidate the generation on any hash change.
+
+6. **P1 — Mid-run assurance downgrade remains unsafe.** Phase-boundary re-probes can discover drift after the holdout exists, but transactional “revalidation” does not say whether a weaker tier may inherit that sealed generation; doing so can expose a holdout created under stronger assumptions. [downgrade rule](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:93)
+
+   **Fix:** Permit assurance downgrade only before holdout creation; afterward, terminate the run and start a fresh generation under the newly consented tier.
+
+7. **P1 — Enterprise’s insider/provider boundary remains ambiguous.** The human is trusted and can read the holdout, yet enterprise claims protection from an “insider”; providers are “semi-trusted” while the default can use the same provider for test authority and builder, without defining whether cross-session leakage or provider compromise is in scope. [TCB table](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:60)
+
+   **Fix:** Define the enterprise insider’s exact privileges and either trust provider session isolation explicitly or require separate provider security domains/accounts for holdout-bearing and builder roles.
+
+8. **P1 — Infra retries do not specify pristine state.** Retrying the same artifact, environment, and seed can preserve candidate/twin writable state, allowing an enterprise-malicious candidate to learn during one attempt and influence the next. [infra-error transition](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:206)
+
+   **Fix:** Define an infra retry as fresh candidate and twin instances restored from immutable snapshots, with the same configuration and seed but no writable state carried across attempts.
+
+9. **P1 — Twin fidelity remains informative rather than decisive.** A fidelity score and unsupported-behavior inventory are produced, but no FSM rule prevents qualification when a required behavior is unsupported or the evidence is stale. [twin fidelity](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:187)
+
+   **Fix:** Make unsupported required behavior or expired calibration a blocking state unless the human records an explicit scoped fidelity waiver in the audit.
+
+VERDICT: REVISE
+### Claude's response (Round 4)
+
+Codex: "the design is now close, and I am not treating enterprise controls as requirements for standard." Folded **all 9** (design-level, cheap, no implementation-schema). P0s were standard-tier overclaims: added an explicit **`cooperative`** sub-standard mode so standard **fails closed** when no OS read-denial primitive exists (P0-1); applied read-denial to the **candidate** too, not just the builder (P0-2); **tiered** the network-authority claim (logical separation at standard, enforced at hardened+) (P0-3). P1s: split workflow step 5 into **public-freeze then holdout** phases (P1-4); expanded the FSM run-input hash set to **every shared/public artifact + policy** (P1-5); **downgrade only before holdout creation**, else terminate + fresh generation (P1-6); defined the enterprise insider + **separate provider accounts** for holdout vs builder (P1-7); infra-retry uses **fresh instances from immutable snapshots**, no writable state carried (P1-8); **unsupported-required-behavior / expired-calibration is now blocking** absent a human fidelity waiver (P1-9). Findings shrank 18 -> 18 -> 17 -> 9, all design-level.

@@ -76,7 +76,11 @@ builder. That protection needs `hardened`+.
 Every tier's TCB also includes the **unavoidable base** it runs on (kernel, container/OS-
 sandbox runtime, filesystem, network stack) — "trust only the supervisor" means *among
 dark-factory's own components*, not literally. The **human is always trusted** to read the
-holdout and authorize downgrades; `enterprise` may add split-custody for that authority.
+holdout and authorize downgrades; `enterprise` may add split-custody for that authority. At
+`enterprise` the trusted **insider** is limited to that human sign-off authority, and
+**holdout-bearing vs builder roles must use separate provider security domains/accounts** so
+cross-session/provider leakage is out of the builder's reach (provider session isolation is
+trusted explicitly, or replaced by separate accounts).
 
 ## 2. The two dials
 
@@ -90,10 +94,12 @@ steps back is the dial:
 - Optional **L4→L5 ramp** as trust builds.
 
 ### 2.2 Assurance dial (new)
-`assurance: standard | hardened | enterprise`. Each tier **adds** enforced mechanisms
-(§7) and a narrower TCB (§1.4). `standard` is the default and ships fully in v1;
+`assurance: cooperative | standard | hardened | enterprise`. Each tier **adds** enforced
+mechanisms (§7) and a narrower TCB (§1.4). `standard` is the default and ships fully in v1;
 `hardened`/`enterprise` are specified and enforced when selected **and** the substrate is
-present.
+present. **`cooperative`** is an explicit *sub-standard* mode for environments lacking an OS
+read-denial primitive (§7.2): honest and exploration-only — it **cannot claim probe-proven
+isolation and never yields a qualified ship-candidate**.
 
 ### 2.3 Cross-rules & fail-closed
 - **L5 requires ≥ `hardened`** — and is **unavailable until a conforming hardened backend
@@ -107,7 +113,10 @@ present.
 - **Fail closed.** A missing substrate/backend aborts, or — with explicit consent —
   **downgrades as a new configuration transaction** that revalidates the autonomy dial
   (e.g. L5→standard is invalid), the notification sink, threat assumptions, and any run
-  state already created. A tier is never a cosmetic label.
+  state already created. **Downgrade is permitted only *before* holdout creation; afterward,
+discovered drift terminates the run and a fresh generation starts under the newly consented
+tier** — a weaker tier never inherits a holdout created under stronger assumptions. A tier is
+never a cosmetic label.
 
 ## 3. The pipeline and the information barrier
 
@@ -182,12 +191,15 @@ fallback** — a substitution needs explicit approval (§7.8).
   final **secret seeds** drawn only *after* the artifact hash commits.
 - **Network authority (§7.4):** the candidate reaches only **twin data-plane** endpoints;
   **observer/control/reset** endpoints are verifier-only; evidence lands in an append-only
-  channel the candidate can't address.
+  channel the candidate can't address. At `standard` this is **logical endpoint separation
+  with residual reachability risk**; **authenticated/enforced** topology begins at `hardened`+.
 - **Fidelity, not faith:** results are **twin-observed outcomes** with a per-service
   **fidelity score + drift evidence + unsupported-behavior inventory**. Indistinguishability
   from prod is *not* claimed (endpoints/timing/certs differ) — instead there are
-  **detection-resistance tests** and stated residual risk. **Nothing is "ship-ready"
-  without a human-gated real contract/staging check.**
+  **detection-resistance tests** and stated residual risk. **An unsupported required behavior
+  or expired calibration is a blocking state** unless the human records an explicit scoped
+  **fidelity waiver** in the audit. **Nothing is "ship-ready" without a human-gated real
+  contract/staging check.**
 
 ## 6. The build/verify loop (state machine)
 
@@ -206,8 +218,9 @@ build snapshot → dev checks → mandatory gates (§7.6) → ARTIFACT FREEZE
 - **Failed final-exam is terminal** for that artifact; disclosed finals promote to dev and
   a fresh sealed set is generated.
 - **Infra-error state:** a twin startup race, lost observer event, or runner failure is a
-  **distinct outcome** (not pass/fail). It permits **bounded retries of the identical
-  artifact+env+seed**; inconsistent results **invalidate the run** rather than fail the
+  **distinct outcome** (not pass/fail). It permits **bounded retries with fresh candidate +
+  twin instances restored from immutable snapshots** (same config+seed, **no writable state
+  carried across attempts**); inconsistent results **invalidate the run** rather than fail the
   candidate (so a flake can't sink a valid artifact, and "runs once" stays truthful).
 - **Termination:** full pass, iteration cap (default 5), or budget cap (§6.2). A persistent
   failure at the cap surfaces as **"likely spec ambiguity — human decision"** (may delegate
@@ -255,8 +268,9 @@ root**; the canonical exported content is what gets hashed.
   primitive** (`sandbox-exec` on macOS, `bwrap`/`unshare` on Linux) so the scenario store is
   genuinely unreachable and the denial probe is *meaningful*; fresh ephemeral
   `HOME`/config/session, hooks/plugins/MCPs/skill-auto-discovery **off**; only allowlisted
-  skills copied in may run. If no read-denial primitive exists, the isolation claim
-  **downgrades to best-effort (not probe-proven)** and says so.
+  skills copied in may run. If no read-denial primitive exists, `standard` **fails closed** —
+  the run drops to the explicit **`cooperative`** mode (§2.2), which cannot claim probe-proven
+  isolation or produce a qualified ship-candidate.
 - *(hardened)* Enforced **container/VM** with a **per-role capability profile** (rootless,
   dropped caps, no docker socket / host PID, read-only rootfs, no stray device
   nodes/sockets); egress **default-deny**.
@@ -279,9 +293,10 @@ root**; the canonical exported content is what gets hashed.
   all provider/registry access via an authenticated broker with query-level egress control.
 
 ### 7.4 Verification-time isolation & network authority
-- *(standard)* Candidate executed as a **separate process** with the **scenario store
-  unmounted**; evidence read from twin/observer state, not from anything the candidate
-  writes; all builder-produced text treated as **untrusted data, never instructions**.
+- *(standard)* Candidate executed under the **same UID/OS read-denial policy as the builder**
+  (§7.2), as a **separate process**, so the scenario store is unreachable from it too;
+  evidence read from twin/observer state, not from anything the candidate writes; all
+  builder-produced text treated as **untrusted data, never instructions**.
 - *(hardened+)* **Authenticated network graph:** candidate → twin **data-plane only**;
   verifier alone reaches **observer/control**; evidence in an **append-only channel the
   candidate cannot address**. Vary twin inputs the candidate can't predict.
@@ -308,8 +323,10 @@ LLM static reviewer (which reads hostile source and is injection-prone) counts a
 A single **deterministic `supervisor` executable** owns this — the **sole state-changing
 entry point** (`SKILL.md` is only its conversational front end). It runs a **locked,
 journaled FSM** with **immutable per-run snapshots**, atomic writes, an **invocation ID**,
-process-group cancellation, and content **hashes for spec, artifact, scenarios, twins,
-adapter, and phase** — so concurrent invocations/crashes can't verify a moving tree,
+process-group cancellation, and content **hashes for spec, contracts/dev-stubs, artifact,
+scenarios, twins, oracle IR, cohort manifest, gate policies, skill allowlist, adapter, and
+phase** (every shared/public artifact + executable policy; any change invalidates the
+generation) — so concurrent invocations/crashes can't verify a moving tree,
 overwrite a generation, redispatch a call, or resume mismatched artifacts. Control state
 lives **outside Git**. A crash after a provider accepted a call is journaled
 **`unknown-outcome`**: the supervisor **prevents automatic re-dispatch** but cannot prove the
@@ -374,7 +391,7 @@ per-run immutable `runs/<invocation-id>/` snapshots + manifest.
 ### 11.1 Config schema (sketch)
 ```yaml
 autonomy: 4                    # 4 = checkpoint each iteration; 5 = lights-off (requires assurance ≥ hardened)
-assurance: standard            # standard | hardened | enterprise (probe-verified, fail-closed)
+assurance: standard            # cooperative | standard | hardened | enterprise (probe-verified, fail-closed)
 feedback: ids                  # ids (default, deterministic) | behavioral | full  (latter two taint)
 max_iterations: 5
 final_exam_fraction: 0.3       # ≥1 dev family AND ≥1 final family per behavior (stratified)
@@ -403,9 +420,11 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 3. **Spec (Planner).** Interview → `spec.md`; human approves.
 4. **Config.** Write/confirm `config.yml` (enforce L5 ⇒ assurance ≥ hardened, and a
    notification sink).
-5. **Acceptance world (Test authority).** Author **contracts + dev-stubs** (shared) and
-   **scenarios + twin variants** (holdout, dev+final families); compile the executable
-   oracle; **freeze + hash** generators/cohorts. Run the **coverage gate**.
+5. **Acceptance world (Test authority) — two ordered phases:** (a) **public** — author +
+   freeze read-only the **contracts + dev-stubs**, then the supervisor **revokes
+   public-write**; (b) **holdout (fresh phase)** — author **scenarios + twin variants**
+   (dev+final families), compile the executable oracle, **freeze + hash** generators/cohorts,
+   run the **coverage gate**. Changing a public artifact later regenerates the holdout.
 6. **Isolate.** Snapshot+hash source into the sandboxed workspace (no holdout).
 7. **Loop (§6):** build → dev checks → mandatory gates → freeze → final once → human
    staging; deterministic ID feedback; budget admission; checkpoints per autonomy dial.
@@ -438,7 +457,8 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 - Builder demonstrably never receives the holdout — verified by **denial probes** at the
   selected tier (scenario store unreachable from builder *and* from the executing candidate),
   not by a copy-check; at `standard` this requires the OS read-denial primitive (§7.2), else
-  the claim is explicitly best-effort.
+  the run **fails closed to `cooperative`** (no probe-proven isolation, no qualified
+  ship-candidate).
 - Selecting a higher `assurance` tier **enforces** its mechanisms or **fails closed**;
   downgrade requires explicit consent + an audit note. A tier without a conforming backend in
   `supported_tiers` is rejected even with the substrate present; **L5 is unavailable until a
