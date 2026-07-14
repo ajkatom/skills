@@ -18,3 +18,5 @@ Lives at `<control_root>/config.json`. JSON, not YAML: runtime is stdlib-only
 | `knowledge_base.kind` | str | optional: `none` (default) \| `wiki` \| `open-brain`. Enables optional grounding + opt-in run-summary write-back. |
 | `knowledge_base.path` | str | required existing directory when kind=`wiki`; the run summary is appended to `<path>/dark-factory-runs.md`. |
 | `knowledge_base.write_back` | bool | default false. When true + kind=`wiki`, the supervisor appends a barrier-safe run summary (outcome/tier/qualified/iterations/failing behavior IDs — no scenario text). `open-brain` write-back is done by the Claude session (MCP), not the supervisor. |
+| `twins.enabled` | bool | default false. When true, the supervisor launches the twin services defined in `<control_root>/twins/*.json` around build/verify and exposes each as `DF_TWIN_<NAME>`. Requires ≥1 twin def. |
+| `twins.startup_timeout_s` | int | 1..120, default 20. Max seconds to wait for a twin to write its endpoint file before the run aborts (exit 2). |

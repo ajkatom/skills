@@ -93,9 +93,24 @@ def load_config(control_root: str) -> dict:
                 f"knowledge_base kind 'wiki' requires 'path' to be an existing directory: {kb_path!r}"
             )
 
+    tw_raw = raw.get("twins", {})
+    if not isinstance(tw_raw, dict):
+        raise ConfigError("twins must be an object")
+    tw_enabled = tw_raw.get("enabled", bool(tw_raw))  # present-but-no-enabled → True
+    if not isinstance(tw_enabled, bool):
+        raise ConfigError("twins.enabled must be a bool")
+    tw_timeout = tw_raw.get("startup_timeout_s", 20)
+    if not isinstance(tw_timeout, int) or isinstance(tw_timeout, bool) or not (1 <= tw_timeout <= 120):
+        raise ConfigError("twins.startup_timeout_s must be an int in 1..120")
+    if tw_enabled:
+        tdir = os.path.join(control_root, "twins")
+        if not os.path.isdir(tdir) or not [n for n in os.listdir(tdir) if n.endswith(".json")]:
+            raise ConfigError("twins.enabled is true but no twins/*.json definitions found")
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
     cfg["_checkpoint"] = checkpoint
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
+    cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     return cfg
