@@ -14,9 +14,13 @@ def respond(status, detail=""):
 
 
 def main():
-    req = json.load(sys.stdin)
-    with open(req["prompt_file"], encoding="utf-8") as f:
-        prompt = f.read()
+    try:
+        req = json.load(sys.stdin)
+        with open(req["prompt_file"], encoding="utf-8") as f:
+            prompt = f.read()
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+        respond("error", f"bad adapter request: {e}")
+        return
     if shutil.which("claude") is None:
         respond("error", "claude CLI not found on PATH")
         return
