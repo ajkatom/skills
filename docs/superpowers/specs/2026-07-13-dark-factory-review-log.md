@@ -315,3 +315,26 @@ VERDICT: REVISE
 ### Claude's response (Round 4)
 
 Codex: "the design is now close, and I am not treating enterprise controls as requirements for standard." Folded **all 9** (design-level, cheap, no implementation-schema). P0s were standard-tier overclaims: added an explicit **`cooperative`** sub-standard mode so standard **fails closed** when no OS read-denial primitive exists (P0-1); applied read-denial to the **candidate** too, not just the builder (P0-2); **tiered** the network-authority claim (logical separation at standard, enforced at hardened+) (P0-3). P1s: split workflow step 5 into **public-freeze then holdout** phases (P1-4); expanded the FSM run-input hash set to **every shared/public artifact + policy** (P1-5); **downgrade only before holdout creation**, else terminate + fresh generation (P1-6); defined the enterprise insider + **separate provider accounts** for holdout vs builder (P1-7); infra-retry uses **fresh instances from immutable snapshots**, no writable state carried (P1-8); **unsupported-required-behavior / expired-calibration is now blocking** absent a human fidelity waiver (P1-9). Findings shrank 18 -> 18 -> 17 -> 9, all design-level.
+
+## Round 5 — Codex (gpt-5.6-sol, read-only, resumed) — FINAL (MAX_ROUNDS)
+
+Round 4 closes the prior architectural blockers. Three residual design issues remain; the first is material.
+
+1. **P0 — The denial boundary protects only `scenarios/`, not the complete holdout-bearing control plane.** Sealed twins, raw final seeds, verifier outcomes, and holdout-bearing role transcripts live outside the scenario store, yet standard probes and success criteria require only that `scenarios/` be unreachable. [hidden artifacts](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:127), [raw seeds](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:174), [control layout](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:386), [denial rule](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:264)
+
+   **Fix:** Deny builder/candidate access to the entire control root and all holdout-bearing role state, exporting only hashed allowlisted copies of spec, contracts, stubs, and filtered feedback.
+
+2. **P1 — Cooperative is simultaneously an assurance tier and a non-probe mode.** It appears in the assurance enum, while §7 says all tiers are probe-verified and the config describes the entire enum as probe-verified/fail-closed. [assurance dial](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:97), [tier claim](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:254), [config](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:392)
+
+   **Fix:** Classify cooperative explicitly outside the assurance-tier ordering and `supported_tiers` registry, or mark it structurally as `qualified: false` and exclude it from probe-backed tier claims.
+
+3. **P1 — Enterprise’s “insider” remains self-contradictory.** The threat table names an insider as adversarial, while the following text calls the human sign-off authority the trusted insider, leaving unclear which insider privileges enterprise actually defends against. [enterprise threat model](/Users/alonadelson/Projects/ai_projects/skills/docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md:64)
+
+   **Fix:** Define the adversarial insider as a builder-side operator without control-plane, sign-off, broker, or signing-key authority, and list the human sign-off authority solely in the TCB.
+
+VERDICT: REVISE
+### Claude's response (Round 5) — resolution
+
+Codex: "Round 4 closes the prior architectural blockers. Three residual design issues remain." All 3 folded (I agree with each; no counter-position): (P0) the denial boundary now covers the **entire holdout-bearing control root** — scenarios, sealed twins, raw seeds, verifier outcomes, role transcripts — not just `scenarios/`; the builder/candidate get only hashed allowlisted exports. (P1) `cooperative` is reclassified **outside** the probe-verified tier ordering + `supported_tiers` (structurally `qualified: false`). (P1) the enterprise **adversarial insider** is defined as a builder-side operator without control-plane/sign-off/broker/signing-key authority, with the human sign-off authority solely in the TCB.
+
+**Outcome:** hit MAX_ROUNDS=5 at VERDICT:REVISE, but findings converged **18 -> 18 -> 17 -> 9 -> 3**, all 3 final points were valid and folded, and there are **no open disagreements** between Claude and Codex. Not a false 'approved' and not a real deadlock — a converged plan with every surfaced point addressed. Ready for human sign-off.

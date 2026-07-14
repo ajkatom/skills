@@ -76,11 +76,13 @@ builder. That protection needs `hardened`+.
 Every tier's TCB also includes the **unavoidable base** it runs on (kernel, container/OS-
 sandbox runtime, filesystem, network stack) — "trust only the supervisor" means *among
 dark-factory's own components*, not literally. The **human is always trusted** to read the
-holdout and authorize downgrades; `enterprise` may add split-custody for that authority. At
-`enterprise` the trusted **insider** is limited to that human sign-off authority, and
-**holdout-bearing vs builder roles must use separate provider security domains/accounts** so
-cross-session/provider leakage is out of the builder's reach (provider session isolation is
-trusted explicitly, or replaced by separate accounts).
+holdout and authorize downgrades; `enterprise` may add split-custody for that authority. The
+**human sign-off authority sits in the TCB (trusted) — it is not the adversary.**
+`enterprise`'s adversarial **"insider" is a builder-side operator without control-plane,
+sign-off, broker, or signing-key authority**; and **holdout-bearing vs builder roles must use
+separate provider security domains/accounts** so cross-session/provider leakage is out of the
+builder's reach (provider session isolation is trusted explicitly, or replaced by separate
+accounts).
 
 ## 2. The two dials
 
@@ -99,7 +101,9 @@ mechanisms (§7) and a narrower TCB (§1.4). `standard` is the default and ships
 `hardened`/`enterprise` are specified and enforced when selected **and** the substrate is
 present. **`cooperative`** is an explicit *sub-standard* mode for environments lacking an OS
 read-denial primitive (§7.2): honest and exploration-only — it **cannot claim probe-proven
-isolation and never yields a qualified ship-candidate**.
+isolation and never yields a qualified ship-candidate**. It sits **outside the probe-verified
+tier ordering and the `supported_tiers` registry** (structurally `qualified: false`); the
+"probe-verified / fail-closed" guarantees apply to `standard`/`hardened`/`enterprise` only.
 
 ### 2.3 Cross-rules & fail-closed
 - **L5 requires ≥ `hardened`** — and is **unavailable until a conforming hardened backend
@@ -135,7 +139,10 @@ The ML analogy done properly: the **contracts/dev-stubs are shared** so the buil
 develop; the **test set + verifier-only twin variants are held out** (§5.1) so it can't
 overfit. The invariant holds only if the builder never receives the holdout **in context
 or on its filesystem**, *and* the candidate is executed under isolation at **verification**
-time so its code can't read the holdout either (§7.4).
+time so its code can't read the holdout either (§7.4). The "holdout" is the **whole control
+root** — scenarios, sealed twins, raw final seeds, verifier outcomes, and holdout-bearing
+role transcripts — **not just `scenarios/`**; the builder and candidate receive only
+**hashed, allowlisted exports** (spec, contracts, dev-stubs, filtered feedback).
 
 ## 4. Roles (pluggable) and separation
 
@@ -265,8 +272,10 @@ root**; the canonical exported content is what gets hashed.
 
 ### 7.2 Sandbox & principals
 - *(standard)* Builder = **separate OS process under a dedicated UID or an OS read-denial
-  primitive** (`sandbox-exec` on macOS, `bwrap`/`unshare` on Linux) so the scenario store is
-  genuinely unreachable and the denial probe is *meaningful*; fresh ephemeral
+  primitive** (`sandbox-exec` on macOS, `bwrap`/`unshare` on Linux) so the **entire
+  holdout-bearing control root** (scenarios, sealed twins, raw seeds, verifier outcomes, role
+  transcripts) is genuinely unreachable and the denial probe is *meaningful* — the builder gets
+  only **hashed, allowlisted exports** (spec, contracts, dev-stubs, filtered feedback); fresh ephemeral
   `HOME`/config/session, hooks/plugins/MCPs/skill-auto-discovery **off**; only allowlisted
   skills copied in may run. If no read-denial primitive exists, `standard` **fails closed** —
   the run drops to the explicit **`cooperative`** mode (§2.2), which cannot claim probe-proven
@@ -294,7 +303,7 @@ root**; the canonical exported content is what gets hashed.
 
 ### 7.4 Verification-time isolation & network authority
 - *(standard)* Candidate executed under the **same UID/OS read-denial policy as the builder**
-  (§7.2), as a **separate process**, so the scenario store is unreachable from it too;
+  (§7.2), as a **separate process**, so the **entire control root** is unreachable from it too;
   evidence read from twin/observer state, not from anything the candidate writes; all
   builder-produced text treated as **untrusted data, never instructions**.
 - *(hardened+)* **Authenticated network graph:** candidate → twin **data-plane only**;
@@ -455,8 +464,8 @@ knowledge_base:  { kind: none, path: "", write_back: false }
 
 ## 14. Success criteria
 - Builder demonstrably never receives the holdout — verified by **denial probes** at the
-  selected tier (scenario store unreachable from builder *and* from the executing candidate),
-  not by a copy-check; at `standard` this requires the OS read-denial primitive (§7.2), else
+  selected tier (the **entire holdout-bearing control root** — not just `scenarios/` —
+  unreachable from builder *and* from the executing candidate), not by a copy-check; at `standard` this requires the OS read-denial primitive (§7.2), else
   the run **fails closed to `cooperative`** (no probe-proven isolation, no qualified
   ship-candidate).
 - Selecting a higher `assurance` tier **enforces** its mechanisms or **fails closed**;
