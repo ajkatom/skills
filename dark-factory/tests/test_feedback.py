@@ -83,3 +83,16 @@ def test_validate_rejects_unknown_taxonomy():
     fb["failures"][0]["taxonomy"] = ["expected 'Hello, World!'"]
     with pytest.raises(id_feedback.FeedbackLeakError):
         id_feedback.validate_feedback(fb)
+
+
+def test_leak_error_messages_never_embed_offending_values():
+    fb = id_feedback.project_feedback(make_report())
+    fb["failures"][0]["behavior_id"] = f"BHV-001 {MARKER}"
+    with pytest.raises(id_feedback.FeedbackLeakError) as ei:
+        id_feedback.validate_feedback(fb)
+    assert MARKER not in str(ei.value)
+    fb = id_feedback.project_feedback(make_report())
+    fb["failures"][0]["taxonomy"] = [f"secret {MARKER}"]
+    with pytest.raises(id_feedback.FeedbackLeakError) as ei:
+        id_feedback.validate_feedback(fb)
+    assert MARKER not in str(ei.value)

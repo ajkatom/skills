@@ -49,9 +49,9 @@ def validate_feedback(fb: dict) -> None:
         if set(f) != ALLOWED_FAILURE:
             raise FeedbackLeakError(f"failure keys must be exactly {sorted(ALLOWED_FAILURE)}")
         if not BEHAVIOR_RE.fullmatch(f["behavior_id"]):
-            raise FeedbackLeakError(f"invalid behavior_id: {f['behavior_id']!r}")
+            raise FeedbackLeakError("invalid behavior_id (offending value withheld)")
         if not isinstance(f["taxonomy"], list) or not f["taxonomy"]:
             raise FeedbackLeakError("taxonomy must be a non-empty list")
         for t in f["taxonomy"]:
             if t not in TAXONOMY:
-                raise FeedbackLeakError(f"unknown taxonomy value: {t!r}")
+                raise FeedbackLeakError("unknown taxonomy value (offending value withheld)")
