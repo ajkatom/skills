@@ -1,6 +1,6 @@
 ---
 name: dark-factory
-description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified) and `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified). Per-iteration human checkpoints (pause/resume) at autonomy 4.
+description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified), `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified), and `hardened` (builder runs in a Docker container with the control root never mounted — denial by construction, probe-verified — and unlocks fully unattended L5/autonomy-5 runs). Per-iteration human checkpoints (pause/resume) at autonomy 4.
 ---
 
 # dark-factory
@@ -8,7 +8,7 @@ description: Use when the user wants to build a task/feature "dark-factory style
 Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 → isolated builder (spec-only) → verifier → deterministic ID feedback → loop →
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
-(Codex-approved). Two assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED) and **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED). Higher tiers (hardened/enterprise) are not yet backed and are refused.
+(Codex-approved). Three assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), and **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`). `hardened` is also the only tier that unlocks **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2). `enterprise` is not yet backed and is refused.
 
 ## Workflow (create one todo per step)
 
@@ -69,10 +69,31 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      Claude authors, Codex builds). Different vendors have different blind spots,
      which hardens the holdout — the "second librarian from a different library."
      Never author scenarios in the same session that will drive the builder.
-   - `assurance`: `cooperative` (works everywhere, unqualified) or `standard` (real OS
+   - `assurance`: `cooperative` (works everywhere, unqualified), `standard` (real OS
      read-denial sandbox → qualified; needs macOS `sandbox-exec` or Linux `bwrap`, and a
-     passing startup denial probe). If `standard` can't be honored, the run fails closed
-     unless you pass `run --allow-downgrade` (→ cooperative, unqualified).
+     passing startup denial probe), or `hardened` (builder runs in a Docker container with
+     the control root never mounted — denial by construction, plus a passing container
+     probe; needs a running Docker daemon AND a working OS sandbox, since the verifier
+     still uses the latter). If the chosen tier can't be honored, the run fails closed
+     unless you pass `run --allow-downgrade` (hardened → standard if the OS sandbox is
+     still healthy, else → cooperative; standard → cooperative).
+   - **`hardened` (optional block, only under `assurance: hardened`).** Set
+     `hardened.image` (default `python:3.12-alpine` — a real cross-model builder needs a
+     user-supplied image with that CLI + credentials baked in), `hardened.network`
+     (default `"none"`; `"bridge"` is unrestricted egress, needed for a real builder CLI's
+     API calls, and is honestly recorded on the manifest), `hardened.memory` (default
+     `"2g"`) and `hardened.pids` (default `256`). `hardened` also forces
+     `audit.signing: true` by default (an explicit `false` is rejected) and requires
+     `roles.builder.adapter` to be an absolute path to an existing file outside the
+     control root (its directory is bind-mounted read-only into the container). See
+     `references/hardened.md` for the full model — what it adds over `standard`, the TCB
+     growth (the Docker daemon), image/credential/network honesty, and the deferred list
+     (credential broker, egress allowlists, off-box audit).
+   - **L5 (`autonomy: 5`, lights-off).** Requires `assurance: "hardened"` — any other
+     tier with `autonomy: 5` is rejected at config load. At hardened + L5, `checkpoint`
+     defaults to `auto`: the loop runs unattended to convergence/cap/failure in one CLI
+     call, with no per-iteration pause (a budget cap can still pause — that's a separate,
+     financial safety rail, see `references/budget.md`).
    - **Budget (optional).** Set `budget.billing`: `"subscription"` (default — no dollar
      metering possible, so it's alert-only) or `"api"` (enforces a dollar cap via an
      estimate). For `"api"`, also set `budget.max_usd` and `budget.per_call_usd`
@@ -129,8 +150,9 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
 - Only the supervisor writes run state. Do not hand-edit `runs/`.
 - Secrets: never put credentials in config.json/spec.md/scenarios; the claude
   adapter uses your ambient login.
-- A **cooperative** run is always UNQUALIFIED — say so. A **standard** run is qualified ONLY when its startup denial probe passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value.
-- Signed audit is opt-in (`audit.signing: true` in config); verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
+- A **cooperative** run is always UNQUALIFIED — say so. A **standard** or **hardened** run is qualified ONLY when its startup probe(s) passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value. Note: `manifest.tier` always echoes the *configured* assurance, even on a downgraded run — read `qualified` plus the journal's `DOWNGRADE` entry for what actually happened.
+- Signed audit is opt-in at `cooperative`/`standard` (`audit.signing: true` in config) but **mandatory** at `hardened` (an explicit `audit.signing: false` is a `ConfigError`). Verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
+- `hardened` is fail-closed on **both** halves: a working Docker daemon + passing container probe, AND a working OS sandbox for the verifier. Either missing refuses (exit 2) unless `--allow-downgrade` is passed. See `references/hardened.md`.
 - Security gates are opt-in (`security_gates.enabled: true`) but, once enabled, mandatory and fail-closed: a `fail_on` finding on the converged artifact rejects it (`SECURITY_GATE_FAILED`, exit 3) even when every scenario passed. Report the manifest's `security` field honestly — `checked: false` means gates never ran, not that the artifact is clean.
 
 ## Composing with other skills (control-plane only)
@@ -146,15 +168,19 @@ around the builder, never inside it:
 | Stuck loop (cap reached, likely spec ambiguity) | `superpowers:systematic-debugging` | operates on spec + behavior IDs only, never scenario internals |
 | Cleanup an accepted artifact | `/simplify`, `code-review` on the workspace | post-acceptance, outside the barrier |
 
-**Honesty:** at `cooperative`/`standard` tiers this is *guidance*, not enforcement —
-these tiers sandbox the builder, not the orchestrator. An **enforced** per-tier skill
-allowlist with content-hash pinning (spec §3B) requires the orchestrator itself to run
-sandboxed, which is a `hardened`/`enterprise` capability (not yet built). Never author
-or reveal holdout scenarios in a session that will also drive the builder.
+**Honesty:** at every tier — including `hardened` — this is *guidance*, not
+enforcement of THIS orchestrating session. `hardened` sandboxes the **builder**
+(container barrier) and the **verifier** (OS sandbox); it does not sandbox the
+Claude session running this skill. An **enforced** per-tier skill allowlist with
+content-hash pinning (spec §3B) that constrains the orchestrator itself is an
+`enterprise` capability (not yet built). Never author or reveal holdout scenarios
+in a session that will also drive the builder.
 
 ## References
 
 - `references/config-reference.md` — config schema
+- `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
+- `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, deferred scope (M10)
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
