@@ -184,6 +184,26 @@ def test_run_all_rejects_unknown_twin_name_before_any_scenario_runs(tmp_path):
     assert not marker.exists(), "a.json ran despite b.json's load-time error — not 'before any scenario runs'"
 
 
+def test_run_all_unknown_twin_in_final_cohort_errors_on_a_dev_run(tmp_path):
+    # A cohort="final" scenario referencing an unknown twin must raise on a
+    # cohort="dev" run_all -- the name-existence check runs over the FULL,
+    # unfiltered scenario set (all cohorts) before the cohort filter, so a
+    # final-cohort typo can't hide until the sealed final exam eventually
+    # runs (after dev converges -- possibly never).
+    d = tmp_path / "scen"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "ok.py").write_text('print("ok")\n', encoding="utf-8")
+    _write_scenario(d, "dev.json", id="BHV-001-S1", behavior_id="BHV-001", cohort="dev",
+                    when={"run": ["python3", "ok.py"], "timeout_s": 10},
+                    then={"exit_code": 0, "stdout_equals": "ok"})
+    _write_scenario(d, "final.json", id="BHV-002-S1", behavior_id="BHV-002", cohort="final",
+                    then={"twin_observed": {"twin": "ghost", "contains": "x"}})
+    with pytest.raises(OracleError, match="ghost"):
+        run_scenarios.run_all(str(d), str(ws), cohort="dev",
+                              observer_files={"greeter": "/nonexistent"})
+
+
 def test_run_all_with_observer_files_none_makes_any_twin_assertion_error(tmp_path):
     d = tmp_path / "scen"
     ws = tmp_path / "ws"
@@ -419,14 +439,18 @@ def test_seed_present_at_verify_reset_only_when_supports_variants(tmp_path, monk
     assert len(_RecordingTwinSet.START_CALLS) == 1
     assert _RecordingTwinSet.START_CALLS[0] == {}, "build-phase start() must NEVER carry a seed"
 
-    # 3 resets: iter1 dev (fails), iter2 dev (passes), iter2 final (sealed exam).
+    # supports_variants=True: 3 seeded resets -- iter1 dev (fails), iter2 dev
+    # (passes), iter2 final exam (its OWN fresh seed, distinct from dev's).
     assert len(_RecordingTwinSet.RESET_CALLS) == 3
     seeds = [r.get("DF_TWIN_VARIANT_SEED") for r in _RecordingTwinSet.RESET_CALLS]
     assert all(s is not None for s in seeds), f"expected a seed on every reset, got {seeds}"
     assert len(set(seeds)) == 3, "every verify pass (dev x2, final x1) must get its OWN fresh seed"
+    # The final-exam seed is distinct from the dev-verify seed of the same
+    # converging iteration (index 1 = iter2 dev, index 2 = iter2 final).
+    assert seeds[1] != seeds[2], "final exam reused dev-verify's seed"
 
 
-def test_seed_absent_at_verify_reset_when_supports_variants_false(tmp_path, monkeypatch):
+def test_seedless_final_exam_does_no_extra_reset_when_supports_variants_false(tmp_path, monkeypatch):
     _RecordingTwinSet.START_CALLS = []
     _RecordingTwinSet.RESET_CALLS = []
     monkeypatch.setattr(supervisor.df_twins, "TwinSet", _RecordingTwinSet)
@@ -436,7 +460,10 @@ def test_seed_absent_at_verify_reset_when_supports_variants_false(tmp_path, monk
     assert rc == 0
 
     assert _RecordingTwinSet.START_CALLS == [{}]
-    assert len(_RecordingTwinSet.RESET_CALLS) == 3
+    # 2 resets ONLY -- iter1 dev, iter2 dev. The final exam does NOT reset:
+    # with no supports_variants twin, a restart would be pure churn, so it
+    # reuses dev-verify's running twins (byte-identical to the pre-M12 path).
+    assert len(_RecordingTwinSet.RESET_CALLS) == 2
     assert all(r == {} for r in _RecordingTwinSet.RESET_CALLS), \
         "no supports_variants twin -> extra_env must be exactly None/{} (today's behavior)"
 

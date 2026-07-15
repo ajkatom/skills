@@ -241,12 +241,15 @@ def run_all(
     observer_files: dict | None = None,
 ) -> dict:
     scs = load_scenarios(scenarios_dir)
-    if cohort is not None:
-        scs = [sc for sc in scs if sc["cohort"] == cohort]
     # Load-time validation (M12): a twin assertion naming a twin this runner
     # doesn't know about is an oracle defect, caught BEFORE any scenario in
-    # this call runs -- observer_files=None means zero known twins, so ANY
-    # twin assertion errors here (correct: no twins are configured).
+    # this call runs. This is checked over the FULL, UNFILTERED scenario set
+    # (all cohorts) on EVERY run_all call -- like the shape validation in
+    # _validate_twin_then -- so a typo'd twin name in a cohort="final"
+    # scenario surfaces on the very first dev-cohort run, not only once the
+    # sealed final exam eventually runs (which may be never, or only after
+    # burning the whole iteration/budget cap). observer_files=None means zero
+    # known twins, so ANY twin assertion errors here (correct: none configured).
     known_twins = set(observer_files) if observer_files else set()
     for sc in scs:
         then = sc["then"]
@@ -254,6 +257,8 @@ def run_all(
             if key in then and then[key]["twin"] not in known_twins:
                 raise OracleError(
                     f"{sc['id']}: {key} references unknown twin {then[key]['twin']!r}")
+    if cohort is not None:
+        scs = [sc for sc in scs if sc["cohort"] == cohort]
     results = [run_scenario(sc, workspace, exec_wrapper, env_extra, observer_files=observer_files)
                for sc in scs]
     return {

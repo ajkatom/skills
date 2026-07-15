@@ -1032,17 +1032,23 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # results are NEVER fed back: project_feedback is never called on it,
                 # nothing from it is written to `workspace`, and only final
                 # behavior-IDs (never title/given/when/then/observed) reach the
-                # journal/manifest. M12: the final exam gets its OWN fresh twin
-                # reset (own fresh seed when supports_variants) rather than
-                # reusing dev-verify's -- a builder that hardcoded dev-verify's
-                # served token cannot rely on seeing it again at final exam.
+                # journal/manifest. M12: when a twin supports_variants, the
+                # final exam gets its OWN fresh twin reset with a fresh seed
+                # (distinct from dev-verify's) -- a builder that hardcoded
+                # dev-verify's served token cannot rely on seeing it again at
+                # final exam. When NO twin supports_variants, a reset would be
+                # pure churn (kill+relaunch+readiness-wait) with no variant to
+                # serve, so we reuse dev-verify's already-running twins --
+                # byte-identical to the pre-M12 final-exam path (zero restart).
                 final_env_extra = verify_env_extra
                 if twins_enabled:
-                    try:
-                        final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
-                                                    extra_env=_variant_seed_extra(twin_defs))
-                    except df_twins.TwinError as e:
-                        return _twin_error_abort(i, e)
+                    seed_extra = _variant_seed_extra(twin_defs)
+                    if seed_extra is not None:
+                        try:
+                            final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
+                                                        extra_env=seed_extra)
+                        except df_twins.TwinError as e:
+                            return _twin_error_abort(i, e)
                 final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
                                  env_extra=final_env_extra, cohort="final",
                                  observer_files=ts.observer_files if ts else None)
