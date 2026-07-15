@@ -7,7 +7,7 @@ given/when/then, no observed output, no model call.
 """
 import re
 
-TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
+TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash", "no_twin_evidence")
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
 ALLOWED_TOP = {"feedback_version", "channel", "total", "failing_count", "failures"}
 ALLOWED_FAILURE = {"behavior_id", "taxonomy"}

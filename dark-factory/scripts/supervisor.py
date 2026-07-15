@@ -513,6 +513,42 @@ def _resolve_credentials(cfg):
     return creds, df_creds.Redactor(creds.values()), None
 
 
+def _twin_manifest_field(cfg, scenarios):
+    """Compute the additive `twin_evidence` manifest field (M12), or None if
+    twins aren't enabled. Loads twin defs FRESH (cheap, pure, read-only) so
+    `variants` reflects whatever is on disk right now; raises
+    df_twins.TwinError if twins are enabled but the defs don't load -- the
+    caller decides how to abort (mirrors the existing twin-precondition
+    failure handling, `_twin_error_abort`).
+
+    `observed_assertions` counts scenarios (either cohort) whose `then`
+    carries a twin-evidence assertion key -- purely a property of the
+    already-validated scenario set, independent of any twin ever starting.
+    """
+    if not cfg["_twins"]["enabled"]:
+        return None
+    defs = df_twins.load_defs(os.path.join(cfg["_control_root"], "twins"))
+    observed_assertions = sum(
+        1 for sc in scenarios
+        if "twin_observed" in sc["then"] or "stdout_echoes_twin" in sc["then"]
+    )
+    return {
+        "variants": any(d.get("supports_variants") for d in defs),
+        "observed_assertions": observed_assertions,
+    }
+
+
+def _variant_seed_extra(twin_defs):
+    """A fresh per-pass DF_TWIN_VARIANT_SEED extra_env dict, ONLY when at
+    least one twin def declares supports_variants -- else None, which makes
+    the caller's ts.reset(..., extra_env=None) byte-identical to the
+    pre-M12 reset call. Build-phase ts.start is NEVER passed this (the
+    builder must never see a seed); only the verifier's reset calls are."""
+    if any(d.get("supports_variants") for d in (twin_defs or [])):
+        return {"DF_TWIN_VARIANT_SEED": uuid.uuid4().hex}
+    return None
+
+
 def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False) -> int:
     creds, redactor, creds_err = _resolve_credentials(cfg)
     if creds_err is not None:
@@ -646,6 +682,26 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # mb_clean unless the CONVERGED path overrides it with the real gate
     # report (gates only run after dev converges + final exam passes).
     manifest_base["security"] = {"checked": False}
+
+    # M12: twin_evidence manifest field, computed here (scenarios validated,
+    # nothing built yet) so it's on every terminal manifest from this point
+    # on -- the same "additive, present as soon as it's knowable" pattern as
+    # `credentials` (M11). A load failure here is a twin precondition
+    # failure exactly like the one _twin_error_abort handles inside the
+    # build/verify loop, just caught before any build is attempted.
+    try:
+        manifest_base["twin_evidence"] = _twin_manifest_field(cfg, scenarios)
+    except df_twins.TwinError as e:
+        journal.write("TWIN_ERROR", iteration=0, detail=str(e))
+        mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
+                  sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                  final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                  container=None, twin_evidence=None,
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        _kb_writeback(cfg, journal, mf, [])
+        sys.stderr.write(f"dark-factory: twin precondition failed: {e}\n")
+        return 2
 
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
@@ -916,16 +972,25 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             builder_calls = calls_after
             estimated_usd = est_after
 
+            # M12: the dev-cohort verify pass gets a FRESH twin reset with a
+            # fresh per-pass seed (only when a twin def supports_variants --
+            # else extra_env=None, exactly today's reset). The seed lives
+            # ONLY in this local var, fed to run_all (the scenario/candidate
+            # env) below -- it never touches build_env_extra/builder_env, so
+            # it cannot reach the builder (see the barrier note above
+            # invoke_adapter's env_extra/env_full handling).
             verify_env_extra = None
             if twins_enabled:
                 try:
-                    verify_env_extra = ts.reset(twin_defs, run_dir, twin_timeout)
+                    verify_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
+                                                 extra_env=_variant_seed_extra(twin_defs))
                 except df_twins.TwinError as e:
                     return _twin_error_abort(i, e)
 
             try:
                 report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
-                                  env_extra=verify_env_extra, cohort="dev")
+                                  env_extra=verify_env_extra, cohort="dev",
+                                  observer_files=ts.observer_files if ts else None)
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -967,9 +1032,26 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # results are NEVER fed back: project_feedback is never called on it,
                 # nothing from it is written to `workspace`, and only final
                 # behavior-IDs (never title/given/when/then/observed) reach the
-                # journal/manifest. Same reset twin env as dev's verify (same phase).
+                # journal/manifest. M12: when a twin supports_variants, the
+                # final exam gets its OWN fresh twin reset with a fresh seed
+                # (distinct from dev-verify's) -- a builder that hardcoded
+                # dev-verify's served token cannot rely on seeing it again at
+                # final exam. When NO twin supports_variants, a reset would be
+                # pure churn (kill+relaunch+readiness-wait) with no variant to
+                # serve, so we reuse dev-verify's already-running twins --
+                # byte-identical to the pre-M12 final-exam path (zero restart).
+                final_env_extra = verify_env_extra
+                if twins_enabled:
+                    seed_extra = _variant_seed_extra(twin_defs)
+                    if seed_extra is not None:
+                        try:
+                            final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
+                                                        extra_env=seed_extra)
+                        except df_twins.TwinError as e:
+                            return _twin_error_abort(i, e)
                 final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
-                                 env_extra=verify_env_extra, cohort="final")
+                                 env_extra=final_env_extra, cohort="final",
+                                 observer_files=ts.observer_files if ts else None)
                 _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
                 final_ran = final["count"] > 0
                 journal.write("FINAL_EXAM", ran=final_ran,
@@ -1129,6 +1211,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         # here), fall back to honest "unknown" fields; a genuine oracle
         # problem still surfaces normally when `continue` re-enters the loop
         # and run_all() re-loads the scenarios itself.
+        gate_scenarios = None
         try:
             gate_scenarios = load_scenarios(scenarios_dir)
             gate_inert = df_gates.validate_oracle(gate_scenarios)
@@ -1147,6 +1230,30 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         # resumed-converge by _run_loop's CONVERGED branch, which is the
         # SAME code both run() and resume() funnel through.
         manifest_base["security"] = {"checked": False}
+
+        # M12: twin_evidence, recomputed fresh on every resume (deterministic
+        # from cfg + the control root's twins/*.json + scenarios) -- same
+        # "fresh + resume" threading as `credentials`. gate_scenarios may be
+        # None if scenarios failed to reload above; observed_assertions then
+        # honestly falls back to 0 rather than raising here too.
+        try:
+            manifest_base["twin_evidence"] = _twin_manifest_field(cfg, gate_scenarios or [])
+        except df_twins.TwinError as e:
+            journal.write("TWIN_ERROR", detail=str(e))
+            mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR",
+                      iterations=state["next_iter"] - 1, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False, container=None,
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=sorted(state.get("regressions", [])),
+                      twin_evidence=None,
+                      budget=_budget_manifest_field(
+                          cfg["_budget"], state.get("builder_calls", 0),
+                          state.get("estimated_usd", 0.0)))
+            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            os.unlink(os.path.join(run_dir, "state.json"))
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(f"dark-factory: twin precondition failed: {e}\n")
+            return 2
 
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")

@@ -30,6 +30,11 @@ def is_discriminating(then: dict) -> bool:
         "exit_code": (then["exit_code"] + 1) if "exit_code" in then else 999999,
         "stdout": "\x00DF-MUTANT-\x00",
         "stderr": "\x00DF-MUTANT-\x00",
+        # M12: the mutant carries NO twin evidence -- any twin_observed/
+        # stdout_echoes_twin assertion must reject an observation with no
+        # recorded evidence, so it's discriminating by construction.
+        "twin_observations": {},
+        "twin_tokens": {},
     }
     return run_scenarios.evaluate_then(then, mutant) is not None
 

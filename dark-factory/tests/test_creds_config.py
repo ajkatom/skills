@@ -370,11 +370,12 @@ def test_twins_plus_credentials_merge_twin_env_over_scoped_env(tmp_path, monkeyp
 
     class _FakeTwinSet:
         env = twin_env
+        observer_files = {}
 
-        def start(self, defs, run_dir, timeout):
+        def start(self, defs, run_dir, timeout, extra_env=None):
             return twin_env
 
-        def reset(self, defs, run_dir, timeout):
+        def reset(self, defs, run_dir, timeout, extra_env=None):
             return twin_env
 
         def stop(self):
