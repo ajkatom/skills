@@ -239,7 +239,7 @@ def _run_external_gate(workspace: str, cmd: list) -> dict:
     out (a gate that errored to run is unavailable, not a silent pass).
     """
     if shutil.which(cmd[0]) is None:
-        return {"status": "unavailable"}
+        return {"status": "unavailable", "detail": f"{cmd[0]} not found on PATH"}
     try:
         proc = subprocess.run(
             cmd,
@@ -291,7 +291,11 @@ def run_gates(workspace: str, sec: dict) -> dict:
     for name in sec.get("fail_on", []):
         gate = gates.get(name)
         if gate is None:
-            continue
+            # A mandatory gate that never ran (its built-in flag is off, or
+            # it otherwise produced no result) is unavailable, not a silent
+            # pass. Surface it in the report so fail-closed is auditable.
+            gate = {"status": "unavailable", "detail": "gate not run"}
+            gates[name] = gate
         status = gate["status"]
         if status == "fail":
             failed.add(name)

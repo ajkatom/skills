@@ -183,6 +183,7 @@ def load_config(control_root: str) -> dict:
             raise ConfigError("security_gates.external must be a list")
         sg_external = []
         external_names = set()
+        _reserved = {"secret_scan", "dangerous_scan", "sbom"}
         for entry in sg_external_raw:
             if not isinstance(entry, dict):
                 raise ConfigError("security_gates.external entries must be objects")
@@ -190,6 +191,15 @@ def load_config(control_root: str) -> dict:
             if not isinstance(name, str) or not name:
                 raise ConfigError(
                     "security_gates.external entries require a non-empty 'name'"
+                )
+            if name in _reserved:
+                raise ConfigError(
+                    f"security_gates.external name {name!r} collides with a reserved "
+                    f"built-in gate name (reserved: {sorted(_reserved)})"
+                )
+            if name in external_names:
+                raise ConfigError(
+                    f"security_gates.external has a duplicate gate name {name!r}"
                 )
             cmd = entry.get("cmd")
             if (

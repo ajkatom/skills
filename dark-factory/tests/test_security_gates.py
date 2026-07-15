@@ -160,6 +160,36 @@ def test_fail_on_not_a_list_rejected(tmp_path):
         df_config.load_config(str(cr))
 
 
+@pytest.mark.parametrize("reserved", ["secret_scan", "dangerous_scan", "sbom"])
+def test_external_name_collides_with_builtin_rejected(tmp_path, reserved):
+    cr = tmp_path / "control"
+    write_config(
+        cr,
+        security_gates={
+            "enabled": True,
+            "external": [{"name": reserved, "cmd": ["true"]}],
+        },
+    )
+    with pytest.raises(df_config.ConfigError, match="reserved"):
+        df_config.load_config(str(cr))
+
+
+def test_external_duplicate_name_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(
+        cr,
+        security_gates={
+            "enabled": True,
+            "external": [
+                {"name": "dup", "cmd": ["true"]},
+                {"name": "dup", "cmd": ["false"]},
+            ],
+        },
+    )
+    with pytest.raises(df_config.ConfigError, match="duplicate"):
+        df_config.load_config(str(cr))
+
+
 # --- df_security.run_gates ---------------------------------------------
 
 
@@ -270,6 +300,45 @@ def test_run_gates_external_failing_command_fails(tmp_path):
     report = df_security.run_gates(str(ws), sec)
     assert report["gates"]["bad"]["status"] == "fail"
     assert report["failed"] == ["bad"]
+
+
+def test_run_gates_fail_on_gate_not_run_is_unavailable_and_fails(tmp_path):
+    # dangerous_scan is disabled but still listed in fail_on: it never runs,
+    # so under strict_unavailable it must be treated as unavailable + failed
+    # (regression: previously it silently vanished and failed==[]).
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write(str(ws), "app.py", "def add(a, b):\n    return a + b\n")
+    sec = {
+        "enabled": True,
+        "secret_scan": True,
+        "dangerous_scan": False,
+        "sbom": False,
+        "external": [],
+        "fail_on": ["secret_scan", "dangerous_scan"],
+        "strict_unavailable": True,
+    }
+    report = df_security.run_gates(str(ws), sec)
+    assert report["gates"]["dangerous_scan"]["status"] == "unavailable"
+    assert report["failed"] == ["dangerous_scan"]
+
+
+def test_run_gates_fail_on_gate_not_run_not_strict_does_not_fail(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write(str(ws), "app.py", "def add(a, b):\n    return a + b\n")
+    sec = {
+        "enabled": True,
+        "secret_scan": True,
+        "dangerous_scan": False,
+        "sbom": False,
+        "external": [],
+        "fail_on": ["secret_scan", "dangerous_scan"],
+        "strict_unavailable": False,
+    }
+    report = df_security.run_gates(str(ws), sec)
+    assert report["gates"]["dangerous_scan"]["status"] == "unavailable"
+    assert report["failed"] == []
 
 
 def test_run_gates_gate_not_in_fail_on_does_not_fail_run(tmp_path):
