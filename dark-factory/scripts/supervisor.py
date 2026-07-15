@@ -183,6 +183,8 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None) -> str
     manifest["manifest_version"] = "0.1"
     manifest["journal_sha256"] = sha256_file(journal_path)
     manifest["finished_ts"] = _now()
+    if audit_key is not None:
+        manifest["audit_signing"] = True
     text = canonical_json(manifest)
     atomic_write(os.path.join(run_dir, "manifest.json"), text)
     digest = sha256_str(text)
@@ -225,6 +227,7 @@ def verify_manifest(run_dir: str, key: bytes = None) -> bool:
         print("TAMPERED (journal.jsonl does not match manifest)")
         return False
     hp = os.path.join(run_dir, "manifest.hmac")
+    expect_sig = (key is not None) or bool(manifest.get("audit_signing"))
     if os.path.exists(hp):
         if key is None:
             print("UNVERIFIED (signed manifest; supply --key-path)")
@@ -233,6 +236,9 @@ def verify_manifest(run_dir: str, key: bytes = None) -> bool:
         if not df_audit.verify(key, text.encode("utf-8"), sig):
             print("TAMPERED (bad signature)")
             return False
+    elif expect_sig:
+        print("UNVERIFIED (expected a signed manifest; manifest.hmac is missing)")
+        return False
     print("OK")
     return True
 

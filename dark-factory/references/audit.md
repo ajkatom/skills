@@ -6,7 +6,7 @@ Every run writes a `manifest.json` + `manifest.sha256` sidecar pair. The signed 
 
 **Every run, always** (all tiers, all outcomes):
 
-- `manifest.json`: canonical JSON with the run's outcome, iterations, per-behavior status, qualified flag, journal hash. Never written into git/artifacts; kept in the run directory only.
+- `manifest.json`: canonical JSON with the run's outcome, iterations, per-behavior status, qualified flag, journal hash, and — only when the run was signed — `audit_signing: true`. Never written into git/artifacts; kept in the run directory only.
 - `manifest.sha256`: a single line, the SHA-256 digest of the manifest text. Detects accidental edits and casual tampering (a local process rewriting both files simultaneously can defeat this; see "Honest limits" below).
 
 ## Signed manifest (opt-in)
@@ -31,11 +31,12 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
 
 **Behavior (prints to stdout, unless noted):**
 
-1. **Unsigned manifest** (no `manifest.hmac` file):
+1. **No `manifest.hmac` file present:**
    - Verifies `manifest.json` SHA-256 matches `manifest.sha256`.
    - Verifies the journal hash embedded in the manifest matches the actual `journal.jsonl`.
    - Missing `manifest.json`/`manifest.sha256`/`journal.jsonl` → `TAMPERED (missing manifest, sidecar, or journal)` (exit 4).
-   - Otherwise: `OK` (exit 0) or `TAMPERED (manifest.json does not match manifest.sha256)` / `TAMPERED (journal.jsonl does not match manifest)` (exit 4).
+   - If those checks pass, a signature is still *expected* when either the caller passed `--key-path` or the manifest itself has `audit_signing: true` (a signed run whose `manifest.hmac` was stripped) → `UNVERIFIED (expected a signed manifest; manifest.hmac is missing)` (exit 4). This is what closes the "strip the .hmac and it verifies as unsigned OK" gap.
+   - Otherwise (genuinely unsigned run, no `--key-path`, no `audit_signing` flag): `OK` (exit 0) or `TAMPERED (manifest.json does not match manifest.sha256)` / `TAMPERED (journal.jsonl does not match manifest)` (exit 4).
 
 2. **Signed manifest** (`manifest.hmac` exists):
    - Same unsigned checks first (same outcomes/exit codes as above if they fail).
@@ -47,6 +48,14 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
 ## Honest limits
 
 **Tamper-evidence holds only while the key stays secret.** A local process with access to the key can forge a new manifest + signature and defeat the entire scheme. This is intrinsic to symmetric HMAC; asymmetric signing + an off-box audit sink are the enterprise upgrade.
+
+**Signature stripping (no key required).** A signed manifest records `audit_signing: true` inside `manifest.json` itself (covered by both `manifest.sha256` and `manifest.hmac`, so it can't be flipped without also breaking the sha256 unless the attacker rewrites that too). This closes the "delete `manifest.hmac` and the run silently reads as unsigned OK" gap:
+
+- Verify **with `--key-path`** (the operator asserting "this run must be signed"): a missing `manifest.hmac` is always `UNVERIFIED (expected a signed manifest; manifest.hmac is missing)`, never `OK` — regardless of what the manifest claims. This is the check that closes the gap fully.
+- A **naive strip** (delete only `manifest.hmac`, leave `manifest.json` untouched) is also caught by a **plain** `verify-manifest` with no `--key-path`, because `audit_signing: true` is still in the manifest and the tool reports `UNVERIFIED` instead of `OK`.
+- Only an attacker who strips `manifest.hmac` **and** flips `audit_signing` to `false` **and** recomputes `manifest.sha256` (all without the key) can make a *plain, no-key* verify print `OK`. This is the irreducible no-trust-anchor limit of a self-declared flag: nothing in an unsigned check can force a downgraded manifest to admit it used to be signed.
+
+**Always verify signed runs with `--key-path`.** That is the only check that cannot be evaded by a no-key attacker stripping the signature.
 
 **Per-tier reality:**
 
