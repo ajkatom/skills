@@ -20,7 +20,7 @@ BACKEND_NAME = "container-docker"
 DEFAULT_IMAGE = "python:3.12-alpine"
 
 # Reuse df_sandbox's marker discipline: a wrapped read that raises must report this
-# literal, never propagate the read content. See df_sandbox._DENIAL_MARKER.
+# literal, never propagate the read content. See df_sandbox._READ_DENIAL_MARKER.
 _DENIAL_MARKER = "DF-READ-DENIED"
 
 
