@@ -606,9 +606,15 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     if eff_tier not in ("standard", "hardened"):
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
-    return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-                     adapter, timeout_s, workspace, start_iter=1, feedback=None,
-                     exec_prefix=exec_prefix, audit_key=audit_key)
+    try:
+        return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+                         adapter, timeout_s, workspace, start_iter=1, feedback=None,
+                         exec_prefix=exec_prefix, audit_key=audit_key)
+    except df_sandbox.SandboxError as e:
+        # In-loop fail-closed guards (e.g. the hardened adapter-mount re-check)
+        # must exit 2 like every other refusal, not escape as a traceback.
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
 
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
@@ -1058,17 +1064,22 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         if eff_tier not in ("standard", "hardened"):
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                              "isolation; outcome can never be a qualified ship-candidate.\n")
-        return _run_loop(
-            cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-            adapter, timeout_s, state["workspace"],
-            start_iter=state["next_iter"], feedback=state["feedback"],
-            exec_prefix=exec_prefix, audit_key=audit_key,
-            prev_dev_status=state.get("dev_status", {}),
-            regressions=state.get("regressions", []),
-            builder_calls=state.get("builder_calls", 0),
-            estimated_usd=state.get("estimated_usd", 0.0),
-            budget_alerted=state.get("budget_alerted", False),
-        )
+        try:
+            return _run_loop(
+                cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+                adapter, timeout_s, state["workspace"],
+                start_iter=state["next_iter"], feedback=state["feedback"],
+                exec_prefix=exec_prefix, audit_key=audit_key,
+                prev_dev_status=state.get("dev_status", {}),
+                regressions=state.get("regressions", []),
+                builder_calls=state.get("builder_calls", 0),
+                estimated_usd=state.get("estimated_usd", 0.0),
+                budget_alerted=state.get("budget_alerted", False),
+            )
+        except df_sandbox.SandboxError as e:
+            # In-loop fail-closed guards exit 2, not an unhandled traceback.
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
     finally:
         release_lock(lock)
 

@@ -548,8 +548,8 @@ def test_supervisor_guard_refuses_control_root_adapter_mount(tmp_path, monkeypat
         lambda *a, **k: called.append("invoke_adapter")
         or ({"adapter_protocol": "0.1", "status": "ok"}, None))
 
-    with pytest.raises(df_sandbox.SandboxError, match="adapter"):
-        supervisor.run(str(cr), None)
+    rc = supervisor.run(str(cr), None)
+    assert rc == 2  # in-loop guard refuses with the standard refusal exit code
     assert called == []  # refused BEFORE any docker argv was built or spawned
 
 
