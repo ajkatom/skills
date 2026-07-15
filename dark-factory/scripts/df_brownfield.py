@@ -164,6 +164,12 @@ def characterize(src_root: str, probes: list[dict], exec_wrapper=None) -> list[d
                 "stdout_equals": observed["stdout"],
                 "stderr_equals": observed["stderr"],
             }
+            # Defense in depth: the three keys above are ALWAYS populated from a
+            # real observation, so `then` is discriminating by construction and
+            # this branch cannot currently fire (is_discriminating only rejects a
+            # `then` with none of its recognized keys). Kept so that if the
+            # captured shape ever changes, a degenerate guard fails loudly here
+            # rather than silently freezing false assurance.
             if not df_gates.is_discriminating(then):
                 raise BrownfieldError(
                     f"probe {probe['id']!r} produced a non-discriminating "
