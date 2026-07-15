@@ -13,13 +13,14 @@ import sys
 import uuid
 
 import df_audit
+import df_container
 import df_gates
 import df_kb
 import df_sandbox
 import df_security
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
-from df_config import ConfigError, load_config
+from df_config import ConfigError, _disjoint, load_config
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
@@ -361,6 +362,44 @@ def _scenario_set_hash(scenarios_dir: str) -> str:
 
 
 def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
+    if cfg["assurance"] == "hardened":
+        os_backend = df_sandbox.current_backend()
+        os_name = os_backend.name if os_backend is not None else None
+        os_ok = os_backend is not None and os_backend.available() and df_sandbox.probe_denial(
+            os_backend, control_root, workspace)
+        c = cfg["_container"]
+        dk_ok = df_container.docker_available() and df_container.probe_container(
+            c["image"], control_root, workspace)
+        if os_ok and dk_ok:
+            return ("hardened", os_backend.wrap_prefix(control_root, workspace),
+                    df_container.BACKEND_NAME, True)
+        failed = []
+        if not dk_ok:
+            failed.append("docker")
+        if not os_ok:
+            failed.append("os_sandbox")
+        reason = f"hardened probe failed: {', '.join(failed)}"
+        if allow_downgrade:
+            if os_ok:
+                journal.write("DOWNGRADE", requested="hardened", effective="standard",
+                              reason=reason)
+                sys.stderr.write("dark-factory: hardened tier UNavailable — DOWNGRADED to "
+                                 "standard (qualified) by --allow-downgrade.\n")
+                return ("standard", os_backend.wrap_prefix(control_root, workspace), os_name, True)
+            journal.write("DOWNGRADE", requested="hardened", effective="cooperative",
+                          reason=reason)
+            sys.stderr.write("dark-factory: hardened tier UNavailable — DOWNGRADED to "
+                             "cooperative (unqualified) by --allow-downgrade.\n")
+            # Intentionally (os_name, False), NOT (None, None) like a
+            # configured-cooperative run: here the backend was probed and
+            # FAILED, vs never probed at all — manifests keep that distinction.
+            return ("cooperative", [], os_name, False)
+        journal.write("PROBE_FAILED", requested="hardened", reason=reason)
+        raise df_sandbox.SandboxError(
+            "hardened tier requires a running Docker daemon + passing container probe "
+            "(and a working OS sandbox for the verifier); none available "
+            f"({reason}). Fix the sandbox/docker or set assurance=standard/cooperative "
+            "(or pass --allow-downgrade).")
     if cfg["assurance"] != "standard":
         return "cooperative", [], None, None
     backend = df_sandbox.current_backend()
@@ -462,7 +501,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
-                  security={"checked": False},
+                  security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
@@ -480,7 +519,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   oracle={"mutation_validated": False, "inert": inert},
                   coverage={"checked": False},
-                  security={"checked": False},
+                  security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
@@ -506,7 +545,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                       final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                       oracle={"mutation_validated": True, "inert": []}, coverage=cov,
-                      security={"checked": False},
+                      security={"checked": False}, container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
@@ -536,7 +575,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       snapshot_sha256=None, qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
                       final_exam={"ran": False, "passed": None, "count": 0},
-                      regressions=[],
+                      regressions=[], container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
@@ -558,17 +597,24 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     except df_sandbox.SandboxError as e:
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
-    manifest_base["qualified"] = (eff_tier == "standard")
+    manifest_base["qualified"] = eff_tier in ("standard", "hardened")
     manifest_base["sandbox_backend"] = backend_name
     manifest_base["denial_probe_passed"] = probe_passed
+    manifest_base["container"] = dict(cfg["_container"]) if eff_tier == "hardened" else None
     manifest_base["_effective_tier"] = eff_tier   # internal; stripped before finalize
     # cooperative banner only when the EFFECTIVE tier is cooperative:
-    if eff_tier != "standard":
+    if eff_tier not in ("standard", "hardened"):
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
-    return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-                     adapter, timeout_s, workspace, start_iter=1, feedback=None,
-                     exec_prefix=exec_prefix, audit_key=audit_key)
+    try:
+        return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+                         adapter, timeout_s, workspace, start_iter=1, feedback=None,
+                         exec_prefix=exec_prefix, audit_key=audit_key)
+    except df_sandbox.SandboxError as e:
+        # In-loop fail-closed guards (e.g. the hardened adapter-mount re-check)
+        # must exit 2 like every other refusal, not escape as a traceback.
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
 
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
@@ -576,6 +622,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               audit_key=None, prev_dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False):
     exec_prefix = exec_prefix or []
+    effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
     # Regression tracking (green->red on dev, spec §6/§15.3): prev_dev_status maps
     # behavior_id -> did every dev scenario of that behavior pass LAST iteration.
@@ -705,8 +752,41 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                       f"{cfg.get('_control_root', '<cr>')} --decision continue")
                 return PAUSED
 
+            # Builder isolation: at effective "hardened" the builder runs inside a
+            # Docker container (control root never mounted — barrier by
+            # construction), built fresh per call; the OS-sandbox exec_prefix
+            # returned by resolve_isolation is reserved for the VERIFIER only
+            # (run_all below), unchanged. Builder-side twin env cannot cross the
+            # container boundary in M10 (journaled, not silently dropped) — the
+            # container always gets a clean env regardless (credential hygiene
+            # until M11).
+            if effective == "hardened":
+                c = cfg["_container"]
+                adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
+                # Belt-and-suspenders (defense in depth against config drift /
+                # TOCTOU): df_config already rejects a hardened adapter whose
+                # directory overlaps the control root, but this dir is about to
+                # be bind-mounted into the builder container — re-verify at the
+                # moment of use rather than trusting the load-time check.
+                if not _disjoint(adapter_ro_dir, cfg["_control_root"]):
+                    raise df_sandbox.SandboxError(
+                        "hardened: refusing to mount the adapter directory — it "
+                        f"overlaps the control root ({adapter_ro_dir}); the "
+                        "holdout barrier would be breached by construction")
+                builder_prefix = df_container.build_argv(
+                    c["image"], workspace,
+                    ro_mounts=[adapter_ro_dir],
+                    network=c["network"], memory=c["memory"], pids=c["pids"])
+                if build_env_extra:
+                    journal.write("TWIN_ENV_SKIPPED", tier="hardened",
+                                  reason="builder-side twin env not forwarded into "
+                                         "container (M12)")
+                builder_env = None
+            else:
+                builder_prefix, builder_env = exec_prefix, build_env_extra
+
             resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                       exec_prefix=exec_prefix, env_extra=build_env_extra)
+                                       exec_prefix=builder_prefix, env_extra=builder_env)
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -816,7 +896,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
                 journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
-                outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
+                outcome = "COMPLETE_QUALIFIED" if eff in ("standard", "hardened") else "COMPLETE_UNQUALIFIED"
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
@@ -825,7 +905,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 _kb_writeback(cfg, journal, mf, [])
                 note = "" if final_ran else " [no sealed final exam administered]"
                 print(f"dark-factory: CONVERGED "
-                      f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
+                      f"({'qualified, ' + eff if eff in ('standard', 'hardened') else 'unqualified, cooperative'} tier). "
                       f"Workspace: {workspace}  Run: {run_dir}{note}")
                 return 0
 
@@ -940,7 +1020,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             mf = dict(manifest_base, outcome="ABORTED_BY_HUMAN",
                       iterations=state["next_iter"] - 1,
                       qualified=False,
-                      sandbox_backend=None, denial_probe_passed=False,
+                      sandbox_backend=None, denial_probe_passed=False, container=None,
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=sorted(state.get("regressions", [])),
                       budget=_budget_manifest_field(
@@ -956,7 +1036,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                           note="human accepted a non-passing build — waived/unverified")
             mf = dict(manifest_base, outcome="ACCEPTED_WAIVED",
                       qualified=False,
-                      sandbox_backend=None, denial_probe_passed=False,
+                      sandbox_backend=None, denial_probe_passed=False, container=None,
                       iterations=state["next_iter"] - 1,
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=sorted(state.get("regressions", [])),
@@ -976,24 +1056,30 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         except df_sandbox.SandboxError as e:
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
-        manifest_base["qualified"] = (eff_tier == "standard")
+        manifest_base["qualified"] = eff_tier in ("standard", "hardened")
         manifest_base["sandbox_backend"] = backend_name
         manifest_base["denial_probe_passed"] = probe_passed
+        manifest_base["container"] = dict(cfg["_container"]) if eff_tier == "hardened" else None
         manifest_base["_effective_tier"] = eff_tier
-        if eff_tier != "standard":
+        if eff_tier not in ("standard", "hardened"):
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                              "isolation; outcome can never be a qualified ship-candidate.\n")
-        return _run_loop(
-            cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-            adapter, timeout_s, state["workspace"],
-            start_iter=state["next_iter"], feedback=state["feedback"],
-            exec_prefix=exec_prefix, audit_key=audit_key,
-            prev_dev_status=state.get("dev_status", {}),
-            regressions=state.get("regressions", []),
-            builder_calls=state.get("builder_calls", 0),
-            estimated_usd=state.get("estimated_usd", 0.0),
-            budget_alerted=state.get("budget_alerted", False),
-        )
+        try:
+            return _run_loop(
+                cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
+                adapter, timeout_s, state["workspace"],
+                start_iter=state["next_iter"], feedback=state["feedback"],
+                exec_prefix=exec_prefix, audit_key=audit_key,
+                prev_dev_status=state.get("dev_status", {}),
+                regressions=state.get("regressions", []),
+                builder_calls=state.get("builder_calls", 0),
+                estimated_usd=state.get("estimated_usd", 0.0),
+                budget_alerted=state.get("budget_alerted", False),
+            )
+        except df_sandbox.SandboxError as e:
+            # In-loop fail-closed guards exit 2, not an unhandled traceback.
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
     finally:
         release_lock(lock)
 

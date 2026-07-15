@@ -1,11 +1,14 @@
 """Config loading + validation for dark-factory. Stdlib only."""
 import json
 import os
+import re
 
+import df_container
 from df_common import canonical_json, sha256_str
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
+_MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 
 
 class ConfigError(ValueError):
@@ -68,12 +71,74 @@ def load_config(control_root: str) -> dict:
     adapter = builder.get("adapter")
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
+    if tier == "hardened":
+        # The adapter's DIRECTORY is bind-mounted ro into the builder container,
+        # so it must be pinned down at config time: a bare command name (e.g.
+        # "claude") would realpath against the process CWD (mounting whatever
+        # directory the operator happens to run from), and an adapter inside
+        # the control root would mount holdout content into the "isolated"
+        # builder. Both are mount-escape paths — reject at load.
+        adapter_path = os.path.expanduser(adapter)
+        if not os.path.isabs(adapter_path) or not os.path.isfile(adapter_path):
+            raise ConfigError(
+                "hardened requires roles.builder.adapter to be an absolute path "
+                "to an existing file (its directory is mounted into the container)"
+            )
+        adapter_dir = os.path.dirname(os.path.realpath(adapter_path))
+        if not _disjoint(adapter_dir, control_root):
+            raise ConfigError(
+                "hardened requires the roles.builder.adapter directory to be "
+                "disjoint from the control root (it would be mounted into the "
+                "builder container)"
+            )
+
+    # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
+    # (lights-off) is available only with a conforming hardened backend.
+    autonomy = raw.get("autonomy", 4)
+    if not isinstance(autonomy, int) or isinstance(autonomy, bool) or autonomy not in (4, 5):
+        raise ConfigError("autonomy must be an int, 4 or 5")
+    if autonomy == 5 and tier != "hardened":
+        raise ConfigError(
+            "autonomy 5 (lights-off) requires assurance: hardened (spec 2.2)"
+        )
 
     checkpoint = raw.get("checkpoint")
     if checkpoint is None:
-        checkpoint = "pause" if raw.get("autonomy") == 4 else "auto"
+        checkpoint = "pause" if autonomy == 4 else "auto"
     elif checkpoint not in ("pause", "auto"):
         raise ConfigError("checkpoint must be 'pause' or 'auto'")
+
+    # hardened tier: optional `hardened` block -> cfg["_container"]. The block
+    # is meaningless (and rejected) outside assurance: hardened; injected with
+    # defaults regardless of tier so downstream code can read cfg["_container"]
+    # unconditionally (mirrors _security/_budget/_twins).
+    hardened_raw = raw.get("hardened")
+    if hardened_raw is not None and tier != "hardened":
+        raise ConfigError("hardened block requires assurance: hardened")
+    if hardened_raw is None:
+        hardened_raw = {}
+    if not isinstance(hardened_raw, dict):
+        raise ConfigError("hardened must be a JSON object")
+
+    c_image = hardened_raw.get("image", df_container.DEFAULT_IMAGE)
+    if not isinstance(c_image, str) or not c_image or c_image.startswith("-"):
+        # Leading "-" could be parsed as a docker flag; df_container.build_argv
+        # rejects it too, but surfacing it lazily as a probe failure is a much
+        # worse operator experience than a load-time ConfigError.
+        raise ConfigError(
+            "hardened.image must be a non-empty string not starting with '-'"
+        )
+    c_network = hardened_raw.get("network", "none")
+    if c_network not in ("none", "bridge"):
+        raise ConfigError("hardened.network must be 'none' or 'bridge'")
+    c_memory = hardened_raw.get("memory", "2g")
+    if not isinstance(c_memory, str) or not _MEMORY_RE.match(c_memory):
+        raise ConfigError(
+            "hardened.memory must match ^[0-9]+[bkmg]$ (lowercase, e.g. '2g', '512m')"
+        )
+    c_pids = hardened_raw.get("pids", 256)
+    if not isinstance(c_pids, int) or isinstance(c_pids, bool) or c_pids < 16:
+        raise ConfigError("hardened.pids must be an int >= 16")
 
     kb_raw = raw.get("knowledge_base", {})
     if not isinstance(kb_raw, dict):
@@ -110,9 +175,16 @@ def load_config(control_root: str) -> dict:
     audit_raw = raw.get("audit", {})
     if not isinstance(audit_raw, dict):
         raise ConfigError("audit must be a JSON object")
-    audit_signing = audit_raw.get("signing", False)
+    # hardened => signed audit (spec 7): default signing to True at hardened
+    # (absent means "on"); an explicit false is a hard rejection, not a quiet
+    # downgrade — a hardened run whose manifest isn't signed is not hardened.
+    audit_signing = audit_raw.get("signing", tier == "hardened")
     if not isinstance(audit_signing, bool):
         raise ConfigError("audit.signing must be a bool")
+    if tier == "hardened" and not audit_signing:
+        raise ConfigError(
+            "hardened requires signed audit manifests (audit.signing: true)"
+        )
     audit_key_path = audit_raw.get("key_path", "")
     if audit_signing:
         if not audit_key_path:
@@ -246,6 +318,9 @@ def load_config(control_root: str) -> dict:
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["_audit"] = {"signing": audit_signing, "key_path": audit_key_path if audit_signing else ""}
     cfg["_security"] = cfg_security
+    cfg["_container"] = {
+        "image": c_image, "network": c_network, "memory": c_memory, "pids": c_pids,
+    }
     cfg["_budget"] = {
         "billing": billing,
         "max_usd": max_usd,
