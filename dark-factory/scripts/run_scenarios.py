@@ -43,6 +43,8 @@ def _validate(sc: dict, fname: str) -> None:
             raise OracleError(f"{fname}: missing {key!r}")
     if not BEHAVIOR_RE.fullmatch(sc["behavior_id"]):
         raise OracleError(f"{fname}: invalid behavior_id {sc['behavior_id']!r}")
+    if "cohort" in sc and sc["cohort"] not in ("dev", "final"):
+        raise OracleError(f"{fname}: cohort must be 'dev' or 'final', got {sc['cohort']!r}")
     run = sc["when"].get("run")
     if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
         raise OracleError(f"{fname}: when.run must be a non-empty list of strings")
@@ -57,6 +59,7 @@ def load_scenarios(scenarios_dir: str) -> list:
         with open(path, encoding="utf-8") as f:
             sc = json.load(f)
         _validate(sc, os.path.basename(path))
+        sc.setdefault("cohort", "dev")
         scs.append(sc)
     if not scs:
         raise OracleError(f"no scenarios found in {scenarios_dir}")
@@ -115,12 +118,21 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env
     }
 
 
-def run_all(scenarios_dir: str, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None) -> dict:
-    results = [
-        run_scenario(sc, workspace, exec_wrapper, env_extra) for sc in load_scenarios(scenarios_dir)
-    ]
+def run_all(
+    scenarios_dir: str,
+    workspace: str,
+    exec_wrapper: list | None = None,
+    env_extra: dict | None = None,
+    cohort: str | None = None,
+) -> dict:
+    scs = load_scenarios(scenarios_dir)
+    if cohort is not None:
+        scs = [sc for sc in scs if sc["cohort"] == cohort]
+    results = [run_scenario(sc, workspace, exec_wrapper, env_extra) for sc in scs]
     return {
         "report_version": "0.1",
+        "cohort": cohort if cohort is not None else "all",
         "results": results,
-        "all_pass": all(r["pass"] for r in results),
+        "all_pass": all(r["pass"] for r in results) if results else True,
+        "count": len(results),
     }
