@@ -14,7 +14,12 @@ Lives at `<control_root>/config.json`. JSON, not YAML: runtime is stdlib-only
 | `workspace_root` | str | absolute path; must be disjoint from the control root |
 | `roles.builder.adapter` | str | path to a protocol-0.1 adapter executable. Shipped: `scripts/adapters/{claude,codex,gemini}`. The chosen model's CLI must be installed (no silent fallback — an absent CLI aborts the run). |
 | `roles.builder.timeout_s` | int | optional, default 600 |
-| `budget.billing` | str | `"subscription"` (alert-only) in M1; metered admission lands later |
+| `budget.billing` | str | `"api"` \| `"subscription"`. Default `"subscription"` (alert-only — dollars can't be metered). `"api"` enforces `budget.max_usd` via the per-call estimate. |
+| `budget.max_usd` | float | optional; must be > 0. Dollar cap; enforced only when `billing: "api"` and `budget.per_call_usd` is also set. If `max_usd` is set without `per_call_usd`, the cap is recorded but downgraded to alert-only (no authoritative usage estimate). |
+| `budget.per_call_usd` | float | optional; must be > 0. Estimated dollar cost reserved per builder call (admission control), not metered usage. |
+| `budget.max_calls` | int | optional; must be >= 1. Exact hard cap on builder calls, enforced under any billing mode. |
+| `budget.alert_at` | float | default `0.85`. Fraction of the cap (0, 1] at which a `BUDGET_ALERT` fires (warn, continue) before the 100% pause. |
+| `budget.notification_sink` | str | optional, default `""`. Recorded destination for L5 budget alerts; delivery is stubbed (journaled + printed) in M8. |
 | `knowledge_base.kind` | str | optional: `none` (default) \| `wiki` \| `open-brain`. Enables optional grounding + opt-in run-summary write-back. |
 | `knowledge_base.path` | str | required existing directory when kind=`wiki`; the run summary is appended to `<path>/dark-factory-runs.md`. |
 | `knowledge_base.write_back` | bool | default false. When true + kind=`wiki`, the supervisor appends a barrier-safe run summary (outcome/tier/qualified/iterations/failing behavior IDs — no scenario text). `open-brain` write-back is done by the Claude session (MCP), not the supervisor. |

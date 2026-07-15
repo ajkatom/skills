@@ -124,6 +124,40 @@ def load_config(control_root: str) -> dict:
                 "workspace_root (the signing key must never be reachable by a run)"
             )
 
+    budget_raw = raw.get("budget", {})
+    if not isinstance(budget_raw, dict):
+        raise ConfigError("budget must be a JSON object")
+    billing = budget_raw.get("billing", "subscription")
+    if billing not in ("api", "subscription"):
+        raise ConfigError("budget.billing must be 'api' or 'subscription'")
+
+    def _positive_number(name):
+        val = budget_raw.get(name)
+        if val is None:
+            return None
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ConfigError(f"budget.{name} must be a number > 0")
+        if not val > 0:
+            raise ConfigError(f"budget.{name} must be a number > 0")
+        return float(val)
+
+    max_usd = _positive_number("max_usd")
+    per_call_usd = _positive_number("per_call_usd")
+
+    max_calls = budget_raw.get("max_calls")
+    if max_calls is not None:
+        if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
+            raise ConfigError("budget.max_calls must be an int >= 1")
+
+    alert_at = budget_raw.get("alert_at", 0.85)
+    if isinstance(alert_at, bool) or not isinstance(alert_at, (int, float)) or not (0 < alert_at <= 1):
+        raise ConfigError("budget.alert_at must be a number in (0, 1]")
+    alert_at = float(alert_at)
+
+    notification_sink = budget_raw.get("notification_sink", "")
+    if not isinstance(notification_sink, str):
+        raise ConfigError("budget.notification_sink must be a str")
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -131,4 +165,12 @@ def load_config(control_root: str) -> dict:
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["_audit"] = {"signing": audit_signing, "key_path": audit_key_path if audit_signing else ""}
+    cfg["_budget"] = {
+        "billing": billing,
+        "max_usd": max_usd,
+        "per_call_usd": per_call_usd,
+        "max_calls": max_calls,
+        "alert_at": alert_at,
+        "notification_sink": notification_sink,
+    }
     return cfg
