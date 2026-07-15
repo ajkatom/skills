@@ -368,6 +368,10 @@ def load_config(control_root: str) -> dict:
         elif "env_file" in creds_raw:
             raise ConfigError("credentials.env_file is only valid when source is 'env-file'")
 
+        if cred_source != "keychain" and "service_prefix" in creds_raw:
+            raise ConfigError(
+                "credentials.service_prefix is only valid when source is 'keychain'"
+            )
         cred_service_prefix = creds_raw.get("service_prefix", "dark-factory/")
         if not isinstance(cred_service_prefix, str) or not cred_service_prefix:
             raise ConfigError("credentials.service_prefix must be a non-empty str")

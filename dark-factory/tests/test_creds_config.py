@@ -180,6 +180,17 @@ def test_credentials_env_file_field_on_non_env_file_source_rejected(tmp_path):
         df_config.load_config(str(cr))
 
 
+@pytest.mark.parametrize("source", ["env", "env-file"])
+def test_credentials_service_prefix_on_non_keychain_source_rejected(tmp_path, source):
+    cr = tmp_path / "control"
+    creds = {"source": source, "service_prefix": "myorg/", "allowlist": ["FOO_API_KEY"]}
+    if source == "env-file":
+        creds["env_file"] = str(tmp_path / "creds" / ".env")
+    write_config(cr, credentials=creds)
+    with pytest.raises(df_config.ConfigError, match="service_prefix"):
+        df_config.load_config(str(cr))
+
+
 # ---------------------------------------------------------------------------
 # df_creds.launcher_scoped_env — pure helper
 # ---------------------------------------------------------------------------
@@ -338,6 +349,60 @@ def test_standard_cooperative_builder_env_is_stripped_and_merged(tmp_path, monke
     assert "DF_LEAKME_API_KEY" not in env_full  # not allowlisted, credential-shaped -> stripped
     assert env_full["FOO_API_KEY"] == SECRET  # allowlisted, merged in from resolved creds
     assert captured[0]["env_extra"] is None  # env_full REPLACES, not merges
+
+
+def test_twins_plus_credentials_merge_twin_env_over_scoped_env(tmp_path, monkeypatch):
+    # Twin env vars (DF_TWIN_* endpoints) are NOT credentials: at
+    # standard/cooperative with credentials configured, the builder env must
+    # be launcher_scoped_env(...) WITH the twin env merged over it — never a
+    # silent drop of the twin endpoints (pre-M11 regression guard).
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    (cr / "twins").mkdir()
+    (cr / "twins" / "x.json").write_text("{}", encoding="utf-8")  # load_defs is faked
+    cfg = json.loads((cr / "config.json").read_text())
+    cfg["twins"] = {"enabled": True, "startup_timeout_s": 20}
+    (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    _add_credentials(cr, allowlist=["FOO_API_KEY"])
+    _fake_load_credentials_ok(monkeypatch)
+    monkeypatch.setenv("DF_LEAKME_API_KEY", "leaked-value-should-never-appear")
+
+    twin_env = {"DF_TWIN_X": "http://127.0.0.1:9"}
+
+    class _FakeTwinSet:
+        env = twin_env
+
+        def start(self, defs, run_dir, timeout):
+            return twin_env
+
+        def reset(self, defs, run_dir, timeout):
+            return twin_env
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(supervisor.df_twins, "TwinSet", _FakeTwinSet)
+    monkeypatch.setattr(supervisor.df_twins, "load_defs", lambda d: [])
+
+    captured = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                    exec_prefix=None, env_extra=None, env_full=None):
+        captured.append({"env_extra": env_extra, "env_full": env_full})
+        with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+            f.write(GREET_PY)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    assert captured
+    env_full = captured[0]["env_full"]
+    assert isinstance(env_full, dict)
+    assert env_full["DF_TWIN_X"] == "http://127.0.0.1:9"  # twin env survives the broker
+    assert env_full["FOO_API_KEY"] == SECRET  # allowlisted cred present
+    assert env_full.get("PATH")  # base env kept
+    assert "DF_LEAKME_API_KEY" not in env_full  # non-allowlisted cred-shaped var stripped
 
 
 def test_no_credentials_configured_env_full_never_passed(tmp_path, monkeypatch):

@@ -302,6 +302,14 @@ def _kb_writeback(cfg, journal, manifest_dict, failing):
     """Opt-in KB write-back after a terminal manifest is finalized.
 
     Side-effect only: never raises, never affects control flow or exit codes.
+
+    REDACTION COUPLING (M11): call sites pass the PRE-redaction manifest
+    object. That is safe today ONLY because df_kb.build_summary hard-
+    allowlists {finished_ts, invocation, outcome, tier, qualified,
+    iterations} and never touches e.g. manifest["security"] (whose
+    external-gate `detail` can embed a matched secret from tools like
+    trufflehog). Any widening of build_summary's field allowlist MUST route
+    the manifest through the run's Redactor (redact_obj) first.
     """
     kb = cfg.get("_kb", {"kind": "none"})
     if kb.get("kind") != "wiki" or not kb.get("write_back"):
@@ -872,13 +880,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # allowlisted, then merge the resolved creds in — a full
                     # env REPLACEMENT (env_full), since env_extra's
                     # dict(os.environ, **env_extra) merge can only add, never
-                    # strip. Twin env (build_env_extra) is not forwarded here:
-                    # launcher_scoped_env already starts from the full
-                    # os.environ, and twin endpoints are separately available
-                    # via ts.env / verify_env_extra if a builder needs them.
+                    # strip. Twin env (build_env_extra: DF_TWIN_* endpoints)
+                    # is NOT a credential and keeps flowing to non-hardened
+                    # builders exactly as pre-M11 — merged over the scoped
+                    # env so twins+credentials compose instead of silently
+                    # dropping the twin endpoints.
                     builder_env = None
                     builder_env_full = df_creds.launcher_scoped_env(
                         os.environ, cfg["_credentials"]["allowlist"], creds)
+                    builder_env_full.update(build_env_extra or {})
                 else:
                     builder_env = build_env_extra
 
