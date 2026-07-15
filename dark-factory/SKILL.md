@@ -113,6 +113,22 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      `references/security-gates.md` for the built-ins, the external-gate interface,
      and the honest heuristic/floor caveat (false positives are the safe direction;
      false negatives mean it's a floor, not a proof).
+   - **Credentials (optional).** If the builder needs a real provider credential (e.g.
+     an API key for the CLI it wraps), set `credentials.source` (`"env-file"` —
+     recommended, an absolute path to a `KEY=VALUE` file OUTSIDE the control root and
+     workspace; `"keychain"` — macOS `security` CLI only in M11; or `"env"` — the
+     launcher's own environment) and `credentials.allowlist` (the exact variable names
+     the builder may receive — nothing else is ever brokered). **Never put a
+     credential in `config.json`, `spec.md`, or a scenario file** — an `env-file` must
+     be `.gitignore`d if it lives inside any git repo, or the run refuses closed with
+     the exact remedy (`git rm --cached` / add to `.gitignore` / `chmod 600`) before
+     anything else happens. Every credential value is scrubbed
+     (`***REDACTED***`) from the journal, every manifest, and every checkpoint/verify
+     report before it's written to disk; the manifest's `credentials` field records
+     only the source + allowlisted names, never a value. See
+     `references/credentials.md` for the containment model and its honest limits (no
+     rotation; `-e` argv `ps`-visibility at `hardened`; bridge-network exfiltration is
+     out of scope until the enterprise credential proxy).
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
    Exit 0 = converged/accepted · 3 = a non-converged terminal a human must evaluate
@@ -149,7 +165,10 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
   more here: `final` is the sealed exam that must stay unseen even by you.
 - Only the supervisor writes run state. Do not hand-edit `runs/`.
 - Secrets: never put credentials in config.json/spec.md/scenarios; the claude
-  adapter uses your ambient login.
+  adapter uses your ambient login. If a builder needs a real provider credential,
+  use the `credentials` config block (env-file/keychain, allowlisted, gitignore
+  enforced, artifact-scrubbed — see `references/credentials.md`), never a bare
+  env var baked into the adapter script or config.
 - A **cooperative** run is always UNQUALIFIED — say so. A **standard** or **hardened** run is qualified ONLY when its startup probe(s) passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value. Note: `manifest.tier` always echoes the *configured* assurance, even on a downgraded run — read `qualified` plus the journal's `DOWNGRADE` entry for what actually happened.
 - Signed audit is opt-in at `cooperative`/`standard` (`audit.signing: true` in config) but **mandatory** at `hardened` (an explicit `audit.signing: false` is a `ConfigError`). Verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
 - `hardened` is fail-closed on **both** halves: a working Docker daemon + passing container probe, AND a working OS sandbox for the verifier. Either missing refuses (exit 2) unless `--allow-downgrade` is passed. See `references/hardened.md`.
@@ -183,6 +202,7 @@ in a session that will also drive the builder.
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, deferred scope (M10)
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
+- `references/credentials.md` — the credential broker: allowlist-only injection, scrubbed artifacts, gitignore/permission gates, launcher-scoped standard-tier env, and honest limits (no rotation, `ps`-visibility, egress) (M11)
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
