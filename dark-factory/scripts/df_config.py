@@ -9,6 +9,7 @@ from df_common import canonical_json, sha256_str
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
+_CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 class ConfigError(ValueError):
@@ -310,6 +311,76 @@ def load_config(control_root: str) -> dict:
     else:
         cfg_security = {"enabled": False}
 
+    # Optional `credentials` block -> cfg["_credentials"] (M11): a brokered
+    # allowlist of provider credentials the builder is permitted to receive.
+    # Absent -> None (exactly today's behavior at every tier). Validated here
+    # (control-plane, load time); df_creds.load_credentials resolves the
+    # actual values at run start, never at config-load time (config load must
+    # never touch a keychain or read a secret file).
+    creds_raw = raw.get("credentials")
+    if creds_raw is not None:
+        if not isinstance(creds_raw, dict):
+            raise ConfigError("credentials must be a JSON object")
+
+        cred_source = creds_raw.get("source")
+        if cred_source not in ("env-file", "keychain", "env"):
+            raise ConfigError(
+                f"credentials.source must be env-file|keychain|env, got {cred_source!r}"
+            )
+
+        cred_allowlist = creds_raw.get("allowlist")
+        if not isinstance(cred_allowlist, list) or not cred_allowlist:
+            raise ConfigError("credentials.allowlist must be a non-empty list")
+        seen_names = set()
+        for name in cred_allowlist:
+            if not isinstance(name, str) or not _CRED_NAME_RE.match(name):
+                raise ConfigError(
+                    "credentials.allowlist entries must match ^[A-Z][A-Z0-9_]*$, "
+                    f"got {name!r}"
+                )
+            if name in seen_names:
+                raise ConfigError(
+                    f"credentials.allowlist has a duplicate entry {name!r}"
+                )
+            seen_names.add(name)
+
+        cred_env_file = None
+        if cred_source == "env-file":
+            cred_env_file = creds_raw.get("env_file")
+            if not isinstance(cred_env_file, str) or not cred_env_file:
+                raise ConfigError(
+                    "credentials.env_file is required when source is 'env-file'"
+                )
+            cred_env_file = os.path.expanduser(cred_env_file)
+            if not os.path.isabs(cred_env_file):
+                raise ConfigError(
+                    "credentials.env_file must be an absolute path (after expanduser)"
+                )
+            if not _disjoint(cred_env_file, control_root):
+                raise ConfigError(
+                    "credentials.env_file must be disjoint from the control root "
+                    "(it would be readable by a run that is supposed to be barrier-safe)"
+                )
+            if not _disjoint(cred_env_file, ws):
+                raise ConfigError(
+                    "credentials.env_file must be disjoint from workspace_root"
+                )
+        elif "env_file" in creds_raw:
+            raise ConfigError("credentials.env_file is only valid when source is 'env-file'")
+
+        cred_service_prefix = creds_raw.get("service_prefix", "dark-factory/")
+        if not isinstance(cred_service_prefix, str) or not cred_service_prefix:
+            raise ConfigError("credentials.service_prefix must be a non-empty str")
+
+        cfg_credentials = {
+            "source": cred_source,
+            "env_file": cred_env_file,
+            "service_prefix": cred_service_prefix,
+            "allowlist": list(cred_allowlist),
+        }
+    else:
+        cfg_credentials = None
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -329,4 +400,5 @@ def load_config(control_root: str) -> dict:
         "alert_at": alert_at,
         "notification_sink": notification_sink,
     }
+    cfg["_credentials"] = cfg_credentials
     return cfg

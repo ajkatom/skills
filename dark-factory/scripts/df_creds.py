@@ -11,12 +11,37 @@ other git failure (timeout, dubious ownership, permissions, corruption) is
 uncertainty and fails closed.
 """
 import os
+import re
 import subprocess
 import sys
 
 
 class CredsError(RuntimeError):
     """Raised whenever a credential cannot be resolved safely."""
+
+
+_SCOPED_VAR_RE = re.compile(r"(_API_KEY|_TOKEN|_SECRET|_PASSWORD)$")
+
+
+def launcher_scoped_env(base_env: dict, allowlist, creds: dict) -> dict:
+    """Scope a launcher-inherited env for the builder (standard/cooperative tiers).
+
+    Every var in `base_env` whose name matches `(_API_KEY|_TOKEN|_SECRET|_PASSWORD)$`
+    AND is NOT in `allowlist` is stripped (it is credential-shaped but not one the
+    config has explicitly vetted for the builder). Everything else — PATH, HOME,
+    allowlisted names, and non-credential-shaped vars — passes through unchanged.
+    `creds` (the resolved values) is merged in last, so it is authoritative for
+    every allowlisted name regardless of what (if anything) was in `base_env`.
+
+    Pure: does not read or mutate os.environ; the caller decides what `base_env` is.
+    """
+    allow = set(allowlist or ())
+    result = {
+        k: v for k, v in base_env.items()
+        if k in allow or not _SCOPED_VAR_RE.search(k)
+    }
+    result.update(creds or {})
+    return result
 
 
 def parse_env_file(path: str) -> dict:

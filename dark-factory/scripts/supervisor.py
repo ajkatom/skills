@@ -14,6 +14,7 @@ import uuid
 
 import df_audit
 import df_container
+import df_creds
 import df_gates
 import df_kb
 import df_sandbox
@@ -72,11 +73,14 @@ def release_lock(lock_path: str) -> None:
 
 
 class Journal:
-    def __init__(self, path: str):
+    def __init__(self, path: str, redactor=None):
         self.path = path
+        self.redactor = redactor
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def write(self, state: str, **data) -> None:
+        if self.redactor is not None:
+            data = self.redactor.redact_obj(data)
         line = canonical_json({"ts": _now(), "state": state, "data": data})
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -84,11 +88,36 @@ class Journal:
             os.fsync(f.fileno())
 
 
+def _redacted_write(path: str, payload, redactor) -> str:
+    """The single choke point every persisted run artifact goes through.
+
+    `payload` is either a str (already-serialized text, e.g. the checkpoint
+    markdown) or a JSON-able dict/list (canonical_json'd here). `redactor`'s
+    redact/redact_obj runs immediately before the bytes hit disk via
+    atomic_write. redactor=None (no credentials configured) is a strict
+    no-op: the exact bytes that would have been written pre-M11. Returns the
+    text actually written (callers that need to hash/sign it use this, never
+    a pre-redaction copy).
+    """
+    if isinstance(payload, str):
+        text = redactor.redact(payload) if redactor is not None else payload
+    else:
+        obj = redactor.redact_obj(payload) if redactor is not None else payload
+        text = canonical_json(obj)
+    atomic_write(path, text)
+    return text
+
+
 def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None,
-              builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint"):
-    atomic_write(
+              builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint",
+              redactor=None):
+    # state.json must NEVER carry a credential value: it holds only control-
+    # plane bookkeeping (iteration counters, ID/taxonomy feedback, paths), but
+    # it goes through the same redaction choke point as every other artifact
+    # for defense in depth (redactor=None is a strict no-op).
+    _redacted_write(
         os.path.join(run_dir, "state.json"),
-        canonical_json({
+        {
             "state_version": "0.1",
             "next_iter": next_iter,
             "feedback": feedback,
@@ -100,7 +129,8 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             "estimated_usd": estimated_usd,
             "budget_alerted": budget_alerted,
             "reason": reason,
-        }),
+        },
+        redactor,
     )
 
 
@@ -138,7 +168,7 @@ def latest_paused_run(control_root):
     return paused[0] if paused else None
 
 
-def write_checkpoint_report(run_dir, iteration, report):
+def write_checkpoint_report(run_dir, iteration, report, redactor=None):
     passing = sum(1 for r in report["results"] if r["pass"])
     total = len(report["results"])
     lines = [
@@ -162,7 +192,7 @@ def write_checkpoint_report(run_dir, iteration, report):
         "",
     ]
     path = os.path.join(run_dir, f"checkpoint_iter_{iteration}.md")
-    atomic_write(path, "\n".join(lines))
+    _redacted_write(path, "\n".join(lines), redactor)
     return path
 
 
@@ -193,7 +223,7 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
     }
 
 
-def _run_security_gates(cfg, journal, run_dir, workspace):
+def _run_security_gates(cfg, journal, run_dir, workspace, redactor=None):
     """Run mandatory security gates (M9) on the converged artifact, if enabled.
 
     Shared by BOTH the primary run() path and resume()'s continue path,
@@ -211,7 +241,7 @@ def _run_security_gates(cfg, journal, run_dir, workspace):
     if not sec_cfg.get("enabled"):
         return {"checked": False}
     sec_report = df_security.run_gates(workspace, sec_cfg)
-    atomic_write(os.path.join(run_dir, "security_report.json"), canonical_json(sec_report))
+    _redacted_write(os.path.join(run_dir, "security_report.json"), sec_report, redactor)
     journal.write("SECURITY_GATES", checked=True, failed=sec_report["failed"])
     return sec_report
 
@@ -234,7 +264,7 @@ def _load_audit_key(cfg, journal):
         return None, 2
 
 
-def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None) -> str:
+def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redactor=None) -> str:
     """Write manifest.json + manifest.sha256 sidecar.
 
     HONESTY (spec 7.5, cooperative/standard tier): a local process that can
@@ -244,6 +274,13 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None) -> str
     If `audit_key` is given, also write manifest.hmac (HMAC-SHA256 over the
     exact canonical manifest text, spec 7.5). The key itself is NEVER
     written to any run artifact.
+
+    `redactor` (M11), if given, redacts credential VALUES out of the manifest
+    before it is ever serialized — the digest and (if signed) the HMAC are
+    computed over the redacted text, so verify-manifest's integrity checks
+    stay consistent with the bytes actually on disk. `credentials` fields on
+    the manifest are names/allowlist only and are never themselves subject to
+    redaction (they contain no values).
     """
     journal_path = os.path.join(run_dir, "journal.jsonl")
     manifest = dict(extra)
@@ -252,8 +289,7 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None) -> str
     manifest["finished_ts"] = _now()
     if audit_key is not None:
         manifest["audit_signing"] = True
-    text = canonical_json(manifest)
-    atomic_write(os.path.join(run_dir, "manifest.json"), text)
+    text = _redacted_write(os.path.join(run_dir, "manifest.json"), manifest, redactor)
     digest = sha256_str(text)
     atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
     if audit_key is not None:
@@ -324,7 +360,13 @@ def compose_prompt(spec_text: str, feedback) -> str:
 
 
 def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, timeout_s: int,
-                   exec_prefix=None, env_extra=None):
+                   exec_prefix=None, env_extra=None, env_full=None):
+    """`env_full`, if given, is used INSTEAD of the inherit+merge below — it is
+    the exact env dict the subprocess gets (e.g. df_creds.launcher_scoped_env's
+    output, which STRIPS vars from os.environ; env_extra's dict(os.environ,
+    **env_extra) merge can only add, never remove, so it cannot express a
+    strip). `env_extra` behavior is unchanged when `env_full` is None (the
+    verifier/twins path never sets env_full)."""
     req = {
         "adapter_protocol": "0.1",
         "role": role,
@@ -333,7 +375,10 @@ def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, time
         "timeout_s": timeout_s,
     }
     argv = (list(exec_prefix) if exec_prefix else []) + [adapter]
-    env = dict(os.environ, **env_extra) if env_extra else None
+    if env_full is not None:
+        env = dict(env_full)
+    else:
+        env = dict(os.environ, **env_extra) if env_extra else None
     try:
         proc = subprocess.run(
             argv, input=json.dumps(req), capture_output=True, text=True,
@@ -442,11 +487,34 @@ def run(control_root: str, project_src, allow_downgrade: bool = False) -> int:
         release_lock(lock)
 
 
+def _resolve_credentials(cfg):
+    """Resolve cfg["_credentials"] (if configured) into (creds, redactor).
+
+    Fail-closed at run start (spec: "ConfigError-style refusal at run start,
+    exit 2, never a silent empty value"): a CredsError here writes only to
+    stderr — no run_dir, no journal entry, nothing on disk — and the caller
+    must return 2 before touching anything else. Absent block -> (None, None):
+    exactly today's behavior, no builder env change, no writer touched.
+    """
+    if not cfg["_credentials"]:
+        return None, None, None
+    try:
+        creds = df_creds.load_credentials(cfg["_credentials"])
+    except df_creds.CredsError as e:
+        return None, None, e
+    return creds, df_creds.Redactor(creds.values()), None
+
+
 def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False) -> int:
+    creds, redactor, creds_err = _resolve_credentials(cfg)
+    if creds_err is not None:
+        sys.stderr.write(f"dark-factory: credentials: {creds_err}\n")
+        return 2
+
     invocation = _now().replace(":", "").replace("-", "") + "-" + uuid.uuid4().hex[:8]
     run_dir = os.path.join(control_root, "runs", invocation)
     os.makedirs(run_dir, exist_ok=True)
-    journal = Journal(os.path.join(run_dir, "journal.jsonl"))
+    journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
 
     audit_key, audit_err = _load_audit_key(cfg, journal)
     if audit_err is not None:
@@ -486,6 +554,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "spec_sha256": sha256_str(spec_text),
         "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
         "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
+        # Additive (M11), names/allowlist only — NEVER values — on every
+        # terminal manifest since manifest_base feeds every `dict(manifest_base,
+        # outcome=...)` branch below, including the pre-build gate aborts.
+        "credentials": ({"source": cfg["_credentials"]["source"],
+                        "allowlist": list(cfg["_credentials"]["allowlist"])}
+                       if cfg["_credentials"] else None),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -503,7 +577,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
@@ -521,7 +595,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   coverage={"checked": False},
                   security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(
             f"dark-factory: pre-build gate FAILED — {len(inert)} inert (non-discriminating) "
@@ -547,7 +621,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       oracle={"mutation_validated": True, "inert": []}, coverage=cov,
                       security={"checked": False}, container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-            finalize_manifest(run_dir, mf, audit_key=audit_key)
+            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(
                 f"dark-factory: pre-build gate FAILED — coverage gap, no build was run: "
@@ -577,7 +651,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=[], container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-            finalize_manifest(run_dir, mf, audit_key=audit_key)
+            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -609,7 +683,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     try:
         return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                          adapter, timeout_s, workspace, start_iter=1, feedback=None,
-                         exec_prefix=exec_prefix, audit_key=audit_key)
+                         exec_prefix=exec_prefix, audit_key=audit_key,
+                         creds=creds, redactor=redactor)
     except df_sandbox.SandboxError as e:
         # In-loop fail-closed guards (e.g. the hardened adapter-mount re-check)
         # must exit 2 like every other refusal, not escape as a traceback.
@@ -620,7 +695,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
               audit_key=None, prev_dev_status=None, regressions=None,
-              builder_calls=0, estimated_usd=0.0, budget_alerted=False):
+              builder_calls=0, estimated_usd=0.0, budget_alerted=False,
+              creds=None, redactor=None):
     exec_prefix = exec_prefix or []
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
@@ -646,7 +722,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
@@ -745,7 +821,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="budget")
+                          budget_alerted=budget_alerted, reason="budget", redactor=redactor)
                 print(f"dark-factory: PAUSED — budget cap reached (estimated_usd={estimated_usd}, "
                       f"builder_calls={builder_calls}). Raise budget.max_usd (or max_calls) in "
                       f"config.json and run: supervisor.py resume --control-root "
@@ -758,8 +834,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             # returned by resolve_isolation is reserved for the VERIFIER only
             # (run_all below), unchanged. Builder-side twin env cannot cross the
             # container boundary in M10 (journaled, not silently dropped) — the
-            # container always gets a clean env regardless (credential hygiene
-            # until M11).
+            # container always gets a clean env regardless of twins, PLUS
+            # (M11) the configured credential allowlist via `-e` container env.
+            builder_env_full = None
             if effective == "hardened":
                 c = cfg["_container"]
                 adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
@@ -773,27 +850,54 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                         "hardened: refusing to mount the adapter directory — it "
                         f"overlaps the control root ({adapter_ro_dir}); the "
                         "holdout barrier would be breached by construction")
+                # (M11) Credential values enter the container ONLY as `-e` argv
+                # baked into the docker invocation by build_argv — never via the
+                # docker CLIENT process's own env. This is the sole channel any
+                # env reaches the hardened builder; `-e K=V` is visible to local
+                # `ps` (documented residual, see references/credentials.md).
                 builder_prefix = df_container.build_argv(
                     c["image"], workspace,
                     ro_mounts=[adapter_ro_dir],
-                    network=c["network"], memory=c["memory"], pids=c["pids"])
+                    network=c["network"], memory=c["memory"], pids=c["pids"],
+                    env=creds if creds else None)
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="hardened",
                                   reason="builder-side twin env not forwarded into "
                                          "container (M12)")
-                builder_env = None
+                builder_env = creds
             else:
-                builder_prefix, builder_env = exec_prefix, build_env_extra
+                builder_prefix = exec_prefix
+                if creds:
+                    # Strip credential-shaped launcher vars that aren't
+                    # allowlisted, then merge the resolved creds in — a full
+                    # env REPLACEMENT (env_full), since env_extra's
+                    # dict(os.environ, **env_extra) merge can only add, never
+                    # strip. Twin env (build_env_extra) is not forwarded here:
+                    # launcher_scoped_env already starts from the full
+                    # os.environ, and twin endpoints are separately available
+                    # via ts.env / verify_env_extra if a builder needs them.
+                    builder_env = None
+                    builder_env_full = df_creds.launcher_scoped_env(
+                        os.environ, cfg["_credentials"]["allowlist"], creds)
+                else:
+                    builder_env = build_env_extra
 
+            # env_full is only ever passed when actually set (M11 credentials
+            # configured at standard/cooperative): existing invoke_adapter
+            # call sites/tests that predate env_full and don't accept it as a
+            # kwarg keep working unchanged when no credentials are configured.
+            _invoke_kwargs = {"exec_prefix": builder_prefix, "env_extra": builder_env}
+            if builder_env_full is not None:
+                _invoke_kwargs["env_full"] = builder_env_full
             resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                       exec_prefix=builder_prefix, env_extra=builder_env)
+                                       **_invoke_kwargs)
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key)
+                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
@@ -818,13 +922,16 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key)
+                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: {e}\n")
                 return 2
             last_report = report
-            atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
+            # verifier_report_iter_*.json carries raw builder-produced observed
+            # stdout/stderr (spec: run_all's `observed` dict) — a real smuggle
+            # channel, not merely defensive — so it goes through the redactor.
+            _redacted_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), report, redactor)
             passing = sum(1 for r in report["results"] if r["pass"])
             journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
 
@@ -853,7 +960,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # journal/manifest. Same reset twin env as dev's verify (same phase).
                 final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
                                  env_extra=verify_env_extra, cohort="final")
-                atomic_write(os.path.join(run_dir, "final_exam_report.json"), canonical_json(final))
+                _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
                 final_ran = final["count"] > 0
                 journal.write("FINAL_EXAM", ran=final_ran,
                               passing=sum(1 for r in final["results"] if r["pass"]),
@@ -868,7 +975,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                    finalize_manifest(run_dir, mf, audit_key=audit_key)
+                    finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
                     print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
@@ -880,14 +987,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # independent of scenario pass — a clean scenario run with a
                 # planted secret still must not ship. AFTER the final exam,
                 # BEFORE CONVERGED is declared.
-                sec_report = _run_security_gates(cfg, journal, run_dir, workspace)
+                sec_report = _run_security_gates(cfg, journal, run_dir, workspace, redactor=redactor)
                 if sec_report.get("failed"):
                     journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
                     mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
                               security=sec_report,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                    finalize_manifest(run_dir, mf, audit_key=audit_key)
+                    finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
                     print(f"dark-factory: security gate failed (artifact rejected): "
@@ -900,7 +1007,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key)
+                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 note = "" if final_ran else " [no sealed final exam administered]"
@@ -910,16 +1017,20 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 return 0
 
             feedback = project_feedback(report)
-            atomic_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), canonical_json(feedback))
+            # feedback_iter/*.json and workspace/feedback.json are structurally
+            # guaranteed value-free (validate_feedback's ALLOWED_TOP/ALLOWED_FAILURE
+            # keysets — behavior_id/taxonomy only), so redaction is a defensive
+            # no-op here rather than a load-bearing choke point.
+            _redacted_write(os.path.join(run_dir, f"feedback_iter_{i}.json"), feedback, redactor)
             atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
             journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
 
             if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
-                write_checkpoint_report(run_dir, i, report)
+                write_checkpoint_report(run_dir, i, report, redactor=redactor)
                 save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="checkpoint")
+                          budget_alerted=budget_alerted, reason="checkpoint", redactor=redactor)
                 journal.write("CHECKPOINT", iteration=i,
                               failing=[f["behavior_id"] for f in feedback["failures"]])
                 print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
@@ -934,7 +1045,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
         print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
@@ -959,6 +1070,15 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         sys.stderr.write("dark-factory: no paused run to resume\n")
         return 2
 
+    # Isolation cannot be trusted across a pause, and neither can credentials:
+    # re-resolve them every resume (env-file/keychain contents may have
+    # changed, or the operator may be fixing a prior refusal) — fail-closed,
+    # exit 2, BEFORE any builder call, exactly like the fresh-run path.
+    creds, redactor, creds_err = _resolve_credentials(cfg)
+    if creds_err is not None:
+        sys.stderr.write(f"dark-factory: credentials: {creds_err}\n")
+        return 2
+
     try:
         lock = acquire_lock(control_root)
     except LockError as e:
@@ -966,7 +1086,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         return 2
     try:
         state = load_state(run_dir)
-        journal = Journal(os.path.join(run_dir, "journal.jsonl"))
+        journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
 
         audit_key, audit_err = _load_audit_key(cfg, journal)
         if audit_err is not None:
@@ -985,6 +1105,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             "scenario_set_sha256": _scenario_set_hash(scenarios_dir),
             "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
             "snapshot_sha256": _snapshot_sha256_from_journal(run_dir),
+            "credentials": ({"source": cfg["_credentials"]["source"],
+                            "allowlist": list(cfg["_credentials"]["allowlist"])}
+                           if cfg["_credentials"] else None),
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -1026,7 +1149,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))
-            finalize_manifest(run_dir, mf, audit_key=audit_key)
+            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ABORTED by human.")
@@ -1043,7 +1166,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))
-            finalize_manifest(run_dir, mf, audit_key=audit_key)
+            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
@@ -1075,6 +1198,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                 builder_calls=state.get("builder_calls", 0),
                 estimated_usd=state.get("estimated_usd", 0.0),
                 budget_alerted=state.get("budget_alerted", False),
+                creds=creds, redactor=redactor,
             )
         except df_sandbox.SandboxError as e:
             # In-loop fail-closed guards exit 2, not an unhandled traceback.
