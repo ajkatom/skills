@@ -40,17 +40,20 @@ def _dev_scenario():
 
 
 def _final_scenario():
-    # Sealed-exam scenario that ALSO calls the twin (a different name), so a
-    # converging run produces a SECOND, independently-seeded twin call --
-    # this is what lets the fresh-per-pass-seed assertion be non-vacuous
-    # (>= 2 distinct tokens actually observed across dev-verify + final).
+    # Sealed-exam scenario that ALSO calls the twin. It greets the SAME name
+    # ("World") as the dev scenario ON PURPOSE: the twin's token is
+    # sha256(seed + path)[:12], so holding the path constant across the two
+    # passes means the ONLY variable left that can make the dev-verify token
+    # differ from the final-exam token is the per-pass DF_TWIN_VARIANT_SEED.
+    # A differing name here would make the tokens differ by path alone and
+    # render the fresh-per-pass-seed assertion vacuous.
     return {
         "ir_version": "0.1", "id": "BHV-002-S1", "behavior_id": "BHV-002",
         "title": f"{MARKER} sealed final exam also talks to the twin",
         "given": f"{MARKER} final-cohort check the twin is called again post-convergence",
         "cohort": "final",
-        "when": {"run": ["python3", "greet.py", "FinalCheck"], "timeout_s": 10},
-        "then": {"exit_code": 0, "stdout_contains": "Hello, FinalCheck!",
+        "when": {"run": ["python3", "greet.py", "World"], "timeout_s": 10},
+        "then": {"exit_code": 0, "stdout_contains": "Hello, World!",
                  "stdout_echoes_twin": {"twin": "greeter"}},
     }
 
@@ -180,15 +183,18 @@ def test_honest_builder_converges_with_fresh_seed_per_pass(tmp_path):
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["twin_evidence"]["variants"] is True
-    assert manifest["twin_evidence"]["observed_assertions"] >= 1
+    assert manifest["twin_evidence"]["observed_assertions"] == 2
 
     # Non-vacuous fresh-seed proof: read the twin's OWN observation ndjson
     # log directly (the evidence channel, not anything the builder produced)
     # and confirm at least 2 DISTINCT tokens were recorded -- one from the
     # dev-verify pass (BHV-001-S1's call) and one from the sealed final-exam
-    # pass (BHV-002-S1's call), each pass having received its OWN fresh
-    # DF_TWIN_VARIANT_SEED. If the seed were reused (or absent) across
-    # passes, the tokens would collide/be missing instead of differing.
+    # pass (BHV-002-S1's call). Both passes greet the SAME name ("World"), so
+    # the token input path is identical between them; the tokens can therefore
+    # differ ONLY because each pass received its OWN fresh DF_TWIN_VARIANT_SEED.
+    # If the seed were reused (or absent) across passes, the tokens would
+    # collide (identical path + identical seed) instead of differing -- so this
+    # assertion isolates seed-freshness rather than path variation.
     obs_path = run_dir / "twins" / "greeter.observations.ndjson"
     assert obs_path.exists()
     tokens = []
