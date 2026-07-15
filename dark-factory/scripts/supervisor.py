@@ -12,6 +12,7 @@ import subprocess
 import sys
 import uuid
 
+import df_audit
 import df_kb
 import df_sandbox
 import df_twins
@@ -148,22 +149,49 @@ def write_checkpoint_report(run_dir, iteration, report):
     return path
 
 
-def finalize_manifest(run_dir: str, extra: dict) -> str:
+def _load_audit_key(cfg, journal):
+    """Load the run's audit signing key once, if cfg["_audit"]["signing"].
+
+    Returns (key_or_None, error_exit_code_or_None). On AuditKeyError this is a
+    precondition failure — journal AUDIT_KEY_ERROR and return an exit code
+    instead of silently proceeding unsigned.
+    """
+    audit_cfg = cfg.get("_audit", {"signing": False, "key_path": ""})
+    if not audit_cfg.get("signing"):
+        return None, None
+    try:
+        return df_audit.load_or_create_key(audit_cfg["key_path"]), None
+    except df_audit.AuditKeyError as e:
+        journal.write("AUDIT_KEY_ERROR", detail=str(e))
+        sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+        return None, 2
+
+
+def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None) -> str:
     """Write manifest.json + manifest.sha256 sidecar.
 
     HONESTY (spec 7.5, cooperative/standard tier): a local process that can
     rewrite both files can defeat this. It detects accidental edits and
     casual tampering only; a signed chain / off-box anchor is hardened+.
+
+    If `audit_key` is given, also write manifest.hmac (HMAC-SHA256 over the
+    exact canonical manifest text, spec 7.5). The key itself is NEVER
+    written to any run artifact.
     """
     journal_path = os.path.join(run_dir, "journal.jsonl")
     manifest = dict(extra)
     manifest["manifest_version"] = "0.1"
     manifest["journal_sha256"] = sha256_file(journal_path)
     manifest["finished_ts"] = _now()
+    if audit_key is not None:
+        manifest["audit_signing"] = True
     text = canonical_json(manifest)
     atomic_write(os.path.join(run_dir, "manifest.json"), text)
     digest = sha256_str(text)
     atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
+    if audit_key is not None:
+        sig = df_audit.sign(audit_key, text.encode("utf-8"))
+        atomic_write(os.path.join(run_dir, "manifest.hmac"), sig + "\n")
     return digest
 
 
@@ -183,7 +211,7 @@ def _kb_writeback(cfg, journal, manifest_dict, failing):
         journal.write("KB_WRITEBACK_ERROR", detail=str(e))
 
 
-def verify_manifest(run_dir: str) -> bool:
+def verify_manifest(run_dir: str, key: bytes = None) -> bool:
     mp = os.path.join(run_dir, "manifest.json")
     sp = os.path.join(run_dir, "manifest.sha256")
     jp = os.path.join(run_dir, "journal.jsonl")
@@ -197,6 +225,19 @@ def verify_manifest(run_dir: str) -> bool:
     manifest = json.loads(text)
     if sha256_file(jp) != manifest.get("journal_sha256"):
         print("TAMPERED (journal.jsonl does not match manifest)")
+        return False
+    hp = os.path.join(run_dir, "manifest.hmac")
+    expect_sig = (key is not None) or bool(manifest.get("audit_signing"))
+    if os.path.exists(hp):
+        if key is None:
+            print("UNVERIFIED (signed manifest; supply --key-path)")
+            return False
+        sig = open(hp, encoding="utf-8").read().strip()
+        if not df_audit.verify(key, text.encode("utf-8"), sig):
+            print("TAMPERED (bad signature)")
+            return False
+    elif expect_sig:
+        print("UNVERIFIED (expected a signed manifest; manifest.hmac is missing)")
         return False
     print("OK")
     return True
@@ -302,6 +343,10 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     os.makedirs(run_dir, exist_ok=True)
     journal = Journal(os.path.join(run_dir, "journal.jsonl"))
 
+    audit_key, audit_err = _load_audit_key(cfg, journal)
+    if audit_err is not None:
+        return audit_err
+
     spec_path = os.path.join(control_root, "spec.md")
     if not os.path.exists(spec_path):
         sys.stderr.write(f"dark-factory: missing spec: {spec_path}\n")
@@ -347,7 +392,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
                       snapshot_sha256=None, qualified=False,
                       sandbox_backend=None, denial_probe_passed=False)
-            finalize_manifest(run_dir, mf)
+            finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
@@ -377,11 +422,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                          "isolation; outcome can never be a qualified ship-candidate.\n")
     return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                      adapter, timeout_s, workspace, start_iter=1, feedback=None,
-                     exec_prefix=exec_prefix)
+                     exec_prefix=exec_prefix, audit_key=audit_key)
 
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
-              adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None):
+              adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
+              audit_key=None):
     exec_prefix = exec_prefix or []
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
 
@@ -393,7 +439,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     def _twin_error_abort(iteration, e):
         journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
         mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False)
-        finalize_manifest(run_dir, mf)
+        finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
@@ -446,7 +492,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
-                finalize_manifest(run_dir, mf)
+                finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
@@ -466,7 +512,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
-                finalize_manifest(run_dir, mf)
+                finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: {e}\n")
@@ -481,7 +527,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
                 mf = dict(mb_clean, outcome=outcome, iterations=i)
-                finalize_manifest(run_dir, mf)
+                finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 print(f"dark-factory: CONVERGED "
@@ -508,7 +554,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         journal.write("CAP_REACHED", failing_behaviors=failing,
                       note="likely spec ambiguity — human decision needed")
         mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False)
-        finalize_manifest(run_dir, mf)
+        finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
         print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
@@ -541,6 +587,11 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
     try:
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"))
+
+        audit_key, audit_err = _load_audit_key(cfg, journal)
+        if audit_err is not None:
+            return audit_err
+
         spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
         scenarios_dir = os.path.join(control_root, "scenarios")
         adapter = cfg["roles"]["builder"]["adapter"]
@@ -562,7 +613,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       iterations=state["next_iter"] - 1,
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False)
-            finalize_manifest(run_dir, mf)
+            finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ABORTED by human.")
@@ -574,7 +625,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
                       iterations=state["next_iter"] - 1)
-            finalize_manifest(run_dir, mf)
+            finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
@@ -598,7 +649,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             adapter, timeout_s, state["workspace"],
             start_iter=state["next_iter"], feedback=state["feedback"],
-            exec_prefix=exec_prefix,
+            exec_prefix=exec_prefix, audit_key=audit_key,
         )
     finally:
         release_lock(lock)
@@ -615,6 +666,9 @@ def main():
                             "cooperative (unqualified) instead of failing closed")
     p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
     p_ver.add_argument("--run-dir", required=True)
+    p_ver.add_argument("--key-path", default=None,
+                       help="path to the audit signing key; required to verify a "
+                            "signed (manifest.hmac) run")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
@@ -625,7 +679,14 @@ def main():
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
     elif args.cmd == "verify-manifest":
-        sys.exit(0 if verify_manifest(args.run_dir) else 4)
+        vkey = None
+        if args.key_path:
+            try:
+                vkey = df_audit.load_key(args.key_path)
+            except df_audit.AuditKeyError as e:
+                sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+                sys.exit(2)
+        sys.exit(0 if verify_manifest(args.run_dir, key=vkey) else 4)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
 

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+python3 -c "import os,time;open('$DF_GRANDCHILD_PIDFILE','w').write(str(os.getpid()));time.sleep(300)" &
+echo "127.0.0.1:1" > "$DF_ENDPOINT_FILE"
+# direct child exits immediately, leaving the grandchild backgrounded in the same group
+exit 0
