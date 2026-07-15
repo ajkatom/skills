@@ -1,8 +1,13 @@
 import json
+import sys
 
 import pytest
 
 import df_config
+
+# At hardened, roles.builder.adapter must be an absolute EXISTING file whose
+# dir is disjoint from the control root (M10-2) — sys.executable always is.
+_HARDENED_ROLES = {"builder": {"adapter": sys.executable, "timeout_s": 60}}
 
 
 def write_config(control_root, **overrides):
@@ -113,7 +118,7 @@ def test_checkpoint_defaults_to_auto_at_autonomy_5(tmp_path):
     # M10-2: autonomy 5 (lights-off) is gated on assurance: hardened (spec 2.2)
     # — see test_hardened_config.py for the full L5-gate matrix.
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", autonomy=5)
+    write_config(cr, assurance="hardened", autonomy=5, roles=_HARDENED_ROLES)
     cfg = df_config.load_config(str(cr))
     assert cfg["_checkpoint"] == "auto"
 
@@ -145,7 +150,7 @@ def test_hardened_tier_now_accepted(tmp_path):
     # detailed hardened config matrix (container block, L5 gate, signed-audit
     # requirement) lives in test_hardened_config.py.
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened")
+    write_config(cr, assurance="hardened", roles=_HARDENED_ROLES)
     cfg = df_config.load_config(str(cr))
     assert cfg["assurance"] == "hardened"
     assert cfg["_qualified"] is True

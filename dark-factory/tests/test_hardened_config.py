@@ -9,6 +9,7 @@ Docker daemon or a real platform sandbox — this suite must pass everywhere.
 """
 import json
 import os
+import sys
 
 import pytest
 
@@ -21,6 +22,20 @@ from test_supervisor import FAKE, MARKER, setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GREETER = os.path.join(HERE, "fixtures", "twin_greeter")
+
+# hardened validates roles.builder.adapter as an absolute EXISTING file whose
+# directory is disjoint from the control root (its dir is mounted into the
+# container). test_config.write_config's default "/bin/true" does not exist on
+# every platform (macOS ships only /usr/bin/true), so hardened tests pin a
+# real file that always exists and lives outside any tmp control root.
+VALID_ADAPTER = sys.executable
+
+
+def write_hardened(cr, **overrides):
+    overrides.setdefault("assurance", "hardened")
+    overrides.setdefault(
+        "roles", {"builder": {"adapter": VALID_ADAPTER, "timeout_s": 60}})
+    return write_config(cr, **overrides)
 
 GREET_PY = (
     "import sys\n"
@@ -36,7 +51,7 @@ GREET_PY = (
 
 def test_hardened_tier_accepted_with_defaults(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened")
+    write_hardened(cr)
     cfg = df_config.load_config(str(cr))
     assert cfg["assurance"] == "hardened"
     assert cfg["_qualified"] is True
@@ -48,7 +63,7 @@ def test_hardened_tier_accepted_with_defaults(tmp_path):
 
 def test_hardened_block_overrides_defaults(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={
+    write_hardened(cr, hardened={
         "image": "myorg/img:1", "network": "bridge", "memory": "512m", "pids": 64,
     })
     cfg = df_config.load_config(str(cr))
@@ -59,21 +74,21 @@ def test_hardened_block_overrides_defaults(tmp_path):
 
 def test_hardened_empty_image_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"image": ""})
+    write_hardened(cr, hardened={"image": ""})
     with pytest.raises(df_config.ConfigError, match="image"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_bad_network_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"network": "host"})
+    write_hardened(cr, hardened={"network": "host"})
     with pytest.raises(df_config.ConfigError, match="network"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_bad_memory_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"memory": "lots"})
+    write_hardened(cr, hardened={"memory": "lots"})
     with pytest.raises(df_config.ConfigError, match="memory"):
         df_config.load_config(str(cr))
 
@@ -81,28 +96,28 @@ def test_hardened_bad_memory_rejected(tmp_path):
 def test_hardened_uppercase_memory_rejected(tmp_path):
     # plan: lowercase ok only ("2g", "512m") — uppercase must not silently pass.
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"memory": "2G"})
+    write_hardened(cr, hardened={"memory": "2G"})
     with pytest.raises(df_config.ConfigError, match="memory"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_low_pids_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"pids": 2})
+    write_hardened(cr, hardened={"pids": 2})
     with pytest.raises(df_config.ConfigError, match="pids"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_bool_pids_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened={"pids": True})
+    write_hardened(cr, hardened={"pids": True})
     with pytest.raises(df_config.ConfigError, match="pids"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_non_dict_block_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", hardened="oops")
+    write_hardened(cr, hardened="oops")
     with pytest.raises(df_config.ConfigError, match="hardened"):
         df_config.load_config(str(cr))
 
@@ -141,7 +156,7 @@ def test_autonomy_5_cooperative_rejected(tmp_path):
 
 def test_autonomy_5_with_hardened_ok_checkpoint_defaults_auto(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", autonomy=5)
+    write_hardened(cr, autonomy=5)
     cfg = df_config.load_config(str(cr))
     assert cfg["assurance"] == "hardened"
     assert cfg["_checkpoint"] == "auto"
@@ -156,7 +171,7 @@ def test_autonomy_3_rejected(tmp_path):
 
 def test_autonomy_string_five_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", autonomy="5")
+    write_hardened(cr, autonomy="5")
     with pytest.raises(df_config.ConfigError, match="autonomy"):
         df_config.load_config(str(cr))
 
@@ -183,14 +198,14 @@ def test_autonomy_absent_defaults_to_4_checkpoint_pause(tmp_path):
 
 def test_hardened_signing_explicit_false_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", audit={"signing": False})
+    write_hardened(cr, audit={"signing": False})
     with pytest.raises(df_config.ConfigError, match="signed audit"):
         df_config.load_config(str(cr))
 
 
 def test_hardened_audit_absent_defaults_signing_true(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened")
+    write_hardened(cr)
     cfg = df_config.load_config(str(cr))
     assert cfg["_audit"]["signing"] is True
     assert cfg["_audit"]["key_path"]
@@ -198,7 +213,7 @@ def test_hardened_audit_absent_defaults_signing_true(tmp_path):
 
 def test_hardened_signing_explicit_true_ok(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened", audit={"signing": True})
+    write_hardened(cr, audit={"signing": True})
     cfg = df_config.load_config(str(cr))
     assert cfg["_audit"]["signing"] is True
 
@@ -433,6 +448,109 @@ def test_container_none_on_resume_abort_manifest(tmp_path):
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "ABORTED_BY_HUMAN"
     assert m["container"] is None
+
+
+# ---------------------------------------------------------------------------
+# M10-2 review fixes: the adapter's directory is bind-mounted ro into the
+# builder container, so at hardened it must be an absolute existing file whose
+# directory is disjoint from the control root — at CONFIG time (layer 1) and
+# re-verified in the supervisor right before the mount (layer 2).
+# ---------------------------------------------------------------------------
+
+def test_hardened_adapter_inside_control_root_rejected(tmp_path):
+    cr = tmp_path / "control"
+    cr.mkdir(parents=True)
+    bad = cr / "adapter.py"
+    bad.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    write_config(cr, assurance="hardened",
+                 roles={"builder": {"adapter": str(bad), "timeout_s": 60}})
+    with pytest.raises(df_config.ConfigError, match="disjoint from the control root"):
+        df_config.load_config(str(cr))
+
+
+def test_hardened_bare_command_adapter_rejected(tmp_path):
+    # A bare command name has no dir component: realpath would resolve against
+    # the process CWD, mounting whatever directory the operator runs from.
+    cr = tmp_path / "control"
+    write_config(cr, assurance="hardened",
+                 roles={"builder": {"adapter": "claude", "timeout_s": 60}})
+    with pytest.raises(df_config.ConfigError, match="absolute path"):
+        df_config.load_config(str(cr))
+
+
+def test_hardened_relative_adapter_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="hardened",
+                 roles={"builder": {"adapter": "./scripts/adapter", "timeout_s": 60}})
+    with pytest.raises(df_config.ConfigError, match="absolute path"):
+        df_config.load_config(str(cr))
+
+
+def test_hardened_absolute_nonexistent_adapter_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="hardened",
+                 roles={"builder": {"adapter": str(tmp_path / "nope"), "timeout_s": 60}})
+    with pytest.raises(df_config.ConfigError, match="existing file"):
+        df_config.load_config(str(cr))
+
+
+def test_hardened_absolute_outside_adapter_ok(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="hardened",
+                 roles={"builder": {"adapter": VALID_ADAPTER, "timeout_s": 60}})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["roles"]["builder"]["adapter"] == VALID_ADAPTER
+
+
+def test_standard_bare_command_adapter_still_ok(tmp_path):
+    # No regression: outside hardened the adapter dir is never mounted, so
+    # bare command names stay legal.
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard",
+                 roles={"builder": {"adapter": "claude", "timeout_s": 60}})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["roles"]["builder"]["adapter"] == "claude"
+
+
+def test_hardened_flag_like_image_rejected_at_config(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr, hardened={"image": "--privileged"})
+    with pytest.raises(df_config.ConfigError, match="image"):
+        df_config.load_config(str(cr))
+
+
+def test_supervisor_guard_refuses_control_root_adapter_mount(tmp_path, monkeypatch):
+    # Layer 2 (defense in depth): even if a control-root-inside adapter slips
+    # past config validation (drift/TOCTOU), the supervisor must refuse to
+    # build the mount — SandboxError, and NEITHER build_argv NOR
+    # invoke_adapter is ever called.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    bad_adapter = cr / "evil_adapter"
+    bad_adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    bad_adapter.chmod(0o755)
+
+    real_load = supervisor.load_config
+
+    def sneaky_load(control_root):
+        cfg = real_load(control_root)  # loads as valid cooperative config
+        cfg["assurance"] = "hardened"  # mutate AFTER validation (simulates drift)
+        cfg["roles"]["builder"]["adapter"] = str(bad_adapter)
+        return cfg
+
+    monkeypatch.setattr(supervisor, "load_config", sneaky_load)
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    called = []
+    monkeypatch.setattr(supervisor.df_container, "build_argv",
+                        lambda *a, **k: called.append("build_argv") or ["docker"])
+    monkeypatch.setattr(
+        supervisor, "invoke_adapter",
+        lambda *a, **k: called.append("invoke_adapter")
+        or ({"adapter_protocol": "0.1", "status": "ok"}, None))
+
+    with pytest.raises(df_sandbox.SandboxError, match="adapter"):
+        supervisor.run(str(cr), None)
+    assert called == []  # refused BEFORE any docker argv was built or spawned
 
 
 def test_container_none_on_resume_accept_manifest(tmp_path):

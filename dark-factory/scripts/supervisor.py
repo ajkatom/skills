@@ -20,7 +20,7 @@ import df_sandbox
 import df_security
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
-from df_config import ConfigError, load_config
+from df_config import ConfigError, _disjoint, load_config
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
@@ -390,6 +390,9 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
                           reason=reason)
             sys.stderr.write("dark-factory: hardened tier UNavailable — DOWNGRADED to "
                              "cooperative (unqualified) by --allow-downgrade.\n")
+            # Intentionally (os_name, False), NOT (None, None) like a
+            # configured-cooperative run: here the backend was probed and
+            # FAILED, vs never probed at all — manifests keep that distinction.
             return ("cooperative", [], os_name, False)
         journal.write("PROBE_FAILED", requested="hardened", reason=reason)
         raise df_sandbox.SandboxError(
@@ -753,9 +756,20 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             # until M11).
             if effective == "hardened":
                 c = cfg["_container"]
+                adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
+                # Belt-and-suspenders (defense in depth against config drift /
+                # TOCTOU): df_config already rejects a hardened adapter whose
+                # directory overlaps the control root, but this dir is about to
+                # be bind-mounted into the builder container — re-verify at the
+                # moment of use rather than trusting the load-time check.
+                if not _disjoint(adapter_ro_dir, cfg["_control_root"]):
+                    raise df_sandbox.SandboxError(
+                        "hardened: refusing to mount the adapter directory — it "
+                        f"overlaps the control root ({adapter_ro_dir}); the "
+                        "holdout barrier would be breached by construction")
                 builder_prefix = df_container.build_argv(
                     c["image"], workspace,
-                    ro_mounts=[os.path.dirname(os.path.realpath(adapter))],
+                    ro_mounts=[adapter_ro_dir],
                     network=c["network"], memory=c["memory"], pids=c["pids"])
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="hardened",

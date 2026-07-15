@@ -18,7 +18,7 @@ Lives at `<control_root>/config.json`. JSON, not YAML: runtime is stdlib-only
 | `feedback` | str | must be `"ids"` in M1 |
 | `max_iterations` | int | 1..20 |
 | `workspace_root` | str | absolute path; must be disjoint from the control root |
-| `roles.builder.adapter` | str | path to a protocol-0.1 adapter executable. Shipped: `scripts/adapters/{claude,codex,gemini}`. The chosen model's CLI must be installed (no silent fallback — an absent CLI aborts the run). |
+| `roles.builder.adapter` | str | path to a protocol-0.1 adapter executable. Shipped: `scripts/adapters/{claude,codex,gemini}`. The chosen model's CLI must be installed (no silent fallback — an absent CLI aborts the run). **At `assurance: "hardened"`** it must additionally be an absolute path to an existing file whose directory is disjoint from the control root — that directory is bind-mounted ro into the builder container, so a bare command name (resolves against CWD) or a control-root-resident adapter would breach the holdout barrier and is a `ConfigError`; the supervisor re-verifies disjointness right before every mount (defense in depth). |
 | `roles.builder.timeout_s` | int | optional, default 600 |
 | `budget.billing` | str | `"api"` \| `"subscription"`. Default `"subscription"` (alert-only — dollars can't be metered). `"api"` enforces `budget.max_usd` via the per-call estimate. |
 | `budget.max_usd` | float | optional; must be > 0. Dollar cap; enforced only when `billing: "api"` and `budget.per_call_usd` is also set. If `max_usd` is set without `per_call_usd`, the cap is recorded but downgraded to alert-only (no authoritative usage estimate). |

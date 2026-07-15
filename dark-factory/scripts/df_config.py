@@ -71,6 +71,26 @@ def load_config(control_root: str) -> dict:
     adapter = builder.get("adapter")
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
+    if tier == "hardened":
+        # The adapter's DIRECTORY is bind-mounted ro into the builder container,
+        # so it must be pinned down at config time: a bare command name (e.g.
+        # "claude") would realpath against the process CWD (mounting whatever
+        # directory the operator happens to run from), and an adapter inside
+        # the control root would mount holdout content into the "isolated"
+        # builder. Both are mount-escape paths — reject at load.
+        adapter_path = os.path.expanduser(adapter)
+        if not os.path.isabs(adapter_path) or not os.path.isfile(adapter_path):
+            raise ConfigError(
+                "hardened requires roles.builder.adapter to be an absolute path "
+                "to an existing file (its directory is mounted into the container)"
+            )
+        adapter_dir = os.path.dirname(os.path.realpath(adapter_path))
+        if not _disjoint(adapter_dir, control_root):
+            raise ConfigError(
+                "hardened requires the roles.builder.adapter directory to be "
+                "disjoint from the control root (it would be mounted into the "
+                "builder container)"
+            )
 
     # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
     # (lights-off) is available only with a conforming hardened backend.
@@ -101,8 +121,13 @@ def load_config(control_root: str) -> dict:
         raise ConfigError("hardened must be a JSON object")
 
     c_image = hardened_raw.get("image", df_container.DEFAULT_IMAGE)
-    if not isinstance(c_image, str) or not c_image:
-        raise ConfigError("hardened.image must be a non-empty string")
+    if not isinstance(c_image, str) or not c_image or c_image.startswith("-"):
+        # Leading "-" could be parsed as a docker flag; df_container.build_argv
+        # rejects it too, but surfacing it lazily as a probe failure is a much
+        # worse operator experience than a load-time ConfigError.
+        raise ConfigError(
+            "hardened.image must be a non-empty string not starting with '-'"
+        )
     c_network = hardened_raw.get("network", "none")
     if c_network not in ("none", "bridge"):
         raise ConfigError("hardened.network must be 'none' or 'bridge'")
