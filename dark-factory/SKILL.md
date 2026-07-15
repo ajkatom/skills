@@ -29,6 +29,18 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
    `references/scenario-format.md`) **in a different session/subagent than any
    builder work**, deriving them ONLY from spec.md. Never echo scenario content
    into the main conversation if the same conversation will drive the builder.
+   - **dev vs final cohorts.** Each scenario carries an optional `"cohort"`
+     (default `"dev"`). `dev` scenarios are what the loop iterates against
+     every step — their pass/fail drives ID+taxonomy feedback back to the
+     builder. `"cohort":"final"` scenarios are the **sealed exam**: held out
+     of every iteration, run **exactly once** after dev fully converges, and
+     their results are **never fed back** — only their behavior-IDs (never
+     content) reach the journal/manifest. A final failure is terminal
+     (`FINAL_EXAM_FAILED`, exit 3): the artifact is rejected, not iterated on.
+     A control root with **no** `final` scenarios administers no sealed exam
+     at all — the manifest honestly records `final_exam.ran = false` so an
+     absent exam is never mistaken for a passed one. Author `final` scenarios
+     for the behaviors you most want protected from teaching-to-the-test.
 4. **Config.** Write `<control_root>/config.json` per
    `references/config-reference.md`.
    - **Choose the builder model.** Run
@@ -66,6 +78,11 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
 
 - Scenario files and their content NEVER enter: the builder prompt, the
   workspace, the main builder-driving conversation, or any feedback.
+- Never feed final-exam results back into the builder loop — a final
+  failure is terminal (`FINAL_EXAM_FAILED`), not another feedback round.
+- Never author `final` scenarios in a session that is also driving the
+  builder — same separation as step 3 for the dev cohort, and it matters
+  more here: `final` is the sealed exam that must stay unseen even by you.
 - Only the supervisor writes run state. Do not hand-edit `runs/`.
 - Secrets: never put credentials in config.json/spec.md/scenarios; the claude
   adapter uses your ambient login.
