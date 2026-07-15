@@ -264,11 +264,16 @@ def test_refusal_without_docker_then_allow_downgrade(tmp_path):
     # Second: --allow-downgrade -> converges at whatever tier the OS sandbox
     # actually supports on THIS host (not hardcoded — some CI hosts may lack
     # even the OS sandbox, in which case cooperative is the honest landing).
+    # Identify the second run by set-diff, NOT by sorting names: invocation ids
+    # have 1-second timestamp resolution + a random suffix, so back-to-back
+    # runs in the same second sort in random order (was a real flake).
+    runs_before = set(os.listdir(cr / "runs")) if (cr / "runs").exists() else set()
     proc2 = _run(cr, "run", "--allow-downgrade", env=env, timeout=240)
     assert proc2.returncode == 0, proc2.stderr
 
-    run_ids = sorted(os.listdir(cr / "runs"))
-    run_id = run_ids[-1]
+    new_runs = set(os.listdir(cr / "runs")) - runs_before
+    assert len(new_runs) == 1, f"expected exactly one new run, got {sorted(new_runs)}"
+    run_id = new_runs.pop()
     run_dir = cr / "runs" / run_id
 
     entries = _journal(cr, run_id)

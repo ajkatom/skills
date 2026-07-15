@@ -34,7 +34,10 @@ that actively tries to walk up from its workspace and glob for scenario files
 and a planted canary token finds **nothing** when run inside the hardened
 container — while the same fixture, run directly on the host (uncontained),
 does find and dump that content. The empty result is proof of denial, not an
-artifact of a broken probe.
+artifact of a broken probe. (Scope note: the snoop searches a bounded number
+of parent levels around the workspace, so it is an empirical complement — the
+**load-bearing** guarantee remains the structural mount-count assertion above,
+which catches any extra mount regardless of where it would appear.)
 
 ## Fail-closed, twice
 
