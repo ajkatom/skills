@@ -3,10 +3,12 @@ keychain, launcher env), gitignore/permission verification, and artifact
 redaction. Stdlib only.
 
 Fail-closed discipline: any uncertainty about resolving a credential raises
-CredsError. There is exactly one deliberate exception, documented at the call
-site in check_gitignored: when git itself is absent or the env-file's
-directory is not inside any git work tree, there is no repository to leak
-the file into, so verification passes.
+CredsError. There is exactly one deliberate exception, documented in
+check_gitignored: when git itself is genuinely absent (OSError launching it)
+or git cleanly reports the env-file's directory is not inside any work tree,
+there is no repository to leak the file into, so verification passes. Every
+other git failure (timeout, dubious ownership, permissions, corruption) is
+uncertainty and fails closed.
 """
 import os
 import subprocess
@@ -46,16 +48,19 @@ def parse_env_file(path: str) -> dict:
             continue
         if line.startswith("export "):
             line = line[len("export "):].strip()
+        # NOTE: malformed-line errors must NEVER include the line content —
+        # a malformed line is often a pasted bare token, and this message
+        # flows to stderr via the supervisor's credential-refusal path.
         if "=" not in line:
             raise CredsError(
-                f"{path}:{lineno}: malformed line (expected KEY=VALUE): {raw.strip()!r}"
+                f"{path}:{lineno}: malformed line (expected KEY=VALUE)"
             )
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
         if not key:
             raise CredsError(
-                f"{path}:{lineno}: malformed line (empty key): {raw.strip()!r}"
+                f"{path}:{lineno}: malformed line (expected KEY=VALUE)"
             )
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
@@ -69,44 +74,74 @@ def check_gitignored(path: str, runner=subprocess.run) -> None:
     If the file's directory is inside a git work tree: `git ls-files
     --error-unmatch` must FAIL (the file is not already tracked — tracking
     predates any gitignore rule and would still leak history), AND `git
-    check-ignore -q` must pass (the file is ignored). Not a work tree, or
-    git itself absent/unusable, is treated as OK: there is no repository
-    for the file to leak into. This is the one deliberate fail-open in this
-    module.
+    check-ignore -q` must pass (the file is ignored).
+
+    The ONLY fail-open cases are the ones where no repository exists to
+    leak through: git binary genuinely absent (OSError launching it), or
+    git cleanly reporting "not a git repository". Anything else that stops
+    us from answering — a hung git (timeout), dubious-ownership refusals,
+    permission errors, repo corruption — is uncertainty, and uncertainty
+    fails closed (CredsError).
     """
     abspath = os.path.abspath(path)
     directory = os.path.dirname(abspath)
+
+    def _git(argv):
+        # Once we know a work tree exists, every failure to answer is
+        # uncertainty and fails closed. A hung git (timeout) is uncertainty
+        # even before that — only a genuinely ABSENT git binary is safe.
+        try:
+            return runner(argv, capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            raise CredsError(
+                f"git timed out while verifying env-file {abspath} is "
+                f"git-ignored; fix git in {directory} before running"
+            )
+        except OSError as e:
+            raise CredsError(
+                f"git failed while verifying env-file {abspath} is "
+                f"git-ignored ({e.__class__.__name__}); fix git in "
+                f"{directory} before running"
+            )
 
     try:
         worktree = runner(
             ["git", "-C", directory, "rev-parse", "--is-inside-work-tree"],
             capture_output=True, text=True, timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return  # git absent/unusable — no repo to leak through
+    except OSError:
+        return  # git binary absent — no repo to leak through (documented)
+    except subprocess.TimeoutExpired:
+        raise CredsError(
+            f"git timed out while verifying env-file {abspath} is "
+            f"git-ignored; fix git in {directory} before running"
+        )
 
-    if worktree.returncode != 0 or worktree.stdout.strip() != "true":
-        return  # not inside a git work tree
+    if worktree.returncode != 0:
+        stderr = worktree.stderr or ""
+        if "not a git repository" in stderr.lower():
+            return  # cleanly outside any work tree — the documented fail-open
+        raise CredsError(
+            f"git could not determine whether env-file {abspath} is inside a "
+            f"work tree (exit {worktree.returncode}); fix git in {directory} "
+            f"(ownership/permissions/repository state) before running"
+        )
+    if worktree.stdout.strip() != "true":
+        return  # inside a .git dir, not a work tree — nothing checked out to leak
 
     # Tracked status must be checked BEFORE trusting check-ignore: git
     # deliberately reports an already-tracked path as "not ignored" (rc 1)
     # regardless of matching .gitignore patterns, since ignore rules never
     # apply to paths already in the index. Checking tracked status first
     # gives the more specific, more urgent diagnostic in that case.
-    tracked_result = runner(
-        ["git", "-C", directory, "ls-files", "--error-unmatch", abspath],
-        capture_output=True, text=True, timeout=10,
-    )
+    tracked_result = _git(["git", "-C", directory, "ls-files", "--error-unmatch", abspath])
     if tracked_result.returncode == 0:
         raise CredsError(
             f"env-file {abspath} is git-TRACKED; remove it from the index "
             f"(git rm --cached) and gitignore it"
         )
 
-    ignore_result = runner(
-        ["git", "-C", directory, "check-ignore", "-q", abspath],
-        capture_output=True, text=True, timeout=10,
-    )
+    ignore_result = _git(["git", "-C", directory, "check-ignore", "-q", abspath])
     if ignore_result.returncode != 0:
         raise CredsError(
             f"env-file {abspath} is inside a git repository but not git-ignored; "
@@ -216,7 +251,11 @@ class Redactor:
 
     def redact_obj(self, obj):
         if isinstance(obj, dict):
-            return {k: self.redact_obj(v) for k, v in obj.items()}
+            # Keys are a leak surface too (e.g. {token: "seen at ..."}).
+            return {
+                (self.redact(k) if isinstance(k, str) else k): self.redact_obj(v)
+                for k, v in obj.items()
+            }
         if isinstance(obj, list):
             return [self.redact_obj(v) for v in obj]
         if isinstance(obj, tuple):

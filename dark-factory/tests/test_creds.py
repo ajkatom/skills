@@ -82,6 +82,31 @@ def test_parse_env_file_empty_key_is_malformed(tmp_path):
     assert "1" in str(exc.value)
 
 
+def test_parse_env_file_malformed_line_never_leaks_content(tmp_path):
+    # A malformed line is often a pasted bare token; the error message must
+    # carry only path + line number, never any part of the line content.
+    token = "sk-FAKE-secret-token-a1b2c3d4e5f6"
+    p = tmp_path / "secrets.env"
+    _write_env_file(p, f"GOOD=ok\n{token}\n")
+    with pytest.raises(CredsError) as exc:
+        parse_env_file(str(p))
+    msg = str(exc.value)
+    assert token not in msg
+    assert "a1b2c3d4e5f6" not in msg
+    assert "2" in msg  # line number still present
+
+
+def test_parse_env_file_empty_key_never_leaks_content(tmp_path):
+    token = "sk-FAKE-other-token-z9y8x7w6"
+    p = tmp_path / "secrets.env"
+    _write_env_file(p, f"={token}\n")
+    with pytest.raises(CredsError) as exc:
+        parse_env_file(str(p))
+    msg = str(exc.value)
+    assert token not in msg
+    assert "z9y8x7w6" not in msg
+
+
 def test_parse_env_file_missing_file(tmp_path):
     p = tmp_path / "nope.env"
     with pytest.raises(CredsError):
@@ -152,6 +177,76 @@ def test_check_gitignored_git_absent_ok(tmp_path):
         raise OSError("git binary not found")
 
     check_gitignored(str(envfile), runner=fake_runner)  # must not raise
+
+
+def test_check_gitignored_revparse_timeout_fails_closed(tmp_path):
+    envfile = tmp_path / "secrets.env"
+    envfile.write_text("FOO=bar\n")
+
+    def fake_runner(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+
+    with pytest.raises(CredsError):
+        check_gitignored(str(envfile), runner=fake_runner)
+
+
+def test_check_gitignored_not_a_repo_stderr_ok(tmp_path):
+    envfile = tmp_path / "secrets.env"
+    envfile.write_text("FOO=bar\n")
+
+    def fake_runner(argv, **kwargs):
+        assert "rev-parse" in argv
+        return _FakeResult(
+            returncode=128,
+            stderr="fatal: not a git repository (or any of the parent directories): .git\n",
+        )
+
+    check_gitignored(str(envfile), runner=fake_runner)  # must not raise
+
+
+def test_check_gitignored_dubious_ownership_fails_closed(tmp_path):
+    envfile = tmp_path / "secrets.env"
+    envfile.write_text("FOO=bar\n")
+
+    def fake_runner(argv, **kwargs):
+        return _FakeResult(
+            returncode=128,
+            stderr="fatal: detected dubious ownership in repository\n",
+        )
+
+    with pytest.raises(CredsError) as exc:
+        check_gitignored(str(envfile), runner=fake_runner)
+    assert "fix git" in str(exc.value)
+
+
+def test_check_gitignored_lsfiles_oserror_fails_closed(tmp_path):
+    # Once we KNOW we are in a work tree, any failure of the follow-up git
+    # calls is uncertainty and must fail closed (unlike the initial probe).
+    envfile = tmp_path / "secrets.env"
+    envfile.write_text("FOO=bar\n")
+
+    def fake_runner(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _FakeResult(returncode=0, stdout="true\n")
+        raise OSError("git vanished mid-check")
+
+    with pytest.raises(CredsError):
+        check_gitignored(str(envfile), runner=fake_runner)
+
+
+def test_check_gitignored_checkignore_timeout_fails_closed(tmp_path):
+    envfile = tmp_path / "secrets.env"
+    envfile.write_text("FOO=bar\n")
+
+    def fake_runner(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _FakeResult(returncode=0, stdout="true\n")
+        if "ls-files" in argv:
+            return _FakeResult(returncode=1)  # not tracked
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+
+    with pytest.raises(CredsError):
+        check_gitignored(str(envfile), runner=fake_runner)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +423,31 @@ def test_redactor_non_str_input_returned_unchanged():
     r = Redactor(["longenoughvalue"])
     assert r.redact(12345) == 12345
     assert r.redact(None) is None
+
+
+def test_redactor_redact_obj_redacts_dict_keys():
+    secret = "supersecretvalue123"
+    r = Redactor([secret])
+    obj = {f"token {secret} seen": "at 12:00", "clean_key": secret, 42: secret}
+    redacted = r.redact_obj(obj)
+    assert redacted == {
+        "token ***REDACTED*** seen": "at 12:00",
+        "clean_key": "***REDACTED***",
+        42: "***REDACTED***",
+    }
+    assert not any(secret in k for k in redacted if isinstance(k, str))
+
+
+def test_redactor_regex_metacharacter_values_replaced_literally():
+    # Pin the literal str.replace guarantee: metacharacters must not be
+    # interpreted as a pattern, and must still be fully redacted.
+    secret = "p@$$w(o)rd.+123"
+    r = Redactor([secret])
+    text = f"login with {secret} now"
+    assert r.redact(text) == "login with ***REDACTED*** now"
+    # A string that would MATCH the secret if it were a regex must be untouched.
+    lookalike = "p@$$wXoYrdZZ123"
+    assert r.redact(lookalike) == lookalike
 
 
 def test_redactor_redact_obj_nested_shape_preserved():
