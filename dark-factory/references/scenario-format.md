@@ -28,3 +28,16 @@ taxonomy is leak-resistant, not diagnostic.
 
 The versioned IR + this runner contract is the seam where M2+ swaps in
 richer backends (spec section 5.1) without redesign.
+
+**Discrimination requirement (M7):** a scenario's `then` must be
+*discriminating* — it must reject a deliberately-wrong observation, not
+just accept the right one. A tautological check (e.g.
+`{"stdout_contains": ""}`, which matches any stdout) passes regardless
+of what the build actually does, so a green run against it proves
+nothing. Before a build starts, every scenario's `then` is
+mutation-validated (`df_gates.is_discriminating`): it is evaluated
+against a constructed adversarial mutant observation
+(`exit_code` off-by-one, `stdout`/`stderr` replaced with a fixed
+marker string), and must reject it. Any scenario whose `then` fails to
+reject the mutant (`df_gates.validate_oracle`) is inert and aborts the
+run before the builder is invoked (fail-closed pre-build gate).
