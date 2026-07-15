@@ -122,6 +122,14 @@ def test_build_argv_relative_workspace_raises(tmp_path, monkeypatch):
         df_container.build_argv("img", "ws", [])
 
 
+def test_build_argv_flag_like_or_empty_image_raises(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for bad in ("--privileged", "-x", ""):
+        with pytest.raises(df_container.ContainerError):
+            df_container.build_argv(bad, str(ws), [])
+
+
 # ---------------------------------------------------------------------------
 # docker_available — injected fake runners
 # ---------------------------------------------------------------------------
@@ -265,6 +273,18 @@ def test_probe_container_canary_removed_even_on_exception(tmp_path):
 # ---------------------------------------------------------------------------
 
 DOCKER_LIVE = df_container.docker_available()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _prepull_image():
+    """Idempotent pre-pull so the first live test never absorbs a cold image
+    download inside its own (tighter) timeout. No-op when docker is absent."""
+    if DOCKER_LIVE:
+        subprocess.run(
+            ["docker", "pull", "-q", df_container.DEFAULT_IMAGE],
+            capture_output=True, timeout=600,
+        )
+    yield
 
 
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")

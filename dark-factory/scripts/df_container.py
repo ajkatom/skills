@@ -64,6 +64,11 @@ def build_argv(image, workspace, ro_mounts, *, network="none", memory="2g",
     absolute after realpath, or contains ':'. df_container does not know the
     control root — the CALLER guarantees the control root is never passed as a
     mount; nothing else can appear in the resulting -v flags."""
+    if not isinstance(image, str) or not image or image.startswith("-"):
+        raise ContainerError(
+            f"image must be a non-empty string not starting with '-' "
+            f"(got {image!r}); a leading '-' could be parsed as a docker flag"
+        )
     ws = _resolve_mount_path(workspace, "workspace")
     real_ro_mounts = sorted({
         _resolve_mount_path(p, "ro_mount") for p in (ro_mounts or [])
