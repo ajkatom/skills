@@ -16,6 +16,7 @@ import df_audit
 import df_gates
 import df_kb
 import df_sandbox
+import df_security
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
@@ -189,6 +190,29 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
         "enforced": bool(dollar_enforced or calls_enforced),
         "estimate_caveat": "estimated from per_call_usd; not metered usage",
     }
+
+
+def _run_security_gates(cfg, journal, run_dir, workspace):
+    """Run mandatory security gates (M9) on the converged artifact, if enabled.
+
+    Shared by BOTH the primary run() path and resume()'s continue path,
+    since both funnel through _run_loop's CONVERGED branch — there is only
+    one call site, so "gates run on resume exactly like the primary path"
+    falls out for free rather than needing a second wiring.
+
+    Disabled (default, back-compatible): returns {"checked": False} with no
+    journal entry and no security_report.json written. Enabled: runs
+    df_security.run_gates over the workspace, writes security_report.json
+    into run_dir (control plane — the report is about the artifact, not
+    holdout content), and journals SECURITY_GATES(checked=True, failed=...).
+    """
+    sec_cfg = cfg["_security"]
+    if not sec_cfg.get("enabled"):
+        return {"checked": False}
+    sec_report = df_security.run_gates(workspace, sec_cfg)
+    atomic_write(os.path.join(run_dir, "security_report.json"), canonical_json(sec_report))
+    journal.write("SECURITY_GATES", checked=True, failed=sec_report["failed"])
+    return sec_report
 
 
 def _load_audit_key(cfg, journal):
@@ -438,6 +462,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                  security={"checked": False},
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
@@ -455,6 +480,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   oracle={"mutation_validated": False, "inert": inert},
                   coverage={"checked": False},
+                  security={"checked": False},
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
@@ -480,6 +506,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                       final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                       oracle={"mutation_validated": True, "inert": []}, coverage=cov,
+                      security={"checked": False},
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
@@ -494,6 +521,10 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     journal.write("GATE_PASSED", coverage_checked=cov["checked"], scenarios=len(scenarios))
     manifest_base["coverage"] = cov
     manifest_base["oracle"] = {"mutation_validated": True, "inert": []}
+    # M9 default: {"checked": False} threads into every terminal manifest via
+    # mb_clean unless the CONVERGED path overrides it with the real gate
+    # report (gates only run after dev converges + final exam passes).
+    manifest_base["security"] = {"checked": False}
 
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
@@ -764,12 +795,30 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           f"scenarios not disclosed). Run: {run_dir}")
                     return 3
 
-                # dev converged AND (final passed OR no final cohort):
+                # dev converged AND (final passed OR no final cohort): mandatory
+                # security gates (M9) run HERE, on the converged artifact,
+                # independent of scenario pass — a clean scenario run with a
+                # planted secret still must not ship. AFTER the final exam,
+                # BEFORE CONVERGED is declared.
+                sec_report = _run_security_gates(cfg, journal, run_dir, workspace)
+                if sec_report.get("failed"):
+                    journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
+                    mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
+                              qualified=False, final_exam=fe, regressions=sorted(regressed),
+                              security=sec_report,
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                    finalize_manifest(run_dir, mf, audit_key=audit_key)
+                    _clear_state()
+                    _kb_writeback(cfg, journal, mf, [])
+                    print(f"dark-factory: security gate failed (artifact rejected): "
+                          f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
+                    return 3
+
                 journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
-                          regressions=sorted(regressed),
+                          regressions=sorted(regressed), security=sec_report,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
@@ -881,6 +930,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             cov, oracle = {"checked": False}, {"mutation_validated": False, "inert": []}
         manifest_base["coverage"] = cov
         manifest_base["oracle"] = oracle
+        # M9 default (same reasoning as _run_locked): overridden on a
+        # resumed-converge by _run_loop's CONVERGED branch, which is the
+        # SAME code both run() and resume() funnel through.
+        manifest_base["security"] = {"checked": False}
 
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")

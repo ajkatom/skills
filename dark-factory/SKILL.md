@@ -81,11 +81,25 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      enforced under any billing. See `references/budget.md` for the full model
      (85% alert, 100% phase-boundary pause, raise-and-resume) and its honest caveat:
      dollars are an **estimate**, not metered usage.
+   - **Security gates (optional, recommended).** Set `security_gates.enabled: true` to
+     run a mandatory secret scan + dangerous-pattern scan + SBOM (plus any configured
+     external tool, e.g. `bandit`/`semgrep`) on the **converged artifact**, once, after
+     the final exam passes and before `CONVERGED` — **independent of scenario
+     pass-rate**: because no human reviews the built code, a fully-passing build with a
+     planted secret still gets rejected. A finding on a `fail_on` gate (default
+     `["secret_scan", "dangerous_scan"]`) makes the run terminal `SECURITY_GATE_FAILED`
+     (exit 3, never qualified) — the artifact is rejected, not iterated on. See
+     `references/security-gates.md` for the built-ins, the external-gate interface,
+     and the honest heuristic/floor caveat (false positives are the safe direction;
+     false negatives mean it's a floor, not a proof).
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
-   Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error
-   (**including a pre-build gate failure** — coverage gap or inert scenario;
-   `GATE_FAILED`, no build ever ran, see `references/coverage-gates.md`) ·
+   Exit 0 = converged/accepted · 3 = a non-converged terminal a human must evaluate
+   (`CAP_REACHED`, `FINAL_EXAM_FAILED`, or **`SECURITY_GATE_FAILED`** — the converged
+   artifact tripped a mandatory security gate, see `references/security-gates.md`) ·
+   2 = config/build/abort error (**including a pre-build gate failure** — coverage gap
+   or inert scenario; `GATE_FAILED`, no build ever ran, see
+   `references/coverage-gates.md`) ·
    **10 = paused** — either at a checkpoint (autonomy 4 / `checkpoint: pause`) or at a
    **budget cap** (`journal` has `BUDGET_PAUSE`; fires even at `checkpoint: auto`).
 6. **At a checkpoint (exit 10).** Show the user `runs/<id>/checkpoint_iter_N.md` (per-behavior
@@ -117,6 +131,7 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
   adapter uses your ambient login.
 - A **cooperative** run is always UNQUALIFIED — say so. A **standard** run is qualified ONLY when its startup denial probe passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value.
 - Signed audit is opt-in (`audit.signing: true` in config); verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
+- Security gates are opt-in (`security_gates.enabled: true`) but, once enabled, mandatory and fail-closed: a `fail_on` finding on the converged artifact rejects it (`SECURITY_GATE_FAILED`, exit 3) even when every scenario passed. Report the manifest's `security` field honestly — `checked: false` means gates never ran, not that the artifact is clean.
 
 ## Composing with other skills (control-plane only)
 
@@ -141,6 +156,7 @@ or reveal holdout scenarios in a session that will also drive the builder.
 
 - `references/config-reference.md` — config schema
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
+- `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
