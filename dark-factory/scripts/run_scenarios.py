@@ -70,6 +70,25 @@ def _norm(s: str) -> str:
     return s[:-1] if s.endswith("\n") else s
 
 
+def evaluate_then(then: dict, observed: dict) -> str | None:
+    """Pure assertion evaluator: returns the failure taxonomy or None (pass).
+
+    `observed` has keys exit_code (int|None), stdout (str), stderr (str).
+    Priority: exit_code is checked before output assertions. Equality
+    assertions strip one trailing newline from both sides (see _norm).
+    """
+    if "exit_code" in then and observed["exit_code"] != then["exit_code"]:
+        return "wrong_exit_code"
+    if (
+        ("stdout_equals" in then and _norm(observed["stdout"]) != _norm(then["stdout_equals"]))
+        or ("stdout_contains" in then and then["stdout_contains"] not in observed["stdout"])
+        or ("stderr_equals" in then and _norm(observed["stderr"]) != _norm(then["stderr_equals"]))
+        or ("stderr_contains" in then and then["stderr_contains"] not in observed["stderr"])
+    ):
+        return "wrong_output"
+    return None
+
+
 def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None) -> dict:
     timeout = sc["when"].get("timeout_s", 30)
     observed = {"exit_code": None, "stdout": "", "stderr": ""}
@@ -98,16 +117,7 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env
         taxonomy = "crash"
 
     if taxonomy is None:
-        then = sc["then"]
-        if "exit_code" in then and observed["exit_code"] != then["exit_code"]:
-            taxonomy = "wrong_exit_code"
-        elif (
-            ("stdout_equals" in then and _norm(observed["stdout"]) != _norm(then["stdout_equals"]))
-            or ("stdout_contains" in then and then["stdout_contains"] not in observed["stdout"])
-            or ("stderr_equals" in then and _norm(observed["stderr"]) != _norm(then["stderr_equals"]))
-            or ("stderr_contains" in then and then["stderr_contains"] not in observed["stderr"])
-        ):
-            taxonomy = "wrong_output"
+        taxonomy = evaluate_then(sc["then"], observed)
 
     return {
         "id": sc["id"],

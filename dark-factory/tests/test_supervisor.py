@@ -68,7 +68,8 @@ def test_converging_run_exits_zero_and_journals(tmp_path):
     assert rc == 0
     entries, _ = read_journal(cr)
     states = [e["state"] for e in entries]
-    assert states[0] == "INIT" and states[1] == "SNAPSHOT"
+    # M7: the pre-build gate (GATE_PASSED) now runs between INIT and SNAPSHOT.
+    assert states[0] == "INIT" and states[1] == "GATE_PASSED" and states[2] == "SNAPSHOT"
     assert "CONVERGED" in states and states[-1] == "CONVERGED"
     # two iterations: buggy then fixed
     assert states.count("BUILD") == 2 and states.count("FEEDBACK") == 1
