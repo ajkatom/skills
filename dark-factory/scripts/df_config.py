@@ -158,6 +158,86 @@ def load_config(control_root: str) -> dict:
     if not isinstance(notification_sink, str):
         raise ConfigError("budget.notification_sink must be a str")
 
+    sg_raw = raw.get("security_gates", {})
+    if not isinstance(sg_raw, dict):
+        raise ConfigError("security_gates must be a JSON object")
+    sg_enabled = sg_raw.get("enabled", False)
+    if not isinstance(sg_enabled, bool):
+        raise ConfigError("security_gates.enabled must be a bool")
+
+    if sg_enabled:
+
+        def _bool_default(key, default):
+            val = sg_raw.get(key, default)
+            if not isinstance(val, bool):
+                raise ConfigError(f"security_gates.{key} must be a bool")
+            return val
+
+        sg_secret_scan = _bool_default("secret_scan", True)
+        sg_dangerous_scan = _bool_default("dangerous_scan", True)
+        sg_sbom = _bool_default("sbom", True)
+        sg_strict_unavailable = _bool_default("strict_unavailable", True)
+
+        sg_external_raw = sg_raw.get("external", [])
+        if not isinstance(sg_external_raw, list):
+            raise ConfigError("security_gates.external must be a list")
+        sg_external = []
+        external_names = set()
+        _reserved = {"secret_scan", "dangerous_scan", "sbom"}
+        for entry in sg_external_raw:
+            if not isinstance(entry, dict):
+                raise ConfigError("security_gates.external entries must be objects")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise ConfigError(
+                    "security_gates.external entries require a non-empty 'name'"
+                )
+            if name in _reserved:
+                raise ConfigError(
+                    f"security_gates.external name {name!r} collides with a reserved "
+                    f"built-in gate name (reserved: {sorted(_reserved)})"
+                )
+            if name in external_names:
+                raise ConfigError(
+                    f"security_gates.external has a duplicate gate name {name!r}"
+                )
+            cmd = entry.get("cmd")
+            if (
+                not isinstance(cmd, list)
+                or not cmd
+                or not all(isinstance(c, str) for c in cmd)
+            ):
+                raise ConfigError(
+                    f"security_gates.external {name!r} 'cmd' must be a non-empty list of str"
+                )
+            sg_external.append({"name": name, "cmd": list(cmd)})
+            external_names.add(name)
+
+        sg_fail_on_raw = sg_raw.get("fail_on", ["secret_scan", "dangerous_scan"])
+        if not isinstance(sg_fail_on_raw, list) or not all(
+            isinstance(n, str) for n in sg_fail_on_raw
+        ):
+            raise ConfigError("security_gates.fail_on must be a list of str")
+        known_gates = {"secret_scan", "dangerous_scan", "sbom"} | external_names
+        for name in sg_fail_on_raw:
+            if name not in known_gates:
+                raise ConfigError(
+                    f"security_gates.fail_on references unknown gate {name!r} "
+                    f"(known: {sorted(known_gates)})"
+                )
+
+        cfg_security = {
+            "enabled": True,
+            "secret_scan": sg_secret_scan,
+            "dangerous_scan": sg_dangerous_scan,
+            "sbom": sg_sbom,
+            "external": sg_external,
+            "fail_on": list(sg_fail_on_raw),
+            "strict_unavailable": sg_strict_unavailable,
+        }
+    else:
+        cfg_security = {"enabled": False}
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -165,6 +245,7 @@ def load_config(control_root: str) -> dict:
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["_audit"] = {"signing": audit_signing, "key_path": audit_key_path if audit_signing else ""}
+    cfg["_security"] = cfg_security
     cfg["_budget"] = {
         "billing": billing,
         "max_usd": max_usd,

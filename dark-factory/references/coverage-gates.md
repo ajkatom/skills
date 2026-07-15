@@ -104,10 +104,11 @@ On a full pass, the supervisor journals `GATE_PASSED(coverage_checked=...,
 scenarios=<count>)` and threads `coverage` + `oracle: {"mutation_validated":
 true, "inert": []}` into every subsequent terminal manifest for that run —
 `COMPLETE_QUALIFIED`/`COMPLETE_UNQUALIFIED`, `CAP_REACHED`,
-`FINAL_EXAM_FAILED`, `ABORTED_BUILD_ERROR`, and (via `resume`)
-`ACCEPTED_WAIVED`/`ABORTED_BY_HUMAN`. Every terminal manifest from a run
-carries `coverage` and `oracle`, so an auditor never has to guess whether
-either gate ran.
+`FINAL_EXAM_FAILED`, `SECURITY_GATE_FAILED`, `ABORTED_BUILD_ERROR`, and (via
+`resume`) `ACCEPTED_WAIVED`/`ABORTED_BY_HUMAN`. Every terminal manifest from a
+run carries `coverage` and `oracle`, so an auditor never has to guess whether
+either gate ran. (M9 adds a `security` field threaded the same way — see
+`references/security-gates.md`.)
 
 **Resume does not re-gate.** The gate runs once, in `run`, before the
 first iteration. A paused-and-resumed run already passed it; re-running it

@@ -78,8 +78,8 @@ the run. `max_calls`, if also set, is unaffected and still enforces exactly.
 ## Manifest `budget` field
 
 Every terminal manifest (`COMPLETE_QUALIFIED`/`COMPLETE_UNQUALIFIED`, `CAP_REACHED`,
-`GATE_FAILED`, `ABORTED_BUILD_ERROR`, `FINAL_EXAM_FAILED`, `ABORTED_BY_HUMAN`,
-`ACCEPTED_WAIVED`) carries:
+`GATE_FAILED`, `ABORTED_BUILD_ERROR`, `FINAL_EXAM_FAILED`, `SECURITY_GATE_FAILED`,
+`ABORTED_BY_HUMAN`, `ACCEPTED_WAIVED`) carries:
 
 ```json
 "budget": {
