@@ -49,8 +49,11 @@ in any of them.
 Scans `*.py` files for five negative-security-invariant patterns:
 `eval_exec` (`eval(`/`exec(`), `os_system` (`os.system(`), `shell_true`
 (`shell=True`, e.g. on `subprocess.run`), `pickle_loads`
-(`pickle.loads(`), `yaml_unsafe` (`yaml.load(` without an explicit
-`Loader=yaml.SafeLoader`). These are patterns that are *usually* a red
+(`pickle.loads(`), `yaml_unsafe` (**every** `yaml.load(` call — the rule
+deliberately does not special-case `Loader=yaml.SafeLoader`, because a
+line-scoped regex can't see a `Loader=` on another line; flagging safe
+loads too is the accepted false-positive direction for a mandatory gate).
+These are patterns that are *usually* a red
 flag (arbitrary code execution, shell injection, insecure deserialization)
 even though each has legitimate uses — see Honest scope below.
 
