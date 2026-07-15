@@ -10,6 +10,7 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 
 
 class ConfigError(ValueError):
@@ -385,6 +386,70 @@ def load_config(control_root: str) -> dict:
     else:
         cfg_credentials = None
 
+    # Optional `brownfield` block -> cfg["_brownfield"] (M15): mode + the
+    # human-curated probe set the supervisor characterizes BEFORE the
+    # builder touches anything. Absent -> {"mode": "auto", "probes": []},
+    # byte-identical to today's greenfield-only behavior (df_brownfield
+    # .detect_mode("auto", None, None) == "greenfield").
+    bf_raw = raw.get("brownfield", {})
+    if not isinstance(bf_raw, dict):
+        raise ConfigError("brownfield must be a JSON object")
+
+    bf_mode = bf_raw.get("mode", "auto")
+    if bf_mode not in ("auto", "greenfield", "brownfield"):
+        raise ConfigError(
+            f"brownfield.mode must be one of 'auto', 'greenfield', 'brownfield', got {bf_mode!r}"
+        )
+
+    bf_probes_raw = bf_raw.get("probes", [])
+    if not isinstance(bf_probes_raw, list):
+        raise ConfigError("brownfield.probes must be a list")
+
+    bf_probes = []
+    seen_probe_ids = set()
+    for probe in bf_probes_raw:
+        if not isinstance(probe, dict):
+            raise ConfigError(f"brownfield.probes entries must be objects: {probe!r}")
+
+        pid = probe.get("id")
+        if not isinstance(pid, str) or not _PROBE_ID_RE.match(pid):
+            raise ConfigError(
+                f"brownfield.probes id must match {_PROBE_ID_RE.pattern!r}: {pid!r}"
+            )
+        if pid in seen_probe_ids:
+            raise ConfigError(f"brownfield.probes has a duplicate id: {pid}")
+        seen_probe_ids.add(pid)
+
+        run = probe.get("run")
+        if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
+            raise ConfigError(f"brownfield.probes {pid!r}: run must be a non-empty list of strings")
+
+        timeout_s = probe.get("timeout_s")
+        if (
+            not isinstance(timeout_s, int)
+            or isinstance(timeout_s, bool)
+            or not (1 <= timeout_s <= 120)
+        ):
+            raise ConfigError(f"brownfield.probes {pid!r}: timeout_s must be an int in 1..120")
+
+        bf_probes.append({"id": pid, "run": list(run), "timeout_s": timeout_s})
+
+    # Brownfield with nothing to characterize is a no-op that would falsely
+    # claim regression coverage; greenfield with probes configured is
+    # contradictory (the human is both overriding detection AND asking for
+    # characterization) -- both are load-time refusals, not silent no-ops.
+    if bf_mode == "brownfield" and not bf_probes:
+        raise ConfigError(
+            "brownfield.mode 'brownfield' requires >=1 probe (nothing to characterize)"
+        )
+    if bf_mode == "greenfield" and bf_probes:
+        raise ConfigError(
+            "brownfield.probes is not allowed when brownfield.mode is 'greenfield' "
+            "(contradictory: greenfield explicitly skips characterization)"
+        )
+
+    cfg_brownfield = {"mode": bf_mode, "probes": bf_probes}
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -405,4 +470,5 @@ def load_config(control_root: str) -> dict:
         "notification_sink": notification_sink,
     }
     cfg["_credentials"] = cfg_credentials
+    cfg["_brownfield"] = cfg_brownfield
     return cfg

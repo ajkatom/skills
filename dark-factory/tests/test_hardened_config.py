@@ -339,10 +339,11 @@ def test_builder_wiring_docker_prefix_no_control_root_mount(tmp_path, monkeypatc
     real_run_all = supervisor.run_all
 
     def fake_run_all(scenarios_dir, workspace, exec_wrapper=None, env_extra=None, cohort=None,
-                     observer_files=None):
+                     observer_files=None, extra_scenarios_dir=None):
         captured_verify.append(list(exec_wrapper) if exec_wrapper else [])
         return real_run_all(scenarios_dir, workspace, exec_wrapper=exec_wrapper,
-                            env_extra=env_extra, cohort=cohort, observer_files=observer_files)
+                            env_extra=env_extra, cohort=cohort, observer_files=observer_files,
+                            extra_scenarios_dir=extra_scenarios_dir)
 
     monkeypatch.setattr(supervisor, "run_all", fake_run_all)
 
