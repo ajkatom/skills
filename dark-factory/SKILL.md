@@ -41,6 +41,19 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      at all — the manifest honestly records `final_exam.ran = false` so an
      absent exam is never mistaken for a passed one. Author `final` scenarios
      for the behaviors you most want protected from teaching-to-the-test.
+   - **Declare behaviors (`behaviors.json`, recommended).** Author
+     `<control_root>/behaviors.json` from the spec's BHV list — one entry
+     per behavior ID (see `references/coverage-gates.md` for the schema).
+     This makes coverage a **hard, fail-closed pre-build gate**: before the
+     builder is ever invoked, the supervisor rejects a run whose scenarios
+     leave any declared behavior without a `dev` scenario, or whose
+     scenarios reference a behavior ID never declared (orphan). It also
+     mutation-validates every scenario's `then` regardless of
+     `behaviors.json` — an inert/tautological check (e.g.
+     `{"stdout_contains": ""}`, which matches any output) fails the gate
+     too. Either failure aborts the run (exit 2, `GATE_FAILED`, no build
+     ever runs). No `behaviors.json` → coverage is skipped, honestly
+     recorded in the manifest as `coverage.checked = false`.
 4. **Config.** Write `<control_root>/config.json` per
    `references/config-reference.md`.
    - **Choose the builder model.** Run
@@ -62,7 +75,9 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      unless you pass `run --allow-downgrade` (→ cooperative, unqualified).
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
-   Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error ·
+   Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error
+   (**including a pre-build gate failure** — coverage gap or inert scenario;
+   `GATE_FAILED`, no build ever ran, see `references/coverage-gates.md`) ·
    **10 = paused at a checkpoint** (autonomy 4 / `checkpoint: pause`).
 6. **At a checkpoint (exit 10).** Show the user `runs/<id>/checkpoint_iter_N.md` (per-behavior
    pass/fail — no scenario text). Then, on their decision, run:
@@ -114,4 +129,5 @@ or reveal holdout scenarios in a session that will also drive the builder.
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
+- `references/coverage-gates.md` — behaviors.json schema + the fail-closed pre-build coverage/mutation gates (M7)
 - `references/role-adapters.md` — adapter protocol

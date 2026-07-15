@@ -13,13 +13,14 @@ import sys
 import uuid
 
 import df_audit
+import df_gates
 import df_kb
 import df_sandbox
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import ConfigError, load_config
 from id_feedback import project_feedback
-from run_scenarios import OracleError, run_all
+from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
 
 BUILDER_RULES = """## Builder rules
@@ -385,6 +386,73 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
     }
 
+    # --- Pre-build gate (M7): mutation validation + coverage traceability,
+    # entirely control-plane, BEFORE any builder invocation — a gate failure
+    # journals + finalizes a GATE_FAILED manifest and returns 2 with no build
+    # ever run. Fresh run ONLY: a resumed run already passed this gate once;
+    # resume() recomputes the same deterministic coverage/oracle fields for
+    # its manifests instead of re-running (and re-failing) the gate.
+    try:
+        scenarios = load_scenarios(scenarios_dir)
+    except OracleError as e:
+        journal.write("ABORTED_BUILD_ERROR", iteration=0, detail=f"invalid scenarios: {e}")
+        mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
+                  sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                  final_exam={"ran": False, "passed": None, "count": 0}, regressions=[])
+        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        _kb_writeback(cfg, journal, mf, [])
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+
+    # Mutation validation first (order matters: an inert oracle is a more
+    # fundamental defect than a coverage gap, and coverage hasn't been
+    # computed yet, so its manifest field is honestly {"checked": False}).
+    inert = df_gates.validate_oracle(scenarios)
+    if inert:
+        journal.write("ORACLE_GATE_FAILED", inert=inert)
+        mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
+                  sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                  final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                  oracle={"mutation_validated": False, "inert": inert},
+                  coverage={"checked": False})
+        finalize_manifest(run_dir, mf, audit_key=audit_key)
+        _kb_writeback(cfg, journal, mf, [])
+        sys.stderr.write(
+            f"dark-factory: pre-build gate FAILED — {len(inert)} inert (non-discriminating) "
+            f"scenario oracle(s), no build was run: {', '.join(inert)}\n"
+        )
+        return 2
+
+    try:
+        behaviors = df_gates.load_behaviors(control_root)
+    except df_gates.GateError as e:
+        journal.write("GATE_ERROR", detail=str(e))
+        sys.stderr.write(f"dark-factory: behaviors.json error: {e}\n")
+        return 2
+
+    if behaviors is not None:
+        cov = df_gates.check_coverage(behaviors, scenarios)
+        if cov["uncovered_dev"] or cov["orphan_scenarios"]:
+            journal.write("COVERAGE_GATE_FAILED", uncovered=cov["uncovered_dev"],
+                          orphans=cov["orphan_scenarios"])
+            mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                      final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                      oracle={"mutation_validated": True, "inert": []}, coverage=cov)
+            finalize_manifest(run_dir, mf, audit_key=audit_key)
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(
+                f"dark-factory: pre-build gate FAILED — coverage gap, no build was run: "
+                f"uncovered_dev={cov['uncovered_dev']} orphan_scenarios={cov['orphan_scenarios']}\n"
+            )
+            return 2
+    else:
+        cov = {"checked": False}
+
+    journal.write("GATE_PASSED", coverage_checked=cov["checked"], scenarios=len(scenarios))
+    manifest_base["coverage"] = cov
+    manifest_base["oracle"] = {"mutation_validated": True, "inert": []}
+
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
         try:
@@ -673,6 +741,30 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             "adapter_sha256": sha256_file(adapter) if os.path.exists(adapter) else None,
             "snapshot_sha256": _snapshot_sha256_from_journal(run_dir),
         }
+
+        # M7: coverage/oracle are deterministic from the control root +
+        # scenarios, so resume() recomputes them (cheaply) instead of
+        # re-running the fail-closed gate — a resumed run already passed the
+        # gate once, on the initial `run`; re-gating here could spuriously
+        # fail an already-approved run. If scenarios no longer load cleanly
+        # (control root edited mid-run — not the gate's contract to police
+        # here), fall back to honest "unknown" fields; a genuine oracle
+        # problem still surfaces normally when `continue` re-enters the loop
+        # and run_all() re-loads the scenarios itself.
+        try:
+            gate_scenarios = load_scenarios(scenarios_dir)
+            gate_inert = df_gates.validate_oracle(gate_scenarios)
+            oracle = {"mutation_validated": not gate_inert, "inert": gate_inert}
+            try:
+                gate_behaviors = df_gates.load_behaviors(control_root)
+                cov = (df_gates.check_coverage(gate_behaviors, gate_scenarios)
+                       if gate_behaviors is not None else {"checked": False})
+            except df_gates.GateError:
+                cov = {"checked": False}
+        except OracleError:
+            cov, oracle = {"checked": False}, {"mutation_validated": False, "inert": []}
+        manifest_base["coverage"] = cov
+        manifest_base["oracle"] = oracle
 
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")
