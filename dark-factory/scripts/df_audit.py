@@ -15,16 +15,24 @@ class AuditKeyError(RuntimeError):
     pass
 
 
+def load_key(key_path: str) -> bytes:
+    """Load an existing audit key (never create). Raises AuditKeyError if the
+    file is missing or malformed. Use this for verification; use
+    load_or_create_key only on the signing/run path."""
+    if not os.path.exists(key_path):
+        raise AuditKeyError(f"audit key not found: {key_path}")
+    try:
+        key = bytes.fromhex(open(key_path, encoding="utf-8").read().strip())
+    except ValueError as e:
+        raise AuditKeyError(f"malformed audit key at {key_path}: {e}")
+    if len(key) != 32:
+        raise AuditKeyError(f"audit key at {key_path} must be 32 bytes")
+    return key
+
+
 def load_or_create_key(key_path: str) -> bytes:
     if os.path.exists(key_path):
-        try:
-            raw = open(key_path, encoding="utf-8").read().strip()
-            key = bytes.fromhex(raw)
-        except ValueError as e:
-            raise AuditKeyError(f"malformed audit key at {key_path}: {e}")
-        if len(key) != 32:
-            raise AuditKeyError(f"audit key at {key_path} must be 32 bytes")
-        return key
+        return load_key(key_path)
     d = os.path.dirname(os.path.abspath(key_path))
     os.makedirs(d, mode=0o700, exist_ok=True)
     key = secrets.token_bytes(32)

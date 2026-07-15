@@ -676,7 +676,7 @@ def main():
         vkey = None
         if args.key_path:
             try:
-                vkey = df_audit.load_or_create_key(args.key_path)
+                vkey = df_audit.load_key(args.key_path)
             except df_audit.AuditKeyError as e:
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 sys.exit(2)

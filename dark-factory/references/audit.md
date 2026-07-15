@@ -25,22 +25,24 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
 ```
 
 **Exit codes:**
-- `0`: manifest OK (unsigned or signature verified).
-- `4`: manifest TAMPERED or UNVERIFIED.
-- `2`: audit key error (malformed/missing/wrong size).
+- `0`: manifest OK (unsigned, or signed and signature verified).
+- `2`: audit key error — `--key-path` given but the file is missing or malformed. Printed to **stderr** as `dark-factory: audit key error: <detail>`; verification is never attempted (the CLI loads the key with `load_key`, which never creates one — a typo'd path fails closed instead of silently minting a fresh key and reporting a false TAMPERED).
+- `4`: manifest TAMPERED (checks failed) or UNVERIFIED (signed manifest, no usable key supplied).
 
-**Behavior (prints to stdout):**
+**Behavior (prints to stdout, unless noted):**
 
 1. **Unsigned manifest** (no `manifest.hmac` file):
    - Verifies `manifest.json` SHA-256 matches `manifest.sha256`.
    - Verifies the journal hash embedded in the manifest matches the actual `journal.jsonl`.
-   - Print: `OK` (exit 0) or `TAMPERED <reason>` (exit 4).
+   - Missing `manifest.json`/`manifest.sha256`/`journal.jsonl` → `TAMPERED (missing manifest, sidecar, or journal)` (exit 4).
+   - Otherwise: `OK` (exit 0) or `TAMPERED (manifest.json does not match manifest.sha256)` / `TAMPERED (journal.jsonl does not match manifest)` (exit 4).
 
-2. **Signed manifest** (manifest.hmac exists):
-   - Same unsigned checks first.
-   - **`--key-path` is required**; if omitted or key fails to load → print `UNVERIFIED (signed manifest; supply --key-path)` (exit 4). **Fail-closed: never treat a signed manifest as OK without proof.**
-   - Verifies the HMAC signature.
-   - Print: `OK` (exit 0) if signature matches, or `TAMPERED (bad signature)` (exit 4).
+2. **Signed manifest** (`manifest.hmac` exists):
+   - Same unsigned checks first (same outcomes/exit codes as above if they fail).
+   - No `--key-path` given → `UNVERIFIED (signed manifest; supply --key-path)` (exit 4). **Fail-closed: never treat a signed manifest as OK without proof.**
+   - `--key-path` given but the file is missing or the key is malformed → the CLI never reaches `verify_manifest`; it prints `dark-factory: audit key error: <detail>` to stderr and exits **2**. (Nothing is written; the key is never auto-created during verification.)
+   - `--key-path` given and the key loads, but it is the **wrong** key → `TAMPERED (bad signature)` (exit 4).
+   - `--key-path` given and the key is correct → `OK` (exit 0).
 
 ## Honest limits
 
@@ -48,7 +50,7 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
 
 **Per-tier reality:**
 
-- **`standard` tier**: The OS sandbox (macOS `sandbox-exec` / Linux `bwrap`) denies the control root and workspace reads/writes, but **the home directory is not sandboxed**. A determined malicious builder can read `~/.dark-factory/audit.key`. Signing there defends against *casual* tampering and unintended overwrites; it does not protect against a hostile build agent.
+- **`standard` tier**: The OS sandbox (macOS `sandbox-exec` / Linux `bwrap`) denies reads of **the control root only** (scenarios/runs) — the workspace is intentionally left readable/writable, and **the home directory is not sandboxed at all**. A determined malicious builder can read `~/.dark-factory/audit.key`. Signing there defends against *casual* tampering and unintended overwrites; it does not protect against a hostile build agent.
 - **`hardened` tier** (infrastructure-gated, not yet built): Per-role capability manifests in a container/VM sandbox where the key path itself is unreachable even with root. True protection.
 - **Off-box/remote audit sink** (not yet built): The enterprise frontier. A verifier running outside the build host, pulling manifests over a trusted channel, anchors the audit chain against local root compromise.
 

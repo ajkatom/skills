@@ -33,3 +33,17 @@ def test_sign_verify_roundtrip():
 
 def test_verify_rejects_garbage_sig():
     assert df_audit.verify(b"\x01" * 32, b"x", "nothex") is False
+
+
+def test_load_key_missing_raises(tmp_path):
+    kp = tmp_path / "sub" / "audit.key"
+    with pytest.raises(df_audit.AuditKeyError):
+        df_audit.load_key(str(kp))
+    assert not os.path.exists(kp)
+
+
+def test_load_key_loads_existing(tmp_path):
+    kp = tmp_path / "sub" / "audit.key"
+    k1 = df_audit.load_or_create_key(str(kp))
+    k2 = df_audit.load_key(str(kp))
+    assert k1 == k2

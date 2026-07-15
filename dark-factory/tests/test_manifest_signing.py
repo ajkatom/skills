@@ -1,9 +1,15 @@
 import json
 import os
+import subprocess
+import sys
 
 import df_audit
 import supervisor
 from test_supervisor import FAKE, setup_control
+
+SUP = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "supervisor.py"
+)
 
 
 def _signed_control(tmp_path, key_path):
@@ -55,3 +61,19 @@ def test_unsigned_run_unchanged(tmp_path):
     rd = cr / "runs" / os.listdir(cr / "runs")[0]
     assert not (rd / "manifest.hmac").exists()
     assert supervisor.verify_manifest(str(rd)) is True  # sha256 path unchanged
+
+
+def test_verify_manifest_cli_missing_keypath_exits_2_without_creating(tmp_path):
+    kp = tmp_path / "keys" / "audit.key"
+    cr = _signed_control(tmp_path, kp)
+    supervisor.run(str(cr), None)
+    rd = cr / "runs" / os.listdir(cr / "runs")[0]
+    missing_kp = tmp_path / "nope.key"
+    proc = subprocess.run(
+        [sys.executable, SUP, "verify-manifest", "--run-dir", str(rd),
+         "--key-path", str(missing_kp)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert not os.path.exists(missing_kp)
+    assert "TAMPERED" not in proc.stdout
