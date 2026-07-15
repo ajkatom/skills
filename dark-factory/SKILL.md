@@ -73,12 +73,21 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      read-denial sandbox → qualified; needs macOS `sandbox-exec` or Linux `bwrap`, and a
      passing startup denial probe). If `standard` can't be honored, the run fails closed
      unless you pass `run --allow-downgrade` (→ cooperative, unqualified).
+   - **Budget (optional).** Set `budget.billing`: `"subscription"` (default — no dollar
+     metering possible, so it's alert-only) or `"api"` (enforces a dollar cap via an
+     estimate). For `"api"`, also set `budget.max_usd` and `budget.per_call_usd`
+     (estimated $ reserved per builder call — a cap without `per_call_usd` is honestly
+     downgraded to alert-only). `budget.max_calls` is an exact, non-estimated cap
+     enforced under any billing. See `references/budget.md` for the full model
+     (85% alert, 100% phase-boundary pause, raise-and-resume) and its honest caveat:
+     dollars are an **estimate**, not metered usage.
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
    Exit 0 = converged/accepted · 3 = cap reached · 2 = config/build/abort error
    (**including a pre-build gate failure** — coverage gap or inert scenario;
    `GATE_FAILED`, no build ever ran, see `references/coverage-gates.md`) ·
-   **10 = paused at a checkpoint** (autonomy 4 / `checkpoint: pause`).
+   **10 = paused** — either at a checkpoint (autonomy 4 / `checkpoint: pause`) or at a
+   **budget cap** (`journal` has `BUDGET_PAUSE`; fires even at `checkpoint: auto`).
 6. **At a checkpoint (exit 10).** Show the user `runs/<id>/checkpoint_iter_N.md` (per-behavior
    pass/fail — no scenario text). Then, on their decision, run:
    - **continue** → `supervisor.py resume --control-root <cr> --decision continue`
@@ -86,6 +95,11 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
    - **accept** (stop, waived/unverified) → `resume --decision accept`
    - **abort** → `resume --decision abort`
    Repeat until exit 0/2/3.
+   - **At a budget pause (exit 10, journal `BUDGET_PAUSE`).** This is resumable, not
+     terminal: raise `budget.max_usd` and/or `budget.max_calls` in `config.json`, then
+     `supervisor.py resume --control-root <cr> --decision continue` — the run re-reads
+     the raised cap and continues from where it paused (builder-call/estimate counts
+     persist, no reset, no double-count). See `references/budget.md`.
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
    path, and `verify-manifest --run-dir <run_dir>`. State that cooperative tier is unqualified.
 
@@ -126,6 +140,7 @@ or reveal holdout scenarios in a session that will also drive the builder.
 ## References
 
 - `references/config-reference.md` — config schema
+- `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
