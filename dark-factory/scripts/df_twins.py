@@ -24,6 +24,14 @@ the twin def) derive per-request tokens from the seed so responses are
 unpredictable to a builder that never sees the seed (the seed is verifier-only
 and must never reach the builder or any feedback channel). Twins that ignore
 extra_env behave exactly as they did before it existed.
+
+CAUTION (supervisor-only channel): `extra_env` is merged into `child_env`
+AFTER `DF_ENDPOINT_FILE`/`DF_OBSERVER_FILE` (`dict(os.environ,
+DF_ENDPOINT_FILE=..., DF_OBSERVER_FILE=..., **(extra_env or {}))`), so an
+`extra_env` entry with either of those keys SILENTLY CLOBBERS the endpoint
+or observer wiring for that twin process. The supervisor is the only caller
+of `start`/`reset` with a non-None `extra_env`, and it must pass ONLY
+`DF_TWIN_VARIANT_SEED` -- never `DF_ENDPOINT_FILE` or `DF_OBSERVER_FILE`.
 """
 import glob
 import json
