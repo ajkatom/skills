@@ -154,3 +154,13 @@ def test_check_coverage_final_covered_lists_all_behaviors_with_final_scenario():
     result = df_gates.check_coverage(behaviors, scenarios)
     assert result["final_covered"] == ["BHV-001", "BHV-002"]
     assert result["uncovered_dev"] == ["BHV-002"]
+
+
+def test_orphan_scenarios_deduplicated():
+    behaviors = [{"id": "BHV-001"}]
+    scenarios = [
+        {"id": "DUP-S1", "behavior_id": "BHV-999", "cohort": "dev"},
+        {"id": "DUP-S1", "behavior_id": "BHV-999", "cohort": "dev"},
+    ]
+    cov = df_gates.check_coverage(behaviors, scenarios)
+    assert cov["orphan_scenarios"] == ["DUP-S1"]  # deduped, not ["DUP-S1","DUP-S1"]

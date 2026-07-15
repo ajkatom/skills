@@ -109,6 +109,6 @@ def check_coverage(behaviors: list[dict], scenarios: list[dict]) -> dict:
         "checked": True,
         "behaviors": sorted(declared_ids),
         "uncovered_dev": sorted(uncovered_dev),
-        "orphan_scenarios": sorted(orphan_scenarios),
+        "orphan_scenarios": sorted(set(orphan_scenarios)),
         "final_covered": sorted(final_covered),
     }
