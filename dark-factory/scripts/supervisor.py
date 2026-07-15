@@ -391,7 +391,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             journal.write("ABORTED_BUILD_ERROR", iteration=0, detail=f"snapshot failed: {e}")
             mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
                       snapshot_sha256=None, qualified=False,
-                      sandbox_backend=None, denial_probe_passed=False)
+                      sandbox_backend=None, denial_probe_passed=False,
+                      final_exam={"ran": False, "passed": None, "count": 0})
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
@@ -438,7 +439,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
     def _twin_error_abort(iteration, e):
         journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
-        mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False)
+        mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False,
+                  final_exam={"ran": False, "passed": None, "count": 0})
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
@@ -491,7 +493,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                        exec_prefix=exec_prefix, env_extra=build_env_extra)
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
-                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
+                          final_exam={"ran": False, "passed": None, "count": 0})
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -508,10 +511,11 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
             try:
                 report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
-                                  env_extra=verify_env_extra)
+                                  env_extra=verify_env_extra, cohort="dev")
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
-                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False)
+                mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
+                          final_exam={"ran": False, "passed": None, "count": 0})
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -523,16 +527,46 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
 
             if report["all_pass"]:
+                # DEV converged. The sealed FINAL exam runs exactly ONCE, here, and its
+                # results are NEVER fed back: project_feedback is never called on it,
+                # nothing from it is written to `workspace`, and only final
+                # behavior-IDs (never title/given/when/then/observed) reach the
+                # journal/manifest. Same reset twin env as dev's verify (same phase).
+                final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
+                                 env_extra=verify_env_extra, cohort="final")
+                atomic_write(os.path.join(run_dir, "final_exam_report.json"), canonical_json(final))
+                final_ran = final["count"] > 0
+                journal.write("FINAL_EXAM", ran=final_ran,
+                              passing=sum(1 for r in final["results"] if r["pass"]),
+                              total=final["count"])
+                fe = {"ran": final_ran, "passed": bool(final["all_pass"]) if final_ran else None,
+                      "count": final["count"]}
+
+                if final_ran and not final["all_pass"]:
+                    journal.write("FINAL_EXAM_FAILED",
+                                  failing=sorted({r["behavior_id"] for r in final["results"]
+                                                  if not r["pass"]}))
+                    mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
+                              qualified=False, final_exam=fe)
+                    finalize_manifest(run_dir, mf, audit_key=audit_key)
+                    _clear_state()
+                    _kb_writeback(cfg, journal, mf, [])
+                    print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
+                          f"scenarios not disclosed). Run: {run_dir}")
+                    return 3
+
+                # dev converged AND (final passed OR no final cohort):
                 journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
-                mf = dict(mb_clean, outcome=outcome, iterations=i)
+                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe)
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
+                note = "" if final_ran else " [no sealed final exam administered]"
                 print(f"dark-factory: CONVERGED "
                       f"({'qualified, standard' if eff == 'standard' else 'unqualified, cooperative'} tier). "
-                      f"Workspace: {workspace}  Run: {run_dir}")
+                      f"Workspace: {workspace}  Run: {run_dir}{note}")
                 return 0
 
             feedback = project_feedback(report)
@@ -553,7 +587,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         failing = sorted({r["behavior_id"] for r in last_report["results"] if not r["pass"]})
         journal.write("CAP_REACHED", failing_behaviors=failing,
                       note="likely spec ambiguity — human decision needed")
-        mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False)
+        mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False,
+                  final_exam={"ran": False, "passed": None, "count": 0})
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
