@@ -171,3 +171,21 @@ def test_resume_manifest_preserves_snapshot_sha256(tmp_path):
     snap = next(e["data"]["snapshot_sha256"] for e in entries if e["state"] == "SNAPSHOT")
     assert snap is not None
     assert manifest["snapshot_sha256"] == snap
+
+
+def test_resume_abort_manifest_has_final_exam(tmp_path):
+    cr = setup_control(tmp_path, FAKE)  # pause mode
+    assert supervisor.run(str(cr), None) == 10
+    assert supervisor.resume(str(cr), "abort") == 2
+    run_id = os.listdir(cr / "runs")[0]
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert manifest["final_exam"] == {"ran": False, "passed": None, "count": 0}
+
+
+def test_resume_accept_manifest_has_final_exam(tmp_path):
+    cr = setup_control(tmp_path, FAKE)  # pause mode
+    assert supervisor.run(str(cr), None) == 10
+    assert supervisor.resume(str(cr), "accept") == 0
+    run_id = os.listdir(cr / "runs")[0]
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert manifest["final_exam"] == {"ran": False, "passed": None, "count": 0}

@@ -647,7 +647,8 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             mf = dict(manifest_base, outcome="ABORTED_BY_HUMAN",
                       iterations=state["next_iter"] - 1,
                       qualified=False,
-                      sandbox_backend=None, denial_probe_passed=False)
+                      sandbox_backend=None, denial_probe_passed=False,
+                      final_exam={"ran": False, "passed": None, "count": 0})
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
@@ -659,7 +660,8 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             mf = dict(manifest_base, outcome="ACCEPTED_WAIVED",
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
-                      iterations=state["next_iter"] - 1)
+                      iterations=state["next_iter"] - 1,
+                      final_exam={"ran": False, "passed": None, "count": 0})
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
