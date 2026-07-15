@@ -82,7 +82,8 @@ class Journal:
             os.fsync(f.fileno())
 
 
-def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None):
+def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None,
+              builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint"):
     atomic_write(
         os.path.join(run_dir, "state.json"),
         canonical_json({
@@ -93,13 +94,24 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             "run_dir": run_dir,
             "dev_status": dev_status or {},
             "regressions": sorted(regressions) if regressions else [],
+            "builder_calls": builder_calls,
+            "estimated_usd": estimated_usd,
+            "budget_alerted": budget_alerted,
+            "reason": reason,
         }),
     )
 
 
 def load_state(run_dir):
     with open(os.path.join(run_dir, "state.json"), encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+    # Additive fields (M8): default them when absent so a pre-M8 state.json
+    # (or an old checkpoint-pause save) resumes cleanly with a fresh budget.
+    state.setdefault("builder_calls", 0)
+    state.setdefault("estimated_usd", 0.0)
+    state.setdefault("budget_alerted", False)
+    state.setdefault("reason", "checkpoint")
+    return state
 
 
 def _snapshot_sha256_from_journal(run_dir):
@@ -150,6 +162,33 @@ def write_checkpoint_report(run_dir, iteration, report):
     path = os.path.join(run_dir, f"checkpoint_iter_{iteration}.md")
     atomic_write(path, "\n".join(lines))
     return path
+
+
+def _budget_enforced(b):
+    """Which caps are actively enforced (can trigger a BUDGET_PAUSE).
+
+    Returns (dollar_enforced, calls_enforced). A $ cap requires billing=="api"
+    AND max_usd AND per_call_usd (no per_call_usd => no estimate to reserve
+    against => downgraded to alert-only, spec M8). max_calls is exact and
+    enforced under any billing.
+    """
+    dollar_enforced = (b["billing"] == "api" and b["max_usd"] is not None
+                       and b["per_call_usd"] is not None)
+    calls_enforced = b["max_calls"] is not None
+    return dollar_enforced, calls_enforced
+
+
+def _budget_manifest_field(b, builder_calls, estimated_usd):
+    dollar_enforced, calls_enforced = _budget_enforced(b)
+    return {
+        "billing": b["billing"],
+        "builder_calls": builder_calls,
+        "estimated_usd": estimated_usd,
+        "cap_usd": b["max_usd"],
+        "max_calls": b["max_calls"],
+        "enforced": bool(dollar_enforced or calls_enforced),
+        "estimate_caveat": "estimated from per_call_usd; not metered usage",
+    }
 
 
 def _load_audit_key(cfg, journal):
@@ -398,7 +437,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         journal.write("ABORTED_BUILD_ERROR", iteration=0, detail=f"invalid scenarios: {e}")
         mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
-                  final_exam={"ran": False, "passed": None, "count": 0}, regressions=[])
+                  final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: {e}\n")
@@ -414,7 +454,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   oracle={"mutation_validated": False, "inert": inert},
-                  coverage={"checked": False})
+                  coverage={"checked": False},
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(
@@ -438,7 +479,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
                       sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                       final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
-                      oracle={"mutation_validated": True, "inert": []}, coverage=cov)
+                      oracle={"mutation_validated": True, "inert": []}, coverage=cov,
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(
@@ -463,7 +505,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       snapshot_sha256=None, qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
                       final_exam={"ran": False, "passed": None, "count": 0},
-                      regressions=[])
+                      regressions=[],
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
@@ -499,7 +542,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
-              audit_key=None, prev_dev_status=None, regressions=None):
+              audit_key=None, prev_dev_status=None, regressions=None,
+              builder_calls=0, estimated_usd=0.0, budget_alerted=False):
     exec_prefix = exec_prefix or []
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
     # Regression tracking (green->red on dev, spec §6/§15.3): prev_dev_status maps
@@ -508,6 +552,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     # Barrier-safe: only ever behavior-IDs, never scenario content.
     prev_dev_status = dict(prev_dev_status or {})
     regressed = set(regressions or [])
+    # Budget accounting (M8): builder_calls/estimated_usd/budget_alerted thread
+    # through resume via state.json — reassigned as plain locals below (no
+    # mutable-container aliasing concern, unlike prev_dev_status/regressed).
+    budget_downgrade_noted = False
 
     def _clear_state():
         p = os.path.join(run_dir, "state.json")
@@ -518,7 +566,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
         mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False,
                   final_exam={"ran": False, "passed": None, "count": 0},
-                  regressions=sorted(regressed))
+                  regressions=sorted(regressed),
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
@@ -567,19 +616,80 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             # spec is already present in the workspace as spec.md — no holdout leak.
             prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
             atomic_write(prompt_file, prompt)
+
+            # --- Budget admission control (M8): reserve BEFORE the builder call,
+            # regardless of checkpoint mode (even auto/L5) — a cost overrun pauses
+            # here rather than proceeding unattended. billing=="subscription" can't
+            # meter dollars (alert-only, milestone-only); max_calls is exact and
+            # enforced under any billing. api+max_usd without per_call_usd has no
+            # estimate to reserve against, so the $ cap downgrades to alert-only
+            # (still counted, never pauses on $).
+            b = cfg["_budget"]
+            calls_after = builder_calls + 1
+            est_after = estimated_usd + (b["per_call_usd"] or 0.0)
+            dollar_enforced, calls_enforced = _budget_enforced(b)
+
+            if (b["billing"] == "api" and b["max_usd"] is not None
+                    and b["per_call_usd"] is None and not budget_downgrade_noted):
+                journal.write(
+                    "BUDGET_DOWNGRADE",
+                    reason="max_usd set without per_call_usd; no estimate to reserve "
+                           "against — $ cap downgraded to alert-only",
+                )
+                budget_downgrade_noted = True
+
+            if not budget_alerted:
+                hit_dollar = dollar_enforced and estimated_usd >= b["alert_at"] * b["max_usd"]
+                hit_calls = calls_enforced and builder_calls >= b["alert_at"] * b["max_calls"]
+                if hit_dollar or hit_calls:
+                    journal.write("BUDGET_ALERT", estimated_usd=estimated_usd,
+                                  builder_calls=builder_calls, cap_usd=b["max_usd"],
+                                  max_calls=b["max_calls"])
+                    sys.stderr.write(
+                        f"dark-factory: BUDGET ALERT — {b['alert_at']:.0%} of budget cap "
+                        f"reached (estimated_usd={estimated_usd}, builder_calls={builder_calls}).\n")
+                    budget_alerted = True
+
+            if (b["billing"] == "subscription" and not dollar_enforced and not calls_enforced
+                    and calls_after % 5 == 0):
+                journal.write("BUDGET_ALERT", milestone=True, builder_calls=calls_after,
+                              estimated_usd=est_after)
+                sys.stderr.write(
+                    f"dark-factory: budget milestone — {calls_after} builder calls "
+                    f"(subscription billing; informational only).\n")
+
+            budget_pause = ((calls_enforced and calls_after > b["max_calls"]) or
+                            (dollar_enforced and est_after > b["max_usd"]))
+            if budget_pause:
+                journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
+                              builder_calls=builder_calls, cap_usd=b["max_usd"],
+                              max_calls=b["max_calls"])
+                save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                          dev_status=prev_dev_status, regressions=regressed,
+                          builder_calls=builder_calls, estimated_usd=estimated_usd,
+                          budget_alerted=budget_alerted, reason="budget")
+                print(f"dark-factory: PAUSED — budget cap reached (estimated_usd={estimated_usd}, "
+                      f"builder_calls={builder_calls}). Raise budget.max_usd (or max_calls) in "
+                      f"config.json and run: supervisor.py resume --control-root "
+                      f"{cfg.get('_control_root', '<cr>')} --decision continue")
+                return PAUSED
+
             resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
                                        exec_prefix=exec_prefix, env_extra=build_env_extra)
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
                           final_exam={"ran": False, "passed": None, "count": 0},
-                          regressions=sorted(regressed))
+                          regressions=sorted(regressed),
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
                 return 2
             journal.write("BUILD", iteration=i)
+            builder_calls = calls_after
+            estimated_usd = est_after
 
             verify_env_extra = None
             if twins_enabled:
@@ -595,7 +705,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
                           final_exam={"ran": False, "passed": None, "count": 0},
-                          regressions=sorted(regressed))
+                          regressions=sorted(regressed),
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -644,7 +755,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                   failing=sorted({r["behavior_id"] for r in final["results"]
                                                   if not r["pass"]}))
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
-                              qualified=False, final_exam=fe, regressions=sorted(regressed))
+                              qualified=False, final_exam=fe, regressions=sorted(regressed),
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
                     finalize_manifest(run_dir, mf, audit_key=audit_key)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
@@ -657,7 +769,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
-                          regressions=sorted(regressed))
+                          regressions=sorted(regressed),
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -675,7 +788,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
                 write_checkpoint_report(run_dir, i, report)
                 save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace,
-                          dev_status=prev_dev_status, regressions=regressed)
+                          dev_status=prev_dev_status, regressions=regressed,
+                          builder_calls=builder_calls, estimated_usd=estimated_usd,
+                          budget_alerted=budget_alerted, reason="checkpoint")
                 journal.write("CHECKPOINT", iteration=i,
                               failing=[f["behavior_id"] for f in feedback["failures"]])
                 print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
@@ -688,7 +803,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                       note="likely spec ambiguity — human decision needed")
         mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False,
                   final_exam={"ran": False, "passed": None, "count": 0},
-                  regressions=sorted(regressed))
+                  regressions=sorted(regressed),
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
@@ -773,7 +889,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
                       final_exam={"ran": False, "passed": None, "count": 0},
-                      regressions=sorted(state.get("regressions", [])))
+                      regressions=sorted(state.get("regressions", [])),
+                      budget=_budget_manifest_field(
+                          cfg["_budget"], state.get("builder_calls", 0),
+                          state.get("estimated_usd", 0.0)))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
@@ -787,7 +906,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       sandbox_backend=None, denial_probe_passed=False,
                       iterations=state["next_iter"] - 1,
                       final_exam={"ran": False, "passed": None, "count": 0},
-                      regressions=sorted(state.get("regressions", [])))
+                      regressions=sorted(state.get("regressions", [])),
+                      budget=_budget_manifest_field(
+                          cfg["_budget"], state.get("builder_calls", 0),
+                          state.get("estimated_usd", 0.0)))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
@@ -815,6 +937,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             exec_prefix=exec_prefix, audit_key=audit_key,
             prev_dev_status=state.get("dev_status", {}),
             regressions=state.get("regressions", []),
+            builder_calls=state.get("builder_calls", 0),
+            estimated_usd=state.get("estimated_usd", 0.0),
+            budget_alerted=state.get("budget_alerted", False),
         )
     finally:
         release_lock(lock)
