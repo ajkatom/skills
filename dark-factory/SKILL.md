@@ -70,6 +70,7 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
 - Secrets: never put credentials in config.json/spec.md/scenarios; the claude
   adapter uses your ambient login.
 - A **cooperative** run is always UNQUALIFIED — say so. A **standard** run is qualified ONLY when its startup denial probe passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value.
+- Signed audit is opt-in (`audit.signing: true` in config); verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
 
 ## Composing with other skills (control-plane only)
 
