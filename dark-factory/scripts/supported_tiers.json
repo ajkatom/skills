@@ -10,6 +10,11 @@
       "qualified": true,
       "backend": "os-read-denial",
       "note": "OS read-denial sandbox (macOS sandbox-exec / Linux bwrap). Usable only when the platform backend is available AND the startup denial probe passes; else fail-closed. Spec 7.2."
+    },
+    "hardened": {
+      "qualified": true,
+      "backend": "container-docker",
+      "note": "Builder in a Docker container; control root never mounted (denial by construction, probe-verified); verifier under host OS read-denial. Requires running Docker daemon + signed audit. Spec 7.2/2.2."
     }
   }
 }

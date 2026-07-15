@@ -33,7 +33,7 @@ def test_valid_cooperative_config_loads_and_is_unqualified(tmp_path):
 
 def test_unbacked_tier_is_rejected(tmp_path):
     cr = tmp_path / "control"
-    write_config(cr, assurance="hardened")
+    write_config(cr, assurance="quantum-teleport")
     with pytest.raises(df_config.ConfigError, match="no conforming backend"):
         df_config.load_config(str(cr))
 
@@ -110,8 +110,10 @@ def test_checkpoint_defaults_to_pause_at_autonomy_4(tmp_path):
 
 
 def test_checkpoint_defaults_to_auto_at_autonomy_5(tmp_path):
+    # M10-2: autonomy 5 (lights-off) is gated on assurance: hardened (spec 2.2)
+    # — see test_hardened_config.py for the full L5-gate matrix.
     cr = tmp_path / "control"
-    write_config(cr, autonomy=5)
+    write_config(cr, assurance="hardened", autonomy=5)
     cfg = df_config.load_config(str(cr))
     assert cfg["_checkpoint"] == "auto"
 
@@ -138,8 +140,12 @@ def test_standard_tier_loads_and_is_qualified(tmp_path):
     assert cfg["_qualified"] is True
 
 
-def test_hardened_tier_still_rejected(tmp_path):
+def test_hardened_tier_now_accepted(tmp_path):
+    # M10-2: hardened gains a real conforming backend (container-docker); the
+    # detailed hardened config matrix (container block, L5 gate, signed-audit
+    # requirement) lives in test_hardened_config.py.
     cr = tmp_path / "control"
     write_config(cr, assurance="hardened")
-    with pytest.raises(df_config.ConfigError, match="no conforming backend"):
-        df_config.load_config(str(cr))
+    cfg = df_config.load_config(str(cr))
+    assert cfg["assurance"] == "hardened"
+    assert cfg["_qualified"] is True
