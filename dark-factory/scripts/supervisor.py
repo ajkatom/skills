@@ -81,7 +81,7 @@ class Journal:
             os.fsync(f.fileno())
 
 
-def save_state(run_dir, next_iter, feedback, workspace):
+def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None):
     atomic_write(
         os.path.join(run_dir, "state.json"),
         canonical_json({
@@ -90,6 +90,8 @@ def save_state(run_dir, next_iter, feedback, workspace):
             "feedback": feedback,
             "workspace": workspace,
             "run_dir": run_dir,
+            "dev_status": dev_status or {},
+            "regressions": sorted(regressions) if regressions else [],
         }),
     )
 
@@ -392,7 +394,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
                       snapshot_sha256=None, qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
-                      final_exam={"ran": False, "passed": None, "count": 0})
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=[])
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
@@ -428,9 +431,15 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
-              audit_key=None):
+              audit_key=None, prev_dev_status=None, regressions=None):
     exec_prefix = exec_prefix or []
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
+    # Regression tracking (green->red on dev, spec §6/§15.3): prev_dev_status maps
+    # behavior_id -> did every dev scenario of that behavior pass LAST iteration.
+    # regressed accumulates behavior-IDs that ever flip True->False across the run.
+    # Barrier-safe: only ever behavior-IDs, never scenario content.
+    prev_dev_status = dict(prev_dev_status or {})
+    regressed = set(regressions or [])
 
     def _clear_state():
         p = os.path.join(run_dir, "state.json")
@@ -440,7 +449,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     def _twin_error_abort(iteration, e):
         journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
         mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False,
-                  final_exam={"ran": False, "passed": None, "count": 0})
+                  final_exam={"ran": False, "passed": None, "count": 0},
+                  regressions=sorted(regressed))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
@@ -494,7 +504,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
-                          final_exam={"ran": False, "passed": None, "count": 0})
+                          final_exam={"ran": False, "passed": None, "count": 0},
+                          regressions=sorted(regressed))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -515,7 +526,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
-                          final_exam={"ran": False, "passed": None, "count": 0})
+                          final_exam={"ran": False, "passed": None, "count": 0},
+                          regressions=sorted(regressed))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -525,6 +537,23 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             atomic_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), canonical_json(report))
             passing = sum(1 for r in report["results"] if r["pass"])
             journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
+
+            # Regression tracking (green->red on dev): a behavior passes this
+            # iteration iff EVERY one of its dev scenarios passed. Any behavior
+            # that was True last iteration and is False now regressed — journal
+            # the behavior-ID only (barrier-safe), then roll prev_dev_status
+            # forward. Informational + auditable; does not change control flow
+            # (a regressed behavior is failing, so the loop already won't
+            # converge on it).
+            cur_dev_status = {}
+            for r in report["results"]:
+                bid = r["behavior_id"]
+                cur_dev_status[bid] = cur_dev_status.get(bid, True) and bool(r["pass"])
+            for bid, ok in cur_dev_status.items():
+                if prev_dev_status.get(bid) is True and not ok:
+                    journal.write("REGRESSION", iteration=i, behavior_id=bid)
+                    regressed.add(bid)
+            prev_dev_status = cur_dev_status
 
             if report["all_pass"]:
                 # DEV converged. The sealed FINAL exam runs exactly ONCE, here, and its
@@ -547,7 +576,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                   failing=sorted({r["behavior_id"] for r in final["results"]
                                                   if not r["pass"]}))
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
-                              qualified=False, final_exam=fe)
+                              qualified=False, final_exam=fe, regressions=sorted(regressed))
                     finalize_manifest(run_dir, mf, audit_key=audit_key)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
@@ -559,7 +588,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 outcome = "COMPLETE_QUALIFIED" if eff == "standard" else "COMPLETE_UNQUALIFIED"
-                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe)
+                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
+                          regressions=sorted(regressed))
                 finalize_manifest(run_dir, mf, audit_key=audit_key)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
@@ -576,7 +606,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
             if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
                 write_checkpoint_report(run_dir, i, report)
-                save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace)
+                save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace,
+                          dev_status=prev_dev_status, regressions=regressed)
                 journal.write("CHECKPOINT", iteration=i,
                               failing=[f["behavior_id"] for f in feedback["failures"]])
                 print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
@@ -588,7 +619,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         journal.write("CAP_REACHED", failing_behaviors=failing,
                       note="likely spec ambiguity — human decision needed")
         mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False,
-                  final_exam={"ran": False, "passed": None, "count": 0})
+                  final_exam={"ran": False, "passed": None, "count": 0},
+                  regressions=sorted(regressed))
         finalize_manifest(run_dir, mf, audit_key=audit_key)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
@@ -648,7 +680,8 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       iterations=state["next_iter"] - 1,
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
-                      final_exam={"ran": False, "passed": None, "count": 0})
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=sorted(state.get("regressions", [])))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
@@ -661,7 +694,8 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       qualified=False,
                       sandbox_backend=None, denial_probe_passed=False,
                       iterations=state["next_iter"] - 1,
-                      final_exam={"ran": False, "passed": None, "count": 0})
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=sorted(state.get("regressions", [])))
             finalize_manifest(run_dir, mf, audit_key=audit_key)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
@@ -687,6 +721,8 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             adapter, timeout_s, state["workspace"],
             start_iter=state["next_iter"], feedback=state["feedback"],
             exec_prefix=exec_prefix, audit_key=audit_key,
+            prev_dev_status=state.get("dev_status", {}),
+            regressions=state.get("regressions", []),
         )
     finally:
         release_lock(lock)
