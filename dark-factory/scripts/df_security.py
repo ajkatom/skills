@@ -13,6 +13,8 @@ the RULE NAME ONLY, never the matched secret value.
 import json
 import os
 import re
+import shutil
+import subprocess
 
 # --- secret_scan -----------------------------------------------------------
 
@@ -222,3 +224,78 @@ def sbom(root: str) -> dict:
     if "pyproject" in declared:
         result["parser"] = "best-effort"
     return result
+
+
+# --- run_gates -----------------------------------------------------------
+
+_EXTERNAL_TIMEOUT_S = 300
+_DETAIL_TAIL_CHARS = 2000
+
+
+def _run_external_gate(workspace: str, cmd: list) -> dict:
+    """Run one external gate command; never raises.
+
+    `unavailable` when the command isn't on PATH or fails to spawn/times
+    out (a gate that errored to run is unavailable, not a silent pass).
+    """
+    if shutil.which(cmd[0]) is None:
+        return {"status": "unavailable"}
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=_EXTERNAL_TIMEOUT_S,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return {"status": "unavailable", "detail": str(e)}
+    if proc.returncode == 0:
+        return {"status": "pass"}
+    output = (proc.stderr or proc.stdout or "")[-_DETAIL_TAIL_CHARS:]
+    return {"status": "fail", "detail": output}
+
+
+def run_gates(workspace: str, sec: dict) -> dict:
+    """Run the enabled built-in + external gates over `workspace`.
+
+    `sec` is the validated `cfg["_security"]` block. Returns
+    `{"checked": True, "gates": {name: {...}}, "failed": [names]}`.
+    A `fail_on` gate that is `fail` (or `unavailable` under
+    `strict_unavailable`) counts as a run failure.
+    """
+    gates = {}
+
+    if sec.get("secret_scan"):
+        findings = secret_scan(workspace)
+        gates["secret_scan"] = {
+            "status": "fail" if findings else "pass",
+            "findings": findings,
+        }
+
+    if sec.get("dangerous_scan"):
+        findings = dangerous_scan(workspace)
+        gates["dangerous_scan"] = {
+            "status": "fail" if findings else "pass",
+            "findings": findings,
+        }
+
+    if sec.get("sbom"):
+        gates["sbom"] = {"status": "pass", "sbom": sbom(workspace)}
+
+    for entry in sec.get("external", []):
+        gates[entry["name"]] = _run_external_gate(workspace, entry["cmd"])
+
+    strict_unavailable = sec.get("strict_unavailable", True)
+    failed = set()
+    for name in sec.get("fail_on", []):
+        gate = gates.get(name)
+        if gate is None:
+            continue
+        status = gate["status"]
+        if status == "fail":
+            failed.add(name)
+        elif status == "unavailable" and strict_unavailable:
+            failed.add(name)
+
+    return {"checked": True, "gates": gates, "failed": sorted(failed)}
