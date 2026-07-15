@@ -130,6 +130,7 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      rotation; `-e` argv `ps`-visibility at `hardened`; bridge-network exfiltration is
      out of scope until the enterprise credential proxy).
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
+   - **Twin evidence (M12, optional, recommended when a behavior depends on genuinely calling a twin).** Add a scenario `then` assertion — `twin_observed: {twin, contains}` (the twin's own observation log, not the candidate's output, must show the call) or `stdout_echoes_twin: {twin}` (the candidate's stdout must echo a token the twin served *this pass*) — and set `"supports_variants": true` on the twin def to make the served token fresh and unpredictable every verify pass. Both assertions fail closed with taxonomy `no_twin_evidence` if the candidate never really invoked the twin (e.g. a hardcoded response) — catching teaching-to-the-test that plain output-matching would miss. See `references/digital-twins.md` for the observation contract, seed semantics, and honest scope (filesystem-authority channel; network-graph enforcement and off-box sinks remain deferred).
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
    Exit 0 = converged/accepted · 3 = a non-converged terminal a human must evaluate
    (`CAP_REACHED`, `FINAL_EXAM_FAILED`, or **`SECURITY_GATE_FAILED`** — the converged
@@ -203,7 +204,7 @@ in a session that will also drive the builder.
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
 - `references/credentials.md` — the credential broker: allowlist-only injection, scrubbed artifacts, gitignore/permission gates, launcher-scoped standard-tier env, and honest limits (no rotation, `ps`-visibility, egress) (M11)
-- `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a)
+- `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a); observation log, evidence assertions, and verifier-only variant seeds (M12)
 - `references/knowledge-base.md` — KB integration (optional, spec §3A)
 - `references/scenario-format.md` — oracle IR v0
 - `references/coverage-gates.md` — behaviors.json schema + the fail-closed pre-build coverage/mutation gates (M7)
