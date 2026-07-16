@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""M21 Task 2 e2e: a builder that PROVES which twin impl it was actually
+handed at build time. On every build call it reads DF_TWIN_VALUEGEN from
+its own process env (the env the supervisor's build_env_extra injects) and
+immediately GETs /value against it, recording the RAW observed response
+into `<workdir>/build_time_twin_value.txt` -- a direct, non-vacuous barrier
+probe: if the builder's env ever pointed at the verify-phase twin instead
+of the build-phase one, this file would contain the VERIFY marker instead
+of the BUILD marker.
+
+It also writes the same honest value.py as fake_builder_calls_twin_value
+(calls the twin dynamically, never hardcodes), so the run converges
+normally and this probe can run unconditionally on the one and only
+iteration."""
+import json
+import os
+import sys
+import urllib.request
+
+VALUE_PY = (
+    "import os\n"
+    "import urllib.request\n"
+    "endpoint = os.environ[\"DF_TWIN_VALUEGEN\"]\n"
+    "with urllib.request.urlopen(f\"http://{endpoint}/value\") as resp:\n"
+    "    print(resp.read().decode())\n"
+)
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    endpoint = os.environ.get("DF_TWIN_VALUEGEN")
+    observed = ""
+    if endpoint:
+        with urllib.request.urlopen(f"http://{endpoint}/value", timeout=5) as resp:
+            observed = resp.read().decode()
+    with open(f"{wd}/build_time_twin_value.txt", "w", encoding="utf-8") as f:
+        f.write(observed)
+    with open(f"{wd}/value.py", "w", encoding="utf-8") as f:
+        f.write(VALUE_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

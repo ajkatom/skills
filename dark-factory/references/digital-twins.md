@@ -11,9 +11,10 @@ Each twin is defined by a JSON file in `<control_root>/twins/<name>.json`.
 | `twin_version` | string | Must be `"0.1"` | Required. Future versions may add new fields. |
 | `name` | string | `^[a-z][a-z0-9_]{0,30}$` (lowercase, digits, underscore; max 31 chars) | Unique within a control root. Used to derive the environment variable name. |
 | `launch` | array of strings | Non-empty list of command parts (argv). | The command that starts the twin service. Runs with `cwd = <control_root>/runs/<invocation_id>` (the run dir) and inherited environment plus `DF_ENDPOINT_FILE`. **A relative path resolves against the run dir, not `twins/`** — use an **absolute path** to your twin script (e.g. `["python3", "/abs/path/to/greeter.py"]`). |
-| `env_var` | string | Optional; defaults to `DF_TWIN_<NAME_UPPER>`. Not format-validated — supply a valid environment-variable name. | Environment variable name exposed to the builder and scenario verifier. Defaults to `DF_TWIN_<NAME_UPPER>` (e.g., `greeter` → `DF_TWIN_GREETER`). |
-| `fidelity` | string | Human-readable note. | Describes the mock's honesty level relative to the real service (e.g., `"dev mock, basic HTTPS stub"`, `"async job enqueue only, no scheduler"`, `"read-only, no mutations"`). A human-readable honesty note in the def file (documentation only; not read or surfaced by the supervisor). |
-| `supports_variants` | boolean | Optional, default `false`. | M12: opts this twin into verifier-only per-pass variant seeding (see "Observation & Evidence" below). `false` (or absent) means this twin's behavior never varies by pass — exactly the M3a behavior. |
+| `verify_launch` | array of strings | Optional. Same shape/validation as `launch` (non-empty list of command parts) when present. | M21: a **separate, verifier-only implementation** — started instead of `launch` on every verify pass (dev-cohort reset AND the sealed final exam's reset), never at build time. See "Verifier-only twin implementations" below. Absent → `launch` is reused at verify, exactly the pre-M21 (M3a/M12) behavior. |
+| `env_var` | string | Optional; defaults to `DF_TWIN_<NAME_UPPER>`. Not format-validated — supply a valid environment-variable name. | Environment variable name exposed to the builder and scenario verifier. Defaults to `DF_TWIN_<NAME_UPPER>` (e.g., `greeter` → `DF_TWIN_GREETER`). Both `launch` and `verify_launch` are exposed under this SAME variable — the builder/scenario code never needs to know which impl is currently running. |
+| `fidelity` | string | Human-readable note. | Describes the mock's honesty level relative to the real service (e.g., `"dev mock, basic HTTPS stub"`, `"async job enqueue only, no scheduler"`, `"read-only, no mutations"`). A human-readable honesty note in the def file. **M21: surfaced verbatim** (or `""` if absent) on the manifest's `twins` field for every run — see "Manifest surfacing" below. It is a LABEL, not read for validation and not a computed score. |
+| `supports_variants` | boolean | Optional, default `false`. | M12: opts this twin into verifier-only per-pass variant seeding (see "Observation & Evidence" below). `false` (or absent) means this twin's behavior never varies by pass — exactly the M3a behavior. Composes with `verify_launch`: a twin can have BOTH — the verify impl also receives the per-pass `DF_TWIN_VARIANT_SEED`. |
 
 ### Example Twin Definition
 
@@ -50,7 +51,7 @@ The supervisor orchestrates twin lifecycle:
 
 2. **Builder development.** The builder runs with all twin endpoints exposed as environment variables (e.g., `DF_TWIN_GREETER=127.0.0.1:8080`). The builder's code can call out to the twins via localhost.
 
-3. **Reset before each verify pass.** Before each verify pass (loop iteration) runs, the supervisor **terminates and restarts** all twins from scratch. This ensures deterministic, repeatable verification: the supervisor resets all twins to a fresh state once before the whole scenario suite for that iteration runs, then each scenario verifies against that fresh instance. (Scenarios within a single verify pass share the reset instance; per-scenario reset is not provided.)
+3. **Reset before each verify pass.** Before each verify pass (loop iteration) runs, the supervisor **terminates and restarts** all twins from scratch. This ensures deterministic, repeatable verification: the supervisor resets all twins to a fresh state once before the whole scenario suite for that iteration runs, then each scenario verifies against that fresh instance. (Scenarios within a single verify pass share the reset instance; per-scenario reset is not provided.) **M21:** this reset — for BOTH the dev-cohort verify pass and the sealed final exam's own reset — starts each twin's `verify_launch` when the def declares one, instead of reusing `launch`. See "Verifier-only twin implementations" below.
 
 4. **Scenario verification.** Each scenario's `when.run` commands run with the twin endpoints in their environment, same as the builder.
 
@@ -171,7 +172,67 @@ the twin for real, every time. The manifest records `twin_evidence =
 scenarios carrying a twin-evidence assertion>}` when twins are enabled, else
 `None`.
 
-### Honest scope (M12)
+### Verifier-only twin implementations (M21)
+
+Variant seeds (above) generalize within a **single running twin process** —
+same code, unpredictable per-request tokens. M21 generalizes one step
+further: a def may declare `verify_launch`, a **separate, author-supplied,
+spec-conformant implementation** started instead of `launch` at every verify
+pass (dev-cohort reset AND the sealed final exam's own reset), never at
+build time.
+
+**What this defends against.** A variant seed defeats a builder that
+memorized one specific *response body*. It does not by itself stop a
+builder that overfits some other property of the *build-time process
+itself* — timing quirks, a bug in the build mock's error handling, an
+undocumented field the build mock happens to include. `verify_launch` closes
+that gap by making the verify-time twin a **genuinely different process**: a
+builder that only ever tested against (and tailored its code to) the
+build-phase mock's specific behavior fails once a differently-behaving —
+but still spec-conformant — implementation is what the verifier actually
+runs against.
+
+**Lifecycle.** `TwinSet.start`/`reset` take a `phase` (`"build"` or
+`"verify"`): the argv used for a def is `verify_launch` iff `phase ==
+"verify"` AND the def declares one, else `launch` is always reused. This is
+fully additive — a def with no `verify_launch` behaves byte-identically at
+both phases, exactly the pre-M21 behavior. The env var exposed to the
+builder/scenario code (`DF_TWIN_<NAME>`) never changes name or shape between
+phases; only which process is listening behind it does. A `verify_launch`
+that fails to start / never becomes ready within `twins.startup_timeout_s` →
+the verify pass aborts with the same `TWIN_ERROR`/non-zero exit as a failing
+`launch`, always process-group reaped — never a vacuous pass.
+
+**Composes with variant seeds.** A twin can declare BOTH `verify_launch` and
+`"supports_variants": true` — the verify impl also receives the per-pass
+`DF_TWIN_VARIANT_SEED` via the same `extra_env` mechanism, so a verifier-only
+implementation can itself vary its responses pass-to-pass, stacking both
+defenses.
+
+**Barrier.** `verify_launch`'s argv, its behavior, and the fidelity label
+are control-plane configuration — nothing new reaches the builder. The
+builder only ever sees the build-phase twin's env (`build_env_extra` is
+assigned exclusively from the BUILD-phase `TwinSet.start`, before any verify
+reset runs each iteration); it never observes which impl is running at
+verify, or that a swap even happened.
+
+**Manifest surfacing.** Every terminal manifest (fresh run AND resume) gets
+an additive `twins` field: a list, sorted by name, of `{"name", "fidelity",
+"verify_only_impl", "supports_variants"}` — one entry per twin def, or
+`None`/absent-equivalent when twins aren't enabled (same convention as
+`twin_evidence`). `fidelity` is the def's own `fidelity` string verbatim (or
+`""` if the def omits it); `verify_only_impl` is `true` iff the def declares
+`verify_launch`. Names/labels/flags only — never any twin response data, and
+never a computed score:
+
+```json
+"twins": [
+  {"name": "valuegen", "fidelity": "dev mock, fixed-value responder",
+   "verify_only_impl": true, "supports_variants": true}
+]
+```
+
+### Honest scope (M12 / M21)
 
 The observation log's trustworthiness rests entirely on the **same
 filesystem-authority channel that already protects the holdout** — this is
@@ -187,7 +248,7 @@ not a new isolation primitive:
 - At `cooperative` tier, this is **honor-system**, exactly like every other
   cooperative-tier guarantee: there is no OS enforcement, only convention.
 
-**Deliberately deferred, not shipped in M12:**
+**Deliberately deferred, not shipped in M12 (or M21):**
 - An **authenticated network graph** — candidate→twin (data-plane) traffic
   distinguished from verifier→control-plane traffic as an *enforced network*
   policy (would need per-role network namespaces or a proxy). M12's channel
@@ -196,13 +257,22 @@ not a new isolation primitive:
 - An **off-box evidence sink** (writing observations somewhere the local
   machine's own processes can't touch at all) — later milestone territory.
 - **Twin fidelity scoring / drift detection** against a real production
-  service remains deferred, unchanged from M3a: a variant token proves the
-  artifact genuinely invoked *this twin instance, this pass* — twin
-  **liveness** — not fidelity to any real service.
-- **Verifier-only hidden twin IMPLEMENTATIONS** (swapping in a fully
-  different mock behavior per verify pass, as opposed to a seeded variant
-  within one implementation) remain a manual/config exercise the human
-  operator can do, not something M12 automates.
+  service remains deferred, unchanged from M3a: a variant token (or a
+  verify-only impl actually running) proves the artifact genuinely invoked
+  *this twin instance, this pass* — twin **liveness** — not measured
+  fidelity to any real service. M21's `fidelity` field on the manifest is a
+  **human-declared label surfaced for audit**, not a computed metric — dark
+  factory does not check it against anything.
+- **Conformance-checking `verify_launch`** — dark-factory runs whatever
+  `verify_launch` the def author supplies and treats it as spec-conformant
+  on trust, exactly like `launch`; it does not (and cannot, without the real
+  service) verify that the verify-time mock's behavior is actually a
+  faithful stand-in. A `verify_launch` that is itself wrong (e.g. it
+  contradicts the real service, or the spec) will reject a builder that was
+  actually correct — the author's responsibility, not the supervisor's.
+- A **library of built-in twin implementations** — authors write and supply
+  their own `launch`/`verify_launch` scripts; dark-factory ships no
+  off-the-shelf mocks.
 
 ## Composition: Twins Outside the Sandbox
 
@@ -236,9 +306,18 @@ this, and enough to detect a hardcoding builder. It does **not** ship
 swapping in a fully different hidden twin *implementation* per scenario;
 that remains the config/manual exercise described above, not automated.
 
+**M21 update:** M21 ships `verify_launch` — swapping in a genuinely
+**different twin implementation** at verify time (see "Verifier-only twin
+implementations" above), defeating a builder that overfits the build-time
+mock. This is still **per-twin, per-phase** (build vs. verify), not
+**per-scenario**: every scenario in a verify pass sees the SAME
+`verify_launch` instance. Per-scenario hidden twin variants chosen after the
+spec freezes (the full §5.2 vision) remain future `hardened`/`enterprise`
+territory, not automated here.
+
 ### Fidelity and Drift
 
-Per-service **fidelity scoring** (measuring how well the twin predicts real-world behavior) and drift-detection (alerting when the real service diverges) are also deferred. Track this separately outside dark-factory.
+Per-service **fidelity scoring** (measuring how well the twin predicts real-world behavior) and drift-detection (alerting when the real service diverges) are also deferred. Track this separately outside dark-factory. **M21** surfaces the def's own `fidelity` string on the manifest's `twins` field for human audit — a **label**, not a measurement; dark-factory does not compute or check it.
 
 ### Results Are Twin-Observed
 
@@ -255,7 +334,7 @@ Before you ship code that relies on external services, a **human must validate**
 1. **Manual smoke test:** Call a few key endpoints on the real service (or staging) with your built code.
 2. **Compare behavior:** Confirm the real service response matches what your mock twin said it would.
 3. **Check error handling:** Trigger a real (or staged) error condition and verify your code handles it.
-4. **Audit fidelity notes:** Read the `fidelity` string in your twin definitions and verify each claim.
+4. **Audit fidelity notes:** Read the `fidelity` string in your twin definitions and verify each claim. **M21:** these strings are also surfaced verbatim on every run's `manifest.json` (`twins[].fidelity`), alongside `verify_only_impl`, so this audit doesn't require re-opening the control root's `twins/*.json` files — the manifest alone is enough to see what honesty level each twin claimed.
 
 Twins are behavioral mocks, not the production contract. The real service owner and its API documentation are the source of truth.
 

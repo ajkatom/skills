@@ -372,10 +372,10 @@ def test_twins_plus_credentials_merge_twin_env_over_scoped_env(tmp_path, monkeyp
         env = twin_env
         observer_files = {}
 
-        def start(self, defs, run_dir, timeout, extra_env=None):
+        def start(self, defs, run_dir, timeout, extra_env=None, phase="build"):
             return twin_env
 
-        def reset(self, defs, run_dir, timeout, extra_env=None):
+        def reset(self, defs, run_dir, timeout, extra_env=None, phase="verify"):
             return twin_env
 
         def stop(self):
