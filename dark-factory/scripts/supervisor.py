@@ -8,6 +8,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -21,6 +22,7 @@ import df_container
 import df_creds
 import df_custody
 import df_gates
+import df_init
 import df_kb
 import df_notify
 import df_proxy
@@ -1024,6 +1026,141 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         "standard tier requires a working OS sandbox + passing denial probe; "
         "none available. Fix the sandbox or set assurance=cooperative "
         "(or pass --allow-downgrade).")
+
+
+def _init_report_lines(report: dict) -> list:
+    """Human-readable failure lines for a not-ok df_init.validate_scaffold
+    report -- covers every branch that report shape can take (config,
+    scenario-load, behaviors-load, inert, coverage, spec_leak)."""
+    lines = []
+    if not report.get("config_ok"):
+        lines.append(f"  config.json: FAILED ({report.get('config_error', 'did not load')})")
+        return lines
+    if "scenarios_error" in report:
+        lines.append(f"  scenarios/: FAILED to load ({report['scenarios_error']})")
+        return lines
+    if "behaviors_error" in report:
+        lines.append(f"  behaviors.json: FAILED to load ({report['behaviors_error']})")
+        return lines
+    if report.get("inert"):
+        lines.append(f"  inert (non-discriminating) scenarios: {report['inert']}")
+    coverage = report.get("coverage", {})
+    if coverage.get("uncovered_dev"):
+        lines.append(f"  behaviors with no dev-cohort scenario: {coverage['uncovered_dev']}")
+    if coverage.get("orphan_scenarios"):
+        lines.append(f"  scenarios referencing an undeclared behavior_id: {coverage['orphan_scenarios']}")
+    if report.get("spec_leak"):
+        ids = sorted({leak["scenario_id"] for leak in report["spec_leak"]})
+        lines.append(
+            f"  spec_leak: scenario(s) {ids} have a `then` value appearing verbatim in "
+            "spec.md (the builder-visible spec would leak the holdout answer)"
+        )
+    if not lines:
+        lines.append("  (validate_scaffold reported not-ok with no specific failure recorded)")
+    return lines
+
+
+def _init_prerequisite_lines(cfg: dict) -> list:
+    """Run-time prerequisites for the scaffolded control root's assurance
+    tier -- printed, never checked here (init never runs a build; `run`
+    fails closed on its own if these aren't actually met)."""
+    adapter = cfg.get("roles", {}).get("builder", {}).get("adapter", "<unset>")
+    lines = [f"  - the builder CLI/adapter must be installed and executable: {adapter}"]
+    assurance = cfg.get("assurance")
+    if assurance in ("hardened", "enterprise"):
+        lines.append(f"  - a running Docker daemon (assurance: {assurance})")
+        lines.append("  - a working OS sandbox backend for the verifier (macOS sandbox-exec / Linux bwrap)")
+    elif assurance == "standard":
+        lines.append("  - a working OS sandbox backend (macOS sandbox-exec / Linux bwrap) + a passing denial probe")
+    if assurance == "enterprise":
+        lines.append(
+            "  - >=1 distinct approver keypair(s) for split-custody sign-off "
+            "(supervisor.py df-custody keygen/sign/attach) -- add a `custody` block to "
+            "config.json yourself; init does not scaffold one (see references/enterprise.md)"
+        )
+    return lines
+
+
+def init_cmd(control_root: str, answers_path: str, force: bool = False, force_keep: bool = False) -> int:
+    """CLI body for `init`: df_init.scaffold(control_root, answers) then
+    df_init.validate_scaffold(control_root) -- init BLESSES a control root
+    only when the real validators (df_config.load_config, oracle
+    discrimination, coverage, the spec_leak barrier check) all pass, exactly
+    what `run` would independently accept. Never runs a build.
+
+    ok -> prints the scaffolded tree summary + the exact `run` command + the
+    tier's run-time prerequisites, returns 0.
+    not ok -> prints the report's specific failures, removes the scaffolded
+    tree (unless `force_keep`), returns 2.
+    An InitError raised by scaffold() itself (a pure-answers violation, or a
+    non-empty control_root refused without `force`) means NOTHING was ever
+    written -- printed to stderr, returns 2, no cleanup needed.
+    """
+    control_root = os.path.abspath(control_root)
+    try:
+        if answers_path == "-":
+            answers_text = sys.stdin.read()
+        else:
+            with open(answers_path, encoding="utf-8") as f:
+                answers_text = f.read()
+    except OSError as e:
+        sys.stderr.write(f"dark-factory: init: cannot read answers ({e})\n")
+        return 2
+
+    try:
+        answers = json.loads(answers_text)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"dark-factory: init: answers is not valid JSON ({e})\n")
+        return 2
+    if not isinstance(answers, dict):
+        sys.stderr.write("dark-factory: init: answers must be a JSON object\n")
+        return 2
+
+    # --control-root is the single source of truth for WHERE the scaffold is
+    # written; overwrite whatever (likely placeholder) control_root the
+    # answers carry so df_init's disjointness check (build_config) runs
+    # against the ACTUAL write target, never a stale path from the file.
+    answers = dict(answers)
+    answers["control_root"] = control_root
+    if force:
+        answers["force"] = True
+
+    try:
+        df_init.scaffold(control_root, answers)
+    except df_init.InitError as e:
+        sys.stderr.write(f"dark-factory: init: {e}\n")
+        return 2
+
+    ok, report = df_init.validate_scaffold(control_root)
+    if not ok:
+        sys.stderr.write(f"dark-factory: init: scaffolded control root FAILED validation ({control_root}):\n")
+        for line in _init_report_lines(report):
+            sys.stderr.write(line + "\n")
+        if force_keep:
+            sys.stderr.write(
+                f"dark-factory: init: --force-keep set -- leaving the invalid tree at {control_root}\n")
+        else:
+            shutil.rmtree(control_root, ignore_errors=True)
+            sys.stderr.write(f"dark-factory: init: removed the invalid control root {control_root}\n")
+        return 2
+
+    cfg = load_config(control_root)
+    scenarios = load_scenarios(os.path.join(control_root, "scenarios"))
+    behaviors = df_gates.load_behaviors(control_root) or []
+    dev_n = sum(1 for s in scenarios if s.get("cohort", "dev") == "dev")
+    final_n = sum(1 for s in scenarios if s.get("cohort") == "final")
+
+    print(f"dark-factory: init OK -- control root {control_root}")
+    print(f"  config.json     assurance={cfg['assurance']}  autonomy={cfg['autonomy']}")
+    print("  spec.md         (builder-visible; no scenario content)")
+    print(f"  behaviors.json  {len(behaviors)} behavior(s): {', '.join(b['id'] for b in behaviors)}")
+    print(f"  scenarios/      {len(scenarios)} scenario(s) ({dev_n} dev, {final_n} final/sealed)")
+    print("Run:")
+    print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
+    print("Prerequisites:")
+    for line in _init_prerequisite_lines(cfg):
+        print(line)
+    return 0
 
 
 def run(control_root: str, project_src, allow_downgrade: bool = False) -> int:
@@ -2243,6 +2380,16 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
 def main():
     ap = argparse.ArgumentParser(prog="dark-factory supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    p_init = sub.add_parser(
+        "init", help="scaffold + validate a ready-to-run control root from an answers file")
+    p_init.add_argument("--control-root", required=True)
+    p_init.add_argument("--answers", required=True,
+                        help="path to an answers JSON file, or '-' to read from stdin")
+    p_init.add_argument("--force", action="store_true",
+                        help="overwrite a non-empty --control-root")
+    p_init.add_argument("--force-keep", action="store_true",
+                        help="on a failed validation, keep the scaffolded tree for inspection "
+                             "instead of removing it")
     p_run = sub.add_parser("run", help="execute the build/verify loop")
     p_run.add_argument("--control-root", required=True)
     p_run.add_argument("--project-src", default=None)
@@ -2294,7 +2441,10 @@ def main():
     dc_attach.add_argument("--run-dir", required=True)
 
     args = ap.parse_args()
-    if args.cmd == "run":
+    if args.cmd == "init":
+        sys.exit(init_cmd(args.control_root, args.answers, force=args.force,
+                          force_keep=args.force_keep))
+    elif args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
     elif args.cmd == "verify-manifest":
         vkey = None
