@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import urllib.parse
 
 import df_container
 from df_common import canonical_json, sha256_str
@@ -307,6 +308,21 @@ def load_config(control_root: str) -> dict:
     notification_sink = budget_raw.get("notification_sink", "")
     if not isinstance(notification_sink, str):
         raise ConfigError("budget.notification_sink must be a str")
+    if notification_sink:
+        _ns = urllib.parse.urlsplit(notification_sink)
+        if _ns.scheme in ("http", "https"):
+            pass
+        elif _ns.scheme == "file":
+            if _ns.netloc or not _ns.path or not os.path.isabs(_ns.path):
+                raise ConfigError(
+                    "budget.notification_sink file:// URLs must carry an "
+                    "absolute path with no host component (file:///abs/path)"
+                )
+        else:
+            raise ConfigError(
+                "budget.notification_sink must be http://, https://, or "
+                f"file://<abs path> (got {notification_sink!r})"
+            )
 
     sg_raw = raw.get("security_gates", {})
     if not isinstance(sg_raw, dict):

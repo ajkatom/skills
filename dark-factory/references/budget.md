@@ -113,11 +113,48 @@ cap, but actual billing may differ from the estimate (a call can cost more or le
 nobody mistakes `estimated_usd` for metered truth. True metering is deferred to a later
 milestone that adds real usage reporting to the adapter protocol.
 
-**L5 alert delivery (`notification_sink`) is recorded, not delivered.** `budget.
-notification_sink` (default `""`) is validated and carried in config, but M8 does not
-implement any delivery integration — alerts are **journaled and printed to stderr**
-only, the same as at any other autonomy level. A configured `notification_sink` string
-is inert in M8; a tested delivery sink (email/Slack/webhook/etc.) is deferred.
+**Cost metering stays `usage.known=false` — deferred, not faked.** Honest per-call
+dollar metering needs the builder CLIs (`claude`, `codex`, `gemini`) to emit a
+parseable token/cost usage report in headless mode; none of them do today, so there is
+no authoritative number to meter against. Rather than fabricate one, dark-factory keeps
+`estimated_usd` clearly labeled as an estimate (see above) and waits on adapter usage
+reporting before claiming real metering. This is the one flagged budget gap M18 does
+**not** close.
+
+## Notification delivery (M18) — fail-soft, best-effort
+
+`budget.notification_sink` (default `""`, no delivery) now actually **delivers** the
+`BUDGET_ALERT`/`BUDGET_PAUSE` event to an operator channel, via `df_notify.deliver()`:
+
+- `http://` / `https://` — `POST` `json.dumps(event)` with `Content-Type:
+  application/json` to the sink URL.
+- `file:///abs/path` — append one ndjson line to the (absolute, no host component)
+  file, creating it and its parent directories if needed.
+
+The delivered event is `{"event": "BUDGET_ALERT"|"BUDGET_PAUSE", "invocation":
+<run id>, "estimated_usd":, "builder_calls":, "cap": {"max_usd":, "max_calls":},
+"ts":}`. When a credentials/redactor is configured for the run (M11), the event is
+passed through `redactor.redact_obj()` **before** it ever leaves the process — the
+same discipline every other persisted/transmitted artifact follows. No secret value
+configured for the run can reach the sink.
+
+**CRITICAL: fail-SOFT, the opposite of the M13 audit sink.** `deliver()` never raises —
+every failure (unreachable host, non-2xx response, an unwritable file path, an unknown
+scheme) comes back as `(False, reason)`, journaled as `NOTIFY_FAILED` with that reason.
+The run's exit code and outcome are **never** affected by a delivery failure: an alert
+channel being down is an operator inconvenience, not an integrity failure, in sharp
+contrast to the audit sink (M13), which is fail-**closed** when required (a broken
+audit chain *does* fail the run). A successful delivery journals `NOTIFY_SENT`.
+
+Notification is **best-effort, fire-and-forget** — a single POST/append attempt with a
+short timeout (`timeout_s=10` default), not a guaranteed-delivery queue with retries or
+backoff. Absent `notification_sink` (the default `""`), `df_notify.deliver()` is never
+called — behavior is byte-identical to pre-M18 (journal + stderr print only).
+
+`budget.notification_sink`, when set, is validated at config-load time: it must be
+`http://`, `https://`, or `file://<abs path, no host>`; anything else (a bare path, an
+unsupported scheme like `ftp://`, a `file://` URL with a host component or a relative
+path) is a `ConfigError` at load time, not a silent no-op or a runtime surprise.
 
 **Per-role budgets are out of scope.** M8 budgets only builder calls — the only
 model-cost driver in the current architecture (verification is local, deterministic
