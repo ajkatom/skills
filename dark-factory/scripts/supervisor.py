@@ -271,6 +271,10 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
     }
 
 
+def _notify_spool_dir(cfg):
+    return os.path.join(cfg["_control_root"], ".notify-spool")
+
+
 def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
                     builder_calls):
     """M18: best-effort delivery of a BUDGET_ALERT/BUDGET_PAUSE event to
@@ -279,7 +283,16 @@ def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
     affects control flow either way: a down alert channel journals
     NOTIFY_FAILED and the run proceeds exactly as it would have with no sink
     configured at all. Absent notification_sink, deliver() is never called
-    (byte-identical to pre-M18 behavior)."""
+    (byte-identical to pre-M18 behavior).
+
+    M22 Task 2: when `budget.notification_durable` is set, the SAME event
+    goes through `df_notify.deliver_durable` instead — still fail-soft (the
+    run's exit/outcome never changes either way) but at-least-once: a final
+    failure after `notification_attempts` retries spools the (already
+    redacted) event to `<control_root>/.notify-spool/pending.ndjson` and
+    journals NOTIFY_SPOOLED rather than NOTIFY_FAILED. Absent
+    notification_durable (default False), this branch is never taken —
+    byte-identical to the M18 best-effort path above."""
     b = cfg["_budget"]
     sink = b["notification_sink"]
     if not sink:
@@ -292,6 +305,18 @@ def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
         "cap": {"max_usd": b["max_usd"], "max_calls": b["max_calls"]},
         "ts": _now(),
     }
+    if b.get("notification_durable"):
+        ok, reason = df_notify.deliver_durable(
+            sink, event, _notify_spool_dir(cfg),
+            attempts=b["notification_attempts"], redactor=redactor,
+        )
+        if ok:
+            journal.write("NOTIFY_SENT", event=trigger)
+        elif reason == "spooled":
+            journal.write("NOTIFY_SPOOLED", event=trigger)
+        else:
+            journal.write("NOTIFY_FAILED", event=trigger, reason=reason)
+        return
     ok, reason = df_notify.deliver(sink, event, redactor=redactor)
     if ok:
         journal.write("NOTIFY_SENT", event=trigger)
@@ -1326,6 +1351,22 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         adapter=adapter,
         adapter_sha256=sha256_file(adapter) if os.path.exists(adapter) else None,
     )
+
+    # M22 Task 2: at run start, flush any events a PRIOR run spooled (durable
+    # notification only — absent notification_durable this is a no-op branch,
+    # byte-identical to pre-M22). Fail-soft like everything else in
+    # df_notify: flush_spool never raises, an unreachable sink just leaves
+    # the counts where they were and the run proceeds unaffected either way.
+    _budget_cfg = cfg["_budget"]
+    if _budget_cfg.get("notification_durable") and _budget_cfg["notification_sink"]:
+        _flush_result = df_notify.flush_spool(
+            _budget_cfg["notification_sink"], _notify_spool_dir(cfg), redactor=redactor,
+        )
+        journal.write(
+            "NOTIFY_FLUSH",
+            flushed=_flush_result["flushed"],
+            remaining=_flush_result["remaining"],
+        )
 
     manifest_base = {
         "invocation": invocation,

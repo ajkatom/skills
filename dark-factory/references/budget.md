@@ -161,6 +161,53 @@ model-cost driver in the current architecture (verification is local, determinis
 scenario execution, not an LLM call). Planner/test-authority/verifier-role budgets are
 not modeled because those roles don't exist yet as separate LLM invocations.
 
+## Durable notification delivery (M22) — at-least-once, still fail-soft
+
+M18's `deliver()` is best-effort, fire-and-forget: a single attempt with a short
+timeout, and a transient sink outage silently drops the alert (journaled
+`NOTIFY_FAILED`, nothing more). `budget.notification_durable: true` (default `false`)
+opts a run into **at-least-once** delivery instead: `df_notify.deliver_durable(sink,
+event, spool_dir, *, attempts, timeout_s, redactor)` retries `deliver()` up to
+`budget.notification_attempts` times (default `3`, must be an int `>= 1`), and only if
+**every** attempt fails does it append the event to a local disk spool —
+`<control_root>/.notify-spool/pending.ndjson`, one ndjson line per event — and return
+`(False, "spooled")` instead of dropping it. The spooled copy goes through the same
+`redactor.redact_obj()` choke point as an in-flight delivery **before** it ever touches
+disk, so a spooled file carries no secret value configured for the run, exactly like
+the in-flight event.
+
+**At run start**, if `notification_durable` is set and a `notification_sink` is
+configured, the supervisor calls `df_notify.flush_spool(sink, spool_dir,
+redactor=redactor)` before doing anything else: it re-attempts every spooled event via
+`deliver()` and rewrites `pending.ndjson` with only what's still undelivered. The
+supervisor journals `NOTIFY_FLUSH` with `{"flushed": <int>, "remaining": <int>}` on
+every durable run — `0`/`0` when the spool is empty (the common case), whatever a prior
+run left behind otherwise. A `BUDGET_ALERT`/`BUDGET_PAUSE` that spools (rather than
+delivers or hard-fails) journals `NOTIFY_SPOOLED` in place of `NOTIFY_FAILED`.
+
+**STILL fail-soft — this is at-least-once delivery, not a guarantee the run waits for
+it.** `deliver_durable()` and `flush_spool()` NEVER raise, same discipline as
+`deliver()`, and neither ever changes the run's exit code or outcome: a permanently-down
+sink just leaves events sitting in the spool (journaled, visible to an operator who
+looks), while the run itself proceeds and converges/pauses/caps out exactly as it would
+have under M18. The spool only raises the odds an alert eventually reaches its
+destination — it does not make notification a correctness gate on the run.
+
+**Honest scope — a local disk spool, NOT a real message queue.** `pending.ndjson` lives
+on the same host/filesystem as the control root: there is no cross-host durability
+(losing the disk loses the spool), no ordering guarantee beyond append-order, and no
+deduplication beyond "this file has this line once." It is a bounded-retry-plus-local-
+buffer, adequate for "don't silently drop an alert because the sink hiccuped for a few
+seconds," not a substitute for a real broker (Kafka/SQS/etc.) with cross-host
+replication, exactly-once semantics, or consumer offsets. An operator who needs those
+guarantees should point `notification_sink` at a real queue's HTTP ingestion endpoint,
+not rely on this spool to provide them.
+
+Absent `notification_durable` (the default `false`), every notification code path is
+byte-identical to M18: no spool directory is ever created, no `NOTIFY_FLUSH`/
+`NOTIFY_SPOOLED` journal entries appear, and a delivery failure still journals only
+`NOTIFY_FAILED` — the durable path is purely additive.
+
 ## See also
 
 - `references/config-reference.md` — `budget.*` schema + validation

@@ -351,6 +351,20 @@ def load_config(control_root: str) -> dict:
                 f"file://<abs path> (got {notification_sink!r})"
             )
 
+    # M22 Task 2: opt-in AT-LEAST-ONCE notification delivery -- a local disk
+    # spool + bounded retry, not a real message queue (see df_notify /
+    # references/budget.md for the honest scope). Absent -> False/3, the
+    # exact defaults that make the M18 best-effort path byte-identical.
+    notification_durable = budget_raw.get("notification_durable", False)
+    if not isinstance(notification_durable, bool):
+        raise ConfigError("budget.notification_durable must be a bool")
+
+    notification_attempts = budget_raw.get("notification_attempts", 3)
+    if (isinstance(notification_attempts, bool)
+            or not isinstance(notification_attempts, int)
+            or notification_attempts < 1):
+        raise ConfigError("budget.notification_attempts must be an int >= 1")
+
     sg_raw = raw.get("security_gates", {})
     if not isinstance(sg_raw, dict):
         raise ConfigError("security_gates must be a JSON object")
@@ -867,6 +881,8 @@ def load_config(control_root: str) -> dict:
         "max_calls": max_calls,
         "alert_at": alert_at,
         "notification_sink": notification_sink,
+        "notification_durable": notification_durable,
+        "notification_attempts": notification_attempts,
     }
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield
