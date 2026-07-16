@@ -25,12 +25,12 @@ they didn't (gates disabled, or the run died before reaching the converged
 gate — pre-build gate failure, build error, final-exam failure, a paused
 run that was aborted/accepted, etc.).
 
-## The three built-ins
+## The built-ins
 
 All stdlib-only (`re`, `os`, `ast` not needed — line-based regex is
-sufficient here — `json`, `shutil`, `subprocess`), deterministic (sorted
-file walk, no randomness), no network I/O. Binary files (a NUL byte in the
-first read chunk) and `.git`/symlinks are skipped.
+sufficient here — `json`, `shutil`, `subprocess`, `tomllib` when available),
+deterministic (sorted file walk, no randomness), no network I/O. Binary
+files (a NUL byte in the first read chunk) and `.git`/symlinks are skipped.
 
 ### `secret_scan`
 
@@ -71,6 +71,51 @@ Missing manifest files are simply omitted, not an error. `sbom` is
 it in `fail_on`, and even then it has no failure condition of its own (no
 declared-dependency shape currently constitutes a "finding").
 
+### `license` (M18)
+
+Spec §7.6 lists license policy among the mandatory security gates; this is
+its offline implementation. An **offline license-policy gate** against an
+operator-supplied allowlist,
+opt-in via `security_gates.license.enabled` (default `false`, absent block
+→ no license gate at all, byte-identical to pre-M18). Runs
+`df_security.license_scan(workspace, allowlist, require_license=...)`
+and produces findings `{"file", "package", "license", "rule"}` where
+`rule` is `"disallowed-license"` (a declared license not in the allowlist)
+or `"missing-license"` (a discovered package with no declared license at
+all, only reported when `require_license: true`). Matching is
+case-insensitive; an **empty allowlist disallows every declared license**
+(the operator must list them explicitly — there is no implicit "anything
+goes" state).
+
+**Sources — declared/vendored metadata physically present in the
+workspace only, no network:**
+
+- `pyproject.toml`: `[project].license` (a string, or `{text = "..."}` —
+  `{file = "..."}` alone contributes no checkable text, since reading an
+  arbitrarily-named referenced file for its contents is out of scope) and
+  any `License ::` trove classifier in `[project].classifiers` (e.g.
+  `"License :: OSI Approved :: MIT License"` → declared value `"MIT
+  License"`).
+- `package.json`: the modern `"license"` field (an SPDX string, or a
+  `{"type": ...}` object) and the legacy `"licenses"` array
+  (`[{"type": "MIT"}, ...]` or a bare string list).
+- Vendored `node_modules/<pkg>/package.json` (including scoped packages,
+  `node_modules/@scope/pkg/package.json`, and nested vendoring) — the
+  same `"license"`/`"licenses"` parse, findings named by the vendored
+  package's directory path (e.g. `"foo"`, `"@scope/foo"`), not the root
+  project.
+- Vendored `*.dist-info/METADATA` — `License:` and `Classifier: License
+  :: ...` header lines (scan stops at the first blank line, i.e. the end
+  of the RFC822-style header block, so the free-text description can
+  never spuriously match). Package name comes from the `Name:` header,
+  falling back to parsing the `<name>-<version>.dist-info` directory name
+  if absent.
+
+**Parser note:** pyproject.toml is parsed with stdlib `tomllib` when
+available (Python 3.11+), falling back to the same tolerant best-effort
+line/regex scan style `sbom()` already uses for its `[project]
+dependencies` array, for interpreters where `tomllib` doesn't exist.
+
 ## Honest scope — heuristic and a floor, not a full SAST engine
 
 **These built-ins are pattern-based, not a real static-analysis or
@@ -97,6 +142,18 @@ nothing more:
   deliberately network-free — determinism and no data exfiltration
   concerns). "Nothing declared is obviously outdated" is not the same
   claim as "nothing in the dependency tree has a known CVE."
+- **`license` covers declared/vendored metadata physically present in the
+  tree — not the full transitive dependency graph.** A dependency that is
+  merely NAMED in a manifest's `dependencies` list but never vendored
+  anywhere in the workspace (a normal state for an un-vendored pip/npm
+  install) is simply invisible to `license_scan` — it produces no
+  finding either way, and is **not silently treated as license-compliant**
+  under `require_license`. Resolving such a dependency's real license
+  would require a network lookup (PyPI/npm registry) or a bundled SPDX/
+  license database, both out of scope for an offline, stdlib-only tool.
+  If you need full transitive coverage, resolve the dependency tree and
+  vendor it (or its metadata) into the artifact before the gate runs, or
+  plug in a real tool via the external-gate interface below.
 
 For anything stronger than this floor, use the **external gate**
 interface below to plug in a real tool.
@@ -119,7 +176,7 @@ capture_output=True, text=True, timeout=300)`:
 ```
 
 - `name` must be unique and must not collide with a built-in name
-  (`secret_scan`, `dangerous_scan`, `sbom` are reserved).
+  (`secret_scan`, `dangerous_scan`, `sbom`, `license` are reserved).
 - **Probed, not assumed.** Before running, `shutil.which(cmd[0])` checks
   the command is actually on `PATH`. Missing → `status: "unavailable"`
   (never a silent pass). A spawn error or a 300s timeout is also
@@ -137,7 +194,8 @@ capture_output=True, text=True, timeout=300)`:
 
 `fail_on` (default `["secret_scan", "dangerous_scan"]` when
 `security_gates.enabled`) is the list of gate names that are **mandatory**
-— `secret_scan`/`dangerous_scan`/`sbom` or a declared `external[].name`.
+— `secret_scan`/`dangerous_scan`/`sbom`/`license` or a declared
+`external[].name`.
 A gate not listed in `fail_on` can still run and appear in the report, but
 a finding on it never rejects the run (it's recorded, not enforced —
 useful for `sbom` or an external gate you want visibility into before
@@ -211,7 +269,8 @@ report:
   "gates": {
     "secret_scan": {"status": "pass", "findings": []},
     "dangerous_scan": {"status": "pass", "findings": []},
-    "sbom": {"status": "pass", "sbom": {"declared": {...}, "count": 3, "unpinned": []}}
+    "sbom": {"status": "pass", "sbom": {"declared": {...}, "count": 3, "unpinned": []}},
+    "license": {"status": "pass", "findings": []}
   },
   "failed": []
 }
@@ -240,8 +299,12 @@ never gate-checked.
 - **Resolved transitive dependency graphs + CVE lookup.** `sbom` is a
   declared-dependency inventory (from manifest files), not a resolved
   graph, and does no network calls (no CVE database lookup).
-- **License-policy enforcement.** Nothing in `sbom` inspects or enforces
-  package licenses beyond recording the declared dependency names.
+- **License resolution for un-vendored transitive dependencies.** `license`
+  (M18) enforces an allowlist against licenses declared in manifests and
+  vendored metadata physically present in the artifact; it does not (and,
+  offline/stdlib-only, cannot) resolve the license of a dependency that's
+  merely named in a manifest but never vendored into the tree — see the
+  `license` honest-scope note above.
 - **Resource-limit enforcement on the built artifact at runtime.** That's
   a sandbox-tier concern (see `references/isolation.md`), not a
   build-time security gate.
