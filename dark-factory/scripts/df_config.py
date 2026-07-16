@@ -725,6 +725,26 @@ def load_config(control_root: str) -> dict:
             raise ConfigError(
                 "enterprise requires signed audit manifests (audit.signing: true)"
             )
+        # Token-collision guard (M17 Task 3 review): the whole point of the
+        # credential proxy is that the raw provider token NEVER enters the
+        # sandbox — the proxy injects it host-side. If the operator ALSO lists
+        # the proxy's token_env in `credentials.allowlist` (M11), df_creds
+        # would resolve that env var and bake its VALUE into the enterprise
+        # container as a `-e` var, silently putting the token right back into
+        # the sandbox and defeating the guarantee. Refuse at load. (Belt-and-
+        # suspenders: the supervisor also passes NO credential env into the
+        # enterprise container at all — the proxy is the sole credential
+        # path — but a config that even expresses this contradiction is
+        # fail-closed here rather than quietly ignored.)
+        if cfg_credentials is not None:
+            proxy_token_env_name = cfg_proxy["token_env"]
+            if proxy_token_env_name in cfg_credentials["allowlist"]:
+                raise ConfigError(
+                    f"enterprise: credential_proxy.token_env ({proxy_token_env_name!r}) must "
+                    "NOT also appear in credentials.allowlist — that would bake the provider "
+                    "token into the container as a -e var, defeating the proxy's "
+                    "token-never-in-sandbox guarantee"
+                )
         cfg_enterprise = {"seccomp": df_container.DEFAULT_SECCOMP_PATH}
     else:
         cfg_enterprise = None

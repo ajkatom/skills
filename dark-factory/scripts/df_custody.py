@@ -67,6 +67,24 @@ def generate_keypair() -> tuple[str, str]:
     return priv_bytes.hex(), pub_bytes.hex()
 
 
+def public_from_private(private_hex: str) -> str:
+    """Derive the ed25519 PUBLIC key (raw-32-byte hex) from a raw-32-byte-hex
+    PRIVATE key. Used by the `df-custody sign` CLI to emit a self-describing
+    {"approver": <public_hex>, "sig": <hex>} entry, so a signer never has to
+    track their public key separately from their private one. Raises
+    CustodyError on a malformed key (an operator action -- loud, not silent)."""
+    _require_cryptography()
+    try:
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(private_hex))
+        pub_bytes = sk.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    except (ValueError, TypeError) as e:
+        raise CustodyError(f"malformed ed25519 private key: {e}") from e
+    return pub_bytes.hex()
+
+
 def sign_manifest(private_hex: str, manifest_bytes: bytes) -> str:
     """Sign manifest_bytes with the ed25519 private key given as raw-32-byte
     hex. Returns the 64-byte signature as hex (128 hex chars). Raises

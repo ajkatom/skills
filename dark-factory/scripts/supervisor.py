@@ -338,24 +338,7 @@ def _load_audit_key(cfg, journal):
         return None, 2
 
 
-def _build_manifest_dict(run_dir: str, extra: dict, audit_key: bytes, finished_ts: str) -> dict:
-    """The exact (pre-redaction) manifest dict finalize_manifest would write:
-    factored out so a caller (the M17 custody gate) can compute BYTE-IDENTICAL
-    manifest content ahead of the real write, to check custody-signatures.json
-    against precisely the bytes about to be sealed — without duplicating this
-    construction logic and risking the two drift apart."""
-    journal_path = os.path.join(run_dir, "journal.jsonl")
-    manifest = dict(extra)
-    manifest["manifest_version"] = "0.1"
-    manifest["journal_sha256"] = sha256_file(journal_path)
-    manifest["finished_ts"] = finished_ts
-    if audit_key is not None:
-        manifest["audit_signing"] = True
-    return manifest
-
-
-def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redactor=None,
-                      finished_ts: str = None) -> str:
+def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redactor=None) -> str:
     """Write manifest.json + manifest.sha256 sidecar.
 
     HONESTY (spec 7.5, cooperative/standard tier): a local process that can
@@ -373,12 +356,10 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     the manifest are names/allowlist only and are never themselves subject to
     redaction (they contain no values).
 
-    `finished_ts` (M17): defaults to `_now()` exactly as before every M17
-    call site. The enterprise custody gate pins ONE `_now()` value BEFORE
-    finalize_manifest runs (via `_build_manifest_dict`, to check custody-
-    signatures.json against the bytes about to be sealed) and passes it here
-    so the actually-written manifest is byte-identical to what was checked —
-    never a second, possibly-different, `_now()` call.
+    M17 note: the manifest this writes is the IMMUTABLE, signable artifact of
+    an enterprise run — split-custody qualification is a SEPARATE attestation
+    (custody_attestation.json, written later by `attach_custody` over these
+    exact bytes), never a rewrite of this file. See references/enterprise.md.
 
     M13 note: finalize_manifest SEALS journal.jsonl — its whole-file hash goes
     into `journal_sha256` and NOTHING may append to journal.jsonl afterward.
@@ -387,7 +368,13 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     `audit_events.jsonl`, never back into journal.jsonl — keeping this
     whole-file seal (M5a) unweakened.
     """
-    manifest = _build_manifest_dict(run_dir, extra, audit_key, finished_ts or _now())
+    journal_path = os.path.join(run_dir, "journal.jsonl")
+    manifest = dict(extra)
+    manifest["manifest_version"] = "0.1"
+    manifest["journal_sha256"] = sha256_file(journal_path)
+    manifest["finished_ts"] = _now()
+    if audit_key is not None:
+        manifest["audit_signing"] = True
     text = _redacted_write(os.path.join(run_dir, "manifest.json"), manifest, redactor)
     digest = sha256_str(text)
     atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
@@ -395,73 +382,6 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
         sig = df_audit.sign(audit_key, text.encode("utf-8"))
         atomic_write(os.path.join(run_dir, "manifest.hmac"), sig + "\n")
     return digest
-
-
-def _manifest_preview_bytes(run_dir, extra, audit_key, finished_ts, redactor) -> bytes:
-    """The EXACT bytes finalize_manifest(run_dir, extra, audit_key, redactor,
-    finished_ts) would write to manifest.json — computed via the SAME
-    _build_manifest_dict + redaction + canonical_json path, without touching
-    disk. Used ONLY by the M17 custody gate, to check custody-signatures.json
-    against precisely what is about to be sealed."""
-    manifest = _build_manifest_dict(run_dir, extra, audit_key, finished_ts)
-    obj = redactor.redact_obj(manifest) if redactor is not None else manifest
-    return canonical_json(obj).encode("utf-8")
-
-
-def _custody_gate(cfg, journal, run_dir, mf_candidate, finished_ts, audit_key, redactor):
-    """M17 Task 3: the split-custody gate — enterprise-only, run at the
-    CONVERGED point (after the final exam AND the M9 security gates have
-    already passed, the same point M9's own security gates run: a run that
-    isn't otherwise ship-worthy should never even reach the custody
-    question).
-
-    Loads `<control_root>/custody-signatures.json` (a JSON list of
-    `{"approver": <64-hex ed25519 pubkey>, "sig": <hex>}` entries) and checks
-    it, via `df_custody.verify_custody`, against the EXACT bytes this run's
-    manifest is about to be sealed with (`_manifest_preview_bytes` — the same
-    construction path `finalize_manifest` itself uses, so a signature
-    collected against a byte-identical local preview genuinely covers what
-    ships). `finished_ts` is the caller's ALREADY-pinned `_now()` value (see
-    finalize_manifest's docstring) — never recomputed here.
-
-    Returns (satisfied: bool, custody_field: dict). custody_field is the
-    additive `custody` manifest field — {"required_k", "approvers",
-    "signatures", "satisfied", "reason"} — and NEVER contains a private key,
-    signature value, or token: only counts and a short human-readable reason
-    (df_custody.verify_custody's own "m/k distinct approver signatures", or a
-    missing/unreadable-file explanation).
-    """
-    custody_cfg = cfg["_custody"]
-    sig_path = os.path.join(cfg["_control_root"], "custody-signatures.json")
-
-    preview_bytes = _manifest_preview_bytes(run_dir, mf_candidate, audit_key, finished_ts, redactor)
-
-    signatures, file_reason = [], None
-    if not os.path.exists(sig_path):
-        file_reason = f"{os.path.basename(sig_path)} not found in the control root"
-    else:
-        try:
-            with open(sig_path, encoding="utf-8") as f:
-                loaded = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            file_reason = f"unreadable custody-signatures.json: {e}"
-        else:
-            if isinstance(loaded, list):
-                signatures = loaded
-            else:
-                file_reason = "custody-signatures.json must be a JSON list"
-
-    satisfied, verify_reason = df_custody.verify_custody(
-        preview_bytes, signatures, custody_cfg["approvers"], custody_cfg["threshold"])
-    custody_field = {
-        "required_k": custody_cfg["threshold"],
-        "approvers": len(custody_cfg["approvers"]),
-        "signatures": len(signatures),
-        "satisfied": satisfied,
-        "reason": file_reason or verify_reason,
-    }
-    journal.write("CUSTODY_CHECK", satisfied=satisfied, reason=custody_field["reason"])
-    return satisfied, custody_field
 
 
 def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, journal) -> int:
@@ -556,24 +476,159 @@ def verify_chain_cmd(control_root: str, key: bytes = None) -> bool:
     return ok
 
 
-def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
-    """CLI body for `verify-custody` — the second phase of split custody's
-    two-phase ship (see the CUSTODY_PENDING terminal in _run_loop /
-    references/enterprise.md): a run can seal a CUSTODY_PENDING manifest,
-    and later — once approvers sign — an operator confirms it flips to
-    satisfied WITHOUT re-running anything. Purely read-only: loads the run's
-    ALREADY-SEALED `manifest.json` bytes exactly as they sit on disk (never
-    re-finalizes, never re-derives them) and `<control_root>/
-    custody-signatures.json`, and reports whether >=K distinct approver
-    signatures now verify over those exact bytes. Mirrors verify_manifest/
-    verify_chain_cmd's print-one-line-and-return-bool shape.
-    """
+CUSTODY_SIGNATURES_FILE = "custody-signatures.json"
+CUSTODY_ATTESTATION_FILE = "custody_attestation.json"
+
+
+def _read_manifest_bytes(run_dir):
+    """Read a run's SEALED manifest.json as raw bytes (exactly what an
+    approver signs and what verification runs over) plus its sha256 (the
+    same digest the manifest.sha256 sidecar carries). Returns (bytes, sha256)
+    or (None, None) if the manifest is absent."""
     mp = os.path.join(run_dir, "manifest.json")
     if not os.path.exists(mp):
-        print(f"NOT FOUND ({mp} does not exist)")
-        return False
+        return None, None
     with open(mp, "rb") as f:
         manifest_bytes = f.read()
+    return manifest_bytes, sha256_str(manifest_bytes.decode("utf-8"))
+
+
+def _load_custody_signatures(control_root):
+    """Load <control_root>/custody-signatures.json (the collected approver
+    signatures, a JSON list of {"approver", "sig"}). Returns (list, None) on
+    success or ([], reason) when absent/unreadable/wrong-shape -- never
+    raises."""
+    sig_path = os.path.join(control_root, CUSTODY_SIGNATURES_FILE)
+    if not os.path.exists(sig_path):
+        return [], f"{CUSTODY_SIGNATURES_FILE} not found in the control root"
+    try:
+        with open(sig_path, encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return [], f"unreadable {CUSTODY_SIGNATURES_FILE}: {e}"
+    if not isinstance(loaded, list):
+        return [], f"{CUSTODY_SIGNATURES_FILE} must be a JSON list"
+    return loaded, None
+
+
+def _satisfying_approvers(manifest_bytes, signatures, approvers):
+    """The DISTINCT approver public keys (from `approvers`) that have a
+    signature in `signatures` verifying over manifest_bytes -- the same
+    distinct-count logic df_custody.verify_custody applies, surfaced here so
+    the attestation can record WHICH approvers satisfied it (never a private
+    key; public keys only)."""
+    approver_set = {a.lower() for a in approvers if isinstance(a, str)}
+    satisfied = []
+    for a in sorted(approver_set):
+        for entry in signatures:
+            if not isinstance(entry, dict):
+                continue
+            ea, es = entry.get("approver"), entry.get("sig")
+            if not isinstance(ea, str) or not isinstance(es, str):
+                continue
+            if ea.lower() == a and df_custody.verify_one(a, manifest_bytes, es):
+                satisfied.append(a)
+                break
+    return satisfied
+
+
+def attach_custody(control_root: str, run_dir: str) -> int:
+    """`df-custody attach` — PHASE 2 of the split-custody two-phase ship
+    (references/enterprise.md). Reads the run's IMMUTABLE, already-sealed
+    manifest.json (never rewrites it) and the collected approver signatures
+    (`<control_root>/custody-signatures.json`), and verifies them via
+    df_custody.verify_custody over the EXACT sealed manifest bytes against the
+    config's approver allowlist + threshold.
+
+    Satisfied (>=K distinct valid approver signatures): writes a SEPARATE
+    `<run_dir>/custody_attestation.json` = {manifest_sha256, threshold,
+    approvers_satisfied, signatures, qualified: true, ts} AND anchors it into
+    the per-control-root hash chain (df_audit_chain -- tamper-evident, the
+    same M13 chain), then returns 0. The manifest still reads
+    outcome:CUSTODY_PENDING -- qualification lives in the attestation, never
+    in a manifest rewrite (no single process/operator can self-ship).
+
+    Not satisfied: prints PENDING with the distinct-count reason, writes NO
+    attestation, and returns 3.
+    """
+    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        sys.stderr.write(f"dark-factory: no manifest.json in {run_dir}\n")
+        return 3
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    if cfg["_custody"] is None:
+        sys.stderr.write("dark-factory: control root has no `custody` block; nothing to attach\n")
+        return 2
+
+    approvers = cfg["_custody"]["approvers"]
+    threshold = cfg["_custody"]["threshold"]
+    signatures, load_reason = _load_custody_signatures(control_root)
+    satisfied, reason = df_custody.verify_custody(manifest_bytes, signatures, approvers, threshold)
+    if not satisfied:
+        print(f"dark-factory: CUSTODY PENDING — not attached ({load_reason or reason}). "
+              f"Collect >={threshold} distinct approver signatures over the sealed manifest, then "
+              f"re-run df-custody attach.")
+        return 3
+
+    satisfied_set = _satisfying_approvers(manifest_bytes, signatures, approvers)
+    kept_sigs = [
+        {"approver": e["approver"].lower(), "sig": e["sig"]}
+        for e in signatures
+        if isinstance(e, dict) and isinstance(e.get("approver"), str)
+        and e["approver"].lower() in satisfied_set
+        and isinstance(e.get("sig"), str)
+    ]
+    attestation = {
+        "attestation_version": "0.1",
+        "manifest_sha256": manifest_sha,
+        "threshold": threshold,
+        "approvers_satisfied": satisfied_set,
+        "signatures": kept_sigs,
+        "qualified": True,
+        "ts": _now(),
+    }
+    att_text = canonical_json(attestation)
+    att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
+    atomic_write(att_path, att_text)
+
+    # Anchor the attestation into the tamper-evident hash chain (M13). The
+    # audit key is required at enterprise (audit.signing), so a signed chain
+    # link binds this attestation off the manifest it qualifies.
+    audit_key = None
+    if cfg.get("_audit", {}).get("signing"):
+        try:
+            audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
+        except df_audit.AuditKeyError as e:
+            sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+            return 2
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    entry = df_audit_chain.append_entry(
+        chain_path, os.path.basename(run_dir) + ":custody", sha256_str(att_text), _now(), audit_key)
+
+    print(f"dark-factory: CUSTODY ATTESTED — {reason}; qualified. "
+          f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…")
+    return 0
+
+
+def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
+    """CLI body for `verify-custody` — read-only confirmation that a run is
+    QUALIFIED under split custody. Recomputes the CURRENT manifest.json
+    sha256, loads `<run_dir>/custody_attestation.json`, checks the attestation
+    binds THIS manifest (its manifest_sha256 must equal the current one -- a
+    single-byte manifest edit breaks this), and RE-VERIFIES the attestation's
+    recorded signatures still satisfy K-of-N over the current manifest bytes
+    against the config's approver allowlist + threshold (so a forged
+    attestation, or one carrying signatures over stale bytes, fails). Prints
+    QUALIFIED (return True) / a PENDING-or-INVALID reason (return False).
+    """
+    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        print(f"NOT FOUND ({os.path.join(run_dir, 'manifest.json')} does not exist)")
+        return False
 
     try:
         cfg = load_config(control_root)
@@ -584,25 +639,37 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
         print("NO CUSTODY CONFIGURED (control root has no `custody` block)")
         return False
 
-    sig_path = os.path.join(control_root, "custody-signatures.json")
-    if not os.path.exists(sig_path):
-        print(f"PENDING (0/{cfg['_custody']['threshold']} distinct approver signatures — "
-              f"{sig_path} not found)")
+    att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
+    if not os.path.exists(att_path):
+        print(f"PENDING (no {CUSTODY_ATTESTATION_FILE}; run df-custody attach once "
+              f">={cfg['_custody']['threshold']} approvers have signed)")
         return False
     try:
-        with open(sig_path, encoding="utf-8") as f:
-            signatures = json.load(f)
+        with open(att_path, encoding="utf-8") as f:
+            attestation = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        print(f"UNREADABLE (custody-signatures.json: {e})")
-        return False
-    if not isinstance(signatures, list):
-        print("UNREADABLE (custody-signatures.json must be a JSON list)")
+        print(f"INVALID (unreadable {CUSTODY_ATTESTATION_FILE}: {e})")
         return False
 
+    if attestation.get("manifest_sha256") != manifest_sha:
+        print("INVALID (attestation does not bind the current manifest bytes — "
+              "manifest tampered or attestation stale)")
+        return False
+
+    sigs = attestation.get("signatures", [])
+    if not isinstance(sigs, list):
+        print(f"INVALID ({CUSTODY_ATTESTATION_FILE} signatures must be a list)")
+        return False
+    # Re-verify against the CONFIG's approvers + threshold (never the
+    # attestation's own claimed values) so a forged attestation can neither
+    # lower K nor introduce rogue approvers.
     satisfied, reason = df_custody.verify_custody(
-        manifest_bytes, signatures, cfg["_custody"]["approvers"], cfg["_custody"]["threshold"])
-    print(f"{'SATISFIED' if satisfied else 'PENDING'} ({reason})")
-    return satisfied
+        manifest_bytes, sigs, cfg["_custody"]["approvers"], cfg["_custody"]["threshold"])
+    if satisfied:
+        print(f"QUALIFIED ({reason}; attestation binds manifest {manifest_sha[:16]}…)")
+        return True
+    print(f"INVALID (attestation signatures no longer satisfy K-of-N: {reason})")
+    return False
 
 
 def _kb_writeback(cfg, journal, manifest_dict, failing):
@@ -1473,6 +1540,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                         "enterprise: refusing to mount the adapter directory — it "
                         f"overlaps the control root ({adapter_ro_dir}); the "
                         "holdout barrier would be breached by construction")
+                # Enterprise passes NO credential env into the container at
+                # all (env=None) — the credential_proxy is the SOLE credential
+                # path: the raw provider token is read host-side by the proxy
+                # and injected on the proxy->provider leg, never baked into the
+                # container as a `-e` var. (df_config additionally refuses a
+                # config where credential_proxy.token_env also appears in
+                # credentials.allowlist, so the two channels can't collide.)
                 builder_prefix = df_container.build_enterprise_argv(
                     c["image"], workspace,
                     ro_mounts=[adapter_ro_dir],
@@ -1480,19 +1554,12 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     seccomp_profile_path=cfg["_enterprise"]["seccomp"],
                     entrypoint_path=entrypoint_path,
                     memory=c["memory"], pids=c["pids"],
-                    env=creds if creds else None)
+                    env=None)
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
                                   reason="builder-side twin env not forwarded into "
                                          "container (M12)")
-                # Same as hardened: credential values enter the container
-                # ONLY as `-e` argv baked into build_enterprise_argv, never
-                # the docker CLIENT process's own env; the raw provider
-                # token additionally never enters at all when routed through
-                # credential_proxy (the proxy injects it host-side) — an
-                # enterprise config's `credentials` block, if also
-                # configured, still flows exactly like hardened's.
-                builder_env = creds
+                builder_env = None
             else:
                 builder_prefix = exec_prefix
                 if creds:
@@ -1722,75 +1789,73 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     return anchor_exit or 3
 
                 eff = manifest_base.get("_effective_tier", "cooperative")
-                qualified = eff in _QUALIFYING_TIERS
-                outcome = "COMPLETE_QUALIFIED" if qualified else "COMPLETE_UNQUALIFIED"
                 custody_field = None
                 proxy_field = None
                 egress_field = None
-                finished_ts_override = None
 
                 if eff == "enterprise":
-                    # M17 Task 3: the split-custody gate. Runs HERE — after the
-                    # final exam AND the M9 security gates above have already
-                    # passed, exactly where M9's own gates run — because a run
-                    # that isn't otherwise ship-worthy should never even reach
-                    # the custody question. `finished_ts_override` is pinned
-                    # ONCE here (see finalize_manifest's docstring) so the
-                    # manifest custody was checked against and the manifest
-                    # actually sealed below are byte-identical.
-                    finished_ts_override = _now()
+                    # M17 Task 3 (redesigned): an enterprise run with required
+                    # custody ALWAYS terminates CUSTODY_PENDING (qualified
+                    # False). The manifest this seals IS the immutable,
+                    # signable artifact — it must NEVER self-qualify (that is
+                    # the whole point of split custody: no single process or
+                    # operator can ship). Qualification is a SEPARATE
+                    # attestation (custody_attestation.json), produced later by
+                    # `attach_custody` ONLY once >=K distinct approvers have
+                    # signed these exact sealed bytes — see the two-phase-ship
+                    # contract in references/enterprise.md. So there is no
+                    # in-loop custody "gate" that could pretend to qualify;
+                    # there is only this honest pending terminal.
+                    outcome, qualified = "CUSTODY_PENDING", False
                     proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
-                    # "probe": "unverified" here is deliberate honesty: this
-                    # run's resolve_isolation live-probed the container
-                    # barrier + docker + a valid seccomp profile, but did NOT
-                    # re-run the full live egress-lock network probe against
-                    # real hosts on THIS run (that is
-                    # df_container.probe_enterprise_egress — expensive,
-                    # network-dependent, exercised by the test suite/operator
-                    # tooling, not unconditionally on every production run).
-                    # Never claim "verified" for a check that didn't run.
-                    egress_field = {"locked": True, "probe": "unverified"}
-                    mf_candidate = dict(
-                        mb_clean, iterations=i, final_exam=fe, regressions=sorted(regressed),
-                        security=sec_report,
-                        budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                        proxy=proxy_field, enterprise_egress=egress_field,
-                    )
-                    satisfied, custody_field = _custody_gate(
-                        cfg, journal, run_dir, mf_candidate, finished_ts_override, audit_key, redactor)
-                    mf_candidate["custody"] = custody_field
-                    if satisfied:
-                        journal.write("CONVERGED", iteration=i)
-                    else:
-                        outcome, qualified = "CUSTODY_PENDING", False
-                        journal.write("CUSTODY_PENDING", iteration=i, reason=custody_field["reason"])
+                    # "locked": "configured" (not True) + "probe": "unverified":
+                    # the container config INCLUDES the egress lockdown, but it
+                    # was NOT empirically re-verified against real hosts on THIS
+                    # run (that live proof is df_container.probe_enterprise_egress
+                    # — expensive/network-dependent, exercised by the test suite
+                    # / operator tooling, never unconditionally per production
+                    # run). Never claim more than what actually ran.
+                    egress_field = {"locked": "configured", "probe": "unverified"}
+                    custody_field = {
+                        "required_k": cfg["_custody"]["threshold"],
+                        "approvers": len(cfg["_custody"]["approvers"]),
+                        "satisfied": False,
+                        "note": "enterprise run sealed CUSTODY_PENDING; qualification requires a "
+                                "valid K-of-N custody_attestation.json over these exact manifest "
+                                "bytes (df-custody attach)",
+                    }
+                    journal.write("CUSTODY_PENDING", iteration=i,
+                                  required_k=cfg["_custody"]["threshold"],
+                                  approvers=len(cfg["_custody"]["approvers"]))
                 else:
                     journal.write("CONVERGED", iteration=i)
-                    mf_candidate = dict(
-                        mb_clean, iterations=i, final_exam=fe, regressions=sorted(regressed),
-                        security=sec_report,
-                        budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                        custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
-                    )
+                    qualified = eff in _QUALIFYING_TIERS
+                    outcome = "COMPLETE_QUALIFIED" if qualified else "COMPLETE_UNQUALIFIED"
 
-                mf = dict(mf_candidate, outcome=outcome, qualified=qualified)
-                finalize_kwargs = {"audit_key": audit_key, "redactor": redactor}
-                if finished_ts_override is not None:
-                    finalize_kwargs["finished_ts"] = finished_ts_override
-                digest = finalize_manifest(run_dir, mf, **finalize_kwargs)
+                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
+                          regressions=sorted(regressed), security=sec_report, qualified=qualified,
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field)
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                             digest, audit_key, journal)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
 
                 if outcome == "CUSTODY_PENDING":
-                    sig_path = os.path.join(cfg["_control_root"], "custody-signatures.json")
+                    manifest_path = os.path.join(run_dir, "manifest.json")
                     print(
-                        f"dark-factory: CUSTODY PENDING — awaiting K-of-N approver "
-                        f"signatures ({custody_field['signatures']} distinct valid / "
-                        f"{custody_field['required_k']} required so far). Have approvers sign "
-                        f"this run's manifest bytes and write entries to {sig_path}, then run: "
-                        f"supervisor.py verify-custody {cfg['_control_root']} --run-dir {run_dir}"
+                        f"dark-factory: CUSTODY PENDING — build converged, but shipping requires "
+                        f"K-of-N split-custody sign-off ({custody_field['required_k']} of "
+                        f"{custody_field['approvers']} approvers). The sealed manifest is the "
+                        f"signable artifact:\n"
+                        f"  manifest: {manifest_path}\n"
+                        f"  sha256:   {digest}\n"
+                        f"Have K-of-N approvers sign these exact bytes:\n"
+                        f"  supervisor.py df-custody sign --manifest {manifest_path} --key-file <privkey>\n"
+                        f"collect the {{approver,sig}} entries into "
+                        f"{os.path.join(cfg['_control_root'], 'custody-signatures.json')}, then attach:\n"
+                        f"  supervisor.py df-custody attach {cfg['_control_root']} --run-dir {run_dir}"
                     )
                     return anchor_exit or 3
 
@@ -2097,10 +2162,32 @@ def main():
                             "downgrade to cooperative (unqualified) instead of failing closed")
     p_vcu = sub.add_parser(
         "verify-custody",
-        help="check whether K-of-N split-custody approver signatures now satisfy an "
-             "enterprise run's sealed manifest (M17 two-phase ship)")
+        help="confirm an enterprise run is QUALIFIED under split custody "
+             "(a valid K-of-N custody_attestation.json binds its sealed manifest)")
     p_vcu.add_argument("control_root")
     p_vcu.add_argument("--run-dir", required=True)
+
+    # `df-custody` — the split-custody operator CLI (M17 two-phase ship):
+    #   keygen  -> a fresh approver ed25519 keypair
+    #   sign    -> an approver signs a run's sealed manifest bytes
+    #   attach  -> PHASE 2: verify collected sigs + write custody_attestation.json
+    p_dc = sub.add_parser("df-custody", help="split-custody keygen / sign / attach (enterprise)")
+    dc_sub = p_dc.add_subparsers(dest="custody_cmd", required=True)
+    dc_keygen = dc_sub.add_parser("keygen", help="generate a fresh approver ed25519 keypair")
+    dc_keygen.add_argument("--out-prefix", default=None,
+                           help="if given, write <prefix>.key (private) + <prefix>.pub (public); "
+                                "otherwise print both to stdout")
+    dc_sign = dc_sub.add_parser(
+        "sign", help="sign a run's sealed manifest bytes; prints a {approver,sig} JSON entry")
+    dc_sign.add_argument("--manifest", required=True, help="path to the run's manifest.json")
+    dc_sign.add_argument("--key-file", required=True,
+                         help="path to the approver's private key (raw-32-byte hex)")
+    dc_attach = dc_sub.add_parser(
+        "attach", help="PHASE 2: verify collected approver signatures over the sealed manifest "
+                       "and, if K-of-N satisfied, write custody_attestation.json + anchor it")
+    dc_attach.add_argument("control_root")
+    dc_attach.add_argument("--run-dir", required=True)
+
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
@@ -2125,7 +2212,55 @@ def main():
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
     elif args.cmd == "verify-custody":
-        sys.exit(0 if verify_custody_cmd(args.control_root, args.run_dir) else 3)
+        # exit 0 = QUALIFIED, 1 = PENDING/INVALID (mirrors verify-chain).
+        sys.exit(0 if verify_custody_cmd(args.control_root, args.run_dir) else 1)
+    elif args.cmd == "df-custody":
+        sys.exit(_df_custody_cli(args))
+
+
+def _df_custody_cli(args) -> int:
+    """Dispatch for the `df-custody` operator CLI (keygen/sign/attach)."""
+    if args.custody_cmd == "keygen":
+        try:
+            priv, pub = df_custody.generate_keypair()
+        except df_custody.CustodyError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        if args.out_prefix:
+            atomic_write(args.out_prefix + ".key", priv + "\n")
+            os.chmod(args.out_prefix + ".key", 0o600)
+            atomic_write(args.out_prefix + ".pub", pub + "\n")
+            print(f"dark-factory: wrote {args.out_prefix}.key (private, 0600) + "
+                  f"{args.out_prefix}.pub (public: {pub})")
+        else:
+            print(json.dumps({"private": priv, "public": pub}))
+        return 0
+
+    if args.custody_cmd == "sign":
+        if not os.path.exists(args.manifest):
+            sys.stderr.write(f"dark-factory: manifest not found: {args.manifest}\n")
+            return 2
+        with open(args.manifest, "rb") as f:
+            manifest_bytes = f.read()
+        try:
+            with open(args.key_file, encoding="utf-8") as f:
+                private_hex = f.read().strip()
+        except OSError as e:
+            sys.stderr.write(f"dark-factory: cannot read key file: {e}\n")
+            return 2
+        try:
+            sig = df_custody.sign_manifest(private_hex, manifest_bytes)
+            approver = df_custody.public_from_private(private_hex)
+        except df_custody.CustodyError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        # Self-describing entry ready to drop into custody-signatures.json.
+        print(json.dumps({"approver": approver, "sig": sig}))
+        return 0
+
+    if args.custody_cmd == "attach":
+        return attach_custody(args.control_root, args.run_dir)
+    return 2
 
 
 if __name__ == "__main__":

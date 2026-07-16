@@ -5,14 +5,17 @@ Enterprise is fail-closed composition on top of hardened: assurance:
 "enterprise" REQUIRES custody (Task 1), credential_proxy.enabled:true (Task
 2), audit.sink.required:true (M13), builder_confinement.required:true (M14),
 and signed audit -- any missing/weakened guarantee is a ConfigError naming
-it. The supervisor's custody gate runs at the CONVERGED point (after the
-final exam + M9 security gates, like M9's own gates): NOT satisfied -> a
-terminal CUSTODY_PENDING (exit 3, qualified False); satisfied -> qualified
-true CONVERGED. Because approvers sign the manifest AFTER it exists, this is
-a genuine TWO-PHASE ship -- covered here via `_custody_gate` unit tests
-(satisfied/unsatisfied against real ed25519 signatures over the exact preview
-bytes) AND a full run -> CUSTODY_PENDING -> sign the real sealed manifest ->
-`verify-custody` flips to SATISFIED integration test.
+it. Split custody is a GENUINE two-phase ship: an enterprise run with required
+custody ALWAYS terminates CUSTODY_PENDING (qualified False) — the sealed
+manifest.json is the IMMUTABLE, signable artifact and never self-qualifies
+(no single process/operator can ship). Approvers then sign those exact bytes;
+`df-custody attach` verifies >=K distinct signatures over the sealed manifest
+and, only then, writes a SEPARATE `custody_attestation.json` (+ anchors it in
+the M13 hash chain); `verify-custody` re-verifies the attestation binds the
+CURRENT manifest bytes, so a one-byte manifest edit or a forged attestation
+fails. Covered by a full run -> 1-of-3 attach (not satisfied) -> 2-of-3
+attach (attestation) -> verify QUALIFIED -> tamper -> FAILS e2e over real
+supervisor.run + real ed25519 signatures.
 
 The live egress/seccomp probe (`df_container.probe_enterprise_egress`) is
 skipif no docker, mirroring test_container.py/test_linux_harness.py.
@@ -328,102 +331,12 @@ def test_resolve_isolation_enterprise_bad_seccomp_no_downgrade_raises(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# _custody_gate — direct unit coverage of the CONVERGED-point gate, using
-# REAL ed25519 signatures over the REAL preview bytes it checks against.
-# ---------------------------------------------------------------------------
-
-def _custody_test_setup(tmp_path, threshold=2):
-    priv_a, pub_a = _approver()
-    priv_b, pub_b = _approver()
-    _priv_c, pub_c = _approver()
-    approvers = [pub_a, pub_b, pub_c]
-    cr = tmp_path / "control"
-    cr.mkdir(parents=True)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    (run_dir / "journal.jsonl").write_text('{"ts":"x","state":"INIT","data":{}}\n', encoding="utf-8")
-    cfg = {"_custody": {"approvers": approvers, "threshold": threshold}, "_control_root": str(cr)}
-    mf_candidate = {"invocation": "run-abc", "outcome": "COMPLETE_QUALIFIED", "iterations": 1}
-    finished_ts = "2026-01-01T00:00:00Z"
-    return cr, run_dir, cfg, mf_candidate, finished_ts, (priv_a, pub_a), (priv_b, pub_b), (_priv_c, pub_c)
-
-
-def test_custody_gate_satisfied_with_two_of_three_real_signatures(tmp_path):
-    cr, run_dir, cfg, mf_candidate, finished_ts, a, b, _c = _custody_test_setup(tmp_path, threshold=2)
-    preview = supervisor._manifest_preview_bytes(str(run_dir), mf_candidate, None, finished_ts, None)
-    sig_a = df_custody.sign_manifest(a[0], preview)
-    sig_b = df_custody.sign_manifest(b[0], preview)
-    (cr / "custody-signatures.json").write_text(json.dumps([
-        {"approver": a[1], "sig": sig_a}, {"approver": b[1], "sig": sig_b},
-    ]), encoding="utf-8")
-    journal = _FakeJournal()
-    satisfied, field = supervisor._custody_gate(
-        cfg, journal, str(run_dir), mf_candidate, finished_ts, None, None)
-    assert satisfied is True
-    assert field == {
-        "required_k": 2, "approvers": 3, "signatures": 2,
-        "satisfied": True, "reason": field["reason"],
-    }
-    assert "2" in field["reason"]
-
-
-def test_custody_gate_not_satisfied_with_only_one_of_two_required(tmp_path):
-    cr, run_dir, cfg, mf_candidate, finished_ts, a, _b, _c = _custody_test_setup(tmp_path, threshold=2)
-    preview = supervisor._manifest_preview_bytes(str(run_dir), mf_candidate, None, finished_ts, None)
-    sig_a = df_custody.sign_manifest(a[0], preview)
-    (cr / "custody-signatures.json").write_text(json.dumps([
-        {"approver": a[1], "sig": sig_a},
-    ]), encoding="utf-8")
-    journal = _FakeJournal()
-    satisfied, field = supervisor._custody_gate(
-        cfg, journal, str(run_dir), mf_candidate, finished_ts, None, None)
-    assert satisfied is False
-    assert field["signatures"] == 1
-    assert field["required_k"] == 2
-
-
-def test_custody_gate_missing_signatures_file_not_satisfied(tmp_path):
-    cr, run_dir, cfg, mf_candidate, finished_ts, *_rest = _custody_test_setup(tmp_path, threshold=2)
-    journal = _FakeJournal()
-    satisfied, field = supervisor._custody_gate(
-        cfg, journal, str(run_dir), mf_candidate, finished_ts, None, None)
-    assert satisfied is False
-    assert field["signatures"] == 0
-    assert "not found" in field["reason"]
-
-
-def test_custody_gate_sig_over_wrong_bytes_not_counted(tmp_path):
-    # A signature over a DIFFERENT manifest preview (e.g. stale, or for a
-    # different run) must not satisfy custody for THIS run.
-    cr, run_dir, cfg, mf_candidate, finished_ts, a, b, _c = _custody_test_setup(tmp_path, threshold=2)
-    other_preview = supervisor._manifest_preview_bytes(
-        str(run_dir), {"invocation": "other-run"}, None, finished_ts, None)
-    sig_a = df_custody.sign_manifest(a[0], other_preview)
-    correct_preview = supervisor._manifest_preview_bytes(
-        str(run_dir), mf_candidate, None, finished_ts, None)
-    sig_b = df_custody.sign_manifest(b[0], correct_preview)
-    (cr / "custody-signatures.json").write_text(json.dumps([
-        {"approver": a[1], "sig": sig_a}, {"approver": b[1], "sig": sig_b},
-    ]), encoding="utf-8")
-    journal = _FakeJournal()
-    satisfied, field = supervisor._custody_gate(
-        cfg, journal, str(run_dir), mf_candidate, finished_ts, None, None)
-    assert satisfied is False
-    # `signatures` is the raw entry count (2 -- both entries are present in
-    # custody-signatures.json); the VALID-distinct count (only sig_b, since
-    # sig_a is over the wrong bytes) is reflected in `reason`, not this
-    # field -- df_custody.verify_custody's "m/k distinct approver
-    # signatures" reason string.
-    assert field["signatures"] == 2
-    assert "1/2" in field["reason"]
-
-
-# ---------------------------------------------------------------------------
 # Full supervisor.run() integration — monkeypatched invoke_adapter + resolve
-# probes, so no docker is needed. Proves the CONVERGED-point wiring: manifest
-# carries custody/proxy/enterprise_egress, CUSTODY_PENDING is exit 3 /
-# qualified False, and the two-phase sign-after-run workflow really flips
-# `verify-custody` to SATISFIED once real signatures cover the sealed bytes.
+# probes, so no docker is needed. Proves the redesigned, genuinely-reachable
+# two-phase ship: an enterprise run ALWAYS seals CUSTODY_PENDING (the manifest
+# is the immutable signable artifact, never self-qualifying); attach over the
+# sealed bytes writes a SEPARATE custody_attestation.json only at K-of-N; and
+# verify-custody is tamper-evident (a one-byte manifest edit breaks it).
 # ---------------------------------------------------------------------------
 
 def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto"):
@@ -437,12 +350,15 @@ def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto"):
 def _fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
                  exec_prefix=None, env_extra=None, env_full=None, confine=False):
     assert role == "builder"
+    # Enterprise passes NO credential env into the container at all -- the
+    # proxy is the sole credential path.
+    assert env_extra is None
     with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
         f.write(GREET_PY)
     return {"adapter_protocol": "0.1", "status": "ok"}, None
 
 
-def test_enterprise_run_custody_unsatisfied_is_custody_pending_exit_3(tmp_path, monkeypatch):
+def test_enterprise_run_always_custody_pending_exit_3(tmp_path, monkeypatch):
     approvers = [_approver()[1] for _ in range(3)]
     cr = _enterprise_control(tmp_path, approvers, threshold=2)
     _patch_enterprise_probes(monkeypatch)
@@ -458,14 +374,23 @@ def test_enterprise_run_custody_unsatisfied_is_custody_pending_exit_3(tmp_path, 
     assert m["custody"]["satisfied"] is False
     assert m["custody"]["required_k"] == 2
     assert m["custody"]["approvers"] == 3
-    assert m["custody"]["signatures"] == 0
     assert m["proxy"] == {"enabled": True, "allowlist": ["api.example.test"]}
-    assert m["enterprise_egress"] == {"locked": True, "probe": "unverified"}
+    # Minor fix: locked is "configured" (config includes the lockdown), not a
+    # per-run empirically-verified True.
+    assert m["enterprise_egress"] == {"locked": "configured", "probe": "unverified"}
     assert m["container"]["image"] == df_container.DEFAULT_IMAGE
     assert m["sandbox_backend"] == df_container.ENTERPRISE_BACKEND_NAME
+    # No attestation exists yet — the manifest never self-qualifies.
+    assert not (cr / "runs" / run_id / "custody_attestation.json").exists()
+    assert supervisor.verify_custody_cmd(str(cr), str(cr / "runs" / run_id)) is False
 
 
-def test_enterprise_two_phase_ship_sign_after_run_flips_to_satisfied(tmp_path, monkeypatch):
+def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
+    """THE end-to-end contract: real supervisor.run + real ed25519 sigs.
+    run -> CUSTODY_PENDING; 1-of-3 attach -> not satisfied (exit 3, no
+    attestation); 2-of-3 attach -> attestation written + verify-custody
+    QUALIFIED; then mutate manifest.json one byte -> verify-custody FAILS.
+    """
     priv_a, pub_a = _approver()
     priv_b, pub_b = _approver()
     _priv_c, pub_c = _approver()
@@ -474,26 +399,66 @@ def test_enterprise_two_phase_ship_sign_after_run_flips_to_satisfied(tmp_path, m
     _patch_enterprise_probes(monkeypatch)
     monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
-    rc = supervisor.run(str(cr), None)
-    assert rc == 3
-
+    assert supervisor.run(str(cr), None) == 3
     run_id = os.listdir(cr / "runs")[0]
     run_dir = cr / "runs" / run_id
-    manifest_bytes = (run_dir / "manifest.json").read_bytes()
+    manifest_path = run_dir / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
 
-    # ONE signature (k=2 required): must NOT qualify -- the single-operator-
-    # proof property holds even across the two-phase boundary.
+    # --- Phase 2a: ONE signature (k=2) -> attach NOT satisfied, exit 3, no attestation.
     sig_a = df_custody.sign_manifest(priv_a, manifest_bytes)
     (cr / "custody-signatures.json").write_text(
         json.dumps([{"approver": pub_a, "sig": sig_a}]), encoding="utf-8")
+    assert supervisor.attach_custody(str(cr), str(run_dir)) == 3
+    assert not (run_dir / "custody_attestation.json").exists()
     assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
 
-    # TWO distinct signatures: satisfied.
+    # --- Phase 2b: TWO distinct signatures -> attach writes attestation, exit 0.
     sig_b = df_custody.sign_manifest(priv_b, manifest_bytes)
     (cr / "custody-signatures.json").write_text(json.dumps([
         {"approver": pub_a, "sig": sig_a}, {"approver": pub_b, "sig": sig_b},
     ]), encoding="utf-8")
+    assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
+    att = json.loads((run_dir / "custody_attestation.json").read_text())
+    assert att["qualified"] is True
+    assert att["threshold"] == 2
+    assert sorted(att["approvers_satisfied"]) == sorted([pub_a.lower(), pub_b.lower()])
+    assert len(att["signatures"]) == 2
+    # The manifest itself is UNCHANGED — still CUSTODY_PENDING (immutable).
+    assert json.loads(manifest_path.read_text())["outcome"] == "CUSTODY_PENDING"
+    # verify-custody now confirms QUALIFIED over the sealed bytes.
     assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is True
+
+    # --- Tamper evidence: flip ONE byte of manifest.json -> verify-custody FAILS.
+    corrupted = bytearray(manifest_bytes)
+    # find a byte inside the JSON we can safely flip (a digit in a hash)
+    corrupted[-5] = corrupted[-5] ^ 0x01
+    manifest_path.write_bytes(bytes(corrupted))
+    assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
+
+
+def test_enterprise_attach_appends_to_audit_chain(tmp_path, monkeypatch):
+    priv_a, pub_a = _approver()
+    priv_b, pub_b = _approver()
+    _priv_c, pub_c = _approver()
+    approvers = [pub_a, pub_b, pub_c]
+    cr = _enterprise_control(tmp_path, approvers, threshold=2)
+    _patch_enterprise_probes(monkeypatch)
+    monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+
+    assert supervisor.run(str(cr), None) == 3
+    run_id = os.listdir(cr / "runs")[0]
+    run_dir = cr / "runs" / run_id
+    manifest_bytes = (run_dir / "manifest.json").read_bytes()
+
+    chain_before = (cr / "audit-chain.jsonl").read_text().count("\n")
+    (cr / "custody-signatures.json").write_text(json.dumps([
+        {"approver": pub_a, "sig": df_custody.sign_manifest(priv_a, manifest_bytes)},
+        {"approver": pub_b, "sig": df_custody.sign_manifest(priv_b, manifest_bytes)},
+    ]), encoding="utf-8")
+    assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
+    chain_after = (cr / "audit-chain.jsonl").read_text().count("\n")
+    assert chain_after == chain_before + 1  # the attestation was anchored
 
 
 def test_verify_custody_cmd_missing_manifest_not_found(tmp_path):
@@ -501,6 +466,47 @@ def test_verify_custody_cmd_missing_manifest_not_found(tmp_path):
     cr.mkdir()
     run_dir = tmp_path / "nope"
     assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
+
+
+# ---------------------------------------------------------------------------
+# df-custody sign CLI — produces a self-describing {approver,sig} entry that
+# verifies over the exact file bytes.
+# ---------------------------------------------------------------------------
+
+def test_df_custody_sign_helper_roundtrip(tmp_path):
+    priv, pub = _approver()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b'{"invocation":"x","outcome":"CUSTODY_PENDING"}')
+    # public_from_private derives the same pubkey the signer advertises.
+    assert df_custody.public_from_private(priv) == pub
+    sig = df_custody.sign_manifest(priv, manifest.read_bytes())
+    assert df_custody.verify_one(pub, manifest.read_bytes(), sig) is True
+
+
+# ---------------------------------------------------------------------------
+# Token-collision guard (Important): credential_proxy.token_env must not also
+# be listed in credentials.allowlist at enterprise.
+# ---------------------------------------------------------------------------
+
+def test_enterprise_token_env_in_credentials_allowlist_rejected(tmp_path):
+    cr = tmp_path / "control"
+    overrides = _base_enterprise()
+    overrides["credentials"] = {
+        "source": "env",
+        "allowlist": ["DF_ENTERPRISE_TEST_TOKEN", "SOME_OTHER_KEY"],
+    }
+    write_config(cr, **overrides)
+    with pytest.raises(df_config.ConfigError, match="token_env"):
+        df_config.load_config(str(cr))
+
+
+def test_enterprise_disjoint_credentials_allowlist_ok(tmp_path):
+    cr = tmp_path / "control"
+    overrides = _base_enterprise()
+    overrides["credentials"] = {"source": "env", "allowlist": ["SOME_OTHER_KEY"]}
+    write_config(cr, **overrides)
+    cfg = df_config.load_config(str(cr))  # token_env not in allowlist -> ok
+    assert cfg["_proxy"]["token_env"] == "DF_ENTERPRISE_TEST_TOKEN"
 
 
 # ---------------------------------------------------------------------------
