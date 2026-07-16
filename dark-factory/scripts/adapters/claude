@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Claude Code adapter, protocol 0.1. Invokes the claude CLI headless with
 cwd = the build workspace. The model only ever sees the prompt file content
-(spec + ID feedback) and the workspace directory."""
+(spec + ID feedback) and the workspace directory.
+
+When req["confine"] is true, argv is built from df_confine's probe-verified
+claude profile instead (no MCP, restricted tool allowlist) — fail-closed:
+this CLI is always confinement-supported, but the check is symmetric with
+the other adapters so a future regression here fails loud, not silent."""
 import json
+import os
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import df_confine  # noqa: E402  (path must be set up first)
 
 
 def respond(status, detail=""):
@@ -21,12 +30,20 @@ def main():
     except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
         respond("error", f"bad adapter request: {e}")
         return
+    confine = bool(req.get("confine"))
+    if confine and not df_confine.is_supported("claude"):
+        respond("error", "confinement unsupported for claude")
+        return
     if shutil.which("claude") is None:
         respond("error", "claude CLI not found on PATH")
         return
+    if confine:
+        argv = df_confine.confinement_flags("claude", prompt)
+    else:
+        argv = ["claude", "-p", prompt, "--permission-mode", "acceptEdits"]
     try:
         proc = subprocess.run(
-            ["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+            argv,
             cwd=req["workdir"],
             timeout=req.get("timeout_s", 600),
             capture_output=True,
