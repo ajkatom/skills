@@ -14,6 +14,9 @@ import http.client
 import http.server
 import io
 import json
+import socket
+import ssl
+import tempfile
 import threading
 
 import pytest
@@ -72,6 +75,93 @@ def start_stub():
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     return httpd, httpd.server_address[1]
+
+
+# --- TLS upstream stub: proves the proxy opens a REAL TLS leg to an https
+# target and injects the token on that leg (never sending it in the clear to
+# a real provider). Uses a self-signed cert (via `cryptography`, already a
+# repo dep for df_custody); the proxy's upstream TLS verification is disabled
+# FOR THIS TEST ONLY (clearly scoped) since a self-signed loopback cert isn't
+# in any system trust store -- production uses the default VERIFIED context.
+
+def _self_signed_cert_files():
+    import datetime as _dt
+    import ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1))
+        .not_valid_after(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    f = tempfile.NamedTemporaryFile(mode="wb", suffix=".pem", delete=False)
+    f.write(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    f.write(cert.public_bytes(serialization.Encoding.PEM))
+    f.close()
+    return f.name
+
+
+class _TLSStubServer(_StubServer):
+    def __init__(self, addr, certfile):
+        super().__init__(addr)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile)
+        self.socket = ctx.wrap_socket(self.socket, server_side=True)
+
+
+def start_tls_stub():
+    certfile = _self_signed_cert_files()
+    httpd = _TLSStubServer(("127.0.0.1", 0), certfile)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    return httpd, httpd.server_address[1]
+
+
+def start_bad_upstream():
+    """A raw TCP server that answers every connection with a NON-HTTP status
+    line then closes -- makes http.client raise BadStatusLine (an
+    http.client.HTTPException, NOT an OSError) so we can prove the proxy
+    fails closed with a clean 5xx rather than resetting the client."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                conn.sendall(b"GARBAGE NOT AN HTTP STATUS LINE\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return srv, port
 
 
 def _client_request(proxy_port, method, absolute_url, headers=None, body=None):
@@ -219,6 +309,69 @@ def test_allowlist_match_is_case_insensitive_for_allowed_host(stub, monkeypatch)
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Real TLS upstream leg: an https target is forwarded over genuine TLS with
+# the token injected on the proxy->provider leg (never sent in the clear).
+# ---------------------------------------------------------------------------
+
+def test_https_target_forwarded_over_real_tls_with_injected_token(monkeypatch):
+    tls_httpd, tls_port = start_tls_stub()
+    # TEST-ONLY: trust the self-signed loopback cert by disabling upstream TLS
+    # verification for the proxy's default HTTPSConnection context. Production
+    # keeps the default VERIFIED context (system trust store). This proves the
+    # upstream leg is genuinely TLS -- a plaintext HTTPConnection could not
+    # complete a handshake with this server at all.
+    monkeypatch.setattr(ssl, "_create_default_https_context", ssl._create_unverified_context)
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    proxy_httpd, proxy_port = serve(allowlist=["127.0.0.1"], token_env=TOKEN_ENV)
+    try:
+        captured_err = io.StringIO()
+        with contextlib.redirect_stderr(captured_err):
+            status, _headers, body = _client_request(
+                proxy_port, "GET", f"https://127.0.0.1:{tls_port}/secure"
+            )
+        assert status == 200
+        assert len(tls_httpd.received) == 1
+        seen = tls_httpd.received[0]
+        # The upstream (reached over TLS) saw the host-side injected token...
+        assert seen.get("Authorization") == f"Bearer {TOKEN_VALUE}"
+        # ...and it never leaked to the client response or any log line.
+        assert TOKEN_VALUE not in body.decode("utf-8", errors="replace")
+        assert TOKEN_VALUE not in captured_err.getvalue()
+    finally:
+        proxy_httpd.shutdown()
+        proxy_httpd.server_close()
+        tls_httpd.shutdown()
+        tls_httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed 5xx for ALL upstream errors -- including http.client.HTTPException
+# (a malformed status line), not only OSError. Client gets a clean 5xx, not a
+# connection reset, and the token is absent from the response.
+# ---------------------------------------------------------------------------
+
+def test_malformed_upstream_status_line_returns_clean_5xx(monkeypatch):
+    srv, bad_port = start_bad_upstream()
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    proxy_httpd, proxy_port = serve(allowlist=["127.0.0.1"], token_env=TOKEN_ENV)
+    try:
+        status, _headers, body = _client_request(
+            proxy_port, "GET", f"http://127.0.0.1:{bad_port}/x"
+        )
+        # A clean 5xx response -- NOT a reset connection (which would surface
+        # as a RemoteDisconnected/BadStatusLine raised in _client_request).
+        assert status == 502
+        text = body.decode("utf-8", errors="replace")
+        assert TOKEN_VALUE not in text
+        # Only the exception class name is surfaced, never an internal message.
+        assert "BadStatusLine" in text or "upstream request failed" in text
+    finally:
+        proxy_httpd.shutdown()
+        proxy_httpd.server_close()
+        srv.close()
 
 
 # ---------------------------------------------------------------------------

@@ -14,22 +14,31 @@ response). A destination host that is NOT in the allowlist is refused with
 any upstream connection is attempted.
 
 Protocol: this is a classic forward proxy. The client sends an
-absolute-URI request line (`GET http://host/path HTTP/1.1`), exactly what
-Python's `http.client`/`requests`/`curl -x` send when configured with an
-HTTP_PROXY pointed at this server. The proxy parses the target host out of
-that absolute URI, checks it against the allowlist, and -- if allowed --
-opens a plain HTTP connection directly to that host:port, forwards the
-request (injecting the auth header if the client didn't already send one),
-and relays the response back unchanged (minus hop-by-hop headers).
+absolute-URI request line (`GET http(s)://host/path HTTP/1.1`), exactly
+what Python's `http.client`/`requests`/`curl -x` send when configured with
+an HTTP_PROXY pointed at this server. The proxy parses the target host out
+of that absolute URI, checks it against the allowlist, and -- if allowed --
+opens a connection directly to that host:port (a real TLS connection via
+`http.client.HTTPSConnection` when the target scheme is `https`, a plain
+`HTTPConnection` when it's `http`), forwards the request (injecting the
+auth header if the client didn't already send one), and relays the response
+back unchanged (minus hop-by-hop headers).
 
-Honesty note (see references/enterprise.md, M17 Task 4): only the
-plain-HTTP forward path is implemented. `CONNECT` (HTTPS tunneling) is a
-noted, documented extension -- `do_CONNECT` refuses cleanly with 501 rather
-than hanging or half-implementing a tunnel. The allowlist + host-side
-injection property holds fully on the implemented (plain-HTTP) path, which
-is what the M17 end-to-end test exercises. A production deployment fronting
-real HTTPS providers would add CONNECT tunneling (or run behind a TLS-
-terminating layer) as a drop-in extension to this module.
+Architecture -- this is an INJECTING proxy (see references/enterprise.md,
+M17 Task 4): the builder speaks plaintext to this local proxy, and the
+PROXY opens the real (TLS, for https targets) leg to the provider and
+injects the credential THERE. That is the only proxy shape that can inject
+a credential at all -- the token is added on the proxy->provider leg, so it
+never leaves the host in the clear and never enters the sandbox. Opaque
+`CONNECT` tunneling is the OPPOSITE model: the proxy relays encrypted bytes
+end-to-end and by design cannot see or inject anything inside the tunnel.
+So `do_CONNECT` is a clean 501 stub (it refuses rather than hanging or
+half-implementing a tunnel), and the allowlist + host-side injection
+property holds fully on the implemented forward path -- which is what the
+M17 end-to-end test exercises. Fronting arbitrary CONNECT-using clients in
+production would require TLS interception (a trusted CA installed in the
+container so the proxy can terminate + re-originate TLS) -- a deliberate,
+documented deferral, not a gap in the injection guarantee.
 
 Runnable standalone:
 
@@ -143,14 +152,30 @@ def _make_handler(allowlist, token_env, header):
 
             conn = None
             try:
-                conn = http.client.HTTPConnection(host, port, timeout=30)
+                if parts.scheme == "https":
+                    # Real TLS upstream leg: the injecting-proxy model is
+                    # builder -> proxy (local plaintext) -> proxy opens a
+                    # genuine TLS connection to the provider and injects the
+                    # token THERE, so the credential is never sent in the
+                    # clear to a real HTTPS provider. Uses the system default
+                    # verified TLS context (HTTPSConnection's default).
+                    conn = http.client.HTTPSConnection(host, port, timeout=30)
+                else:
+                    conn = http.client.HTTPConnection(host, port, timeout=30)
                 conn.request(self.command, target, body=body, headers=fwd_headers)
                 resp = conn.getresponse()
                 resp_body = resp.read()
-            except OSError as e:
+            except (OSError, http.client.HTTPException, ValueError) as e:
+                # Fail closed with a clean 502 for EVERY upstream error --
+                # not only OSError. An http.client.HTTPException (a malformed
+                # status line, IncompleteRead, ...) or a ValueError from
+                # putheader must not escape and reset the client connection
+                # with no HTTP response. Only the exception CLASS name is
+                # surfaced -- never its message (which could echo a forwarded
+                # header) and never the token.
                 self._send_json(
                     502,
-                    {"error": f"upstream connection failed: {e.__class__.__name__}"},
+                    {"error": f"upstream request failed: {e.__class__.__name__}"},
                 )
                 return
             finally:
