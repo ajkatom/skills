@@ -532,6 +532,15 @@ import ctypes, ctypes.util, json, os, subprocess
 
 result = {}
 
+# FAIL-CLOSED POLARITY: on an EXCEPTION (a missing mount/unshare binary on a
+# minimal/distroless image, an unloadable libc, etc.) we CANNOT distinguish
+# "the kernel/seccomp denied it" from "we couldn't even attempt the syscall"
+# -- so we record AMBIGUITY (None), NOT denial (True). The host-side
+# probe_seccomp requires each `*_denied is True` (not merely truthy), so a
+# None resolves the whole probe to False: an inconclusive probe refuses the
+# tier rather than "verifying" a profile it could not actually test on this
+# image. (Contrast the allow-check below, whose fail-closed direction is the
+# opposite: an error there means the allowed op did NOT succeed -> False.)
 try:
     os.makedirs("/tmp/df-seccomp-mnt", exist_ok=True)
     proc = subprocess.run(
@@ -539,14 +548,14 @@ try:
         capture_output=True, timeout=10)
     result["mount_denied"] = (proc.returncode != 0)
 except Exception as e:
-    result["mount_denied"] = True
+    result["mount_denied"] = None
     result["mount_error"] = repr(e)
 
 try:
     proc = subprocess.run(["unshare", "-m", "true"], capture_output=True, timeout=10)
     result["unshare_denied"] = (proc.returncode != 0)
 except Exception as e:
-    result["unshare_denied"] = True
+    result["unshare_denied"] = None
     result["unshare_error"] = repr(e)
 
 try:
@@ -554,7 +563,7 @@ try:
     rc = libc.ptrace(0, 0, 0, 0)
     result["ptrace_denied"] = (rc != 0)
 except Exception as e:
-    result["ptrace_denied"] = True
+    result["ptrace_denied"] = None
     result["ptrace_error"] = repr(e)
 
 try:

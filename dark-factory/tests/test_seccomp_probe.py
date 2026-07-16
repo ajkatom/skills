@@ -191,6 +191,24 @@ def test_probe_seccomp_false_when_allowed_write_failed(tmp_path):
     assert df_container.probe_seccomp("img", str(profile), runner=runner) is False
 
 
+def test_probe_seccomp_false_when_deny_canary_is_ambiguous_none(tmp_path):
+    # FAIL-CLOSED: a deny-canary that could not be ATTEMPTED (missing
+    # mount/unshare binary on a minimal image, unloadable libc) reports None,
+    # NOT True — otherwise a tooling error would masquerade as a seccomp
+    # denial and "verify" a toothless profile. `mount_denied is True` must be
+    # required, so None -> the whole probe is False.
+    profile = tmp_path / "p.json"
+    profile.write_text("{}", encoding="utf-8")
+    runner = lambda *a, **k: _FakeProc(0, _marker(None, True, True, True))
+    assert df_container.probe_seccomp("img", str(profile), runner=runner) is False
+    # and a missing key (never recorded) is likewise not a pass
+    import json as _json
+    partial = "DF-SECCOMP-PROBE " + _json.dumps(
+        {"unshare_denied": True, "ptrace_denied": True, "write_ok": True}) + "\n"
+    runner2 = lambda *a, **k: _FakeProc(0, partial)
+    assert df_container.probe_seccomp("img", str(profile), runner=runner2) is False
+
+
 def test_probe_seccomp_false_on_nonzero_rc_even_with_good_marker(tmp_path):
     profile = tmp_path / "p.json"
     profile.write_text("{}", encoding="utf-8")
