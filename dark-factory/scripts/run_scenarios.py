@@ -26,12 +26,48 @@ builder cannot forge it by pattern-matching stdout.
 Taxonomy priority on failure: timeout > crash > wrong_exit_code >
 wrong_output > no_twin_evidence. Equality assertions strip one trailing
 newline from both sides.
+
+M20 Task 1: a NEW, additive `when.http` scenario type (a first-class HTTP
+service check, alongside the existing `when.run` CLI check):
+  "when": {"http": {"start": ["cmd", ...],       # argv that launches the
+                                                   # service, same as `run`
+                     "port_env": "PORT",          # optional: this env var is
+                                                   # set to a chosen ephemeral
+                                                   # port before `start` runs,
+                                                   # so the service can bind
+                                                   # it (the primary mechanism
+                                                   # for locating the service
+                                                   # -- a service that binds
+                                                   # :0 and self-reports its
+                                                   # port is out of scope v1)
+                     "ready_path": "/health",     # polled on 127.0.0.1:<port>
+                                                   # until any response, or a
+                                                   # deadline (fail-closed)
+                     "request": {"method": "GET", "path": "/...",
+                                 "headers": {...}, "body": "..."}}}
+`then` for an http scenario uses `http_status` (int), `body_contains`
+(substring of the raw response body), `json_equals`/`json_contains` (a
+subset match against the parsed JSON body), and `json_path`
+({"a.b[0]": value} -- a dotted+indexed accessor, NOT full JSONPath).
+`evaluate_http` maps these onto the SAME fixed taxonomy vocabulary as CLI
+scenarios: no response at all -> "crash" (fail-closed -- a service that
+never becomes ready or dies before answering is never a vacuous pass);
+`http_status` mismatch -> "wrong_exit_code" (the http analogue of an exit
+code); a body/json/json_path mismatch -> "wrong_output". Load-time
+validation of `when.http`/http `then` shape is Task 2 scope; Task 1 wires
+execution (`_run_http_scenario`), the pure oracle (`evaluate_http`), and
+`run_all`/`run_scenario` dispatch only. Existing `when.run` scenarios are
+completely unaffected (same code path, unchanged).
 """
 import glob
+import http.client
 import json
 import os
 import re
+import signal
+import socket
 import subprocess
+import time
 
 IR_VERSION = "0.1"
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
@@ -163,6 +199,303 @@ def evaluate_then(then: dict, observed: dict) -> str | None:
     return None
 
 
+HTTP_ASSERT_KEYS = {
+    "http_status", "body_contains", "json_equals", "json_contains", "json_path",
+}
+
+_JSON_PATH_TOKEN_RE = re.compile(r"([^.\[\]]+)|\[(\d+)\]")
+
+
+def _json_path_get(obj, path: str):
+    """Resolve a small dotted+indexed accessor ("a.b[0]") against `obj`.
+
+    NOT full JSONPath (see module docstring / scenario-format honest-scope
+    note) -- just dotted keys and `[i]` list indices, composable in any
+    order (`a.b[0]`, `a[0].b`, `a[0][1]`, ...). Raises KeyError/IndexError/
+    TypeError on any missing key, out-of-range index, or type mismatch
+    (dict expected but got something else, etc.) -- the caller treats any
+    of those as a mismatch, never a silent None.
+    """
+    cur = obj
+    for m in _JSON_PATH_TOKEN_RE.finditer(path):
+        key, idx = m.group(1), m.group(2)
+        if idx is not None:
+            if not isinstance(cur, list):
+                raise TypeError(f"{path}: expected a list, got {type(cur).__name__}")
+            cur = cur[int(idx)]
+        else:
+            if not isinstance(cur, dict) or key not in cur:
+                raise KeyError(f"{path}: missing key {key!r}")
+            cur = cur[key]
+    return cur
+
+
+def _json_contains(sub, full) -> bool:
+    """True iff `sub` is a subset of `full`: every key/value pair in a
+    `sub` dict must be present (recursively) in the matching `full` dict;
+    lists and scalars are compared by equality. An empty `sub` dict is
+    vacuously a subset of anything (mirrors the CLI oracle's empty-string
+    tautology -- caught by the mutation gate, not rejected here)."""
+    if isinstance(sub, dict):
+        if not isinstance(full, dict):
+            return False
+        return all(k in full and _json_contains(v, full[k]) for k, v in sub.items())
+    return sub == full
+
+
+def evaluate_http(then: dict, observed: dict) -> str | None:
+    """Pure HTTP assertion evaluator: returns the failure taxonomy or None.
+
+    `observed` = {"http_status": int|None, "body": str, "json": <parsed
+    JSON, or None if the body wasn't valid JSON>}. Maps onto the SAME fixed
+    taxonomy vocabulary as `evaluate_then` (no new constant):
+      - no response at all (`http_status` is None) -> "crash", regardless
+        of what `then` asks for -- fail-closed, never a vacuous pass for a
+        service that never became ready or died before answering.
+      - `http_status` mismatch -> "wrong_exit_code" (the http analogue of
+        an exit code).
+      - `body_contains` / `json_equals` / `json_contains` / `json_path`
+        mismatch -> "wrong_output". A json_* assertion against
+        observed["json"] is None (body wasn't parseable JSON) is always a
+        mismatch.
+    Priority: no-response, then status, then body/json, checked in that
+    order -- the first mismatch wins (mirrors evaluate_then's priority
+    discipline: a wrong status never reports "wrong_output" even if a
+    body assertion would also fail).
+    """
+    if observed.get("http_status") is None:
+        return "crash"
+    if "http_status" in then and observed["http_status"] != then["http_status"]:
+        return "wrong_exit_code"
+    body = observed.get("body", "")
+    json_obs = observed.get("json")
+    if "body_contains" in then and then["body_contains"] not in body:
+        return "wrong_output"
+    if "json_equals" in then and (json_obs is None or json_obs != then["json_equals"]):
+        return "wrong_output"
+    if "json_contains" in then and (
+        json_obs is None or not _json_contains(then["json_contains"], json_obs)
+    ):
+        return "wrong_output"
+    if "json_path" in then:
+        if json_obs is None:
+            return "wrong_output"
+        for path, expected in then["json_path"].items():
+            try:
+                actual = _json_path_get(json_obs, path)
+            except (KeyError, IndexError, TypeError):
+                return "wrong_output"
+            if actual != expected:
+                return "wrong_output"
+    return None
+
+
+def _pick_ephemeral_port() -> int:
+    """Bind to 127.0.0.1:0 to let the OS choose a free port, then close
+    immediately so the child service can bind it. Small TOCTOU window
+    (another process could grab the port before the child binds it) is
+    accepted -- same tradeoff every "pick a free port for a child" pattern
+    makes; a bind failure in the child surfaces as never-ready -> "crash",
+    fail-closed, never a silent pass."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _http_probe(host: str, port: int, path: str, timeout: float) -> int:
+    """Issue a bare GET and return the status code, or raise on any
+    connection-level failure (used for the readiness poll -- ANY response,
+    not just 2xx, counts as ready)."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
+
+
+def _reap_process_group(proc: subprocess.Popen, pgid: int | None) -> None:
+    """Mirror df_twins.TwinSet.stop()'s single-process discipline: SIGTERM
+    the captured pgid, reap the direct child, then SIGKILL the group if
+    anything is still alive. `pgid` is captured at launch time (== proc.pid
+    under start_new_session=True), never re-resolved later, so an already-
+    exited direct child (e.g. a shell wrapper) never causes a backgrounded
+    grandchild in the same group to leak (see df_twins.py for the full
+    macOS race explanation). Always called from a `finally` -- no orphan
+    service process, ever, even on assertion failure or timeout."""
+    if pgid is None:
+        try:
+            proc.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    grace_deadline = time.time() + 3
+    try:
+        proc.wait(timeout=max(0.0, grace_deadline - time.time()))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return  # group is empty (or gone) -- nothing left to reap
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    kill_deadline = time.time() + 2
+    while time.time() < kill_deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, OSError):
+            break
+        time.sleep(0.02)
+
+
+def _run_http_scenario(
+    sc: dict,
+    workspace: str,
+    exec_wrapper: list | None,
+    env_extra: dict | None,
+    timeout_s: float,
+) -> dict:
+    """Start `sc["when"]["http"]["start"]` in `workspace` (under the same
+    exec_wrapper/twin-env as a CLI scenario), poll `ready_path` until any
+    response or a deadline, issue the one configured `request`, and return
+    `observed` = {"http_status": int|None, "body": str, "json": parsed|None}
+    for `evaluate_http`. `http_status` stays None (fail-closed -- never a
+    vacuous pass) if the service never becomes ready, dies before
+    answering, or the request itself fails at the connection level. The
+    service is ALWAYS reaped by process group in `finally`, whatever
+    happened above -- no orphan, even on timeout or a crash mid-poll.
+    """
+    http_spec = sc["when"]["http"]
+    start_argv = http_spec["start"]
+    port_env = http_spec.get("port_env")
+    ready_path = http_spec.get("ready_path", "/")
+    req_spec = http_spec.get("request", {})
+    method = req_spec.get("method", "GET")
+    path = req_spec.get("path", "/")
+    headers = req_spec.get("headers") or {}
+    req_body = req_spec.get("body")
+
+    observed = {"http_status": None, "body": "", "json": None}
+
+    port = _pick_ephemeral_port()
+    env = dict(os.environ, **(env_extra or {}))
+    if port_env:
+        env[port_env] = str(port)
+
+    command = (list(exec_wrapper) if exec_wrapper else []) + start_argv
+
+    proc = None
+    pgid = None
+    try:
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # Capture pgid NOW while the child is definitely alive -- see
+            # _reap_process_group / df_twins.py for why this must not be
+            # re-resolved later via os.getpgid(proc.pid).
+            pgid = proc.pid
+        except OSError:
+            return observed  # never started -> http_status stays None -> "crash"
+
+        deadline = time.time() + timeout_s
+        ready = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break  # process exited before ready -> fail closed, not ready
+            remaining = max(0.05, deadline - time.time())
+            try:
+                _http_probe("127.0.0.1", port, ready_path, timeout=min(1.0, remaining))
+                ready = True
+                break
+            except (OSError, ConnectionError, http.client.HTTPException):
+                time.sleep(0.05)
+
+        if not ready:
+            return observed  # never ready within the deadline -> "crash"
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_s)
+            try:
+                body_bytes = req_body.encode("utf-8") if isinstance(req_body, str) else req_body
+                conn.request(method, path, body=body_bytes, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace")
+                observed["http_status"] = resp.status
+                observed["body"] = text
+                try:
+                    observed["json"] = json.loads(text)
+                except (json.JSONDecodeError, ValueError):
+                    observed["json"] = None
+            finally:
+                conn.close()
+        except (OSError, ConnectionError, http.client.HTTPException):
+            pass  # request failed at the connection level -> status stays None
+
+        return observed
+    finally:
+        if proc is not None:
+            _reap_process_group(proc, pgid)
+
+
+def _run_http_and_evaluate(
+    sc: dict,
+    workspace: str,
+    exec_wrapper: list | None,
+    env_extra: dict | None,
+    observer_files: dict | None,
+) -> dict:
+    """The http-scenario counterpart of the run_scenario body below: same
+    result shape (id/behavior_id/pass/taxonomy/observed), same twin-delta
+    plumbing (a twin the http service happens to call still produces
+    observable evidence under `observed["twin_observations"/"twin_tokens"]`
+    for reporting -- `evaluate_http` itself only inspects the http keys)."""
+    http_spec = sc["when"]["http"]
+    timeout_s = http_spec.get("timeout_s", sc["when"].get("timeout_s", 30))
+    offsets = _observer_offsets(observer_files)
+    observed = _run_http_scenario(sc, workspace, exec_wrapper, env_extra, timeout_s)
+    twin_observations, twin_tokens = _read_twin_deltas(observer_files, offsets)
+    observed["twin_observations"] = twin_observations
+    observed["twin_tokens"] = twin_tokens
+    taxonomy = evaluate_http(sc["then"], observed)
+    return {
+        "id": sc["id"],
+        "behavior_id": sc["behavior_id"],
+        "pass": taxonomy is None,
+        "taxonomy": taxonomy,
+        "observed": observed,
+    }
+
+
 def _observer_offsets(observer_files: dict | None) -> dict:
     offsets = {}
     for name, path in (observer_files or {}).items():
@@ -201,6 +534,12 @@ def _read_twin_deltas(observer_files: dict | None, offsets: dict) -> tuple[dict,
 
 def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None,
                  observer_files: dict | None = None) -> dict:
+    # M20 Task 1: `when.http` is a NEW, additive path -- dispatched here so
+    # `run_all` (which just calls run_scenario per scenario, unchanged)
+    # picks it up automatically. Every existing `when.run` scenario falls
+    # through to the unchanged code below (byte-identical).
+    if "http" in sc["when"]:
+        return _run_http_and_evaluate(sc, workspace, exec_wrapper, env_extra, observer_files)
     timeout = sc["when"].get("timeout_s", 30)
     observed = {"exit_code": None, "stdout": "", "stderr": ""}
     taxonomy = None
