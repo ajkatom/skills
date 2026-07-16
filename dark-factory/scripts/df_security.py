@@ -326,7 +326,13 @@ def _pyproject_name_and_licenses(path: str):
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
-        except (tomllib.TOMLDecodeError, OSError):
+        except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+            # tomllib.load does a STRICT utf-8 decode before parsing, so a
+            # manifest with invalid encoding raises UnicodeDecodeError (NOT
+            # TOMLDecodeError) — catch it too and fall through to the
+            # tolerant regex fallback (which reads errors="ignore"), so a
+            # malformed manifest is benign here rather than an uncaught
+            # exception escaping license_scan -> run_gates -> the run.
             data = None
         if isinstance(data, dict):
             project = data.get("project")

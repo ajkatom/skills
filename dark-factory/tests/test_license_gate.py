@@ -249,6 +249,71 @@ def test_clean_tree_no_manifests_no_findings(tmp_path):
     assert findings == []
 
 
+def test_non_utf8_pyproject_does_not_crash(tmp_path):
+    # tomllib.load does a strict utf-8 decode first, so an invalid byte
+    # raises UnicodeDecodeError (not TOMLDecodeError). license_scan must
+    # NOT let that escape -- it falls through to the tolerant regex
+    # fallback (errors="ignore") and returns instead of crashing the run.
+    root = str(tmp_path)
+    path = os.path.join(root, "pyproject.toml")
+    with open(path, "wb") as f:
+        f.write(b'[project]\nname = "demo"\nlicense = "MIT"\n# bad byte -> \xff\n')
+    # Should not raise; the regex fallback still recovers the "MIT" license.
+    findings = df_security.license_scan(root, ["Apache-2.0"])
+    assert len(findings) == 1
+    assert findings[0]["license"] == "MIT"
+    # And a garbage-byte manifest with no recoverable license is simply benign.
+    assert df_security.license_scan(root, ["MIT"]) == []
+
+
+def test_non_utf8_pyproject_run_gates_completes(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    path = os.path.join(str(ws), "pyproject.toml")
+    with open(path, "wb") as f:
+        f.write(b'[project]\nname = "demo"\n# garbage byte \xff\xfe\nlicense = "MIT"\n')
+    sec = {
+        "enabled": True,
+        "secret_scan": False,
+        "dangerous_scan": False,
+        "sbom": False,
+        "external": [],
+        "fail_on": ["license"],
+        "strict_unavailable": True,
+        "license": {"enabled": True, "allowlist": ["Apache-2.0"], "require_license": False},
+    }
+    # run_gates must complete normally (no traceback escaping) -- the
+    # regex fallback still recovers "MIT", which is disallowed here.
+    report = df_security.run_gates(str(ws), sec)
+    assert report["checked"] is True
+    assert report["gates"]["license"]["status"] == "fail"
+    assert report["failed"] == ["license"]
+
+
+def test_malformed_package_json_does_not_crash(tmp_path):
+    # A package.json with invalid JSON / garbage bytes must be tolerated
+    # (json.load raises JSONDecodeError, caught) -- no crash, no finding.
+    root = str(tmp_path)
+    path = os.path.join(root, "package.json")
+    with open(path, "wb") as f:
+        f.write(b'{"name": "demo", "license": "MIT" \xff not json at all')
+    assert df_security.license_scan(root, ["Apache-2.0"]) == []
+
+
+def test_non_utf8_dist_info_metadata_does_not_crash(tmp_path):
+    # METADATA is read with errors="ignore"; a stray non-utf-8 byte must
+    # not crash the scan.
+    root = str(tmp_path)
+    path = os.path.join(root, "site-packages", "foo-1.0.dist-info", "METADATA")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"Name: foo\nLicense: MIT\xff\n\ndescription\n")
+    # Must not raise; the license line is still recoverable (byte dropped).
+    findings = df_security.license_scan(root, ["Apache-2.0"])
+    assert len(findings) == 1
+    assert findings[0]["package"] == "foo"
+
+
 # --- run_gates wiring ----------------------------------------------------
 
 
