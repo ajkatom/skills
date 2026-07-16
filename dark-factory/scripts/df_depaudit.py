@@ -191,15 +191,15 @@ def parse_installed(root) -> list:
     pkgs = []
 
     req_path = os.path.join(root, "requirements.txt")
-    if os.path.isfile(req_path):
+    if os.path.isfile(req_path) and not os.path.islink(req_path):
         pkgs.extend(_parse_requirements_txt(req_path))
 
     pkg_json_path = os.path.join(root, "package.json")
-    if os.path.isfile(pkg_json_path):
+    if os.path.isfile(pkg_json_path) and not os.path.islink(pkg_json_path):
         pkgs.extend(_parse_package_json_deps(pkg_json_path))
 
     pyproject_path = os.path.join(root, "pyproject.toml")
-    if os.path.isfile(pyproject_path):
+    if os.path.isfile(pyproject_path) and not os.path.islink(pyproject_path):
         pkgs.extend(_parse_pyproject_toml_deps(pyproject_path))
 
     for dirpath, dirnames, filenames in _walk_installed_dirs(root):
@@ -210,9 +210,13 @@ def parse_installed(root) -> list:
                     pkgs.append({"ecosystem": "PyPI", "name": nv[0], "version": nv[1]})
 
         if "package.json" in filenames and _is_npm_package_dir(dirpath):
-            rec = _npm_installed_from_package_json(os.path.join(dirpath, "package.json"))
-            if rec:
-                pkgs.append(rec)
+            pkg_json = os.path.join(dirpath, "package.json")
+            # Skip a symlinked manifest, matching df_security._walk_files's
+            # discipline (never follow a symlinked file into an off-tree read).
+            if not os.path.islink(pkg_json):
+                rec = _npm_installed_from_package_json(pkg_json)
+                if rec:
+                    pkgs.append(rec)
 
     seen = set()
     out = []
@@ -421,9 +425,16 @@ def _match_affected_entry(pkg_version_tuple, pkg_version: str, entry: dict, ecos
 
     for rng in ranges:
         if not isinstance(rng, dict):
+            # A malformed range entry on a name-matching package is NOT
+            # something we can positively clear -- flag it rather than drop
+            # it (err toward a finding, never a silent miss).
+            uncertain = True
             continue
         events = rng.get("events")
         if not isinstance(events, list) or not events:
+            # Missing/empty events: no version data to evaluate, but the
+            # package NAME matched -- flag as uncertain, don't drop.
+            uncertain = True
             continue
 
         introduced = None

@@ -215,6 +215,30 @@ def test_skips_git_dir(tmp_path):
     assert not any(p["name"] == "sneaky" for p in pkgs)
 
 
+def test_symlinked_top_level_manifest_skipped(tmp_path):
+    """A symlinked requirements.txt must not be followed off-tree (matches
+    df_security._walk_files discipline)."""
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "outside_requirements.txt"
+    target.write_text("evil==6.6.6\n", encoding="utf-8")
+    os.symlink(str(target), str(root / "requirements.txt"))
+    pkgs = parse_installed(str(root))
+    assert not any(p["name"] == "evil" for p in pkgs)
+
+
+def test_symlinked_node_modules_manifest_skipped(tmp_path):
+    """A symlinked node_modules/<pkg>/package.json must not be followed."""
+    root = tmp_path / "root"
+    pkg_dir = root / "node_modules" / "evilpkg"
+    pkg_dir.mkdir(parents=True)
+    target = tmp_path / "outside_package.json"
+    target.write_text(json.dumps({"name": "evilpkg", "version": "6.6.6"}), encoding="utf-8")
+    os.symlink(str(target), str(pkg_dir / "package.json"))
+    pkgs = parse_installed(str(root))
+    assert not any(p["name"] == "evilpkg" for p in pkgs)
+
+
 # --- query_osv_api -----------------------------------------------------------
 
 
@@ -402,6 +426,40 @@ def test_query_osv_snapshot_unparseable_range_flagged_uncertain():
     vulns = result["results"][0]["vulns"]
     assert len(vulns) == 1
     assert vulns[0]["id"] == "GHSA-uncertain-demo"
+    assert vulns[0].get("note") == "range-uncertain"
+
+
+def test_query_osv_snapshot_empty_events_range_flagged_uncertain():
+    """A name-matching record whose ONLY range has empty/malformed events
+    (no enumerated versions either) must be FLAGGED range-uncertain, never
+    silently dropped -- a missed vuln is the dangerous direction."""
+    snapshot = load_snapshot(FIXTURE_DIR)
+    pkgs = [{"ecosystem": "PyPI", "name": "weirdpkg", "version": "1.0.0"}]
+    result = query_osv_snapshot(pkgs, snapshot)
+    vulns = result["results"][0]["vulns"]
+    assert len(vulns) == 1
+    assert vulns[0]["id"] == "GHSA-emptyrange-demo"
+    assert vulns[0].get("note") == "range-uncertain"
+
+
+def test_query_osv_snapshot_malformed_non_dict_range_flagged_uncertain():
+    """A name-matching record whose ranges[] entry isn't even a dict must be
+    FLAGGED, not dropped."""
+    snapshot = {
+        ("PyPI", "brokenpkg"): [
+            {
+                "id": "GHSA-broken",
+                "affected": [
+                    {"package": {"ecosystem": "PyPI", "name": "brokenpkg"}, "ranges": ["not-a-dict"]}
+                ],
+            }
+        ]
+    }
+    pkgs = [{"ecosystem": "PyPI", "name": "brokenpkg", "version": "1.0.0"}]
+    result = query_osv_snapshot(pkgs, snapshot)
+    vulns = result["results"][0]["vulns"]
+    assert len(vulns) == 1
+    assert vulns[0]["id"] == "GHSA-broken"
     assert vulns[0].get("note") == "range-uncertain"
 
 
