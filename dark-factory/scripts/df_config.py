@@ -11,6 +11,7 @@ TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class ConfigError(ValueError):
@@ -558,6 +559,57 @@ def load_config(control_root: str) -> dict:
 
     cfg_confine = {"enabled": bc_enabled, "required": bc_required, "profile": bc_profile}
 
+    # Optional `custody` block -> cfg["_custody"] (M17 Task 1): the K-of-N
+    # split-custody approver allowlist + threshold. Absent -> None (byte-
+    # identical to pre-M17 behavior at every tier). Only the BLOCK SHAPE is
+    # validated here -- approvers are ed25519 public keys as raw-32-byte hex
+    # (64 hex chars), unique; threshold an int in 1..len(approvers). This
+    # module never imports `cryptography` (df_custody.py is the sole,
+    # guarded import site) and never checks whether a hex string is a valid
+    # *curve point* -- verify_custody rejects a bad key at verify time,
+    # returning False rather than crashing. Enforcing custody as REQUIRED at
+    # assurance: "enterprise" is Task 3 (the enterprise tier doesn't exist
+    # in supported_tiers.json until then); here an absent block at ANY tier,
+    # including a future enterprise, is still None.
+    custody_raw = raw.get("custody")
+    if custody_raw is not None:
+        if not isinstance(custody_raw, dict):
+            raise ConfigError("custody must be a JSON object")
+
+        custody_approvers = custody_raw.get("approvers")
+        if not isinstance(custody_approvers, list) or not custody_approvers:
+            raise ConfigError("custody.approvers must be a non-empty list")
+        seen_approvers = set()
+        for entry in custody_approvers:
+            if not isinstance(entry, str) or not _HEX64_RE.match(entry):
+                raise ConfigError(
+                    "custody.approvers entries must be 64-hex-char ed25519 "
+                    f"public keys, got {entry!r}"
+                )
+            if entry in seen_approvers:
+                raise ConfigError(
+                    f"custody.approvers has a duplicate entry (approvers must be unique): {entry!r}"
+                )
+            seen_approvers.add(entry)
+
+        custody_threshold = custody_raw.get("threshold")
+        if (
+            not isinstance(custody_threshold, int)
+            or isinstance(custody_threshold, bool)
+            or not (1 <= custody_threshold <= len(custody_approvers))
+        ):
+            raise ConfigError(
+                "custody.threshold must be an int in 1.."
+                f"{len(custody_approvers)} (the number of approvers)"
+            )
+
+        cfg_custody = {
+            "approvers": list(custody_approvers),
+            "threshold": custody_threshold,
+        }
+    else:
+        cfg_custody = None
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -584,4 +636,5 @@ def load_config(control_root: str) -> dict:
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield
     cfg["_confine"] = cfg_confine
+    cfg["_custody"] = cfg_custody
     return cfg
