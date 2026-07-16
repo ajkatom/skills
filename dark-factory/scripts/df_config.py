@@ -24,6 +24,33 @@ def load_supported_tiers() -> dict:
         return json.load(f)
 
 
+def _validate_seccomp_profile(path, label="enterprise.seccomp_profile"):
+    """Fail-closed offline shape-check (M22 Task 1) for a Docker seccomp
+    profile: the file exists, parses as JSON, and is a dict with a string
+    `defaultAction` and a list `syscalls`. This is a SHAPE check only -- it
+    proves nothing about what the profile actually denies on a real kernel
+    (that is df_container.probe_seccomp, a live probe run at enterprise
+    resolve time, not at config load). Raises ConfigError naming the exact
+    problem; never silently accepts a malformed/missing profile."""
+    if not os.path.isfile(path):
+        raise ConfigError(f"{label} does not exist: {path}")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError as e:
+        raise ConfigError(f"{label} could not be read ({path}): {e}") from e
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{label} is not valid JSON ({path}): {e}") from e
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"{label} must be a JSON object, got {type(data).__name__} ({path})"
+        )
+    if not isinstance(data.get("defaultAction"), str):
+        raise ConfigError(f"{label} must have a string 'defaultAction' ({path})")
+    if not isinstance(data.get("syscalls"), list):
+        raise ConfigError(f"{label} must have a list 'syscalls' ({path})")
+
+
 def _disjoint(a: str, b: str) -> bool:
     a = os.path.realpath(a)
     b = os.path.realpath(b)
@@ -323,6 +350,20 @@ def load_config(control_root: str) -> dict:
                 "budget.notification_sink must be http://, https://, or "
                 f"file://<abs path> (got {notification_sink!r})"
             )
+
+    # M22 Task 2: opt-in AT-LEAST-ONCE notification delivery -- a local disk
+    # spool + bounded retry, not a real message queue (see df_notify /
+    # references/budget.md for the honest scope). Absent -> False/3, the
+    # exact defaults that make the M18 best-effort path byte-identical.
+    notification_durable = budget_raw.get("notification_durable", False)
+    if not isinstance(notification_durable, bool):
+        raise ConfigError("budget.notification_durable must be a bool")
+
+    notification_attempts = budget_raw.get("notification_attempts", 3)
+    if (isinstance(notification_attempts, bool)
+            or not isinstance(notification_attempts, int)
+            or notification_attempts < 1):
+        raise ConfigError("budget.notification_attempts must be an int >= 1")
 
     sg_raw = raw.get("security_gates", {})
     if not isinstance(sg_raw, dict):
@@ -791,7 +832,30 @@ def load_config(control_root: str) -> dict:
                     "token into the container as a -e var, defeating the proxy's "
                     "token-never-in-sandbox guarantee"
                 )
-        cfg_enterprise = {"seccomp": df_container.DEFAULT_SECCOMP_PATH}
+        # M22 Task 1: enterprise.seccomp_profile is an OPTIONAL operator
+        # knob -- absent means the shipped M17 default (byte-identical
+        # behavior to before this task). When given, it must be a real,
+        # parseable, well-shaped Docker seccomp profile (see
+        # _validate_seccomp_profile) or ConfigError at LOAD time, before any
+        # run starts. This is a SHAPE check only; the supervisor's
+        # enterprise resolve additionally LIVE-PROBES the resolved path
+        # (df_container.probe_seccomp) to prove it actually denies what it
+        # claims to -- a parseable-but-toothless profile is caught there,
+        # fail-closed, not here.
+        enterprise_raw = raw.get("enterprise", {})
+        if not isinstance(enterprise_raw, dict):
+            raise ConfigError("enterprise must be a JSON object")
+        seccomp_profile_raw = enterprise_raw.get("seccomp_profile")
+        if seccomp_profile_raw is None:
+            seccomp_path = df_container.DEFAULT_SECCOMP_PATH
+        else:
+            if not isinstance(seccomp_profile_raw, str) or not seccomp_profile_raw:
+                raise ConfigError(
+                    "enterprise.seccomp_profile must be a non-empty path string"
+                )
+            seccomp_path = os.path.abspath(seccomp_profile_raw)
+        _validate_seccomp_profile(seccomp_path)
+        cfg_enterprise = {"seccomp": seccomp_path}
     else:
         cfg_enterprise = None
 
@@ -817,6 +881,8 @@ def load_config(control_root: str) -> dict:
         "max_calls": max_calls,
         "alert_at": alert_at,
         "notification_sink": notification_sink,
+        "notification_durable": notification_durable,
+        "notification_attempts": notification_attempts,
     }
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield

@@ -499,3 +499,136 @@ def probe_enterprise_egress(image, proxy_endpoint, allowed_url, denied_host, *,
         return ok, result
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# M22 Task 1: configurable + LIVE-PROBED enterprise seccomp.
+#
+# M17 shipped one FIXED seccomp profile, sanity-checked only offline (parses
+# as JSON, has the right shape -- see supervisor._seccomp_profile_ok). That
+# proves nothing about what the profile actually DOES on a real kernel: a
+# profile with `defaultAction: SCMP_ACT_ALLOW` and an empty (or wrong) deny
+# list parses fine and denies nothing. `probe_seccomp` closes that gap the
+# same way M16/M17's other probes do: run a REAL container under the
+# profile and observe, not assume.
+# ---------------------------------------------------------------------------
+
+_SECCOMP_PROBE_MARKER = "DF-SECCOMP-PROBE "
+
+# In-container payload (M16-harness style): every check is independently
+# try/excepted into `result` so the script itself never raises/crashes the
+# probe -- ambiguity is resolved on the HOST side (probe_seccomp), which
+# treats a missing/unparseable marker line, or any check that didn't
+# unambiguously report denied/allowed, as False. Three denied-syscall
+# canaries (mount, unshare, ptrace) are attempted WITH SYS_ADMIN granted
+# (via --cap-add SYS_ADMIN in the docker invocation below) -- so a profile
+# that fails to deny one of them would otherwise SUCCEED (the capability is
+# present), proving it is the SECCOMP FILTER, not a missing capability, that
+# denies it. One allowed op (a plain file write under /tmp) must still
+# succeed, proving the profile isn't so broad it breaks ordinary builder
+# operation.
+_SECCOMP_PROBE_SCRIPT = """
+import ctypes, ctypes.util, json, os, subprocess
+
+result = {}
+
+# FAIL-CLOSED POLARITY: on an EXCEPTION (a missing mount/unshare binary on a
+# minimal/distroless image, an unloadable libc, etc.) we CANNOT distinguish
+# "the kernel/seccomp denied it" from "we couldn't even attempt the syscall"
+# -- so we record AMBIGUITY (None), NOT denial (True). The host-side
+# probe_seccomp requires each `*_denied is True` (not merely truthy), so a
+# None resolves the whole probe to False: an inconclusive probe refuses the
+# tier rather than "verifying" a profile it could not actually test on this
+# image. (Contrast the allow-check below, whose fail-closed direction is the
+# opposite: an error there means the allowed op did NOT succeed -> False.)
+try:
+    os.makedirs("/tmp/df-seccomp-mnt", exist_ok=True)
+    proc = subprocess.run(
+        ["mount", "-t", "tmpfs", "tmpfs", "/tmp/df-seccomp-mnt"],
+        capture_output=True, timeout=10)
+    result["mount_denied"] = (proc.returncode != 0)
+except Exception as e:
+    result["mount_denied"] = None
+    result["mount_error"] = repr(e)
+
+try:
+    proc = subprocess.run(["unshare", "-m", "true"], capture_output=True, timeout=10)
+    result["unshare_denied"] = (proc.returncode != 0)
+except Exception as e:
+    result["unshare_denied"] = None
+    result["unshare_error"] = repr(e)
+
+try:
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    rc = libc.ptrace(0, 0, 0, 0)
+    result["ptrace_denied"] = (rc != 0)
+except Exception as e:
+    result["ptrace_denied"] = None
+    result["ptrace_error"] = repr(e)
+
+try:
+    with open("/tmp/df-seccomp-ok", "w", encoding="utf-8") as f:
+        f.write("ok")
+    result["write_ok"] = True
+except Exception as e:
+    result["write_ok"] = False
+    result["write_error"] = repr(e)
+
+print("DF-SECCOMP-PROBE " + json.dumps(result))
+"""
+
+
+def probe_seccomp(image, profile_path, *, timeout_s=120, runner=subprocess.run) -> bool:
+    """Fail-closed live probe (M22 Task 1): proves, on a REAL Docker
+    container, that the seccomp profile at `profile_path` actually DENIES
+    mount/unshare/ptrace -- not merely that the JSON parses -- while still
+    ALLOWING an ordinary file write.
+
+    Runs `docker run --rm --security-opt seccomp=<profile_path> --cap-add
+    SYS_ADMIN <image> sh -c 'python3 -c "$1"' _ <probe script>` (SYS_ADMIN is
+    added back so a profile that FAILS to deny mount/unshare would otherwise
+    SUCCEED -- proving the seccomp filter, not a missing capability, is what
+    denies it).
+
+    Returns True ONLY IF the container provably ran (rc == 0), a single
+    well-formed DF-SECCOMP-PROBE marker line was found, AND that line's
+    parsed result shows mount_denied, unshare_denied, and ptrace_denied all
+    True AND write_ok True. Any error, timeout, missing/duplicate marker,
+    unparseable JSON, or a check that didn't unambiguously report denied
+    (e.g. a missing key) resolves to False -- never a vacuous/partial PASS.
+    This is scoped, honest coverage of the canary syscalls it checks, NOT a
+    full profile audit (see references/enterprise.md).
+    """
+    if not isinstance(profile_path, str) or not profile_path:
+        return False
+    if not os.path.isfile(profile_path):
+        return False
+    if not isinstance(image, str) or not image or image.startswith("-"):
+        return False
+    argv = [
+        "docker", "run", "--rm",
+        "--security-opt", f"seccomp={profile_path}",
+        "--cap-add", "SYS_ADMIN",
+        image, "sh", "-c", 'exec python3 -c "$1"', "_", _SECCOMP_PROBE_SCRIPT,
+    ]
+    try:
+        proc = runner(argv, capture_output=True, text=True, timeout=timeout_s)
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    lines = [l for l in proc.stdout.splitlines() if l.startswith(_SECCOMP_PROBE_MARKER)]
+    if len(lines) != 1:
+        return False
+    try:
+        result = json.loads(lines[0][len(_SECCOMP_PROBE_MARKER):])
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(result, dict):
+        return False
+    return bool(
+        result.get("mount_denied") is True
+        and result.get("unshare_denied") is True
+        and result.get("ptrace_denied") is True
+        and result.get("write_ok") is True
+    )

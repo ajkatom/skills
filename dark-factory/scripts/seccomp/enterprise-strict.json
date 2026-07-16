@@ -1,0 +1,43 @@
+{
+  "comment": "dark-factory M22 enterprise tier: a STRICTER variant of the M17 conservative profile (scripts/seccomp/enterprise.json). Same shape (defaultAction SCMP_ACT_ALLOW -- this is NOT a default-deny allowlist profile, same honest-scope note applies: see dark-factory/references/enterprise.md), plus additional denials for keyring/keyctl manipulation (keyctl, add_key, request_key -- kernel keyring is a cross-process secret store an untrusted builder has no legitimate reason to touch), process accounting (acct), disk-quota manipulation (quotactl), and raw I/O port access (ioperm, iopl -- x86-only privileged I/O primitives). Selectable via enterprise.seccomp_profile (M22 Task 1); operators who want the stricter posture point at this file instead of the M17 default. Live-probed the same way as the default profile by df_container.probe_seccomp.",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "mount",
+        "umount2",
+        "ptrace",
+        "bpf",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "reboot",
+        "swapon",
+        "swapoff",
+        "setns",
+        "unshare",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "acct",
+        "quotactl",
+        "ioperm",
+        "iopl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

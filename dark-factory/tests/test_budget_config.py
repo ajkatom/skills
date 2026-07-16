@@ -25,6 +25,8 @@ def test_absent_budget_block_gets_defaults(tmp_path):
         "max_calls": None,
         "alert_at": 0.85,
         "notification_sink": "",
+        "notification_durable": False,
+        "notification_attempts": 3,
     }
 
 
@@ -49,6 +51,8 @@ def test_valid_api_budget_with_estimate_injected(tmp_path):
         "max_calls": 10,
         "alert_at": 0.9,
         "notification_sink": "https://ops.example.com/hook",
+        "notification_durable": False,
+        "notification_attempts": 3,
     }
 
 

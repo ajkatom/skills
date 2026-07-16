@@ -11,7 +11,8 @@ off-box sink, required builder confinement):
    token host-side and allowlists destination hosts.
 3. **Kernel-locked egress + seccomp** — the enterprise container can reach *only*
    the proxy (iptables default-deny egress, `NET_ADMIN` dropped for the child so
-   the lock cannot be undone), under a restrictive seccomp profile.
+   the lock cannot be undone), under a restrictive, **configurable and
+   live-probed** seccomp profile (M22 Task 1 — see below).
 
 `enterprise` is **fail-closed**: `df_config` refuses to load an enterprise config
 that is missing or weakens any required guarantee (custody block,
@@ -19,7 +20,52 @@ that is missing or weakens any required guarantee (custody block,
 `builder_confinement.required: true`, `audit.signing`), and `resolve_isolation`
 refuses at run start if the Docker/OS-sandbox/seccomp probes don't pass (with an
 `--allow-downgrade` path that steps down enterprise → hardened → standard →
-cooperative, each journaled).
+cooperative, each journaled). The seccomp probe (M22 Task 1) is one of these
+gates: a profile that parses fine but doesn't actually deny what it claims to
+fails the resolve just like a down Docker daemon does.
+
+## Configurable + live-probed seccomp (M22 Task 1)
+
+M17 shipped exactly one fixed seccomp profile
+(`scripts/seccomp/enterprise.json`), sanity-checked only *offline* — parses as
+JSON, has a `defaultAction` + `syscalls` shape. That proves nothing about what
+the profile actually **does** on a real kernel: a profile with
+`defaultAction: SCMP_ACT_ALLOW` and an empty (or wrong) `syscalls` list parses
+fine and denies nothing.
+
+M22 Task 1 makes the profile an operator knob and proves it on a real kernel
+before trusting it:
+
+- **`enterprise.seccomp_profile`** (`df_config`, optional) — a path to a Docker
+  seccomp JSON profile. Absent → the shipped M17 default
+  (`scripts/seccomp/enterprise.json`), byte-identical behavior to before this
+  task. When given, `df_config` validates at load time (before any run starts)
+  that the file exists, parses as JSON, and is a dict with a string
+  `defaultAction` and a list `syscalls` — else `ConfigError`. This is a **shape**
+  check only.
+- **`scripts/seccomp/enterprise-strict.json`** — a stricter shipped variant:
+  the M17 denials (`mount`, `umount2`, `ptrace`, `bpf`, module load/unload,
+  `kexec*`, `reboot`, `swapon`/`swapoff`, `setns`, `unshare`) plus keyring
+  manipulation (`keyctl`, `add_key`, `request_key`), process accounting
+  (`acct`), quota manipulation (`quotactl`), and raw I/O port access
+  (`ioperm`, `iopl`). Point `enterprise.seccomp_profile` at it for the stricter
+  posture.
+- **`df_container.probe_seccomp(image, profile_path)`** — the **live** proof.
+  Runs a real container under the resolved profile with `--cap-add SYS_ADMIN`
+  (added back so a profile that *fails* to deny `mount` would otherwise
+  succeed — proving the seccomp filter, not a missing capability, is what
+  denies it) and attempts three canary syscalls (`mount`, `unshare`, `ptrace`)
+  that must each be denied, plus an ordinary file write under `/tmp` that must
+  still succeed. `resolve_isolation` calls this after the existing
+  Docker/container-barrier checks; a failing probe fails the enterprise
+  resolve exactly like a failing egress/container probe (`PROBE_FAILED` +
+  `SandboxError`, or a journaled `DOWNGRADE` under `--allow-downgrade`) — never
+  runs under an unverified profile.
+- The manifest records `enterprise_seccomp = {"profile": <basename>, "probe":
+  "verified"}` on every `enterprise`-tier terminal — unlike
+  `enterprise_egress` (below), `"verified"` is honest here: `resolve_isolation`
+  only ever returns `"enterprise"` once `probe_seccomp` already ran, live,
+  against this run's image and resolved profile, and passed.
 
 ## The split-custody two-phase ship (the core contract)
 
@@ -133,10 +179,30 @@ as a `-e` var).
   live-tested (`probe_enterprise_egress`): allowlisted-via-proxy reachable,
   direct-to-other-host denied, and the child cannot re-add iptables rules
   (NET_ADMIN dropped from the bounding set — irrevocable).
-- The seccomp profile (`scripts/seccomp/enterprise.json`) is a **conservative
-  default** (deny `mount`, `ptrace`, `bpf`, kernel-module ops, `setns`,
-  `unshare`, …); a per-role hand-tuned profile is a documented refinement.
+- The seccomp profile (`scripts/seccomp/enterprise.json`, or the stricter
+  `scripts/seccomp/enterprise-strict.json`, or an operator-supplied path via
+  `enterprise.seccomp_profile`) is a **conservative default** (deny `mount`,
+  `ptrace`, `bpf`, kernel-module ops, `setns`, `unshare`, …); a per-role
+  hand-tuned profile is a documented refinement (deferred — see below).
+- **The live seccomp probe is honest, bounded coverage, not a completeness
+  proof.** `probe_seccomp` proves the profile denies the *specific canary
+  syscalls it checks* (`mount`, `unshare`, `ptrace`) while still allowing an
+  ordinary file write — it raises the floor (a profile that's toothless on
+  these three is caught, fail-closed), but it is **not** a full audit of the
+  profile: a profile could still leave some *other* dangerous syscall allowed
+  that the operator never thought to deny and the probe never checks. Treat a
+  passing probe as "doesn't fail on the syscalls we know to ask about," not
+  "provably safe against every syscall."
 - Approver keys are file/CLI ed25519 keys; an HSM/KMS is a drop-in for
-  `sign_manifest`.
+  `sign_manifest` — **deferred** (this module uses file keys; wiring a real
+  HSM/KMS signer is separate work, needing real hardware/service integration).
+- **mTLS on the credential-proxy channel is deferred** — the proxy currently
+  speaks plaintext HTTP on `host.docker.internal`/loopback (a private,
+  container↔host channel, not exposed beyond it); real mutual-TLS needs a
+  certificate authority and cert lifecycle management, out of scope here.
+- **Per-role candidate seccomp is deferred** — the *candidate* (verifier) side
+  runs host-side under the OS sandbox (`df_sandbox`), not the enterprise
+  Docker container; applying seccomp there is Linux-only `bwrap` wiring,
+  separate from this container-side profile, and not built here.
 - The `cryptography` dependency is enterprise-only, imported solely by
   `df_custody.py` (`requirements-enterprise.txt`).

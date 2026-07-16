@@ -271,6 +271,10 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
     }
 
 
+def _notify_spool_dir(cfg):
+    return os.path.join(cfg["_control_root"], ".notify-spool")
+
+
 def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
                     builder_calls):
     """M18: best-effort delivery of a BUDGET_ALERT/BUDGET_PAUSE event to
@@ -279,7 +283,16 @@ def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
     affects control flow either way: a down alert channel journals
     NOTIFY_FAILED and the run proceeds exactly as it would have with no sink
     configured at all. Absent notification_sink, deliver() is never called
-    (byte-identical to pre-M18 behavior)."""
+    (byte-identical to pre-M18 behavior).
+
+    M22 Task 2: when `budget.notification_durable` is set, the SAME event
+    goes through `df_notify.deliver_durable` instead — still fail-soft (the
+    run's exit/outcome never changes either way) but at-least-once: a final
+    failure after `notification_attempts` retries spools the (already
+    redacted) event to `<control_root>/.notify-spool/pending.ndjson` and
+    journals NOTIFY_SPOOLED rather than NOTIFY_FAILED. Absent
+    notification_durable (default False), this branch is never taken —
+    byte-identical to the M18 best-effort path above."""
     b = cfg["_budget"]
     sink = b["notification_sink"]
     if not sink:
@@ -292,6 +305,18 @@ def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
         "cap": {"max_usd": b["max_usd"], "max_calls": b["max_calls"]},
         "ts": _now(),
     }
+    if b.get("notification_durable"):
+        ok, reason = df_notify.deliver_durable(
+            sink, event, _notify_spool_dir(cfg),
+            attempts=b["notification_attempts"], redactor=redactor,
+        )
+        if ok:
+            journal.write("NOTIFY_SENT", event=trigger)
+        elif reason == "spooled":
+            journal.write("NOTIFY_SPOOLED", event=trigger)
+        else:
+            journal.write("NOTIFY_FAILED", event=trigger, reason=reason)
+        return
     ok, reason = df_notify.deliver(sink, event, redactor=redactor)
     if ok:
         journal.write("NOTIFY_SENT", event=trigger)
@@ -925,7 +950,21 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         c = cfg["_container"]
         dk_ok = df_container.docker_available() and df_container.probe_container(
             c["image"], control_root, workspace)
-        seccomp_ok = _seccomp_profile_ok(cfg["_enterprise"]["seccomp"])
+        seccomp_path = cfg["_enterprise"]["seccomp"]
+        # M22 Task 1: the offline shape-check (_seccomp_profile_ok) is a
+        # fast, no-docker-needed rejection of a missing/malformed profile
+        # (mirrors df_config's own load-time validation); the LIVE probe
+        # (df_container.probe_seccomp) is the actual proof the profile
+        # DENIES what it claims to on a real kernel -- run it only once the
+        # offline check and the container probe both already passed (no
+        # point spending a docker run on a profile path that's already known
+        # bad, or when docker itself isn't even up). Same fail-closed
+        # discipline as the egress probe: any doubt -> seccomp_ok False.
+        seccomp_ok = (
+            _seccomp_profile_ok(seccomp_path)
+            and dk_ok
+            and df_container.probe_seccomp(c["image"], seccomp_path)
+        )
         if os_ok and dk_ok and seccomp_ok:
             return ("enterprise", os_backend.wrap_prefix(control_root, workspace),
                     df_container.ENTERPRISE_BACKEND_NAME, True)
@@ -1313,6 +1352,22 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         adapter_sha256=sha256_file(adapter) if os.path.exists(adapter) else None,
     )
 
+    # M22 Task 2: at run start, flush any events a PRIOR run spooled (durable
+    # notification only — absent notification_durable this is a no-op branch,
+    # byte-identical to pre-M22). Fail-soft like everything else in
+    # df_notify: flush_spool never raises, an unreachable sink just leaves
+    # the counts where they were and the run proceeds unaffected either way.
+    _budget_cfg = cfg["_budget"]
+    if _budget_cfg.get("notification_durable") and _budget_cfg["notification_sink"]:
+        _flush_result = df_notify.flush_spool(
+            _budget_cfg["notification_sink"], _notify_spool_dir(cfg), redactor=redactor,
+        )
+        journal.write(
+            "NOTIFY_FLUSH",
+            flushed=_flush_result["flushed"],
+            remaining=_flush_result["remaining"],
+        )
+
     manifest_base = {
         "invocation": invocation,
         "tier": cfg["assurance"],
@@ -1359,6 +1414,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "custody": None,
         "proxy": None,
         "enterprise_egress": None,
+        # Additive (M22 Task 1): same "None unless CONVERGED at enterprise"
+        # threading as enterprise_egress — overridden below only once the
+        # enterprise resolve's LIVE seccomp probe has actually verified True
+        # (resolve_isolation never returns "enterprise" otherwise).
+        "enterprise_seccomp": None,
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -2072,6 +2132,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 custody_field = None
                 proxy_field = None
                 egress_field = None
+                seccomp_field = None
 
                 if eff == "enterprise":
                     # M17 Task 3 (redesigned): an enterprise run with required
@@ -2096,6 +2157,17 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # / operator tooling, never unconditionally per production
                     # run). Never claim more than what actually ran.
                     egress_field = {"locked": "configured", "probe": "unverified"}
+                    # Unlike egress_field, "verified" (not "unverified") is
+                    # honest here: resolve_isolation only ever returns
+                    # "enterprise" once df_container.probe_seccomp already
+                    # ran, live, against THIS run's image + resolved profile,
+                    # and passed -- so by the time we're here it genuinely
+                    # was proven on a real kernel this run, not merely
+                    # configured.
+                    seccomp_field = {
+                        "profile": os.path.basename(cfg["_enterprise"]["seccomp"]),
+                        "probe": "verified",
+                    }
                     custody_field = {
                         "required_k": cfg["_custody"]["threshold"],
                         "approvers": len(cfg["_custody"]["approvers"]),
@@ -2115,7 +2187,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report, qualified=qualified,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                          custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field)
+                          custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
+                          enterprise_seccomp=seccomp_field)
                 digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                             digest, audit_key, journal)
@@ -2260,6 +2333,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             "custody": None,
             "proxy": None,
             "enterprise_egress": None,
+            # Additive (M22 Task 1): see the matching seed in the fresh-run
+            # manifest_base above.
+            "enterprise_seccomp": None,
         }
 
         # M7: coverage/oracle are deterministic from the control root +

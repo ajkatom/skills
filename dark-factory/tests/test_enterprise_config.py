@@ -285,11 +285,17 @@ class _FakeOSBackend:
         return []
 
 
-def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True):
+def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=True):
     monkeypatch.setattr(supervisor.df_sandbox, "current_backend", lambda: _FakeOSBackend())
     monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: os_ok)
     monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: dk_ok)
     monkeypatch.setattr(supervisor.df_container, "probe_container", lambda *a, **k: dk_ok)
+    # M22 Task 1: the enterprise resolve now ALSO live-probes the seccomp
+    # profile (df_container.probe_seccomp) before accepting enterprise —
+    # patched here (like docker_available/probe_container above) so these
+    # config-composition/custody-gate tests stay fast and docker-free; the
+    # real live probe is exercised separately in test_seccomp_probe.py.
+    monkeypatch.setattr(supervisor.df_container, "probe_seccomp", lambda *a, **k: seccomp_ok)
 
 
 def test_resolve_isolation_enterprise_both_ok(tmp_path, monkeypatch):
