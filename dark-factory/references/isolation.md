@@ -6,17 +6,33 @@ cannot read the control root (scenarios/runs). Backends: macOS `sandbox-exec`
 Linux `bwrap` (masks the control root with a tmpfs, then **seals that mask
 read-only** with `--remount-ro`). Windows: no backend yet → unsupported.
 
-The Linux mask is two ordered steps: `--tmpfs <control_root>` shadows the real
+The Linux mask is three ordered steps: `--tmpfs <control_root>` shadows the real
 control-root content with an empty overlay (reads denied — the real scenarios/
-journal are gone from the wrapped view), and `--remount-ro <control_root>`
-remounts that overlay `MS_RDONLY` (writes denied — even a root process with
-`CAP_DAC_OVERRIDE` cannot write, because a read-only MOUNT is kernel-enforced
-regardless of permission bits or capabilities). This gives Linux the same
-read AND write denial macOS already had, satisfying M12's dual-denial probe on
-a real kernel. (A bare `--tmpfs` alone leaves an owner-writable overlay, so the
-write half of `probe_denial` would fail — the Linux backend would fail its own
-fail-closed startup probe and the tier would be unusable on Linux. The
-`--remount-ro` seal is what closes that gap.)
+journal are gone from the wrapped view), `--remount-ro <control_root>` remounts
+that overlay `MS_RDONLY` (defeats permission-bit / `CAP_DAC_OVERRIDE` writes — a
+read-only MOUNT is kernel-enforced regardless of DAC), and `--cap-drop ALL`
+(defeats the `CAP_SYS_ADMIN` remount escape). All three are required:
+
+- A bare `--tmpfs` alone leaves an owner-writable overlay, so the write half of
+  `probe_denial` fails — the backend would fail its own fail-closed startup
+  probe and the tier would be unusable on Linux.
+- `--remount-ro` alone is still escapable: a child holding **ambient
+  `CAP_SYS_ADMIN`** (setuid-root bwrap, as Debian/Ubuntu package it, or a
+  supervisor running as root) can `mount -o remount,rw <control_root>` and then
+  write, because privileged bwrap does not strip caps from the child unless told.
+  `--cap-drop ALL` makes that remount fail ("permission denied, are you root?").
+- The `--bind` workspace stays read-write throughout, so the builder can still
+  write its artifact.
+
+Together these give Linux the same read AND write denial macOS already had,
+satisfying M12's dual-denial probe on a real kernel.
+
+`probe_denial` proves all of this and is itself hardened against the escape: on
+Linux its wrapped child performs a FOURTH check beyond the naive fresh-file
+write and canary truncation — it attempts a rw remount of the masked control
+root (`mount(..., MS_REMOUNT, ...)` via ctypes) and treats a successful remount
+as a leak. So dropping `--cap-drop ALL` makes `probe_denial` return False rather
+than false-PASS (regression-guarded by `test_probe_catches_cap_sys_admin_remount_escape`).
 
 A tier is claimed only when **probe-verified**: at startup a canary is planted in
 the control root and a wrapped process must fail to read it AND fail to write

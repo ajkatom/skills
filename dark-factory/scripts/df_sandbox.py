@@ -60,13 +60,23 @@ class _LinuxBackend:
                                          # tmpfs is otherwise owner-writable, and a root
                                          # process has CAP_DAC_OVERRIDE so permission BITS
                                          # (chmod) would not stop it — only a read-only
-                                         # MOUNT is kernel-enforced regardless of caps.
+                                         # MOUNT is kernel-enforced regardless of DAC.
                                          # bwrap applies args in order, so tmpfs-then-
                                          # remount-ro yields an empty, read-only mount:
                                          # reads denied (empty, shadows real content),
-                                         # writes denied (MS_RDONLY). This is what makes
-                                         # M12's write-denial half of probe_denial hold on
-                                         # a real Linux kernel.
+                                         # writes denied (MS_RDONLY).
+            "--cap-drop", "ALL",         # MS_RDONLY alone is NOT enough: a child holding
+                                         # ambient CAP_SYS_ADMIN (setuid-root bwrap, as
+                                         # Debian/Ubuntu package it, or a root supervisor)
+                                         # can `mount -o remount,rw` the mask and then
+                                         # write. bwrap running privileged does not strip
+                                         # caps from the child unless told, so drop them
+                                         # ALL here — this makes the remount fail
+                                         # ("permission denied, are you root?") while the
+                                         # --bind workspace stays writable. Together
+                                         # --remount-ro (defeats DAC_OVERRIDE) + --cap-drop
+                                         # ALL (defeats the CAP_SYS_ADMIN remount) make
+                                         # M12's write-denial hold on a real kernel.
             "--bind", real_ws, real_ws,  # workspace read-write
             "--chdir", real_ws,
             "--die-with-parent",
@@ -92,9 +102,16 @@ def probe_denial(backend, deny_root, workspace):
     """
     if backend is None or not backend.available():
         return False
+    # On Linux the write-denial proof must also cover the CAP_SYS_ADMIN remount
+    # escape: a naive open() being denied is not enough if a privileged child can
+    # `mount -o remount,rw` the masked control root and then write. So on Linux
+    # the wrapped child performs a FOURTH check — attempt to remount deny_root
+    # read-write and treat a successful remount as a leak.
+    is_linux = sys.platform.startswith("linux")
     read_token = "DF-CANARY-" + uuid.uuid4().hex
     canary = os.path.join(deny_root, ".probe-canary-" + uuid.uuid4().hex)
     write_probe = os.path.join(deny_root, ".probe-write-" + uuid.uuid4().hex)
+    remount_probe = os.path.join(deny_root, ".probe-remount-" + uuid.uuid4().hex)
     try:
         try:
             with open(canary, "w", encoding="utf-8") as f:
@@ -105,10 +122,10 @@ def probe_denial(backend, deny_root, workspace):
             prefix = backend.wrap_prefix(deny_root, workspace)
         except SandboxError:
             return False
-        # Wrapped process performs three checks and prints one marker line per
-        # check. If the sandbox does NOT deny an operation, the corresponding
-        # line will be the real content / a success marker instead of the
-        # denial marker → treated as a leak, fail closed.
+        # Wrapped process performs three (macOS) or four (Linux) checks and prints
+        # one marker line per check. If the sandbox does NOT deny an operation, the
+        # corresponding line will be the real content / a success marker instead of
+        # the denial marker → treated as a leak, fail closed.
         code = (
             "import sys\n"
             "canary_path, write_probe_path = sys.argv[1], sys.argv[2]\n"
@@ -129,9 +146,37 @@ def probe_denial(backend, deny_root, workspace):
             "except Exception:\n"
             f"    sys.stdout.write({_WRITE_DENIAL_MARKER!r})\n"
         )
+        # Linux-only 4th check: try to defeat the read-only mount with a rw
+        # remount (needs CAP_SYS_ADMIN). rc==0 means the seal was broken — a
+        # successful rw remount IS the escape, whether or not the follow-up write
+        # open then happens to succeed → treat it as a leak.
+        if is_linux:
+            code += (
+                "sys.stdout.write(chr(10))\n"
+                "import ctypes, os\n"
+                "remount_probe_path = sys.argv[3]\n"
+                "deny_dir = os.path.dirname(remount_probe_path)\n"
+                "try:\n"
+                "    libc = ctypes.CDLL(None, use_errno=True)\n"
+                "    MS_REMOUNT = 32\n"
+                "    rc = libc.mount(b'none', deny_dir.encode(), b'', MS_REMOUNT, None)\n"
+                "    if rc == 0:\n"
+                "        try:\n"
+                "            open(remount_probe_path, 'w').write('leak')\n"
+                "        except Exception:\n"
+                "            pass\n"
+                "        sys.stdout.write('DF-WRITE-LEAKED')\n"
+                "    else:\n"
+                f"        sys.stdout.write({_WRITE_DENIAL_MARKER!r})\n"
+                "except Exception:\n"
+                f"    sys.stdout.write({_WRITE_DENIAL_MARKER!r})\n"
+            )
+        argv = prefix + [sys.executable, "-c", code, canary, write_probe]
+        if is_linux:
+            argv.append(remount_probe)
         try:
             proc = subprocess.run(
-                prefix + [sys.executable, "-c", code, canary, write_probe],
+                argv,
                 capture_output=True, text=True, errors="replace", timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -141,26 +186,26 @@ def probe_denial(backend, deny_root, workspace):
         # launch failure must NOT be mistaken for a proven denial. A write-probe
         # file that exists on disk (even if the sandbox reported an exception on
         # some other line) is independent, physical proof of a leak.
-        if os.path.exists(write_probe):
+        if os.path.exists(write_probe) or os.path.exists(remount_probe):
             return False
         lines = proc.stdout.split("\n")
-        if len(lines) < 3:
+        min_lines = 4 if is_linux else 3
+        if len(lines) < min_lines:
             return False
         read_denied = lines[0].strip() == _READ_DENIAL_MARKER
         write_open_denied = lines[1].strip() == _WRITE_DENIAL_MARKER
         truncate_denied = lines[2].strip() == _WRITE_DENIAL_MARKER
+        remount_denied = (not is_linux) or lines[3].strip() == _WRITE_DENIAL_MARKER
         return (
             proc.returncode == 0
             and read_denied
             and write_open_denied
             and truncate_denied
+            and remount_denied
         )
     finally:
-        try:
-            os.unlink(canary)
-        except OSError:
-            pass
-        try:
-            os.unlink(write_probe)
-        except OSError:
-            pass
+        for path in (canary, write_probe, remount_probe):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass

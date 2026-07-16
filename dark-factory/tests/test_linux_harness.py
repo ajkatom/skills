@@ -88,6 +88,45 @@ def test_egress_denial_live(linux_probe_image):
     assert "DF-PROBE egress PASS" in proc.stdout
 
 
+# Weaken the Linux backend by stripping the "--cap-drop ALL" pair from
+# wrap_prefix, then assert probe_denial FAILS — proving the probe catches the
+# CAP_SYS_ADMIN remount escape (the pre-fix backend would false-PASS without
+# this coverage).
+_CAP_DROP_REGRESSION_SNIPPET = (
+    "import sys\n"
+    "sys.path.insert(0, '/df')\n"
+    "import df_sandbox\n"
+    "backend = df_sandbox.BACKENDS['linux']\n"
+    "orig = backend.wrap_prefix\n"
+    "def weakened(deny_root, workspace):\n"
+    "    argv = orig(deny_root, workspace)\n"
+    "    i = argv.index('--cap-drop')\n"
+    "    del argv[i:i+2]\n"
+    "    return argv\n"
+    "backend.wrap_prefix = weakened\n"
+    "result = df_sandbox.probe_denial(backend, '/tmp/deny', '/tmp/ws')\n"
+    "print('PROBE_RESULT', result)\n"
+    "sys.exit(0 if result is False else 1)\n"
+)
+
+
+@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+def test_probe_catches_cap_sys_admin_remount_escape(linux_probe_image):
+    """Regression guard: with ambient CAP_SYS_ADMIN, a bwrap child whose backend
+    forgot "--cap-drop ALL" can `mount -o remount,rw` the masked control root and
+    write. probe_denial's Linux 4th check (remount vector) must catch that — so
+    the weakened backend must make probe_denial return False. If this test ever
+    goes green with the escape working, the fail-closed guarantee is broken."""
+    proc = _run_probe(
+        linux_probe_image,
+        ["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"],
+        ["sh", "-c", "mkdir -p /tmp/deny /tmp/ws && python3 -c "
+                     + "\"" + _CAP_DROP_REGRESSION_SNIPPET.replace('"', '\\"') + "\""],
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "PROBE_RESULT False" in proc.stdout
+
+
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
 def test_no_new_privs_live(linux_probe_image):
     """Live coverage for the M17 no-new-privs self-application primitive. No
