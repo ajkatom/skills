@@ -233,11 +233,21 @@ def _iter_then_strings(then: dict):
 def _find_spec_leaks(spec_text: str, scenarios: list) -> list:
     """Barrier scaffold-check: any scenario `then` string literal that
     appears verbatim in the builder-visible spec.md is a scaffold bug -- it
-    would leak the holdout answer straight to the builder."""
+    would leak the holdout answer straight to the builder.
+
+    A `then` value (e.g. a `stdout_equals` assertion) commonly carries one
+    trailing newline (the candidate's own `print(...)` terminator) that has
+    nothing to do with whether the literal answer is embedded in spec.md --
+    comparing the raw value would let a leak evade this check merely because
+    the leaked copy in spec.md happens to lack that trailing "\n" (or vice
+    versa). Normalize exactly one trailing newline off the value before the
+    substring check, mirroring run_scenarios._norm's equality handling.
+    """
     leaks = []
     for sc in scenarios:
         for value in _iter_then_strings(sc.get("then", {})):
-            if value in spec_text:
+            normalized = value[:-1] if value.endswith("\n") else value
+            if normalized and normalized in spec_text:
                 leaks.append({"scenario_id": sc["id"], "value": value})
     return leaks
 

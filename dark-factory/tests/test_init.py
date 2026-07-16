@@ -250,6 +250,27 @@ def test_spec_leak_of_scenario_expected_output_fails_validation(tmp_path):
     assert any(leak["value"] == "value: indigo" for leak in report["spec_leak"])
 
 
+def test_spec_leak_survives_a_trailing_newline_on_the_then_value(tmp_path):
+    # BHV-GET's expected stdout is "value: indigo" but the scenario asserts
+    # it via stdout_equals with a trailing "\n" (as a real candidate's
+    # print(...) output would end) -- the leaked literal in spec.md has no
+    # trailing newline (it's prose). The barrier must still catch this: a
+    # bare trailing "\n" must never be enough to dodge the spec_leak check.
+    answers = _kv_answers(tmp_path)
+    answers["behaviors"][1]["scenarios"][0]["then"] = {
+        "exit_code": 0, "stdout_equals": "value: indigo\n",
+    }
+    answers["spec_text"] += "\nNote: GET of an existing key prints `value: indigo`.\n"
+    control_root = answers["control_root"]
+
+    df_init.scaffold(control_root, answers)
+    ok, report = df_init.validate_scaffold(control_root)
+
+    assert ok is False
+    assert report["spec_leak"] != []
+    assert any(leak["value"] == "value: indigo\n" for leak in report["spec_leak"])
+
+
 def test_scaffold_refuses_to_overwrite_non_empty_dir_without_force(tmp_path):
     answers = _kv_answers(tmp_path)
     control_root = answers["control_root"]

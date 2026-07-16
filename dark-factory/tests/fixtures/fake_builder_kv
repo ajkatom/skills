@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Deterministic fake builder for the KV-service worked example (M19 Task 2
+e2e). Speaks adapter protocol 0.1. Always writes a CORRECT `app.py`
+implementing `examples/kv-service/answers.json`'s spec (the same code that
+was hand-verified against every scenario in that answers file, and that
+matches a real model's converged output from the live acceptance build) --
+so a run driven by this fixture converges in exactly one iteration.
+
+This stands in for a real model builder purely to make
+`test_e2e_init.py`'s "init produces a control root that `run` actually
+converges on" assertion fast and deterministic; the real builder role (a
+live model reading only spec.md, never the scenarios) was already proven
+separately. Never reads scenarios -- cannot, they are not reachable from
+the workspace.
+"""
+import json
+import os
+import sys
+
+APP_PY = '''import argparse
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+_STORE = {}
+
+
+def handle(method, path, body):
+    if path == "/health" and method == "GET":
+        return 200, json.dumps({"status": "ok"})
+    if path == "/kv" and method == "GET":
+        return 200, json.dumps({"keys": sorted(_STORE.keys())})
+    if path.startswith("/kv/"):
+        key = path[len("/kv/"):]
+        if method == "PUT":
+            try:
+                data = json.loads(body) if body is not None else None
+            except (ValueError, TypeError):
+                return 400, json.dumps({"error": "invalid JSON body"})
+            if not isinstance(data, dict) or "value" not in data:
+                return 400, json.dumps({"error": "missing value field"})
+            _STORE[key] = data["value"]
+            return 200, json.dumps({"key": key, "value": data["value"]})
+        if method == "GET":
+            if key in _STORE:
+                return 200, json.dumps({"key": key, "value": _STORE[key]})
+            return 404, json.dumps({"error": "not found"})
+        if method == "DELETE":
+            if key in _STORE:
+                del _STORE[key]
+                return 200, json.dumps({"deleted": key})
+            return 404, json.dumps({"error": "not found"})
+    return 404, json.dumps({"error": "not found"})
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def _dispatch(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length).decode() if length else None
+        status, payload = handle(self.command, self.path, body)
+        data = payload.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_PUT = do_DELETE = do_POST = _dispatch
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=0)
+    args = parser.parse_args()
+    srv = HTTPServer(("127.0.0.1", args.port), _Handler)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "app.py"), "w", encoding="utf-8") as f:
+        f.write(APP_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

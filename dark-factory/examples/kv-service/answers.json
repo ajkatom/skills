@@ -1,0 +1,235 @@
+{
+  "_readme": "Worked example for `dark-factory init` (see references/authoring.md). Edit workspace_root, control_root, and builder_adapter below to real absolute paths on your machine before running init -- this field is documentation only and is ignored by df_init/init.",
+  "app_name": "kv-service",
+  "spec_text": "# KV Store \u2014 a small JSON HTTP API (Python standard library only)\n\nBuild a tiny in-memory key/value store exposed as a JSON HTTP API, in a\nsingle file `app.py`, using ONLY the Python standard library (no\nthird-party packages).\n\n## Required internal interface (this is how your code is exercised)\n\nFactor ALL request handling into one pure function:\n\n    handle(method: str, path: str, body: str | None) -> tuple[int, str]\n\n- `method` is the HTTP method (\"GET\", \"PUT\", \"DELETE\", ...).\n- `path` is the request path (e.g. \"/kv/color\").\n- `body` is the raw request body as a string, or None when there is no body.\n- It returns `(status_code, response_body)` where `response_body` is a JSON\n  string.\n- `handle` uses a module-level dict as the store, so repeated calls within\n  one process share state (a PUT then a GET in the same process sees the\n  value).\n\nAlso provide `main()` that starts a `http.server` on a `--port <N>`\nargument and dispatches every request through `handle(...)`. Running\n`python3 app.py --port 0` must start the server (binding an ephemeral port\nis fine). The HTTP layer must be a thin wrapper over `handle`.\n\n## Behaviors\n\n1. **Health**: `GET /health` -> `200`, body `{\"status\": \"ok\"}`.\n2. **Put**: `PUT /kv/<key>` with body `{\"value\": <any JSON>}` -> `200`, body\n   `{\"key\": \"<key>\", \"value\": <value>}`, and the value is stored under\n   `<key>`.\n3. **Get**: `GET /kv/<key>` -> `200` body `{\"key\": \"<key>\", \"value\": <value>}`\n   if the key exists; otherwise `404` body `{\"error\": \"not found\"}`.\n4. **List**: `GET /kv` -> `200` body `{\"keys\": [<sorted list of stored keys>]}`.\n5. **Delete**: `DELETE /kv/<key>` -> `200` body `{\"deleted\": \"<key>\"}` if it\n   existed (and it is removed); otherwise `404` body `{\"error\": \"not found\"}`.\n6. **Validation**: `PUT /kv/<key>` with a body that is not valid JSON, or\n   valid JSON lacking a `\"value\"` field -> `400` body `{\"error\": \"<message>\"}`.\n7. **Unknown route**: any path that is not `/health`, `/kv`, or `/kv/<key>`\n   -> `404` body `{\"error\": \"not found\"}`.\n\nResponse bodies must be JSON. Keys in the `/kv` listing are sorted\nascending.\n",
+  "assurance": "cooperative",
+  "workspace_root": "/absolute/path/you/choose/kv-service-workspace",
+  "control_root": "/absolute/path/you/choose/kv-service-control",
+  "builder_adapter": "/absolute/path/to/skills/dark-factory/scripts/adapters/claude",
+  "max_iterations": 8,
+  "behaviors": [
+    {
+      "id": "BHV-HEALTH",
+      "description": "GET /health returns 200 with body {\"status\": \"ok\"}",
+      "scenarios": [
+        {
+          "id": "BHV-HEALTH-S1",
+          "cohort": "dev",
+          "title": "health check returns 200 ok",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"status\": \"ok\"}",
+            "stderr_equals": ""
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"GET\", \"/health\", null]]"
+          ]
+        },
+        {
+          "id": "BHV-HEALTH-S2",
+          "cohort": "dev",
+          "title": "health check ignores an unexpected request body",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"status\": \"ok\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"GET\", \"/health\", \"{\\\"ignored\\\": true}\"]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-PUT",
+      "description": "PUT /kv/<key> stores a value and returns 200",
+      "scenarios": [
+        {
+          "id": "BHV-PUT-S1",
+          "cohort": "dev",
+          "title": "put a new key returns 200 and echoes it",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"key\": \"color\", \"value\": \"blue\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/color\", \"{\\\"value\\\": \\\"blue\\\"}\"]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-GET",
+      "description": "GET /kv/<key> returns the stored value, or 404 if absent",
+      "scenarios": [
+        {
+          "id": "BHV-GET-S1",
+          "cohort": "dev",
+          "title": "get after put returns the stored value",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"key\": \"color\", \"value\": \"blue\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/color\", \"{\\\"value\\\": \\\"blue\\\"}\"], [\"GET\", \"/kv/color\", null]]"
+          ]
+        },
+        {
+          "id": "BHV-GET-S2",
+          "cohort": "dev",
+          "title": "get a missing key returns 404",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "404\n{\"error\": \"not found\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"GET\", \"/kv/missing\", null]]"
+          ]
+        },
+        {
+          "id": "BHV-GET-F1",
+          "cohort": "final",
+          "title": "sealed: get after put returns the stored value",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"key\": \"season\", \"value\": \"summer\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/season\", \"{\\\"value\\\": \\\"summer\\\"}\"], [\"GET\", \"/kv/season\", null]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-LIST",
+      "description": "GET /kv returns the sorted list of stored keys",
+      "scenarios": [
+        {
+          "id": "BHV-LIST-S1",
+          "cohort": "dev",
+          "title": "list returns sorted stored keys",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "200\n{\"keys\": [\"a\", \"b\"]}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/b\", \"{\\\"value\\\": 2}\"], [\"PUT\", \"/kv/a\", \"{\\\"value\\\": 1}\"], [\"GET\", \"/kv\", null]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-DELETE",
+      "description": "DELETE /kv/<key> removes a key and returns 200, or 404 if absent",
+      "scenarios": [
+        {
+          "id": "BHV-DELETE-S1",
+          "cohort": "dev",
+          "title": "delete then get returns 404",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "404\n{\"error\": \"not found\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/x\", \"{\\\"value\\\": 9}\"], [\"DELETE\", \"/kv/x\", null], [\"GET\", \"/kv/x\", null]]"
+          ]
+        },
+        {
+          "id": "BHV-DELETE-F1",
+          "cohort": "final",
+          "title": "sealed: delete then get returns 404",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "404\n{\"error\": \"not found\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/z\", \"{\\\"value\\\": 1}\"], [\"DELETE\", \"/kv/z\", null], [\"GET\", \"/kv/z\", null]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-VALIDATION",
+      "description": "PUT with an invalid or incomplete body returns 400",
+      "scenarios": [
+        {
+          "id": "BHV-VALIDATION-S1",
+          "cohort": "dev",
+          "title": "invalid JSON body returns 400",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "400\n{\"error\""
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/x\", \"not json\"]]"
+          ]
+        },
+        {
+          "id": "BHV-VALIDATION-S2",
+          "cohort": "dev",
+          "title": "missing value field returns 400",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "400\n{\"error\""
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"PUT\", \"/kv/x\", \"{\\\"novalue\\\": 1}\"]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "BHV-UNKNOWN",
+      "description": "any other route returns 404",
+      "scenarios": [
+        {
+          "id": "BHV-UNKNOWN-S1",
+          "cohort": "dev",
+          "title": "unknown route returns 404",
+          "then": {
+            "exit_code": 0,
+            "stdout_contains": "404\n{\"error\": \"not found\"}"
+          },
+          "run": [
+            "python3",
+            "-c",
+            "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+            "[[\"GET\", \"/nope\", null]]"
+          ]
+        }
+      ]
+    }
+  ]
+}

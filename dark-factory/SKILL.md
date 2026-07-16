@@ -10,6 +10,52 @@ Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
 (Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2).
 
+## Authoring a run (`init`) — the on-ramp for "provide context and specs"
+
+When the user's ask is "here's my spec/context, build me a dark-factory
+run" rather than a from-scratch interview, `dark-factory init` scaffolds a
+**ready-to-run control root** — validated `config.json`, builder-visible
+`spec.md`, `behaviors.json`, and holdout `scenarios/*.json` — from a small
+`answers` JSON document, instead of hand-writing every control-plane file
+across workflow steps 2-4 below. It reuses the exact same validators `run`
+does (`df_config.load_config`, oracle discrimination, coverage, plus a
+barrier check that no scenario's exact expected output leaked into
+`spec.md`), so a control root `init` blesses is one `run` accepts — and it
+refuses (removing the invalid tree) rather than leaving a broken control
+root to fail confusingly later.
+
+- **The interview.** `references/authoring.md` is the script to follow:
+  what the app does + its interface (the spec), which assurance tier and
+  why, the must-pass behaviors with 1-3 holdout scenarios each (with
+  guidance on writing scenarios that are actually discriminating and don't
+  leak the answer into the spec), and the optional config blocks
+  (`security_gates`/`twins`/`budget`/`knowledge_base`).
+- **A worked example.** `examples/kv-service/answers.json` is a complete,
+  copyable answers document for a small KV JSON HTTP API — 7 behaviors, 12
+  dev+final scenarios, hand-verified against a real converged
+  implementation. Copy it, edit `workspace_root`/`control_root`/
+  `builder_adapter` to real absolute paths, and adapt the spec/behaviors to
+  your app.
+- **Run it:**
+  `python3 <skill_dir>/scripts/supervisor.py init --control-root <cr> --answers <file.json|-> [--force]`.
+  Exit 0 prints the scaffolded tree summary, the exact `run` command, and
+  the tier's run-time prerequisites (Docker for hardened/enterprise, the
+  builder CLI, approver keys for enterprise custody). Exit 2 prints the
+  specific validation failure (an inert scenario, uncovered behavior,
+  orphan scenario, or spec leak) and removes the invalid tree unless
+  `--force-keep` is passed.
+- **Honest scope:** `init` validates STRUCTURE — it cannot judge whether
+  your scenarios truly capture what you meant by the spec (that's still
+  your call — review the generated `scenarios/*.json` before trusting
+  them), it does not auto-generate scenarios from spec text, and it never
+  runs a build (it prints the `run` command instead). See
+  `references/authoring.md` for the full interview and scenario-writing
+  guidance.
+
+This on-ramp only produces the control-plane files; the rest of this
+skill's workflow (running, checkpoints, tiers, security gates, etc.) is
+unchanged below.
+
 ## Workflow (create one todo per step)
 
 1. **Engage.** Announce the skill; offer opt-out. Ask which directory to use as
@@ -220,6 +266,7 @@ in a session that will also drive the builder.
 
 ## References
 
+- `references/authoring.md` — the `init` interview script: spec, tier choice, writing discriminating holdout scenarios (dev vs. sealed final), and the optional config blocks; see also `examples/kv-service/answers.json` (M19)
 - `references/config-reference.md` — config schema
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
