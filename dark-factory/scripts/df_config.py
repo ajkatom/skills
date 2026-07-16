@@ -610,6 +610,67 @@ def load_config(control_root: str) -> dict:
     else:
         cfg_custody = None
 
+    # Optional `credential_proxy` block -> cfg["_proxy"] (M17 Task 2): a
+    # host-side allowlist credential proxy (see scripts/df_proxy.py). The
+    # provider token is NEVER accepted inline here -- only the NAME of an
+    # env var the proxy reads host-side at request time, mirroring the
+    # M11/M13 inline-secret rejection (credentials.*, audit.sink.*). Absent
+    # -> {"enabled": False}, byte-identical to pre-M17 behavior at every
+    # tier (the enterprise tier's REQUIRED credential_proxy.enabled:true
+    # gate is Task 3 -- this module validates only the block's shape).
+    proxy_raw = raw.get("credential_proxy", {})
+    if not isinstance(proxy_raw, dict):
+        raise ConfigError("credential_proxy must be a JSON object")
+
+    if "token" in proxy_raw:
+        raise ConfigError(
+            "credential_proxy.token is a raw secret value and is not "
+            "allowed inline; use credential_proxy.token_env to name an "
+            f"environment variable instead (must match {_CRED_NAME_RE.pattern!r})"
+        )
+
+    proxy_header = proxy_raw.get("header", "authorization")
+    if proxy_header not in ("authorization", "x-api-key"):
+        raise ConfigError(
+            "credential_proxy.header must be 'authorization' or "
+            f"'x-api-key', got {proxy_header!r}"
+        )
+
+    proxy_enabled = proxy_raw.get("enabled", False)
+    if not isinstance(proxy_enabled, bool):
+        raise ConfigError("credential_proxy.enabled must be a bool")
+
+    if proxy_enabled:
+        proxy_allowlist = proxy_raw.get("allowlist")
+        if not isinstance(proxy_allowlist, list) or not proxy_allowlist:
+            raise ConfigError(
+                "credential_proxy.allowlist must be a non-empty list of "
+                "hostnames when credential_proxy.enabled is true"
+            )
+        for entry in proxy_allowlist:
+            if not isinstance(entry, str) or not entry:
+                raise ConfigError(
+                    "credential_proxy.allowlist entries must be non-empty "
+                    f"hostname strings, got {entry!r}"
+                )
+
+        proxy_token_env = proxy_raw.get("token_env")
+        if not isinstance(proxy_token_env, str) or not _CRED_NAME_RE.match(proxy_token_env):
+            raise ConfigError(
+                "credential_proxy.token_env must be an environment "
+                f"variable NAME matching {_CRED_NAME_RE.pattern!r}, got "
+                f"{proxy_token_env!r}"
+            )
+
+        cfg_proxy = {
+            "enabled": True,
+            "allowlist": list(proxy_allowlist),
+            "token_env": proxy_token_env,
+            "header": proxy_header,
+        }
+    else:
+        cfg_proxy = {"enabled": False}
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -637,4 +698,5 @@ def load_config(control_root: str) -> dict:
     cfg["_brownfield"] = cfg_brownfield
     cfg["_confine"] = cfg_confine
     cfg["_custody"] = cfg_custody
+    cfg["_proxy"] = cfg_proxy
     return cfg
