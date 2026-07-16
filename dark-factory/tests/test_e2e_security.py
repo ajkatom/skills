@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 
-from test_supervisor import FAKE, setup_control, terminal_state
+from test_supervisor import FAKE, setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_SECRET = os.path.join(HERE, "fixtures", "fake_builder_secret")
@@ -144,7 +144,7 @@ def test_no_security_block_converges_with_security_unchecked(tmp_path):
     states = [e["state"] for e in entries]
     assert "SECURITY_GATES" not in states
     assert "SECURITY_GATE_FAILED" not in states
-    assert terminal_state(entries)["state"] == "CONVERGED"
+    assert states[-1] == "CONVERGED"
 
 
 def test_resumed_converge_also_runs_security_gates(tmp_path):
@@ -178,4 +178,4 @@ def test_resumed_converge_also_runs_security_gates(tmp_path):
     entries = _journal(cr, run_id)
     states = [e["state"] for e in entries]
     assert "SECURITY_GATES" in states
-    assert terminal_state(entries)["state"] == "CONVERGED"
+    assert states[-1] == "CONVERGED"

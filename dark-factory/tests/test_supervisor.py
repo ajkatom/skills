@@ -62,19 +62,6 @@ def read_journal(cr):
     return [json.loads(l) for l in lines.strip().splitlines()], runs[0]
 
 
-def terminal_state(entries):
-    """The run's actual terminal-state entry -- the last journal entry that
-    is NOT one of the M13 audit-chain anchor events. `_anchor_audit` always
-    journals AUDIT_CHAINED (and, with a sink configured, AUDIT_SINK_*)
-    immediately AFTER every real terminal state (CONVERGED, CAP_REACHED,
-    ABORTED_*, etc.), so `entries[-1]` is no longer the terminal state
-    itself -- callers that want "what actually happened" use this instead."""
-    for e in reversed(entries):
-        if e["state"] not in supervisor._AUDIT_ANCHOR_STATES:
-            return e
-    return entries[-1]
-
-
 def test_converging_run_exits_zero_and_journals(tmp_path):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     rc = supervisor.run(str(cr), None)
@@ -83,7 +70,7 @@ def test_converging_run_exits_zero_and_journals(tmp_path):
     states = [e["state"] for e in entries]
     # M7: the pre-build gate (GATE_PASSED) now runs between INIT and SNAPSHOT.
     assert states[0] == "INIT" and states[1] == "GATE_PASSED" and states[2] == "SNAPSHOT"
-    assert "CONVERGED" in states and terminal_state(entries)["state"] == "CONVERGED"
+    assert "CONVERGED" in states and states[-1] == "CONVERGED"
     # two iterations: buggy then fixed
     assert states.count("BUILD") == 2 and states.count("FEEDBACK") == 1
 
@@ -94,9 +81,9 @@ def test_stubborn_run_hits_cap_with_exit_3(tmp_path):
     assert rc == 3
     entries, _ = read_journal(cr)
     states = [e["state"] for e in entries]
-    assert terminal_state(entries)["state"] == "CAP_REACHED" and states.count("BUILD") == 2
+    assert states[-1] == "CAP_REACHED" and states.count("BUILD") == 2
     # cap message names failing behaviors, not scenario content
-    cap = terminal_state(entries)["data"]
+    cap = entries[-1]["data"]
     assert cap["failing_behaviors"] == ["BHV-001"]
 
 
@@ -125,7 +112,7 @@ def test_adapter_hard_failure_aborts_with_exit_2(tmp_path):
     rc = supervisor.run(str(cr), None)
     assert rc == 2
     entries, _ = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ABORTED_BUILD_ERROR"
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"
 
 
 def test_prompt_contains_spec_and_feedback_but_never_scenarios(tmp_path):
@@ -170,7 +157,7 @@ def test_adapter_missing_status_aborts_with_exit_2(tmp_path):
     rc = supervisor.run(str(cr), None)
     assert rc == 2
     entries, _ = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ABORTED_BUILD_ERROR"
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"
 
 
 def test_bad_project_src_exits_2(tmp_path):
@@ -181,7 +168,7 @@ def test_bad_project_src_exits_2(tmp_path):
     os.mkfifo(bad_src / "pipe")  # special file -> SnapshotError
     assert supervisor.run(str(cr), str(bad_src)) == 2
     entries, _ = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ABORTED_BUILD_ERROR"
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"
 
 
 def test_invalid_scenario_ir_exits_2(tmp_path):
@@ -192,4 +179,4 @@ def test_invalid_scenario_ir_exits_2(tmp_path):
     bad.write_text(json.dumps({"ir_version": "0.1"}), encoding="utf-8")
     assert supervisor.run(str(cr), None) == 2
     entries, _ = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ABORTED_BUILD_ERROR"
+    assert entries[-1]["state"] == "ABORTED_BUILD_ERROR"

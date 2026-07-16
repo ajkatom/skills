@@ -6,7 +6,6 @@ M1 walking skeleton, cooperative tier only. FSM:
 """
 import argparse
 import datetime
-import hashlib
 import json
 import os
 import subprocess
@@ -45,12 +44,6 @@ class LockError(RuntimeError):
 
 
 PAUSED = 10
-
-# M13: the only journal states _anchor_audit ever writes AFTER a manifest's
-# finalize -- see verify_manifest's journal_bytes prefix check.
-_AUDIT_ANCHOR_STATES = frozenset(
-    {"AUDIT_CHAINED", "AUDIT_SINK_OK", "AUDIT_SINK_WARN", "AUDIT_SINK_FAILED"}
-)
 
 
 def _now() -> str:
@@ -310,24 +303,17 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     the manifest are names/allowlist only and are never themselves subject to
     redaction (they contain no values).
 
-    `journal_bytes` (M13): recorded alongside `journal_sha256` as the exact
-    journal.jsonl size AT FINALIZE TIME. `_anchor_audit` (called immediately
-    after this function returns, on every terminal) journals AUDIT_CHAINED
-    (and, with a sink configured, AUDIT_SINK_*) into this SAME journal.jsonl
-    -- necessarily AFTER it was hashed here, since the chain entry binds the
-    manifest's own digest and can't be computed before the manifest exists.
-    Without `journal_bytes`, verify_manifest's whole-file journal hash would
-    go stale (TAMPERED) the instant those lines land. Recording the prefix
-    length lets verify_manifest hash only the bytes that existed AT finalize
-    -- exactly the tamper-evidence the check always meant (was journal
-    content UP TO the terminal state altered?) -- while legitimate,
-    expected post-finalize audit-chain appends don't trip it.
+    M13 note: finalize_manifest SEALS journal.jsonl — its whole-file hash goes
+    into `journal_sha256` and NOTHING may append to journal.jsonl afterward.
+    The audit-chain anchoring that runs right after this (`_anchor_audit`)
+    happens AFTER the seal, so its events go to a SEPARATE, unhashed
+    `audit_events.jsonl`, never back into journal.jsonl — keeping this
+    whole-file seal (M5a) unweakened.
     """
     journal_path = os.path.join(run_dir, "journal.jsonl")
     manifest = dict(extra)
     manifest["manifest_version"] = "0.1"
     manifest["journal_sha256"] = sha256_file(journal_path)
-    manifest["journal_bytes"] = os.path.getsize(journal_path)
     manifest["finished_ts"] = _now()
     if audit_key is not None:
         manifest["audit_signing"] = True
@@ -351,8 +337,19 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     cannot live inside that same manifest (embedding them would change the
     very digest the chain anchors). They are recorded as run_dir SIDECARS
     (`audit_chain.json`, and — only when a sink is configured —
-    `audit_sink_receipt.json`) plus journal events, never as manifest
-    fields. `finalize_manifest` is never called a second time.
+    `audit_sink_receipt.json`). `finalize_manifest` is never called a
+    second time.
+
+    WHY A SEPARATE EVENT LOG: this runs AFTER `finalize_manifest` has already
+    SEALED `journal.jsonl` (its whole-file hash is in the manifest, which the
+    chain entry then binds). Writing these events back into `journal.jsonl`
+    would either break that seal or force verify-manifest to hash less than
+    the whole file — weakening a security primitive to fit a feature. So the
+    audit-anchor events go to their OWN append log, `audit_events.jsonl`,
+    which is NOT hashed into the manifest. It is a convenience/debugging
+    trail; the AUTHORITATIVE, verifiable records are the chain file
+    (`<control_root>/audit-chain.jsonl`, with signed links, checked by
+    verify-chain) and the run_dir sidecars — NOT this event log.
 
     Returns 0 on the normal path: chain is always written (append-only,
     additive, cheap — unconditional even with no sink configured); a sink
@@ -362,10 +359,24 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     outcome; the caller folds this 3 into ITS OWN exit code (fail-closed)
     instead of the outcome's normal exit.
     """
+    redactor = getattr(journal, "redactor", None)
+    events_path = os.path.join(run_dir, "audit_events.jsonl")
+
+    def _event(state, **data):
+        # Same shape as a journal line, but to the UNHASHED audit_events log
+        # (see docstring) -- never journal.jsonl, which is sealed by now.
+        if redactor is not None:
+            data = redactor.redact_obj(data)
+        line = canonical_json({"ts": _now(), "state": state, "data": data})
+        with open(events_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
     chain_path = os.path.join(control_root, "audit-chain.jsonl")
     entry = df_audit_chain.append_entry(chain_path, invocation, digest, _now(), audit_key)
     atomic_write(os.path.join(run_dir, "audit_chain.json"), canonical_json(entry))
-    journal.write("AUDIT_CHAINED", chain_hash=entry["chain_hash"], prev=entry["prev_chain_hash"])
+    _event("AUDIT_CHAINED", chain_hash=entry["chain_hash"], prev=entry["prev_chain_hash"])
 
     sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
     if sink.get("kind", "none") == "none":
@@ -375,13 +386,13 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
         receipt = df_audit_sink.push(sink, invocation, json.dumps(entry).encode("utf-8"))
     except df_audit_sink.SinkError as e:
         if sink.get("required"):
-            journal.write("AUDIT_SINK_FAILED", kind=sink["kind"], error=str(e))
+            _event("AUDIT_SINK_FAILED", kind=sink["kind"], error=str(e))
             return 3
-        journal.write("AUDIT_SINK_WARN", kind=sink["kind"], error=str(e))
+        _event("AUDIT_SINK_WARN", kind=sink["kind"], error=str(e))
         return 0
 
     atomic_write(os.path.join(run_dir, "audit_sink_receipt.json"), canonical_json(receipt))
-    journal.write("AUDIT_SINK_OK", kind=sink["kind"], receipt=receipt)
+    _event("AUDIT_SINK_OK", kind=sink["kind"], receipt=receipt)
     return 0
 
 
@@ -443,46 +454,7 @@ def verify_manifest(run_dir: str, key: bytes = None) -> bool:
         print("TAMPERED (manifest.json does not match manifest.sha256)")
         return False
     manifest = json.loads(text)
-    # M13: journal.jsonl legitimately grows AFTER finalize (_anchor_audit
-    # journals AUDIT_CHAINED/AUDIT_SINK_* into this same file once the chain
-    # entry, which binds this manifest's digest, exists). `journal_bytes`
-    # (recorded alongside journal_sha256 at finalize time) lets this check
-    # hash only the PREFIX that existed at finalize -- content up to the
-    # terminal state must be byte-identical, exactly like the pre-M13 check.
-    # But a bare prefix check alone would go BLIND to anything appended
-    # afterward, including a forged line -- so every line AFTER the prefix
-    # must ALSO parse as ndjson whose "state" is one of the known audit-
-    # anchor events; anything else (unparseable, or a state outside that
-    # allowlist -- e.g. a hand-forged entry) is still TAMPERED. This does
-    # NOT vouch for the trailing entries' CONTENT (that's verify-chain's
-    # job against audit-chain.jsonl) -- only that nothing arbitrary was
-    # spliced into the journal after the terminal state. Absent (older/no
-    # journal_bytes) manifest -> today's whole-file hash, unchanged.
-    journal_bytes = manifest.get("journal_bytes")
-    if journal_bytes is not None:
-        with open(jp, "rb") as f:
-            prefix, suffix = f.read(journal_bytes), f.read()
-        journal_ok = hashlib.sha256(prefix).hexdigest() == manifest.get("journal_sha256")
-        if journal_ok and suffix:
-            try:
-                suffix_lines = suffix.decode("utf-8").splitlines()
-            except UnicodeDecodeError:
-                journal_ok = False
-                suffix_lines = []
-            for line in suffix_lines:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    journal_ok = False
-                    break
-                if not isinstance(entry, dict) or entry.get("state") not in _AUDIT_ANCHOR_STATES:
-                    journal_ok = False
-                    break
-    else:
-        journal_ok = sha256_file(jp) == manifest.get("journal_sha256")
-    if not journal_ok:
+    if sha256_file(jp) != manifest.get("journal_sha256"):
         print("TAMPERED (journal.jsonl does not match manifest)")
         return False
     hp = os.path.join(run_dir, "manifest.hmac")

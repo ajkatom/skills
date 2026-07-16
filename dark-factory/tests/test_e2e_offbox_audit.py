@@ -12,13 +12,19 @@ test_e2e_security.py's `_run`/`_journal` conventions).
       than silently reporting OK.
   (c) an `http-append` sink (the reference receiver, in-process on an
       ephemeral port): a run pushes its chain entry; `audit_sink_receipt.json`
-      lands in run_dir; the journal has AUDIT_SINK_OK; the receiver actually
-      holds the entry (GET returns the exact pushed bytes).
+      lands in run_dir; `audit_events.jsonl` has AUDIT_SINK_OK; the receiver
+      actually holds the entry (GET returns the exact pushed bytes).
   (d) `required: true` against a closed port -> fail-closed: nonzero exit,
-      journal AUDIT_SINK_FAILED, no `audit_sink_receipt.json` -- but
-      `audit_chain.json` IS still there (the local chain is written before
-      the sink is ever pushed to). `required: false` against the same closed
-      port -> the run still converges normally, journal AUDIT_SINK_WARN.
+      AUDIT_SINK_FAILED in `audit_events.jsonl`, no `audit_sink_receipt.json`
+      -- but `audit_chain.json` IS still there (the local chain is written
+      before the sink is ever pushed to). `required: false` against the same
+      closed port -> the run still converges normally, AUDIT_SINK_WARN.
+
+Throughout: audit-anchor events (AUDIT_CHAINED / AUDIT_SINK_*) live in
+`audit_events.jsonl`, NEVER in the finalize-sealed journal.jsonl -- these
+tests assert both that the events land in the event log AND that nothing
+AUDIT_* touched journal.jsonl (so verify-manifest's whole-file journal seal
+stays valid).
 """
 import json
 import os
@@ -59,6 +65,18 @@ def _set_audit(cr, audit):
 def _journal(run_dir):
     lines = (run_dir / "journal.jsonl").read_text(encoding="utf-8").strip().splitlines()
     return [json.loads(l) for l in lines]
+
+
+def _audit_events(run_dir):
+    """The audit-anchor event log (AUDIT_CHAINED / AUDIT_SINK_*). These live
+    in their OWN unhashed `audit_events.jsonl`, NEVER in journal.jsonl --
+    journal.jsonl is sealed by finalize_manifest and its whole-file hash must
+    stay valid (verify-manifest), so nothing may append to it afterward."""
+    path = run_dir / "audit_events.jsonl"
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    return [json.loads(l) for l in lines if l.strip()]
 
 
 def _closed_port() -> int:
@@ -113,10 +131,22 @@ def test_two_sequential_runs_chain_linked_and_verify_chain_detects_tamper(tmp_pa
         assert sidecar == entry
         manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
         assert "audit_chain" not in manifest and "audit_sink" not in manifest
-        j = _journal(run_dir)
-        chained = next(e for e in j if e["state"] == "AUDIT_CHAINED")
+        # audit-anchor events live in audit_events.jsonl, NOT journal.jsonl
+        # (which finalize_manifest already sealed). journal.jsonl must not
+        # carry any AUDIT_* line -- that would break its whole-file hash.
+        assert "AUDIT_CHAINED" not in [e["state"] for e in _journal(run_dir)]
+        ev = _audit_events(run_dir)
+        chained = next(e for e in ev if e["state"] == "AUDIT_CHAINED")
         assert chained["data"]["chain_hash"] == entry["chain_hash"]
         assert chained["data"]["prev"] == entry["prev_chain_hash"]
+        # the journal seal is intact AFTER anchoring -- verify-manifest still
+        # OK (whole-file journal hash, unweakened by M13).
+        vm = subprocess.run(
+            [sys.executable, SUP, "verify-manifest", "--run-dir", str(run_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert vm.returncode == 0, vm.stdout + vm.stderr
+        assert vm.stdout.strip() == "OK"
 
     ok = _verify_chain(cr)
     assert ok.returncode == 0, ok.stderr
@@ -134,6 +164,62 @@ def test_two_sequential_runs_chain_linked_and_verify_chain_detects_tamper(tmp_pa
     assert bad.returncode == 1
     assert not bad.stdout.strip().startswith("OK")
     assert entries[0]["invocation"] in bad.stdout or "tampered" in bad.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# (a') journal seal is NOT weakened by the audit feature -- the exact attacks
+#      a prefix+trailing-allowlist scheme would have let through are caught,
+#      because journal.jsonl is hashed WHOLE and nothing appends to it after
+#      finalize.
+# ---------------------------------------------------------------------------
+
+def _run_dir_of(cr):
+    return cr / "runs" / os.listdir(cr / "runs")[0]
+
+
+def test_journal_seal_is_whole_file_and_unweakened_by_audit(tmp_path):
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    p = _run(cr, "run")
+    assert p.returncode == 0, p.stderr
+    run_dir = _run_dir_of(cr)
+
+    # baseline: an honest run verifies, and NOTHING was appended to journal
+    # after finalize (no AUDIT_* lines, no manifest journal_bytes field).
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "journal_bytes" not in manifest
+    assert not any(e["state"].startswith("AUDIT_") for e in _journal(run_dir))
+
+    def _verify():
+        return subprocess.run(
+            [sys.executable, SUP, "verify-manifest", "--run-dir", str(run_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    assert _verify().stdout.strip() == "OK"
+
+    jp = run_dir / "journal.jsonl"
+    original = jp.read_text(encoding="utf-8")
+
+    # Attack 1: append a forged line that WEARS an allowlisted state but
+    # carries an attacker payload. A whole-file hash catches ANY append.
+    jp.write_text(
+        original + json.dumps({"ts": "later", "state": "AUDIT_CHAINED",
+                               "data": {"forged": "smuggled payload"}}) + "\n",
+        encoding="utf-8",
+    )
+    r = _verify()
+    assert r.returncode == 4 and "TAMPERED" in r.stdout
+
+    # Attack 2: truncate the journal (e.g. drop trailing lines). A whole-file
+    # hash of a shorter file no longer matches journal_sha256.
+    truncated = "\n".join(original.strip().splitlines()[:-1]) + "\n"
+    jp.write_text(truncated, encoding="utf-8")
+    r = _verify()
+    assert r.returncode == 4 and "TAMPERED" in r.stdout
+
+    # restore -> OK again (proves the two failures were the edits, not a flake)
+    jp.write_text(original, encoding="utf-8")
+    assert _verify().stdout.strip() == "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +279,13 @@ def test_http_append_sink_pushes_entry_and_receiver_holds_it(tmp_path):
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         assert receipt["kind"] == "http-append"
 
-        j = _journal(run_dir)
-        ok_entry = next(e for e in j if e["state"] == "AUDIT_SINK_OK")
+        ev = _audit_events(run_dir)
+        ok_entry = next(e for e in ev if e["state"] == "AUDIT_SINK_OK")
         assert ok_entry["data"]["kind"] == "http-append"
-        assert "AUDIT_SINK_FAILED" not in [e["state"] for e in j]
-        assert "AUDIT_SINK_WARN" not in [e["state"] for e in j]
+        assert "AUDIT_SINK_FAILED" not in [e["state"] for e in ev]
+        assert "AUDIT_SINK_WARN" not in [e["state"] for e in ev]
+        # and none of it leaked into the sealed journal
+        assert not any(e["state"].startswith("AUDIT_") for e in _journal(run_dir))
 
         entry = _chain_entries(cr)[0]
         import urllib.request
@@ -234,17 +322,24 @@ def test_required_sink_failure_is_fail_closed(tmp_path):
     assert not (run_dir / "audit_sink_receipt.json").exists()
     assert (run_dir / "audit_chain.json").exists()  # local chain still written
 
-    j = _journal(run_dir)
-    states = [e["state"] for e in j]
+    states = [e["state"] for e in _audit_events(run_dir)]
     assert "AUDIT_SINK_FAILED" in states
     assert "AUDIT_SINK_WARN" not in states
     assert "AUDIT_CHAINED" in states
+    assert not any(e["state"].startswith("AUDIT_") for e in _journal(run_dir))
 
     # the terminal manifest itself is untouched by the sink failure -- the
-    # run genuinely converged; only the process exit + journal reflect it.
+    # run genuinely converged; only the process exit + event log reflect it.
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["outcome"] == "COMPLETE_UNQUALIFIED"
     assert "audit_sink" not in manifest
+    # and the sealed journal still verifies -- the fail-closed run did not
+    # corrupt the manifest's whole-file journal hash.
+    vm = subprocess.run(
+        [sys.executable, SUP, "verify-manifest", "--run-dir", str(run_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert vm.returncode == 0 and vm.stdout.strip() == "OK"
 
 
 def test_non_required_sink_failure_warns_and_converges(tmp_path):
@@ -263,7 +358,7 @@ def test_non_required_sink_failure_warns_and_converges(tmp_path):
     assert not (run_dir / "audit_sink_receipt.json").exists()
     assert (run_dir / "audit_chain.json").exists()
 
-    j = _journal(run_dir)
-    states = [e["state"] for e in j]
+    states = [e["state"] for e in _audit_events(run_dir)]
     assert "AUDIT_SINK_WARN" in states
     assert "AUDIT_SINK_FAILED" not in states
+    assert not any(e["state"].startswith("AUDIT_") for e in _journal(run_dir))

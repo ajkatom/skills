@@ -3,7 +3,7 @@ import os
 import subprocess
 
 import supervisor
-from test_supervisor import setup_control, terminal_state
+from test_supervisor import setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GREETER = os.path.join(HERE, "fixtures", "twin_greeter")
@@ -81,7 +81,7 @@ def test_twin_startup_failure_aborts_exit_2(tmp_path):
     j = (run_dir / "journal.jsonl").read_text()
     assert "TWIN_ERROR" in j
     entries = [json.loads(l) for l in j.strip().splitlines()]
-    assert terminal_state(entries)["state"] == "TWIN_ERROR"
+    assert entries[-1]["state"] == "TWIN_ERROR"
     manifest = json.loads((run_dir / "manifest.json").read_text())
     assert manifest["outcome"] == "ABORTED_BUILD_ERROR"
     # no-orphans: the never-ready launch process must still be reaped

@@ -4,7 +4,7 @@ import os
 import pytest
 
 import supervisor
-from test_supervisor import FAKE, setup_control, read_journal, terminal_state
+from test_supervisor import FAKE, setup_control, read_journal
 
 SAMPLE_REPORT = {
     "report_version": "0.1",
@@ -99,7 +99,7 @@ def test_resume_abort_exits_2_and_is_terminal(tmp_path):
     assert supervisor.run(str(cr), None) == 10
     assert supervisor.resume(str(cr), "abort") == 2
     entries, run_id = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ABORTED_BY_HUMAN"
+    assert entries[-1]["state"] == "ABORTED_BY_HUMAN"
     assert not (cr / "runs" / run_id / "state.json").exists()
 
 
@@ -108,7 +108,7 @@ def test_resume_accept_is_waived_and_exits_0(tmp_path):
     assert supervisor.run(str(cr), None) == 10
     assert supervisor.resume(str(cr), "accept") == 0
     entries, run_id = read_journal(cr)
-    assert terminal_state(entries)["state"] == "ACCEPTED_BY_HUMAN"
+    assert entries[-1]["state"] == "ACCEPTED_BY_HUMAN"
     manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert manifest["outcome"] == "ACCEPTED_WAIVED"
     assert manifest["qualified"] is False

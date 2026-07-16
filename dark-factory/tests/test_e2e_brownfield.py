@@ -40,7 +40,7 @@ import subprocess
 import sys
 
 from test_brownfield_config import LEGACY_APP_FIXTURE, set_brownfield
-from test_supervisor import FAKE, setup_control, terminal_state
+from test_supervisor import FAKE, setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUP = os.path.join(HERE, "..", "scripts", "supervisor.py")
@@ -143,7 +143,7 @@ def test_regression_caught_cap_reached_and_barrier_holds(tmp_path):
     states = [e["state"] for e in entries]
     assert "MODE_DETECTED" in states
     assert "CHARACTERIZED" in states
-    assert terminal_state(entries)["state"] == "CAP_REACHED"
+    assert states[-1] == "CAP_REACHED"
 
     char_entry = next(e for e in entries if e["state"] == "CHARACTERIZED")
     assert char_entry["data"]["generated"] == 2
@@ -151,7 +151,7 @@ def test_regression_caught_cap_reached_and_barrier_holds(tmp_path):
 
     # The guard for `add` fired -- and ONLY that guard. The new-behavior
     # scenario (BHV-DOUBLE) and the untouched bad-args guard both pass.
-    cap = terminal_state(entries)["data"]
+    cap = entries[-1]["data"]
     assert cap["failing_behaviors"] == ["BHV-REGRESS-0"]
 
     report = json.loads((run_dir / "verifier_report_iter_1.json").read_text(encoding="utf-8"))
