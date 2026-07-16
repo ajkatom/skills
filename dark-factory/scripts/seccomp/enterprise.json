@@ -1,0 +1,36 @@
+{
+  "comment": "dark-factory M17 enterprise tier: a CONSERVATIVE Docker seccomp profile. defaultAction is SCMP_ACT_ALLOW (this is NOT a default-deny allowlist profile like Docker's default.json) -- it denies a specific, named set of syscalls that are either kernel-integrity-sensitive (mount/umount2, kernel-module load/unload, kexec, reboot) or namespace/inspection primitives that could be used to weaken or observe past the container barrier (ptrace, bpf, setns, unshare, swapon). See dark-factory/references/enterprise.md for the honest-scope note: this is a documented starting point, not a hand-tuned per-role profile (that is a named, deliberate deferral).",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "mount",
+        "umount2",
+        "ptrace",
+        "bpf",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "reboot",
+        "swapon",
+        "swapoff",
+        "setns",
+        "unshare"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

@@ -129,8 +129,23 @@ def verify_custody(
     count of distinct, valid approver signatures is >= k. reason is always a
     human-readable "m/k distinct approver signatures" (satisfied) or a short
     explanation (not satisfied) -- never a private key or signature value.
+
+    Defensive: k < 1 is never satisfiable (a "0-of-N" threshold would let an
+    empty signature list "satisfy" custody, defeating the whole point of
+    split custody) -- returns (False, "invalid threshold") without looking at
+    signatures at all, regardless of how many valid sigs are present.
+
+    Case: approver hex is matched CASE-INSENSITIVELY (canonicalized to
+    lowercase on both sides here) so an uppercase-hex entry in `approvers` or
+    in a signature's "approver" field can never cause a spurious mismatch --
+    df_config.py canonicalizes `custody.approvers` to lowercase at load time
+    for the same reason; this is defense in depth for any caller that
+    constructs `approvers`/`signatures` directly, bypassing df_config.
     """
-    approver_set = set(approvers)
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        return (False, "invalid threshold")
+
+    approver_set = {a.lower() for a in approvers if isinstance(a, str)}
     valid_distinct = set()
 
     for entry in signatures:
@@ -140,6 +155,7 @@ def verify_custody(
         sig_hex = entry.get("sig")
         if not isinstance(approver, str) or not isinstance(sig_hex, str):
             continue
+        approver = approver.lower()
         if approver not in approver_set:
             continue
         if not verify_one(approver, manifest_bytes, sig_hex):

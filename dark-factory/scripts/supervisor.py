@@ -19,8 +19,10 @@ import df_brownfield
 import df_confine
 import df_container
 import df_creds
+import df_custody
 import df_gates
 import df_kb
+import df_proxy
 import df_sandbox
 import df_security
 import df_twins
@@ -29,6 +31,27 @@ from df_config import ConfigError, _disjoint, load_config
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
+
+# M17 Task 3: the hostname the enterprise builder container uses to reach the
+# host-side credential proxy. "host.docker.internal" is a Docker Desktop
+# convenience (macOS/Windows) that routes to services bound on the HOST,
+# including 127.0.0.1-bound listeners like df_proxy.serve() -- documented
+# Docker-Desktop assumption (see references/enterprise.md); a native-Linux
+# Docker Engine deployment would need `--add-host=host.docker.internal:
+# host-gateway` wired in here too (a named, deliberate deferral -- M16
+# already established Docker Desktop's Linux VM as this project's live-test
+# target).
+_ENTERPRISE_PROXY_HOST = "host.docker.internal"
+
+# Tiers whose manifests read "qualified" (probe-proven isolation) — every
+# tier at or above "standard". Enterprise is a superset of hardened's
+# guarantees, so it belongs here too; kept as one tuple so the three call
+# sites that used to hardcode ("standard", "hardened") can't drift apart.
+_QUALIFYING_TIERS = ("standard", "hardened", "enterprise")
+# Tiers whose builder runs inside a Docker container (so `container` is
+# non-None on the manifest, and the builder-isolation branch below builds a
+# docker argv instead of using the OS-sandbox exec_prefix).
+_CONTAINER_TIERS = ("hardened", "enterprise")
 
 BUILDER_RULES = """## Builder rules
 - You are the BUILDER in a dark-factory run. Implement the specification below
@@ -315,7 +338,24 @@ def _load_audit_key(cfg, journal):
         return None, 2
 
 
-def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redactor=None) -> str:
+def _build_manifest_dict(run_dir: str, extra: dict, audit_key: bytes, finished_ts: str) -> dict:
+    """The exact (pre-redaction) manifest dict finalize_manifest would write:
+    factored out so a caller (the M17 custody gate) can compute BYTE-IDENTICAL
+    manifest content ahead of the real write, to check custody-signatures.json
+    against precisely the bytes about to be sealed — without duplicating this
+    construction logic and risking the two drift apart."""
+    journal_path = os.path.join(run_dir, "journal.jsonl")
+    manifest = dict(extra)
+    manifest["manifest_version"] = "0.1"
+    manifest["journal_sha256"] = sha256_file(journal_path)
+    manifest["finished_ts"] = finished_ts
+    if audit_key is not None:
+        manifest["audit_signing"] = True
+    return manifest
+
+
+def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redactor=None,
+                      finished_ts: str = None) -> str:
     """Write manifest.json + manifest.sha256 sidecar.
 
     HONESTY (spec 7.5, cooperative/standard tier): a local process that can
@@ -333,6 +373,13 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     the manifest are names/allowlist only and are never themselves subject to
     redaction (they contain no values).
 
+    `finished_ts` (M17): defaults to `_now()` exactly as before every M17
+    call site. The enterprise custody gate pins ONE `_now()` value BEFORE
+    finalize_manifest runs (via `_build_manifest_dict`, to check custody-
+    signatures.json against the bytes about to be sealed) and passes it here
+    so the actually-written manifest is byte-identical to what was checked —
+    never a second, possibly-different, `_now()` call.
+
     M13 note: finalize_manifest SEALS journal.jsonl — its whole-file hash goes
     into `journal_sha256` and NOTHING may append to journal.jsonl afterward.
     The audit-chain anchoring that runs right after this (`_anchor_audit`)
@@ -340,13 +387,7 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     `audit_events.jsonl`, never back into journal.jsonl — keeping this
     whole-file seal (M5a) unweakened.
     """
-    journal_path = os.path.join(run_dir, "journal.jsonl")
-    manifest = dict(extra)
-    manifest["manifest_version"] = "0.1"
-    manifest["journal_sha256"] = sha256_file(journal_path)
-    manifest["finished_ts"] = _now()
-    if audit_key is not None:
-        manifest["audit_signing"] = True
+    manifest = _build_manifest_dict(run_dir, extra, audit_key, finished_ts or _now())
     text = _redacted_write(os.path.join(run_dir, "manifest.json"), manifest, redactor)
     digest = sha256_str(text)
     atomic_write(os.path.join(run_dir, "manifest.sha256"), digest + "\n")
@@ -354,6 +395,73 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
         sig = df_audit.sign(audit_key, text.encode("utf-8"))
         atomic_write(os.path.join(run_dir, "manifest.hmac"), sig + "\n")
     return digest
+
+
+def _manifest_preview_bytes(run_dir, extra, audit_key, finished_ts, redactor) -> bytes:
+    """The EXACT bytes finalize_manifest(run_dir, extra, audit_key, redactor,
+    finished_ts) would write to manifest.json — computed via the SAME
+    _build_manifest_dict + redaction + canonical_json path, without touching
+    disk. Used ONLY by the M17 custody gate, to check custody-signatures.json
+    against precisely what is about to be sealed."""
+    manifest = _build_manifest_dict(run_dir, extra, audit_key, finished_ts)
+    obj = redactor.redact_obj(manifest) if redactor is not None else manifest
+    return canonical_json(obj).encode("utf-8")
+
+
+def _custody_gate(cfg, journal, run_dir, mf_candidate, finished_ts, audit_key, redactor):
+    """M17 Task 3: the split-custody gate — enterprise-only, run at the
+    CONVERGED point (after the final exam AND the M9 security gates have
+    already passed, the same point M9's own security gates run: a run that
+    isn't otherwise ship-worthy should never even reach the custody
+    question).
+
+    Loads `<control_root>/custody-signatures.json` (a JSON list of
+    `{"approver": <64-hex ed25519 pubkey>, "sig": <hex>}` entries) and checks
+    it, via `df_custody.verify_custody`, against the EXACT bytes this run's
+    manifest is about to be sealed with (`_manifest_preview_bytes` — the same
+    construction path `finalize_manifest` itself uses, so a signature
+    collected against a byte-identical local preview genuinely covers what
+    ships). `finished_ts` is the caller's ALREADY-pinned `_now()` value (see
+    finalize_manifest's docstring) — never recomputed here.
+
+    Returns (satisfied: bool, custody_field: dict). custody_field is the
+    additive `custody` manifest field — {"required_k", "approvers",
+    "signatures", "satisfied", "reason"} — and NEVER contains a private key,
+    signature value, or token: only counts and a short human-readable reason
+    (df_custody.verify_custody's own "m/k distinct approver signatures", or a
+    missing/unreadable-file explanation).
+    """
+    custody_cfg = cfg["_custody"]
+    sig_path = os.path.join(cfg["_control_root"], "custody-signatures.json")
+
+    preview_bytes = _manifest_preview_bytes(run_dir, mf_candidate, audit_key, finished_ts, redactor)
+
+    signatures, file_reason = [], None
+    if not os.path.exists(sig_path):
+        file_reason = f"{os.path.basename(sig_path)} not found in the control root"
+    else:
+        try:
+            with open(sig_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            file_reason = f"unreadable custody-signatures.json: {e}"
+        else:
+            if isinstance(loaded, list):
+                signatures = loaded
+            else:
+                file_reason = "custody-signatures.json must be a JSON list"
+
+    satisfied, verify_reason = df_custody.verify_custody(
+        preview_bytes, signatures, custody_cfg["approvers"], custody_cfg["threshold"])
+    custody_field = {
+        "required_k": custody_cfg["threshold"],
+        "approvers": len(custody_cfg["approvers"]),
+        "signatures": len(signatures),
+        "satisfied": satisfied,
+        "reason": file_reason or verify_reason,
+    }
+    journal.write("CUSTODY_CHECK", satisfied=satisfied, reason=custody_field["reason"])
+    return satisfied, custody_field
 
 
 def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, journal) -> int:
@@ -446,6 +554,55 @@ def verify_chain_cmd(control_root: str, key: bytes = None) -> bool:
     ok, msg = df_audit_chain.verify_chain(chain_path, audit_key=key)
     print(msg)
     return ok
+
+
+def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
+    """CLI body for `verify-custody` — the second phase of split custody's
+    two-phase ship (see the CUSTODY_PENDING terminal in _run_loop /
+    references/enterprise.md): a run can seal a CUSTODY_PENDING manifest,
+    and later — once approvers sign — an operator confirms it flips to
+    satisfied WITHOUT re-running anything. Purely read-only: loads the run's
+    ALREADY-SEALED `manifest.json` bytes exactly as they sit on disk (never
+    re-finalizes, never re-derives them) and `<control_root>/
+    custody-signatures.json`, and reports whether >=K distinct approver
+    signatures now verify over those exact bytes. Mirrors verify_manifest/
+    verify_chain_cmd's print-one-line-and-return-bool shape.
+    """
+    mp = os.path.join(run_dir, "manifest.json")
+    if not os.path.exists(mp):
+        print(f"NOT FOUND ({mp} does not exist)")
+        return False
+    with open(mp, "rb") as f:
+        manifest_bytes = f.read()
+
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        print(f"CONFIG ERROR ({e})")
+        return False
+    if cfg["_custody"] is None:
+        print("NO CUSTODY CONFIGURED (control root has no `custody` block)")
+        return False
+
+    sig_path = os.path.join(control_root, "custody-signatures.json")
+    if not os.path.exists(sig_path):
+        print(f"PENDING (0/{cfg['_custody']['threshold']} distinct approver signatures — "
+              f"{sig_path} not found)")
+        return False
+    try:
+        with open(sig_path, encoding="utf-8") as f:
+            signatures = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"UNREADABLE (custody-signatures.json: {e})")
+        return False
+    if not isinstance(signatures, list):
+        print("UNREADABLE (custody-signatures.json must be a JSON list)")
+        return False
+
+    satisfied, reason = df_custody.verify_custody(
+        manifest_bytes, signatures, cfg["_custody"]["approvers"], cfg["_custody"]["threshold"])
+    print(f"{'SATISFIED' if satisfied else 'PENDING'} ({reason})")
+    return satisfied
 
 
 def _kb_writeback(cfg, journal, manifest_dict, failing):
@@ -571,7 +728,76 @@ def _scenario_set_hash(scenarios_dir: str) -> str:
     return sha256_str(canonical_json(files))
 
 
+def _seccomp_profile_ok(path):
+    """Fast, deterministic, offline sanity check that the enterprise seccomp
+    profile at `path` exists and parses as a plausible Docker seccomp JSON
+    document (has "defaultAction" + "syscalls"). This is NOT the live proof
+    that the egress lock actually holds on a real kernel — that is
+    df_container.probe_enterprise_egress, which needs a running proxy and
+    specific allowed/denied hosts and is exercised by the test suite /
+    operator tooling rather than re-run against arbitrary network targets on
+    every single production `run` invocation. Any error (missing file,
+    invalid JSON, wrong shape) → False, never a silent pass."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and "defaultAction" in data and "syscalls" in data
+
+
 def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
+    if cfg["assurance"] == "enterprise":
+        os_backend = df_sandbox.current_backend()
+        os_name = os_backend.name if os_backend is not None else None
+        os_ok = os_backend is not None and os_backend.available() and df_sandbox.probe_denial(
+            os_backend, control_root, workspace)
+        c = cfg["_container"]
+        dk_ok = df_container.docker_available() and df_container.probe_container(
+            c["image"], control_root, workspace)
+        seccomp_ok = _seccomp_profile_ok(cfg["_enterprise"]["seccomp"])
+        if os_ok and dk_ok and seccomp_ok:
+            return ("enterprise", os_backend.wrap_prefix(control_root, workspace),
+                    df_container.ENTERPRISE_BACKEND_NAME, True)
+        failed = []
+        if not dk_ok:
+            failed.append("docker")
+        if not os_ok:
+            failed.append("os_sandbox")
+        if not seccomp_ok:
+            failed.append("seccomp_profile")
+        reason = f"enterprise probe failed: {', '.join(failed)}"
+        if allow_downgrade:
+            # Enterprise ⊇ hardened: a failed enterprise probe with a
+            # WORKING hardened path (os+docker both ok, only the seccomp
+            # profile is the problem) downgrades one step to hardened —
+            # still container-barrier-qualified, just without the egress
+            # lock/seccomp — before falling further to standard/cooperative.
+            if os_ok and dk_ok:
+                journal.write("DOWNGRADE", requested="enterprise", effective="hardened",
+                              reason=reason)
+                sys.stderr.write("dark-factory: enterprise tier UNavailable — DOWNGRADED to "
+                                 "hardened (qualified, no egress lock/split-custody) by "
+                                 "--allow-downgrade.\n")
+                return ("hardened", os_backend.wrap_prefix(control_root, workspace),
+                        df_container.BACKEND_NAME, True)
+            if os_ok:
+                journal.write("DOWNGRADE", requested="enterprise", effective="standard",
+                              reason=reason)
+                sys.stderr.write("dark-factory: enterprise tier UNavailable — DOWNGRADED to "
+                                 "standard (qualified) by --allow-downgrade.\n")
+                return ("standard", os_backend.wrap_prefix(control_root, workspace), os_name, True)
+            journal.write("DOWNGRADE", requested="enterprise", effective="cooperative",
+                          reason=reason)
+            sys.stderr.write("dark-factory: enterprise tier UNavailable — DOWNGRADED to "
+                             "cooperative (unqualified) by --allow-downgrade.\n")
+            return ("cooperative", [], os_name, False)
+        journal.write("PROBE_FAILED", requested="enterprise", reason=reason)
+        raise df_sandbox.SandboxError(
+            "enterprise tier requires a running Docker daemon + passing container probe "
+            "+ a valid seccomp profile (and a working OS sandbox for the verifier); "
+            f"none available ({reason}). Fix docker/the sandbox/seccomp profile, or set "
+            "assurance=hardened/standard/cooperative (or pass --allow-downgrade).")
     if cfg["assurance"] == "hardened":
         os_backend = df_sandbox.current_backend()
         os_name = os_backend.name if os_backend is not None else None
@@ -784,6 +1010,16 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # a not-required WARN fallback overrides it later via mb_clean once
         # the builder is actually invoked (_run_loop).
         "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
+        # Additive (M17 Task 3): seeded None here — like `credentials`/`mode`/
+        # `builder_confinement` — so EVERY terminal manifest carries
+        # custody/proxy/enterprise_egress, including every pre-build abort
+        # branch below (all enterprise-only concepts; None at every
+        # non-enterprise tier, and at enterprise for any terminal reached
+        # before the CONVERGED custody gate runs — only _run_loop's CONVERGED
+        # branch ever overrides these with real values).
+        "custody": None,
+        "proxy": None,
+        "enterprise_egress": None,
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -925,13 +1161,13 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     except df_sandbox.SandboxError as e:
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
-    manifest_base["qualified"] = eff_tier in ("standard", "hardened")
+    manifest_base["qualified"] = eff_tier in _QUALIFYING_TIERS
     manifest_base["sandbox_backend"] = backend_name
     manifest_base["denial_probe_passed"] = probe_passed
-    manifest_base["container"] = dict(cfg["_container"]) if eff_tier == "hardened" else None
+    manifest_base["container"] = dict(cfg["_container"]) if eff_tier in _CONTAINER_TIERS else None
     manifest_base["_effective_tier"] = eff_tier   # internal; stripped before finalize
     # cooperative banner only when the EFFECTIVE tier is cooperative:
-    if eff_tier not in ("standard", "hardened"):
+    if eff_tier not in _QUALIFYING_TIERS:
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
 
@@ -1071,9 +1307,28 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
     twins_enabled = cfg["_twins"]["enabled"]
     ts = df_twins.TwinSet() if twins_enabled else None
+    # M17 Task 3: the host-side credential proxy + the rendered egress-lock
+    # entrypoint script — enterprise-only, started ONCE per _run_loop
+    # invocation (not per iteration: the proxy's allowlist is static config,
+    # and re-rendering the entrypoint per iteration would be pure churn) and
+    # reaped in the SAME finally that reaps twins below — no orphaned
+    # listener on any terminal or exception, mirroring the twin lifecycle
+    # discipline this module already follows.
+    proxy_httpd = None
+    proxy_endpoint = None
+    entrypoint_path = None
+    if effective == "enterprise":
+        pcfg = cfg["_proxy"]
+        proxy_httpd, proxy_port = df_proxy.serve(
+            pcfg["allowlist"], pcfg["token_env"], header=pcfg["header"])
+        proxy_endpoint = f"{_ENTERPRISE_PROXY_HOST}:{proxy_port}"
+        entrypoint_path = os.path.join(run_dir, "enterprise-entrypoint.sh")
+        df_container.write_enterprise_entrypoint(entrypoint_path, proxy_endpoint)
+        journal.write("PROXY_STARTED", port=proxy_port, allowlist=pcfg["allowlist"])
     # Twins are SHARED/dev (not holdout): reaping them is non-negotiable — this
     # try/finally must wrap the WHOLE loop so every terminal (return) and any
-    # exception still stops the twin processes. No orphans, ever.
+    # exception still stops the twin processes (and, at enterprise, the proxy
+    # started above). No orphans, ever.
     try:
         twin_defs = None
         twin_timeout = None
@@ -1205,6 +1460,38 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     journal.write("TWIN_ENV_SKIPPED", tier="hardened",
                                   reason="builder-side twin env not forwarded into "
                                          "container (M12)")
+                builder_env = creds
+            elif effective == "enterprise":
+                # M17 Task 3: the hardened container path PLUS the egress
+                # lock + seccomp. Same adapter-mount TOCTOU re-check as
+                # hardened above (the enterprise container mounts the
+                # adapter directory too).
+                c = cfg["_container"]
+                adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
+                if not _disjoint(adapter_ro_dir, cfg["_control_root"]):
+                    raise df_sandbox.SandboxError(
+                        "enterprise: refusing to mount the adapter directory — it "
+                        f"overlaps the control root ({adapter_ro_dir}); the "
+                        "holdout barrier would be breached by construction")
+                builder_prefix = df_container.build_enterprise_argv(
+                    c["image"], workspace,
+                    ro_mounts=[adapter_ro_dir],
+                    proxy_endpoint=proxy_endpoint,
+                    seccomp_profile_path=cfg["_enterprise"]["seccomp"],
+                    entrypoint_path=entrypoint_path,
+                    memory=c["memory"], pids=c["pids"],
+                    env=creds if creds else None)
+                if build_env_extra:
+                    journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
+                                  reason="builder-side twin env not forwarded into "
+                                         "container (M12)")
+                # Same as hardened: credential values enter the container
+                # ONLY as `-e` argv baked into build_enterprise_argv, never
+                # the docker CLIENT process's own env; the raw provider
+                # token additionally never enters at all when routed through
+                # credential_proxy (the proxy injects it host-side) — an
+                # enterprise config's `credentials` block, if also
+                # configured, still flows exactly like hardened's.
                 builder_env = creds
             else:
                 builder_prefix = exec_prefix
@@ -1434,20 +1721,82 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
                     return anchor_exit or 3
 
-                journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
-                outcome = "COMPLETE_QUALIFIED" if eff in ("standard", "hardened") else "COMPLETE_UNQUALIFIED"
-                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
-                          regressions=sorted(regressed), security=sec_report,
-                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                qualified = eff in _QUALIFYING_TIERS
+                outcome = "COMPLETE_QUALIFIED" if qualified else "COMPLETE_UNQUALIFIED"
+                custody_field = None
+                proxy_field = None
+                egress_field = None
+                finished_ts_override = None
+
+                if eff == "enterprise":
+                    # M17 Task 3: the split-custody gate. Runs HERE — after the
+                    # final exam AND the M9 security gates above have already
+                    # passed, exactly where M9's own gates run — because a run
+                    # that isn't otherwise ship-worthy should never even reach
+                    # the custody question. `finished_ts_override` is pinned
+                    # ONCE here (see finalize_manifest's docstring) so the
+                    # manifest custody was checked against and the manifest
+                    # actually sealed below are byte-identical.
+                    finished_ts_override = _now()
+                    proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
+                    # "probe": "unverified" here is deliberate honesty: this
+                    # run's resolve_isolation live-probed the container
+                    # barrier + docker + a valid seccomp profile, but did NOT
+                    # re-run the full live egress-lock network probe against
+                    # real hosts on THIS run (that is
+                    # df_container.probe_enterprise_egress — expensive,
+                    # network-dependent, exercised by the test suite/operator
+                    # tooling, not unconditionally on every production run).
+                    # Never claim "verified" for a check that didn't run.
+                    egress_field = {"locked": True, "probe": "unverified"}
+                    mf_candidate = dict(
+                        mb_clean, iterations=i, final_exam=fe, regressions=sorted(regressed),
+                        security=sec_report,
+                        budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                        proxy=proxy_field, enterprise_egress=egress_field,
+                    )
+                    satisfied, custody_field = _custody_gate(
+                        cfg, journal, run_dir, mf_candidate, finished_ts_override, audit_key, redactor)
+                    mf_candidate["custody"] = custody_field
+                    if satisfied:
+                        journal.write("CONVERGED", iteration=i)
+                    else:
+                        outcome, qualified = "CUSTODY_PENDING", False
+                        journal.write("CUSTODY_PENDING", iteration=i, reason=custody_field["reason"])
+                else:
+                    journal.write("CONVERGED", iteration=i)
+                    mf_candidate = dict(
+                        mb_clean, iterations=i, final_exam=fe, regressions=sorted(regressed),
+                        security=sec_report,
+                        budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                        custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
+                    )
+
+                mf = dict(mf_candidate, outcome=outcome, qualified=qualified)
+                finalize_kwargs = {"audit_key": audit_key, "redactor": redactor}
+                if finished_ts_override is not None:
+                    finalize_kwargs["finished_ts"] = finished_ts_override
+                digest = finalize_manifest(run_dir, mf, **finalize_kwargs)
                 anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                             digest, audit_key, journal)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
+
+                if outcome == "CUSTODY_PENDING":
+                    sig_path = os.path.join(cfg["_control_root"], "custody-signatures.json")
+                    print(
+                        f"dark-factory: CUSTODY PENDING — awaiting K-of-N approver "
+                        f"signatures ({custody_field['signatures']} distinct valid / "
+                        f"{custody_field['required_k']} required so far). Have approvers sign "
+                        f"this run's manifest bytes and write entries to {sig_path}, then run: "
+                        f"supervisor.py verify-custody {cfg['_control_root']} --run-dir {run_dir}"
+                    )
+                    return anchor_exit or 3
+
                 note = "" if final_ran else " [no sealed final exam administered]"
                 print(f"dark-factory: CONVERGED "
-                      f"({'qualified, ' + eff if eff in ('standard', 'hardened') else 'unqualified, cooperative'} tier). "
+                      f"({'qualified, ' + eff if qualified else 'unqualified, cooperative'} tier). "
                       f"Workspace: {workspace}  Run: {run_dir}{note}")
                 return anchor_exit or 0
 
@@ -1491,6 +1840,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     finally:
         if ts is not None:
             ts.stop()
+        if proxy_httpd is not None:
+            proxy_httpd.shutdown()
+            proxy_httpd.server_close()
 
 
 def resume(control_root, decision="continue", allow_downgrade: bool = False):
@@ -1556,6 +1908,13 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             # pause. Deterministic (same adapter => same unsupported result),
             # so this just re-derives the same WARN, never silently skips it.
             "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
+            # Additive (M17 Task 3), same "fresh + resume" threading as
+            # `credentials`/`builder_confinement`: None here, overridden only
+            # by _run_loop's CONVERGED branch when the effective tier is
+            # enterprise.
+            "custody": None,
+            "proxy": None,
+            "enterprise_egress": None,
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -1682,12 +2041,12 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         except df_sandbox.SandboxError as e:
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
-        manifest_base["qualified"] = eff_tier in ("standard", "hardened")
+        manifest_base["qualified"] = eff_tier in _QUALIFYING_TIERS
         manifest_base["sandbox_backend"] = backend_name
         manifest_base["denial_probe_passed"] = probe_passed
-        manifest_base["container"] = dict(cfg["_container"]) if eff_tier == "hardened" else None
+        manifest_base["container"] = dict(cfg["_container"]) if eff_tier in _CONTAINER_TIERS else None
         manifest_base["_effective_tier"] = eff_tier
-        if eff_tier not in ("standard", "hardened"):
+        if eff_tier not in _QUALIFYING_TIERS:
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                              "isolation; outcome can never be a qualified ship-candidate.\n")
         try:
@@ -1736,6 +2095,12 @@ def main():
     p_res.add_argument("--allow-downgrade", action="store_true",
                        help="if standard tier is unavailable/probe fails on re-probe, "
                             "downgrade to cooperative (unqualified) instead of failing closed")
+    p_vcu = sub.add_parser(
+        "verify-custody",
+        help="check whether K-of-N split-custody approver signatures now satisfy an "
+             "enterprise run's sealed manifest (M17 two-phase ship)")
+    p_vcu.add_argument("control_root")
+    p_vcu.add_argument("--run-dir", required=True)
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
@@ -1759,6 +2124,8 @@ def main():
         sys.exit(0 if verify_chain_cmd(args.control_root, key=vkey) else 1)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
+    elif args.cmd == "verify-custody":
+        sys.exit(0 if verify_custody_cmd(args.control_root, args.run_dir) else 3)
 
 
 if __name__ == "__main__":
