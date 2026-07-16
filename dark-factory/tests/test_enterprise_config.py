@@ -20,13 +20,16 @@ supervisor.run + real ed25519 signatures.
 The live egress/seccomp probe (`df_container.probe_enterprise_egress`) is
 skipif no docker, mirroring test_container.py/test_linux_harness.py.
 """
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 import pytest
 
+import df_audit_receiver
 import df_config
 import df_container
 import df_custody
@@ -339,12 +342,30 @@ def test_resolve_isolation_enterprise_bad_seccomp_no_downgrade_raises(tmp_path, 
 # verify-custody is tamper-evident (a one-byte manifest edit breaks it).
 # ---------------------------------------------------------------------------
 
-def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto"):
+def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto", sink_url=None):
     cr = setup_control(tmp_path, FAKE, checkpoint=checkpoint)
     cfg = json.loads((cr / "config.json").read_text())
-    cfg.update(_base_enterprise(approvers=approvers, threshold=threshold))
+    overrides = _base_enterprise(approvers=approvers, threshold=threshold)
+    if sink_url is not None:
+        overrides["audit"] = {
+            "sink": {"kind": "http-append", "url": sink_url, "required": True}}
+    cfg.update(overrides)
     (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     return cr
+
+
+@contextlib.contextmanager
+def _sink_receiver(tmp_path):
+    """A live M13 reference receiver (http-append). Enterprise mandates a
+    REQUIRED sink, and attach now pushes the qualification off-box, so any
+    test that reaches attach's success path needs a reachable sink."""
+    store = tmp_path / "sink-store"
+    httpd, port = df_audit_receiver.serve(str(store), port=0)
+    try:
+        yield f"http://127.0.0.1:{port}", store
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def _fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
@@ -360,29 +381,30 @@ def _fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
 
 def test_enterprise_run_always_custody_pending_exit_3(tmp_path, monkeypatch):
     approvers = [_approver()[1] for _ in range(3)]
-    cr = _enterprise_control(tmp_path, approvers, threshold=2)
-    _patch_enterprise_probes(monkeypatch)
-    monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+        monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
-    rc = supervisor.run(str(cr), None)
-    assert rc == 3
+        rc = supervisor.run(str(cr), None)
+        assert rc == 3
 
-    run_id = os.listdir(cr / "runs")[0]
-    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
-    assert m["outcome"] == "CUSTODY_PENDING"
-    assert m["qualified"] is False
-    assert m["custody"]["satisfied"] is False
-    assert m["custody"]["required_k"] == 2
-    assert m["custody"]["approvers"] == 3
-    assert m["proxy"] == {"enabled": True, "allowlist": ["api.example.test"]}
-    # Minor fix: locked is "configured" (config includes the lockdown), not a
-    # per-run empirically-verified True.
-    assert m["enterprise_egress"] == {"locked": "configured", "probe": "unverified"}
-    assert m["container"]["image"] == df_container.DEFAULT_IMAGE
-    assert m["sandbox_backend"] == df_container.ENTERPRISE_BACKEND_NAME
-    # No attestation exists yet — the manifest never self-qualifies.
-    assert not (cr / "runs" / run_id / "custody_attestation.json").exists()
-    assert supervisor.verify_custody_cmd(str(cr), str(cr / "runs" / run_id)) is False
+        run_id = os.listdir(cr / "runs")[0]
+        m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+        assert m["outcome"] == "CUSTODY_PENDING"
+        assert m["qualified"] is False
+        assert m["custody"]["satisfied"] is False
+        assert m["custody"]["required_k"] == 2
+        assert m["custody"]["approvers"] == 3
+        assert m["proxy"] == {"enabled": True, "allowlist": ["api.example.test"]}
+        # Minor fix: locked is "configured" (config includes the lockdown), not
+        # a per-run empirically-verified True.
+        assert m["enterprise_egress"] == {"locked": "configured", "probe": "unverified"}
+        assert m["container"]["image"] == df_container.DEFAULT_IMAGE
+        assert m["sandbox_backend"] == df_container.ENTERPRISE_BACKEND_NAME
+        # No attestation exists yet — the manifest never self-qualifies.
+        assert not (cr / "runs" / run_id / "custody_attestation.json").exists()
+        assert supervisor.verify_custody_cmd(str(cr), str(cr / "runs" / run_id)) is False
 
 
 def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
@@ -395,54 +417,93 @@ def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
     priv_b, pub_b = _approver()
     _priv_c, pub_c = _approver()
     approvers = [pub_a, pub_b, pub_c]
-    cr = _enterprise_control(tmp_path, approvers, threshold=2)
-    _patch_enterprise_probes(monkeypatch)
-    monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+        monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
-    assert supervisor.run(str(cr), None) == 3
-    run_id = os.listdir(cr / "runs")[0]
-    run_dir = cr / "runs" / run_id
-    manifest_path = run_dir / "manifest.json"
-    manifest_bytes = manifest_path.read_bytes()
+        assert supervisor.run(str(cr), None) == 3
+        run_id = os.listdir(cr / "runs")[0]
+        run_dir = cr / "runs" / run_id
+        manifest_path = run_dir / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
 
-    # --- Phase 2a: ONE signature (k=2) -> attach NOT satisfied, exit 3, no attestation.
-    sig_a = df_custody.sign_manifest(priv_a, manifest_bytes)
-    (cr / "custody-signatures.json").write_text(
-        json.dumps([{"approver": pub_a, "sig": sig_a}]), encoding="utf-8")
-    assert supervisor.attach_custody(str(cr), str(run_dir)) == 3
-    assert not (run_dir / "custody_attestation.json").exists()
-    assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
+        # --- Phase 2a: ONE signature (k=2) -> attach NOT satisfied, exit 3, no attestation.
+        sig_a = df_custody.sign_manifest(priv_a, manifest_bytes)
+        (cr / "custody-signatures.json").write_text(
+            json.dumps([{"approver": pub_a, "sig": sig_a}]), encoding="utf-8")
+        assert supervisor.attach_custody(str(cr), str(run_dir)) == 3
+        assert not (run_dir / "custody_attestation.json").exists()
+        assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
 
-    # --- Phase 2b: TWO distinct signatures -> attach writes attestation, exit 0.
-    sig_b = df_custody.sign_manifest(priv_b, manifest_bytes)
-    (cr / "custody-signatures.json").write_text(json.dumps([
-        {"approver": pub_a, "sig": sig_a}, {"approver": pub_b, "sig": sig_b},
-    ]), encoding="utf-8")
-    assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
-    att = json.loads((run_dir / "custody_attestation.json").read_text())
-    assert att["qualified"] is True
-    assert att["threshold"] == 2
-    assert sorted(att["approvers_satisfied"]) == sorted([pub_a.lower(), pub_b.lower()])
-    assert len(att["signatures"]) == 2
-    # The manifest itself is UNCHANGED — still CUSTODY_PENDING (immutable).
-    assert json.loads(manifest_path.read_text())["outcome"] == "CUSTODY_PENDING"
-    # verify-custody now confirms QUALIFIED over the sealed bytes.
-    assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is True
+        # --- Phase 2b: TWO distinct signatures -> attach writes attestation, exit 0.
+        sig_b = df_custody.sign_manifest(priv_b, manifest_bytes)
+        (cr / "custody-signatures.json").write_text(json.dumps([
+            {"approver": pub_a, "sig": sig_a}, {"approver": pub_b, "sig": sig_b},
+        ]), encoding="utf-8")
+        assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
+        att = json.loads((run_dir / "custody_attestation.json").read_text())
+        assert att["qualified"] is True
+        assert att["threshold"] == 2
+        assert sorted(att["approvers_satisfied"]) == sorted([pub_a.lower(), pub_b.lower()])
+        assert len(att["signatures"]) == 2
+        # The manifest itself is UNCHANGED — still CUSTODY_PENDING (immutable).
+        assert json.loads(manifest_path.read_text())["outcome"] == "CUSTODY_PENDING"
+        # verify-custody now confirms QUALIFIED over the sealed bytes.
+        assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is True
 
-    # --- Tamper evidence: flip ONE byte of manifest.json -> verify-custody FAILS.
-    corrupted = bytearray(manifest_bytes)
-    # find a byte inside the JSON we can safely flip (a digit in a hash)
-    corrupted[-5] = corrupted[-5] ^ 0x01
-    manifest_path.write_bytes(bytes(corrupted))
-    assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
+        # --- Tamper evidence: flip ONE byte of manifest.json -> verify-custody FAILS.
+        corrupted = bytearray(manifest_bytes)
+        corrupted[-5] = corrupted[-5] ^ 0x01
+        manifest_path.write_bytes(bytes(corrupted))
+        assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
 
 
-def test_enterprise_attach_appends_to_audit_chain(tmp_path, monkeypatch):
+def test_enterprise_attach_appends_to_audit_chain_and_pushes_off_box(tmp_path, monkeypatch):
     priv_a, pub_a = _approver()
     priv_b, pub_b = _approver()
     _priv_c, pub_c = _approver()
     approvers = [pub_a, pub_b, pub_c]
-    cr = _enterprise_control(tmp_path, approvers, threshold=2)
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+        monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+
+        assert supervisor.run(str(cr), None) == 3
+        run_id = os.listdir(cr / "runs")[0]
+        run_dir = cr / "runs" / run_id
+        manifest_bytes = (run_dir / "manifest.json").read_bytes()
+
+        chain_before = (cr / "audit-chain.jsonl").read_text().count("\n")
+        (cr / "custody-signatures.json").write_text(json.dumps([
+            {"approver": pub_a, "sig": df_custody.sign_manifest(priv_a, manifest_bytes)},
+            {"approver": pub_b, "sig": df_custody.sign_manifest(priv_b, manifest_bytes)},
+        ]), encoding="utf-8")
+        assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
+        chain_after = (cr / "audit-chain.jsonl").read_text().count("\n")
+        assert chain_after == chain_before + 1  # the attestation was anchored
+
+        # Important fix: the qualification event is pushed OFF-BOX (enterprise
+        # mandates sink.required). A receipt sidecar is written, and the
+        # receiver actually holds the exact attestation bytes.
+        assert (run_dir / "custody_sink_receipt.json").exists()
+        att_text = (run_dir / "custody_attestation.json").read_text()
+        key = run_id + ".custody"
+        with urllib.request.urlopen(f"{sink_url}/audit/{key}", timeout=5) as resp:
+            stored = resp.read().decode("utf-8")
+        assert stored == att_text
+
+
+def test_enterprise_attach_required_sink_down_fails_closed(tmp_path, monkeypatch):
+    # A REQUIRED sink that is unreachable makes attach fail closed (exit 3):
+    # qualification must be recorded off-box or it does not count.
+    priv_a, pub_a = _approver()
+    priv_b, pub_b = _approver()
+    _priv_c, pub_c = _approver()
+    approvers = [pub_a, pub_b, pub_c]
+    # A port that nothing is listening on.
+    cr = _enterprise_control(tmp_path, approvers, threshold=2,
+                             sink_url="http://127.0.0.1:9")
     _patch_enterprise_probes(monkeypatch)
     monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
@@ -450,15 +511,88 @@ def test_enterprise_attach_appends_to_audit_chain(tmp_path, monkeypatch):
     run_id = os.listdir(cr / "runs")[0]
     run_dir = cr / "runs" / run_id
     manifest_bytes = (run_dir / "manifest.json").read_bytes()
-
-    chain_before = (cr / "audit-chain.jsonl").read_text().count("\n")
     (cr / "custody-signatures.json").write_text(json.dumps([
         {"approver": pub_a, "sig": df_custody.sign_manifest(priv_a, manifest_bytes)},
         {"approver": pub_b, "sig": df_custody.sign_manifest(priv_b, manifest_bytes)},
     ]), encoding="utf-8")
-    assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
-    chain_after = (cr / "audit-chain.jsonl").read_text().count("\n")
-    assert chain_after == chain_before + 1  # the attestation was anchored
+    # Custody IS satisfied, but the required sink push fails -> exit 3.
+    assert supervisor.attach_custody(str(cr), str(run_dir)) == 3
+
+
+def test_enterprise_config_mutation_after_run_refuses_attach_and_verify(tmp_path, monkeypatch):
+    """The Critical bypass: an operator with control-root write access edits
+    config.json's custody block to {rogue_key, threshold:1} AFTER a legit
+    threshold:2 run, self-signs, and tries to self-qualify. Binding the
+    policy to the manifest's sealed config_sha256 makes attach AND
+    verify-custody fail closed."""
+    priv_a, pub_a = _approver()
+    _priv_b, pub_b = _approver()
+    _priv_c, pub_c = _approver()
+    approvers = [pub_a, pub_b, pub_c]
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+        monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+
+        assert supervisor.run(str(cr), None) == 3
+        run_id = os.listdir(cr / "runs")[0]
+        run_dir = cr / "runs" / run_id
+        manifest_bytes = (run_dir / "manifest.json").read_bytes()
+        # sanity: sealed policy is required_k 2
+        assert json.loads(manifest_bytes)["custody"]["required_k"] == 2
+
+        # Attacker rewrites config.json: threshold 1, their OWN key.
+        rogue_priv, rogue_pub = _approver()
+        cfg = json.loads((cr / "config.json").read_text())
+        cfg["custody"] = {"approvers": [rogue_pub], "threshold": 1}
+        (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        (cr / "custody-signatures.json").write_text(json.dumps([
+            {"approver": rogue_pub, "sig": df_custody.sign_manifest(rogue_priv, manifest_bytes)},
+        ]), encoding="utf-8")
+
+        # attach REFUSES (config_sha256 mismatch) — no attestation.
+        assert supervisor.attach_custody(str(cr), str(run_dir)) == 3
+        assert not (run_dir / "custody_attestation.json").exists()
+        # verify-custody REFUSES too.
+        assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
+
+
+def test_verify_custody_rejects_forged_attestation(tmp_path, monkeypatch):
+    """Even a hand-written custody_attestation.json (bypassing attach) with a
+    self-declared threshold:1 + rogue approver is REJECTED: verify-custody
+    re-derives approvers/threshold from the (unchanged) config, never trusting
+    the attestation's own claimed values."""
+    priv_a, pub_a = _approver()
+    _priv_b, pub_b = _approver()
+    _priv_c, pub_c = _approver()
+    approvers = [pub_a, pub_b, pub_c]
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+        monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
+
+        assert supervisor.run(str(cr), None) == 3
+        run_id = os.listdir(cr / "runs")[0]
+        run_dir = cr / "runs" / run_id
+        manifest_bytes = (run_dir / "manifest.json").read_bytes()
+        manifest_sha = (run_dir / "manifest.sha256").read_text().strip()
+
+        rogue_priv, rogue_pub = _approver()
+        forged = {
+            "attestation_version": "0.1",
+            "manifest_sha256": manifest_sha,   # correct sha -> binding check passes
+            "threshold": 1,                    # self-declared, must be IGNORED
+            "approvers_satisfied": [rogue_pub],
+            "signatures": [
+                {"approver": rogue_pub, "sig": df_custody.sign_manifest(rogue_priv, manifest_bytes)}
+            ],
+            "qualified": True,
+            "ts": "2026-01-01T00:00:00Z",
+        }
+        (run_dir / "custody_attestation.json").write_text(json.dumps(forged), encoding="utf-8")
+        # config unchanged (config_sha256 matches), so the rejection is purely
+        # from re-verifying against config approvers (rogue ∉ set) + threshold 2.
+        assert supervisor.verify_custody_cmd(str(cr), str(run_dir)) is False
 
 
 def test_verify_custody_cmd_missing_manifest_not_found(tmp_path):

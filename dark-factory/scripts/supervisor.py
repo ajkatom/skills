@@ -511,6 +511,31 @@ def _load_custody_signatures(control_root):
     return loaded, None
 
 
+def _custody_config_bound(cfg, manifest_bytes):
+    """Bind the custody POLICY to the exact run it gates.
+
+    The approver allowlist + threshold are read fresh from config.json, but an
+    operator who ran the build has control-root write access (they drop
+    custody-signatures.json there) — so nothing stops them editing config.json's
+    custody block to {approvers:[their_key], threshold:1} AFTER a legitimate
+    threshold:2 run, self-signing, and self-qualifying, while manifest.json
+    still records required_k:2. That would defeat single-operator-proof.
+
+    Defense: every manifest (including the CUSTODY_PENDING one) already seals
+    `config_sha256` = sha256 of the canonical config at run time (cfg[
+    "_config_sha256"]). Require the CURRENT config's _config_sha256 to equal
+    the sealed one; ANY edit to config.json (threshold, approvers, anything)
+    changes _config_sha256 → mismatch → the caller refuses fail-closed.
+
+    Returns (bound: bool, sealed_sha, current_sha)."""
+    try:
+        manifest = json.loads(manifest_bytes)
+    except json.JSONDecodeError:
+        return False, None, cfg.get("_config_sha256")
+    sealed = manifest.get("config_sha256")
+    return sealed == cfg["_config_sha256"], sealed, cfg["_config_sha256"]
+
+
 def _satisfying_approvers(manifest_bytes, signatures, approvers):
     """The DISTINCT approver public keys (from `approvers`) that have a
     signature in `signatures` verifying over manifest_bytes -- the same
@@ -564,6 +589,18 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         sys.stderr.write("dark-factory: control root has no `custody` block; nothing to attach\n")
         return 2
 
+    # Refuse if config.json changed since the run — the custody policy
+    # (approvers/threshold) is bound to the manifest's sealed config_sha256,
+    # so post-run threshold/approver tampering fails closed (see
+    # _custody_config_bound).
+    bound, sealed_sha, current_sha = _custody_config_bound(cfg, manifest_bytes)
+    if not bound:
+        sys.stderr.write(
+            "dark-factory: config.json changed since this run (custody policy is bound to the "
+            f"sealed config_sha256 {sealed_sha} != current {current_sha}); attestation refused "
+            "— re-run under the intended config.\n")
+        return 3
+
     approvers = cfg["_custody"]["approvers"]
     threshold = cfg["_custody"]["threshold"]
     signatures, load_reason = _load_custody_signatures(control_root)
@@ -606,8 +643,33 @@ def attach_custody(control_root: str, run_dir: str) -> int:
             sys.stderr.write(f"dark-factory: audit key error: {e}\n")
             return 2
     chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    # Dot-separated (not ':') so the same key is a valid http-append sink key:
+    # the reference receiver's key regex is [A-Za-z0-9._-], and a ':' would be
+    # percent-encoded to %3A and rejected.
+    custody_key = os.path.basename(run_dir) + ".custody"
     entry = df_audit_chain.append_entry(
-        chain_path, os.path.basename(run_dir) + ":custody", sha256_str(att_text), _now(), audit_key)
+        chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
+
+    # Push the QUALIFICATION event off-box (M13). Qualification is the single
+    # most security-relevant enterprise event, and enterprise MANDATES
+    # audit.sink.required:true — so it must leave the box, failing closed if
+    # the required sink is unreachable (mirrors _anchor_audit's required-sink
+    # handling: a required push failure is a nonzero exit, never a silent
+    # skip). The pushed body is the attestation itself.
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+    if sink.get("kind", "none") != "none":
+        try:
+            receipt = df_audit_sink.push(sink, custody_key, att_text.encode("utf-8"))
+        except df_audit_sink.SinkError as e:
+            if sink.get("required"):
+                sys.stderr.write(
+                    f"dark-factory: CUSTODY ATTESTED locally, but the REQUIRED audit sink push "
+                    f"FAILED ({e}) — enterprise qualification must be recorded off-box; "
+                    f"fix the sink and re-run df-custody attach.\n")
+                return 3
+            sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
+        else:
+            atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"), canonical_json(receipt))
 
     print(f"dark-factory: CUSTODY ATTESTED — {reason}; qualified. "
           f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…")
@@ -637,6 +699,16 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
         return False
     if cfg["_custody"] is None:
         print("NO CUSTODY CONFIGURED (control root has no `custody` block)")
+        return False
+
+    # The custody policy is bound to the run's sealed config_sha256: a
+    # config.json edited after the run (to lower the threshold or swap in a
+    # rogue approver) fails closed here, even if an attestation exists.
+    bound, sealed_sha, current_sha = _custody_config_bound(cfg, manifest_bytes)
+    if not bound:
+        print("INVALID (config.json changed since this run — custody policy is bound to the "
+              f"sealed config_sha256 {sealed_sha} != current {current_sha}; re-run under the "
+              "intended config)")
         return False
 
     att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
