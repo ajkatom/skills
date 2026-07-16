@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Fake builder for the M15-3 e2e "regression caught" proof
+(test_e2e_brownfield.py). Speaks adapter protocol 0.1.
+
+Given a brownfield task whose spec asks for a NEW `double N` subcommand on
+top of an existing `app.py` CLI, this builder ships the requested feature
+correctly but BREAKS the pre-existing `add` behavior (subtracts instead of
+adding) -- a builder that "did what was asked" while silently regressing
+something it was never told to touch, because it never saw it: it doesn't
+read the snapshotted `app.py` in the workspace, doesn't read scenarios
+(unreachable from the workspace -- same information barrier as
+fake_builder), and doesn't even look at feedback.json -- its output is
+unconditional so the run can never converge, giving CAP_REACHED something
+real to report.
+
+Paired with `fake_builder_extend` (fixes NOTHING, i.e. also implements
+`add` correctly) to make (a) vs (b) a true A/B: same control root, same
+probes, same spec -- only this file differs.
+"""
+import json
+import os
+import sys
+
+APP_PY = (
+    "import sys\n"
+    "\n"
+    "\n"
+    "def main(argv):\n"
+    "    if len(argv) == 3 and argv[0] == 'add':\n"
+    "        try:\n"
+    "            a, b = int(argv[1]), int(argv[2])\n"
+    "        except ValueError:\n"
+    "            sys.stderr.write('legacy_app: add requires two integers\\n')\n"
+    "            return 2\n"
+    "        print(a - b)  # BUG: subtracts instead of adds -- regresses `add`\n"
+    "        return 0\n"
+    "    if len(argv) == 2 and argv[0] == 'double':\n"
+    "        try:\n"
+    "            n = int(argv[1])\n"
+    "        except ValueError:\n"
+    "            sys.stderr.write('app: double requires an integer\\n')\n"
+    "            return 2\n"
+    "        print(n * 2)\n"
+    "        return 0\n"
+    "    sys.stderr.write('legacy_app: unknown or bad args\\n')\n"
+    "    return 2\n"
+    "\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main(sys.argv[1:]))\n"
+)
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "app.py"), "w", encoding="utf-8") as f:
+        f.write(APP_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

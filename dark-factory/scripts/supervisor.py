@@ -13,6 +13,7 @@ import sys
 import uuid
 
 import df_audit
+import df_brownfield
 import df_container
 import df_creds
 import df_gates
@@ -154,6 +155,24 @@ def _snapshot_sha256_from_journal(run_dir):
             if e.get("state") == "SNAPSHOT":
                 return e.get("data", {}).get("snapshot_sha256")
     return None
+
+
+def _mode_from_journal(run_dir):
+    """Recover the ORIGINAL run's brownfield mode + legacy_ignored flag from
+    its journal (M15). Resume must NOT re-run detect_mode (project_src isn't
+    even passed to resume(), and re-detecting against a possibly-changed
+    source would be exactly the re-observation the sealed cohort must avoid)
+    -- the fresh-run path always writes MODE_DETECTED unconditionally, so a
+    resumed run's manifest reports the same mode it converged/paused under.
+    """
+    path = os.path.join(run_dir, "journal.jsonl")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            e = json.loads(line)
+            if e.get("state") == "MODE_DETECTED":
+                data = e.get("data", {})
+                return data.get("mode", "greenfield"), bool(data.get("legacy_ignored", False))
+    return "greenfield", False
 
 
 def latest_paused_run(control_root):
@@ -604,6 +623,20 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "credentials": ({"source": cfg["_credentials"]["source"],
                         "allowlist": list(cfg["_credentials"]["allowlist"])}
                        if cfg["_credentials"] else None),
+        # Additive (M15): seeded here — like `credentials` — so EVERY terminal
+        # manifest carries mode/characterization, including the five pre-build
+        # abort branches below (they finalize BEFORE detection runs). Detection
+        # hasn't happened yet, so the honest seed is "unknown"; the real values
+        # overwrite these once detect_mode + characterize complete (after
+        # isolation is resolved). `probes` is knowable now (config-time), the
+        # rest is not until we snapshot + detect.
+        "mode": "unknown",
+        "characterization": {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": 0,
+            "note": "not yet characterized (aborted before build)",
+            "legacy_ignored": False,
+        },
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -744,11 +777,89 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     if eff_tier not in ("standard", "hardened"):
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
+
+    # M15: brownfield detection + characterization. Runs HERE -- after
+    # isolation is resolved (characterization probes execute under the same
+    # exec_wrapper the verifier uses, per the barrier: a probe can read the
+    # snapshot copy but the control root stays denied, same as any scenario
+    # run) and BEFORE the build loop, so any generated regression scenario is
+    # in place for the very first dev-cohort verify pass. `manifest` here is
+    # already snapshot_source.build_manifest(project_src)'s output (snapshot()
+    # returns it) when project_src was given -- no need to rebuild it.
+    snap_manifest = manifest if project_src else None
+    try:
+        mode = df_brownfield.detect_mode(cfg["_brownfield"]["mode"], project_src, snap_manifest)
+    except df_brownfield.BrownfieldError as e:
+        sys.stderr.write(f"dark-factory: brownfield: {e}\n")
+        return 2
+    legacy_ignored = bool(mode == "greenfield" and snap_manifest and snap_manifest["files"])
+    journal.write("MODE_DETECTED", mode=mode, legacy_ignored=legacy_ignored)
+
+    generated = []
+    gen_dir = None
+    # Only actually characterize when there are probes to run. `mode` can be
+    # "brownfield" via AUTO-DETECTION (any project_src with >=1 file, fail-safe
+    # toward brownfield per df_brownfield.detect_mode) with ZERO probes
+    # configured -- e.g. every pre-M15 project-src run, which never configured
+    # a `brownfield` block at all. That combination must stay a back-compat
+    # no-op (honest mode="brownfield", zero guards), not a BrownfieldError:
+    # df_config already refuses an EXPLICIT `mode: "brownfield"` with empty
+    # probes at load time (nothing to characterize is a ConfigError there),
+    # so this branch only ever sees probes==[] via auto-detection.
+    if mode == "brownfield" and cfg["_brownfield"]["probes"]:
+        try:
+            generated = df_brownfield.characterize(
+                project_src, cfg["_brownfield"]["probes"], exec_wrapper=exec_prefix)
+        except df_brownfield.BrownfieldError as e:
+            sys.stderr.write(f"dark-factory: brownfield characterization failed: {e}\n")
+            return 2
+        gen_dir = os.path.join(run_dir, "generated-scenarios")
+        os.makedirs(gen_dir, exist_ok=True)
+        for sc in generated:
+            atomic_write(os.path.join(gen_dir, sc["id"] + ".json"), canonical_json(sc))
+        journal.write("CHARACTERIZED", mode=mode, generated=len(generated),
+                      behavior_ids=[sc["behavior_id"] for sc in generated])
+    elif mode == "brownfield":
+        # Auto-detected brownfield with ZERO probes: a valid no-op, but a
+        # SILENT one would let a manifest read as "regressions checked" when
+        # nothing was guarded. Make the gap loud (stderr WARN + a distinct
+        # journal entry) and unambiguous in the manifest (note below), so an
+        # auditor can tell "brownfield, nothing guarded" from "guards passed".
+        sys.stderr.write(
+            "dark-factory: brownfield detected but no probes configured — NO regression "
+            "guards were captured; add brownfield.probes to guard existing behavior.\n")
+        journal.write("BROWNFIELD_UNGUARDED", reason="brownfield detected, zero probes")
+
+    manifest_base["mode"] = mode
+    if mode == "brownfield":
+        # generated>0: real snapshot captured. generated==0: the unguarded
+        # no-op above — the note must NOT read as if a snapshot happened.
+        char_note = (
+            "behavioral snapshot at probe points; unprobed behavior may regress"
+            if generated
+            else "NO regression guards captured (no probes configured); unguarded"
+        )
+        manifest_base["characterization"] = {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": len(generated),
+            "note": char_note,
+            "legacy_ignored": bool(legacy_ignored),
+        }
+    elif legacy_ignored:
+        manifest_base["characterization"] = {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": len(generated),
+            "note": "behavioral snapshot at probe points; unprobed behavior may regress",
+            "legacy_ignored": True,
+        }
+    else:
+        manifest_base["characterization"] = {"probes": 0, "generated": 0}
+
     try:
         return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                          adapter, timeout_s, workspace, start_iter=1, feedback=None,
                          exec_prefix=exec_prefix, audit_key=audit_key,
-                         creds=creds, redactor=redactor)
+                         creds=creds, redactor=redactor, extra_scenarios_dir=gen_dir)
     except df_sandbox.SandboxError as e:
         # In-loop fail-closed guards (e.g. the hardened adapter-mount re-check)
         # must exit 2 like every other refusal, not escape as a traceback.
@@ -760,7 +871,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
               audit_key=None, prev_dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False,
-              creds=None, redactor=None):
+              creds=None, redactor=None, extra_scenarios_dir=None):
     exec_prefix = exec_prefix or []
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
@@ -988,9 +1099,19 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     return _twin_error_abort(i, e)
 
             try:
+                # M15: extra_scenarios_dir merges the brownfield-generated
+                # BHV-REGRESS-* guards into the DEV cohort here at verify time.
+                # They are deliberately NOT in the M7 pre-build coverage/mutation
+                # gate above (which loads only the control scenarios/ dir): each
+                # generated `then` is already proven discriminating by
+                # characterize() itself, and folding them into check_coverage
+                # would flag every BHV-REGRESS-* as an orphan_scenario (no
+                # matching behaviors.json entry) and spuriously fail any
+                # brownfield+coverage run. See references/brownfield.md.
                 report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
                                   env_extra=verify_env_extra, cohort="dev",
-                                  observer_files=ts.observer_files if ts else None)
+                                  observer_files=ts.observer_files if ts else None,
+                                  extra_scenarios_dir=extra_scenarios_dir)
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -1231,6 +1352,30 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         # SAME code both run() and resume() funnel through.
         manifest_base["security"] = {"checked": False}
 
+        # M15: brownfield mode/characterization -- NOT re-detected or
+        # re-characterized on resume (project_src isn't even passed to
+        # resume(), and re-observing a possibly-changed source would defeat
+        # the sealed dev cohort the first `run` already froze). Reuse the
+        # ORIGINAL run's <run_dir>/generated-scenarios/ (if any) and recover
+        # `mode`/`legacy_ignored` from the MODE_DETECTED journal entry the
+        # fresh-run path always writes; `probes` is deterministic from cfg
+        # (same as a fresh run), `generated` is the actual sealed file count.
+        gen_dir = os.path.join(run_dir, "generated-scenarios")
+        extra_scenarios_dir = gen_dir if os.path.isdir(gen_dir) else None
+        resumed_mode, resumed_legacy_ignored = _mode_from_journal(run_dir)
+        generated_count = (
+            len([n for n in os.listdir(gen_dir) if n.endswith(".json")])
+            if extra_scenarios_dir else 0
+        )
+        manifest_base["mode"] = resumed_mode
+        manifest_base["characterization"] = (
+            {"probes": len(cfg["_brownfield"]["probes"]), "generated": generated_count,
+             "note": "behavioral snapshot at probe points; unprobed behavior may regress",
+             "legacy_ignored": bool(resumed_legacy_ignored)}
+            if resumed_mode == "brownfield" or resumed_legacy_ignored
+            else {"probes": 0, "generated": 0}
+        )
+
         # M12: twin_evidence, recomputed fresh on every resume (deterministic
         # from cfg + the control root's twins/*.json + scenarios) -- same
         # "fresh + resume" threading as `credentials`. gate_scenarios may be
@@ -1315,7 +1460,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                 builder_calls=state.get("builder_calls", 0),
                 estimated_usd=state.get("estimated_usd", 0.0),
                 budget_alerted=state.get("budget_alerted", False),
-                creds=creds, redactor=redactor,
+                creds=creds, redactor=redactor, extra_scenarios_dir=extra_scenarios_dir,
             )
         except df_sandbox.SandboxError as e:
             # In-loop fail-closed guards exit 2, not an unhandled traceback.

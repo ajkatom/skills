@@ -90,3 +90,34 @@ def test_run_all_cohort_none_runs_all_back_compat(tmp_path):
     assert rep["count"] == 2
     assert len(rep["results"]) == 2
     assert rep["all_pass"] is True
+
+
+# ---------------------------------------------------------------------------
+# extra_scenarios_dir union (M15: brownfield-generated dev-cohort scenarios)
+# ---------------------------------------------------------------------------
+
+def test_load_scenarios_unions_extra_scenarios_dir(tmp_path):
+    control = tmp_path / "scen"
+    write_scenario(control, "a.json")
+    extra = tmp_path / "generated"
+    write_scenario(
+        extra, "b.json", id="BHV-REGRESS-0-S1", behavior_id="BHV-REGRESS-0",
+    )
+    scs = run_scenarios.load_scenarios(str(control), extra_scenarios_dir=str(extra))
+    assert {sc["id"] for sc in scs} == {"BHV-001-S1", "BHV-REGRESS-0-S1"}
+
+
+def test_load_scenarios_absent_extra_dir_is_back_compat(tmp_path):
+    control = tmp_path / "scen"
+    write_scenario(control, "a.json")
+    scs = run_scenarios.load_scenarios(str(control))
+    assert {sc["id"] for sc in scs} == {"BHV-001-S1"}
+
+
+def test_load_scenarios_duplicate_id_across_dirs_raises_oracle_error(tmp_path):
+    control = tmp_path / "scen"
+    write_scenario(control, "a.json")
+    extra = tmp_path / "generated"
+    write_scenario(extra, "a.json")  # same default id BHV-001-S1
+    with pytest.raises(run_scenarios.OracleError, match="BHV-001-S1"):
+        run_scenarios.load_scenarios(str(control), extra_scenarios_dir=str(extra))

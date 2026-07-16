@@ -94,14 +94,30 @@ def _validate(sc: dict, fname: str) -> None:
     _validate_twin_then(then, fname)
 
 
-def load_scenarios(scenarios_dir: str) -> list:
+def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None) -> list:
+    """Load scenarios from `scenarios_dir` (the control-plane, human-authored
+    set) unioned with `extra_scenarios_dir` if given (M15: the supervisor's
+    brownfield-generated dev-cohort regression scenarios, written per-run to
+    `<run_dir>/generated-scenarios/`). A scenario id present in BOTH dirs is
+    an oracle defect (ambiguous which one applies), not silently resolved --
+    OracleError names the id and both source dirs.
+    """
     scs = []
-    for path in sorted(glob.glob(os.path.join(scenarios_dir, "*.json"))):
-        with open(path, encoding="utf-8") as f:
-            sc = json.load(f)
-        _validate(sc, os.path.basename(path))
-        sc.setdefault("cohort", "dev")
-        scs.append(sc)
+    seen_ids: dict[str, str] = {}
+    dirs = [scenarios_dir] + ([extra_scenarios_dir] if extra_scenarios_dir else [])
+    for d in dirs:
+        for path in sorted(glob.glob(os.path.join(d, "*.json"))):
+            with open(path, encoding="utf-8") as f:
+                sc = json.load(f)
+            _validate(sc, os.path.basename(path))
+            sc.setdefault("cohort", "dev")
+            if sc["id"] in seen_ids:
+                raise OracleError(
+                    f"duplicate scenario id {sc['id']!r} in both {seen_ids[sc['id']]!r} "
+                    f"and {d!r}"
+                )
+            seen_ids[sc["id"]] = d
+            scs.append(sc)
     if not scs:
         raise OracleError(f"no scenarios found in {scenarios_dir}")
     return scs
@@ -239,8 +255,9 @@ def run_all(
     env_extra: dict | None = None,
     cohort: str | None = None,
     observer_files: dict | None = None,
+    extra_scenarios_dir: str | None = None,
 ) -> dict:
-    scs = load_scenarios(scenarios_dir)
+    scs = load_scenarios(scenarios_dir, extra_scenarios_dir=extra_scenarios_dir)
     # Load-time validation (M12): a twin assertion naming a twin this runner
     # doesn't know about is an oracle defect, caught BEFORE any scenario in
     # this call runs. This is checked over the FULL, UNFILTERED scenario set

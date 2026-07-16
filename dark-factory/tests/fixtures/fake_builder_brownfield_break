@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Fake builder for M15-2 brownfield wiring tests (test_brownfield_config.py).
+
+Writes the CORRECT greet.py on the very first call (so the human-authored
+BHV-001/BHV-002 scenarios always pass -- no feedback loop needed for those)
+but overwrites `legacy_app` (present in the workspace because it was
+snapshotted from project_src before this builder ever ran) so `add`
+computes the WRONG sum -- breaking a pre-existing, captured behavior while
+satisfying the new spec. Never reads scenarios directly (unreachable from
+the workspace, same information barrier as fake_builder) -- it has no way
+to know legacy_app's `add` is being characterized; the generated
+BHV-REGRESS-* dev-cohort scenario is what must catch the regression.
+"""
+import json
+import os
+import sys
+
+GOOD_GREET = (
+    "import sys\n"
+    "if len(sys.argv) != 2:\n"
+    "    print('usage: greet.py <name>', file=sys.stderr); sys.exit(2)\n"
+    "print(f'Hello, {sys.argv[1]}!')\n"
+)
+
+BROKEN_LEGACY_APP = (
+    "import sys\n"
+    "def main(argv):\n"
+    "    if len(argv) == 3 and argv[0] == 'add':\n"
+    "        try:\n"
+    "            a, b = int(argv[1]), int(argv[2])\n"
+    "        except ValueError:\n"
+    "            sys.stderr.write('legacy_app: add requires two integers\\n')\n"
+    "            return 2\n"
+    "        print(a - b)  # BUG: subtracts instead of adds -- regresses `add`\n"
+    "        return 0\n"
+    "    sys.stderr.write('legacy_app: unknown or bad args\\n')\n"
+    "    return 2\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main(sys.argv[1:]))\n"
+)
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "greet.py"), "w", encoding="utf-8") as f:
+        f.write(GOOD_GREET)
+    legacy_path = os.path.join(wd, "legacy_app")
+    if os.path.exists(legacy_path):
+        with open(legacy_path, "w", encoding="utf-8") as f:
+            f.write(BROKEN_LEGACY_APP)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()
