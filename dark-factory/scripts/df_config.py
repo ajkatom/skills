@@ -401,6 +401,13 @@ def load_config(control_root: str) -> dict:
             f"brownfield.mode must be one of 'auto', 'greenfield', 'brownfield', got {bf_mode!r}"
         )
 
+    # Per-probe shape validation below is intentionally kept in lockstep with
+    # df_brownfield._validate_probes (slug id regex, unique id, non-empty
+    # list[str] `run`, int timeout_s 1..120) — the two MUST stay in sync. We do
+    # NOT delegate to _validate_probes here because it also requires a NON-EMPTY
+    # probe list, whereas an empty `probes` is the valid config-time default for
+    # mode auto/greenfield (only mode: "brownfield" requires >=1, enforced
+    # separately below); it also raises BrownfieldError, not ConfigError.
     bf_probes_raw = bf_raw.get("probes", [])
     if not isinstance(bf_probes_raw, list):
         raise ConfigError("brownfield.probes must be a list")

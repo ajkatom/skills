@@ -623,6 +623,20 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "credentials": ({"source": cfg["_credentials"]["source"],
                         "allowlist": list(cfg["_credentials"]["allowlist"])}
                        if cfg["_credentials"] else None),
+        # Additive (M15): seeded here — like `credentials` — so EVERY terminal
+        # manifest carries mode/characterization, including the five pre-build
+        # abort branches below (they finalize BEFORE detection runs). Detection
+        # hasn't happened yet, so the honest seed is "unknown"; the real values
+        # overwrite these once detect_mode + characterize complete (after
+        # isolation is resolved). `probes` is knowable now (config-time), the
+        # rest is not until we snapshot + detect.
+        "mode": "unknown",
+        "characterization": {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": 0,
+            "note": "not yet characterized (aborted before build)",
+            "legacy_ignored": False,
+        },
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -805,15 +819,41 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             atomic_write(os.path.join(gen_dir, sc["id"] + ".json"), canonical_json(sc))
         journal.write("CHARACTERIZED", mode=mode, generated=len(generated),
                       behavior_ids=[sc["behavior_id"] for sc in generated])
+    elif mode == "brownfield":
+        # Auto-detected brownfield with ZERO probes: a valid no-op, but a
+        # SILENT one would let a manifest read as "regressions checked" when
+        # nothing was guarded. Make the gap loud (stderr WARN + a distinct
+        # journal entry) and unambiguous in the manifest (note below), so an
+        # auditor can tell "brownfield, nothing guarded" from "guards passed".
+        sys.stderr.write(
+            "dark-factory: brownfield detected but no probes configured — NO regression "
+            "guards were captured; add brownfield.probes to guard existing behavior.\n")
+        journal.write("BROWNFIELD_UNGUARDED", reason="brownfield detected, zero probes")
 
     manifest_base["mode"] = mode
-    manifest_base["characterization"] = (
-        {"probes": len(cfg["_brownfield"]["probes"]), "generated": len(generated),
-         "note": "behavioral snapshot at probe points; unprobed behavior may regress",
-         "legacy_ignored": bool(legacy_ignored)}
-        if mode == "brownfield" or legacy_ignored
-        else {"probes": 0, "generated": 0}
-    )
+    if mode == "brownfield":
+        # generated>0: real snapshot captured. generated==0: the unguarded
+        # no-op above — the note must NOT read as if a snapshot happened.
+        char_note = (
+            "behavioral snapshot at probe points; unprobed behavior may regress"
+            if generated
+            else "NO regression guards captured (no probes configured); unguarded"
+        )
+        manifest_base["characterization"] = {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": len(generated),
+            "note": char_note,
+            "legacy_ignored": bool(legacy_ignored),
+        }
+    elif legacy_ignored:
+        manifest_base["characterization"] = {
+            "probes": len(cfg["_brownfield"]["probes"]),
+            "generated": len(generated),
+            "note": "behavioral snapshot at probe points; unprobed behavior may regress",
+            "legacy_ignored": True,
+        }
+    else:
+        manifest_base["characterization"] = {"probes": 0, "generated": 0}
 
     try:
         return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
@@ -1059,6 +1099,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     return _twin_error_abort(i, e)
 
             try:
+                # M15: extra_scenarios_dir merges the brownfield-generated
+                # BHV-REGRESS-* guards into the DEV cohort here at verify time.
+                # They are deliberately NOT in the M7 pre-build coverage/mutation
+                # gate above (which loads only the control scenarios/ dir): each
+                # generated `then` is already proven discriminating by
+                # characterize() itself, and folding them into check_coverage
+                # would flag every BHV-REGRESS-* as an orphan_scenario (no
+                # matching behaviors.json entry) and spuriously fail any
+                # brownfield+coverage run. See references/brownfield.md.
                 report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
                                   env_extra=verify_env_extra, cohort="dev",
                                   observer_files=ts.observer_files if ts else None,

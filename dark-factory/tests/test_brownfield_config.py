@@ -243,6 +243,69 @@ def test_auto_mode_with_project_src_autodetects_brownfield(tmp_path):
     assert manifest["mode"] == "brownfield"
 
 
+def test_auto_brownfield_with_zero_probes_warns_journals_and_flags_unguarded(tmp_path, capsys):
+    # Auto-detected brownfield (project_src with files) but NO probes configured
+    # -- the valid back-compat no-op. It must NOT read as "regressions checked":
+    # stderr WARN + a distinct BROWNFIELD_UNGUARDED journal entry + an
+    # unambiguous manifest note.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    # no brownfield block at all -> {"mode": "auto", "probes": []}
+    src = make_legacy_src(tmp_path)
+
+    rc = supervisor.run(str(cr), str(src))
+    assert rc == 0  # FAKE still converges; the greet spec is unaffected
+
+    err = capsys.readouterr().err
+    assert "no probes configured" in err
+    assert "NO regression guards were captured" in err
+
+    entries, run_id = read_journal(cr)
+    states = [e["state"] for e in entries]
+    assert "BROWNFIELD_UNGUARDED" in states
+    assert states.count("CHARACTERIZED") == 0  # nothing was characterized
+
+    manifest = json.loads(
+        (cr / "runs" / run_id / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["mode"] == "brownfield"
+    assert manifest["characterization"]["generated"] == 0
+    assert "unguarded" in manifest["characterization"]["note"]
+    assert "snapshot at probe points" not in manifest["characterization"]["note"]
+
+
+def test_fresh_prebuild_abort_manifest_still_carries_mode_and_characterization(tmp_path):
+    # An oracle-gate failure (inert `then`) finalizes a GATE_FAILED manifest
+    # BEFORE brownfield detection ever runs. The additive mode/characterization
+    # fields are seeded into manifest_base at construction (like credentials),
+    # so even this early abort carries them -- honoring config-reference.md's
+    # "every terminal manifest" claim.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    # Plant an inert scenario oracle: {"stdout_contains": ""} passes any output.
+    inert = {
+        "ir_version": "0.1", "id": "BHV-777-S1", "behavior_id": "BHV-777",
+        "title": "inert", "given": "x",
+        "when": {"run": ["python3", "greet.py", "X"], "timeout_s": 10},
+        "then": {"stdout_contains": ""},
+    }
+    (cr / "scenarios" / "inert.json").write_text(json.dumps(inert), encoding="utf-8")
+    src = make_legacy_src(tmp_path)
+
+    rc = supervisor.run(str(cr), str(src))
+    assert rc == 2  # pre-build gate failed, no build run
+
+    _, run_id = read_journal(cr)
+    manifest = json.loads(
+        (cr / "runs" / run_id / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["outcome"] == "GATE_FAILED"
+    assert "mode" in manifest
+    assert "characterization" in manifest
+    # Detection never ran (aborted before it) -> the honest "unknown" seed.
+    assert manifest["mode"] == "unknown"
+    assert manifest["characterization"]["generated"] == 0
+    assert "aborted before build" in manifest["characterization"]["note"]
+
+
 def test_generated_scenario_content_never_reaches_builder_prompt_or_workspace(tmp_path):
     cr = setup_control(tmp_path, FAKE_BROWNFIELD_BREAK, max_iterations=1, checkpoint="auto")
     set_brownfield(cr, {"mode": "brownfield", "probes": [ADD_PROBE]})

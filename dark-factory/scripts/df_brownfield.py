@@ -75,6 +75,12 @@ def detect_mode(configured_mode: str, project_src: str | None,
 
 
 def _validate_probes(probes) -> None:
+    # The per-probe shape rules here (slug id regex, unique id, non-empty
+    # list[str] `run`, int timeout_s 1..120) are mirrored by df_config's
+    # inline brownfield.probes validation — the two MUST stay in sync. df_config
+    # cannot simply call this function because it permits an EMPTY probe list as
+    # the default (this one requires non-empty) and raises ConfigError (this one
+    # raises BrownfieldError).
     if not isinstance(probes, list) or not probes:
         raise BrownfieldError("probes must be a non-empty list")
 
