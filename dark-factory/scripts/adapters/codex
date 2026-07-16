@@ -6,10 +6,15 @@ git-repo check is skipped. No -m pin (uses the user's ~/.codex default; pinning
 -codex variants breaks ChatGPT-account auth). The model sees only the prompt
 file content (spec + ID feedback) and the workspace directory.
 
-When req["confine"] is true, argv is built from df_confine's probe-verified
-codex profile instead (mcp_servers disabled — MCP is the escalation path
-this profile closes; codex's own sandbox is still disabled in favor of
-dark-factory's OS/container sandbox either way)."""
+When req["confine"] is true this adapter fails closed WITHOUT spawning: as of
+M14 (Task 3) codex has no probe-verified confinement profile
+(df_confine.PROFILES["codex"]["supported"] is False). The live probe caught
+that `-c mcp_servers={}` does not actually remove codex's MCP surface on an
+install where the desktop-app runtime injects an mcp__ tool bridge (it created
+DENIED_PROOF via a real mcp__ tool), so a confinement-required caller must
+refuse rather than run codex under a flag that doesn't hold. See
+references/builder-confinement.md. The unconfined path (confine false/absent)
+is unchanged."""
 import json
 import os
 import shutil

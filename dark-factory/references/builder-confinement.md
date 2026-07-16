@@ -39,7 +39,7 @@ the CLI unconfined. This is why `gemini` ships **unsupported** (see below):
 shipping an unverified profile that *looks* like it constrains the CLI, but
 hasn't been proven to, would be worse than shipping nothing.
 
-## Per-CLI profiles (claude / codex verified; gemini refused-until-probed)
+## Per-CLI profiles (claude verified; codex + gemini unsupported/refused)
 
 ### claude — verified: Bash tool blocked entirely
 
@@ -65,45 +65,50 @@ repeated live runs, the confined session consistently created `ALLOWED_PROOF`
 action) once the probe used a dedicated, single-purpose call for the denied
 attempt (see "Why the probe makes two calls, not one" below).
 
-### codex — verified: MCP tools removed (Bash/exec stays open by design)
+### codex — UNSUPPORTED: the live probe falsified its confinement
 
-```
-codex exec --sandbox danger-full-access --skip-git-repo-check \
-  -c mcp_servers={} <prompt>
-```
+`df_confine.PROFILES["codex"] = {"supported": False, "reason": "…"}`. codex
+shipped a candidate profile — `codex exec --sandbox danger-full-access
+--skip-git-repo-check -c mcp_servers={} <prompt>`, on the theory that
+`-c mcp_servers={}` clears codex's MCP surface (the escalation path, since
+codex has no individually-nameable Bash/sub-agent tool like claude). **The
+M14 live probe falsified that theory, and this is precisely the failure the
+airtight probe exists to catch.**
 
-`--sandbox danger-full-access` here does **not** mean "unconfined" — it means
-"don't layer codex's own sandbox on top of dark-factory's own OS/container
-sandbox tier, which already provides the filesystem isolation." The
-confinement this profile actually closes is `-c mcp_servers={}`: codex's own
-tool surface (`functions.exec`, `apply_patch`, `web__run`, …) has no
-individually-nameable "sub-agent" or "Bash" tool the way claude does — MCP
-servers are the escalation path this profile removes.
+What the probe observed on this install:
 
-**Live-verified: `-c mcp_servers={}` removes every `mcp__`-prefixed tool.**
-This machine has real, configured MCP servers (`node_repl`, `open-brain`,
-`sites-design-picker`, plus the desktop app's `codex_apps` bridge). Asked to
-list every tool/function available, an **unconfined** `codex exec` session
-enumerates dozens of `mcp__node_repl__*`, `mcp__open_brain__*`,
-`mcp__sites_design_picker__*`, and `mcp__codex_apps__*` entries. The
-**identical** ask under `-c mcp_servers={}` returns zero `mcp__`-prefixed
-names — only codex's own built-ins (`functions.exec`, `apply_patch`,
-`web__run`, `collaboration.*`, …) remain. The live probe's own
-`DENIED_PROOF`/`ALLOWED_PROOF` runs confirm the same thing behaviorally: a
-confined session asked to use an `mcp__`-prefixed tool to create
-`DENIED_PROOF` consistently finds none and creates nothing, while a separate
-confined call still creates `ALLOWED_PROOF` via its normal (allowed)
-write path.
+- An **unconfined** `codex exec` enumerating its tools lists a large
+  `mcp__*` bridge — `mcp__codex_apps__*` (300+ tools: GitHub write, Google
+  Drive, site deploys), `mcp__node_repl__*`, `mcp__open_brain__*`,
+  `mcp__sites_design_picker__*`.
+- The **identical** ask under `-c mcp_servers={}` — **and** under
+  `-c mcp_servers={} -c plugins={} -c marketplaces={}`, **and** under
+  `--ignore-user-config` — *still* lists those `mcp__*` tools on roughly half
+  of runs (a nondeterministic race). They are not cosmetic: the probe's
+  denied-tool call **actually created `DENIED_PROOF` via a real, functional
+  `mcp__node_repl__js` / `mcp__codex_apps__*` tool**.
+- These tools are injected by the ChatGPT **desktop-app / app-server
+  runtime**, out-of-band from `$CODEX_HOME/config.toml`. No CLI config
+  override reliably removes them, and a clean `CODEX_HOME` that would exclude
+  them also loses authentication (401), so there is no flag combination that
+  both authenticates and confines on this install.
 
-**Honesty — what this profile does NOT close for codex.** Unlike claude,
-codex's confinement here does not remove shell/exec (`functions.exec`,
-`apply_patch`) or the built-in `web__run` network tool — those remain part of
-codex's normal, allowed surface under this profile, matching the plan's
-scoping ("MCP is the escalation path we close" for codex). A codex-confined
-builder can still read/write anywhere the surrounding sandbox tier allows and
-still reach the network via `web__run`; if that residual surface is
-unacceptable for a given run, the OS/container sandbox tier (`standard`/
-`hardened`) is what has to close it, not `builder_confinement`.
+A confinement that holds only ~half the time is **false assurance — worse
+than none**, because it invites a caller to trust a barrier that isn't there.
+So codex is marked `supported: False` and the codex adapter fail-closes on a
+`confine: true` request **without ever spawning** (identical to gemini,
+below) — a confinement-required tier refuses rather than run codex under a
+flag that doesn't hold. This is the fail-closed, honest outcome the milestone
+mandates: *a passed flag is not proof; where the probe can't produce proof,
+the tier refuses.*
+
+**Not a permanent verdict.** This is a property of *this* install (the
+desktop-app MCP bridge), not of codex universally. A clean codex install
+without that bridge — where `-c mcp_servers={}` genuinely empties the tool
+list — can be re-probed with `probe_confinement("codex", …)` and, if it
+returns `(True, "verified")`, re-enabled by flipping `PROFILES["codex"]`
+back to a supported profile. The probe is the gate; the static profile only
+claims what the probe has confirmed.
 
 ### gemini — unsupported (refused, not best-effort-trusted)
 
@@ -155,13 +160,45 @@ the artificial constraint.
 The fix: `probe_confinement` makes **two separate, single-purpose confined
 CLI calls** — one whose entire prompt is "create `ALLOWED_PROOF`," and a
 second, independent call whose entire prompt is "is a denied tool available?
-if yes, use it to create `DENIED_PROOF`; if no, create nothing and stop" with
-nothing else competing for the model's attention in that turn. Across
-repeated live trials after this change (6/6 for `claude`, 6/6 for `codex` in
-the acceptance runs for this milestone), the substitution behavior did not
-recur. `dark-factory/scripts/df_confine.py`'s `_ALLOWED_PROBE_PROMPT` /
-`_DENIED_PROBE_PROMPT_BY_CLI` carry this history in comments so a future
-editor doesn't re-collapse the two calls into one without re-discovering why.
+if yes, use it to create `DENIED_PROOF`; if no, create nothing" with nothing
+else competing for the model's attention in that turn. For `claude` this made
+the substitution behavior stop recurring across repeated live trials. (For
+`codex` the two-call split was not enough on its own — the follow-on trials
+that exposed codex's real confinement hole, above, ran under this same
+two-call design; the *reason* codex creates `DENIED_PROOF` turned out to be a
+genuinely-present MCP tool, not mere substitution.)
+`dark-factory/scripts/df_confine.py`'s `_ALLOWED_PROBE_PROMPT` /
+`_denied_probe_prompt` carry this history in comments so a future editor
+doesn't re-collapse the two calls into one without re-discovering why.
+
+### Non-vacuity: the DENIED_CALL_RAN liveness marker
+
+Splitting into two calls introduced a subtler trap: once `ALLOWED_PROOF` only
+proves *call 1* ran, the denied-only *call 2* could silently no-op — a spawn
+hiccup, an empty model response, a nonzero exit — and `DENIED_PROOF`'s absence
+would then read as "blocked" when in fact **nothing was ever attempted**. That
+is a false PASS, and it defeats the whole point of an airtight probe.
+
+So the denied-only call's **final, unconditional** instruction is to write
+`DENIED_CALL_RAN` (via the allowed Write tool) as its very last action,
+regardless of what happened with the denied tool. `probe_confinement` now
+requires **all three** conditions for `(True, "verified")`:
+
+1. `ALLOWED_PROOF` exists — call 1 ran and could use an allowed tool;
+2. `DENIED_CALL_RAN` exists — call 2 actually executed to completion (a
+   missing marker → `(False, "denied-call did not complete — inconclusive")`,
+   never a pass);
+3. `DENIED_PROOF` does **not** exist — the denied tool was blocked.
+
+Writing `DENIED_CALL_RAN` with the allowed Write tool is deliberately **not**
+a substitution of the denied action: it targets a distinct path and proves
+liveness, it does not stand in for creating `DENIED_PROOF` via the denied
+tool. The three deterministic non-vacuity branches (call 2 no-ops →
+inconclusive; call 2 creates `DENIED_PROOF` → not-blocked; all markers correct
+→ verified) are pinned by fake-runner tests in
+`dark-factory/tests/test_confine.py`, with no live CLI. On any non-verifying
+live run, each call's returncode + stderr tail is surfaced into the failure
+`reason` so a failure is diagnosable without a re-run.
 
 ## Fail-closed tier gating
 
@@ -186,13 +223,25 @@ the builder's `invoke_adapter` request. If the adapter reports
 `builder_confinement` is additive on **every** terminal manifest (fresh,
 resumed, aborted) — same pattern as `credentials` (M11) and `mode`/
 `characterization` (M15): `{"enabled": bool, "profile": str, "mcp_disabled":
-bool, "tool_allowlist": [str, ...], "probe": "unverified"|"n/a"}`. M14 does
+bool, "tool_allowlist": [str, ...], "probe": "unverified"|"n/a"}`.
+`tool_allowlist` reflects only what the CLI **actually enforces**, so the
+field is honest and per-CLI distinguishable. **claude** (the one supported
+profile) records `mcp_disabled: true` + `["Read", "Write", "Edit"]` (genuinely
+enforced via `--allowedTools`/`--disallowedTools`). An **unsupported** CLI
+(codex, gemini) that somehow reaches the manifest with `enabled: true` records
+`mcp_disabled: false` + `[]` — never claude's allowlist — because
+`profile_for(<unsupported cli>)` carries no enforced properties; an auditor
+reading the machine-readable manifest is therefore never misled into thinking
+an un-enforced allowlist was applied. (In practice an unsupported CLI at a
+confinement-required tier refuses before producing a converged manifest, and
+at a not-required tier WARN-downgrades to `enabled: false`; the empty/false
+field is the belt-and-suspenders honesty guarantee.) M14 does
 not wire `probe_confinement`'s own `(True, "verified")`/`(False, reason)`
 result into any manifest — no run yet calls it as a startup gate, so the
 manifest field's `probe` value is only ever `"unverified"` (confinement
 enabled for this run) or `"n/a"` (not applied). `"verified"` only ever
 appears as `probe_confinement`'s own live return value, exercised directly by
-`test_e2e_confinement.py`'s opt-in live tests and by this milestone's
+`test_e2e_confinement.py`'s opt-in live claude test and by this milestone's
 acceptance runs (see below) — wiring that result into the manifest as a
 startup gate is M17/enterprise scope.
 
@@ -216,6 +265,16 @@ egress for a real builder's API calls, at which point `builder_confinement`
 is the thing still keeping *this run's* MCP surface closed even though the
 network isn't).
 
+The codex finding above sharpens this: the very MCP bridge that no codex
+*flag* could close (`mcp__codex_apps__*` reaching `api.openai.com`,
+`mcp__node_repl__*` shelling to a local helper) is exactly what
+`hardened`'s `network: "none"` container **would** cut off by construction —
+no route to the remote bridge, no way for a bundled helper to phone home. So
+codex being unsupported here is specifically a `standard`/`cooperative`-tier
+gap; a hardened container closes the same hole a different way, reinforcing
+that the flag-based confinement is the *supplement*, not the primary barrier,
+at the strongest tier.
+
 ## Deliberately out of scope (honest, matches the plan)
 
 - **Confining the orchestrator** (this Claude session, or whichever session
@@ -232,8 +291,11 @@ network isn't).
 - **Version pinning + probe-on-version-change.** Recording the exact CLI
   version a profile was verified against, and re-probing automatically when
   that version drifts, is a future hardening — not built in M14.
-- **codex's shell/exec and `web__run`.** As documented above, these are not
-  part of what `builder_confinement` closes for codex; only MCP is.
+- **A working codex profile.** codex is unsupported on this install (its MCP
+  bridge survives every flag — see "codex — UNSUPPORTED" above). Finding a
+  codex configuration that the live probe can verify (or a clean install
+  without the desktop-app bridge) and re-enabling it is future work; M14 ships
+  it fail-closed rather than trusted.
 
 ## References
 
@@ -244,9 +306,9 @@ network isn't).
 - `dark-factory/tests/test_confine_config.py` — config matrix + supervisor
   fail-closed/WARN gating (monkeypatched `invoke_adapter`)
 - `dark-factory/tests/test_e2e_confinement.py` — the deterministic fail-closed
-  refusal e2e (real supervisor CLI + real gemini adapter, no live CLI needed)
-  and the opt-in live probe tests (`DF_LIVE_CONFINE=1`) that are the airtight
-  evidence for claude/codex
+  refusal e2e (real supervisor CLI + real gemini adapter, no live CLI needed),
+  the deterministic codex-unsupported assertion, and the opt-in live claude
+  probe test (`DF_LIVE_CONFINE=1`) that is the airtight evidence for claude
 - `references/config-reference.md` — `builder_confinement.*` config schema
 - `references/hardened.md` — the container barrier's own MCP-closing effect
   via `hardened.network: "none"`

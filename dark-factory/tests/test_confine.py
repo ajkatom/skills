@@ -32,14 +32,13 @@ def test_claude_confinement_flags_disable_mcp_and_restrict_tools():
     assert "--permission-mode" in argv and "acceptEdits" in argv
 
 
-def test_codex_confinement_flags_disable_mcp_servers():
-    argv = df_confine.confinement_flags("codex", "PROMPT")
-    assert argv[:2] == ["codex", "exec"]
-    assert "--sandbox" in argv and "danger-full-access" in argv
-    assert "--skip-git-repo-check" in argv
-    i = argv.index("-c")
-    assert argv[i + 1] == "mcp_servers={}"
-    assert argv[-1] == "PROMPT"  # prompt passed through as final positional arg
+def test_codex_confinement_flags_raise_unsupported():
+    # codex was marked unsupported in M14 (Task 3): the live probe caught that
+    # `-c mcp_servers={}` does not close codex's desktop-app-injected MCP
+    # bridge on this install, so no probe-verified profile exists. Requesting
+    # its flags must fail-closed, exactly like gemini.
+    with pytest.raises(df_confine.ConfineError):
+        df_confine.confinement_flags("codex", "PROMPT")
 
 
 def test_gemini_confinement_flags_raise():
@@ -53,7 +52,9 @@ def test_unknown_cli_confinement_flags_raise():
 
 
 @pytest.mark.parametrize("cli,expected", [
-    ("claude", True), ("codex", True), ("gemini", False), ("unknown-cli", False),
+    # codex is False in M14: unsupported after the live probe falsified its
+    # confinement (desktop-app MCP bridge survives the flags).
+    ("claude", True), ("codex", False), ("gemini", False), ("unknown-cli", False),
 ])
 def test_is_supported_matrix(cli, expected):
     assert df_confine.is_supported(cli) is expected
@@ -81,6 +82,83 @@ def test_probe_confinement_unsupported_cli_fails_closed_without_spawning(tmp_pat
     assert ok is False
     assert isinstance(reason, str) and reason
     assert calls == []
+
+
+# ---------- probe non-vacuity: DENIED_CALL_RAN liveness marker (deterministic) ----------
+#
+# The probe makes TWO calls: call 1 (allowed) writes ALLOWED_PROOF; call 2
+# (denied-only) attempts DENIED_PROOF via the denied tool and ALWAYS writes
+# DENIED_CALL_RAN as its final action. A pass requires ALLOWED_PROOF AND
+# DENIED_CALL_RAN present AND DENIED_PROOF absent. These fake-runner tests
+# prove the three branches with NO live CLI — the runner just materializes
+# the files a real confined CLI would (or would not) leave behind.
+
+class _FakeProc:
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def _make_probe_runner(workdir, *, write_allowed=True, write_denied_ran=True,
+                        write_denied_proof=False):
+    """A fake `runner` that distinguishes the allowed call (mentions
+    ALLOWED_PROOF, not SECURITY TEST) from the denied-only call (SECURITY
+    TEST) by the prompt baked into argv, and materializes the files each side
+    would leave. Toggles model the three scenarios under test."""
+    def fake_runner(argv, cwd=None, timeout=None, capture_output=True, text=True):
+        joined = " ".join(argv)
+        is_denied_call = "SECURITY TEST" in joined
+        if is_denied_call:
+            if write_denied_proof:
+                open(os.path.join(cwd, "DENIED_PROOF"), "w").close()
+            if write_denied_ran:
+                with open(os.path.join(cwd, "DENIED_CALL_RAN"), "w") as f:
+                    f.write("ran")
+        else:  # the allowed call
+            if write_allowed:
+                with open(os.path.join(cwd, "ALLOWED_PROOF"), "w") as f:
+                    f.write("ok")
+        return _FakeProc(returncode=0, stderr="")
+    return fake_runner
+
+
+def test_probe_denied_call_noop_is_inconclusive_never_pass(tmp_path):
+    # call 2 silently no-ops: DENIED_CALL_RAN absent -> DENIED_PROOF's absence
+    # proves nothing -> MUST be a fail-closed inconclusive, NEVER a pass.
+    runner = _make_probe_runner(str(tmp_path), write_denied_ran=False,
+                                write_denied_proof=False)
+    ok, reason = df_confine.probe_confinement("claude", str(tmp_path), runner=runner)
+    assert ok is False
+    assert "DENIED_CALL_RAN" in reason and "inconclusive" in reason
+
+
+def test_probe_denied_proof_created_is_not_blocked(tmp_path):
+    # call 2 actually created DENIED_PROOF (denied tool was NOT blocked) ->
+    # False even though the liveness marker is present.
+    runner = _make_probe_runner(str(tmp_path), write_denied_ran=True,
+                                write_denied_proof=True)
+    ok, reason = df_confine.probe_confinement("claude", str(tmp_path), runner=runner)
+    assert ok is False
+    assert "DENIED_PROOF exists" in reason
+
+
+def test_probe_all_markers_correct_is_verified(tmp_path):
+    # ALLOWED_PROOF present + DENIED_CALL_RAN present + DENIED_PROOF absent
+    # -> the only path to (True, "verified").
+    runner = _make_probe_runner(str(tmp_path), write_allowed=True,
+                                write_denied_ran=True, write_denied_proof=False)
+    ok, reason = df_confine.probe_confinement("claude", str(tmp_path), runner=runner)
+    assert (ok, reason) == (True, "verified")
+
+
+def test_probe_allowed_call_noop_is_inconclusive(tmp_path):
+    # call 1 no-ops: ALLOWED_PROOF absent -> inconclusive (the CLI/allowed
+    # tool never demonstrably ran), never a pass.
+    runner = _make_probe_runner(str(tmp_path), write_allowed=False,
+                                write_denied_ran=True, write_denied_proof=False)
+    ok, reason = df_confine.probe_confinement("claude", str(tmp_path), runner=runner)
+    assert ok is False
+    assert "ALLOWED_PROOF missing" in reason
 
 
 # ---------- adapter argv wiring (subprocess, deterministic fake CLIs) ----------
@@ -148,17 +226,18 @@ def test_claude_adapter_confine_absent_matches_today(tmp_path):
     assert argv == ["-p", "Build greet.py per SPEC.", "--permission-mode", "acceptEdits"]
 
 
-def test_codex_adapter_confine_true_disables_mcp_servers(tmp_path):
+def test_codex_adapter_confine_true_is_fail_closed_no_spawn(tmp_path):
+    # codex is unsupported in M14 (Task 3): a confine=true request must
+    # fail-closed WITHOUT spawning the CLI, exactly like gemini — the live
+    # probe proved `-c mcp_servers={}` does not actually close codex's MCP
+    # surface on this install.
     argv_out = tmp_path / "argv.txt"
-    b = bindir_with(tmp_path, "codex", OK)
+    b = bindir_with(tmp_path, "codex", OK)  # CLI present and would happily succeed
     env = dict(os.environ, PATH=str(b), DF_ARGV_OUT=str(argv_out))
     resp = invoke(CODEX_ADAPTER, tmp_path, env, confine=True)
-    assert resp["status"] == "ok"
-    argv = argv_out.read_text(encoding="utf-8").splitlines()
-    assert argv[0] == "exec"
-    i = argv.index("-c")
-    assert argv[i + 1] == "mcp_servers={}"
-    assert "--skip-git-repo-check" in argv
+    assert resp["status"] == "error"
+    assert "confinement unsupported" in resp["detail"]
+    assert not argv_out.exists()  # the CLI was never spawned
 
 
 def test_codex_adapter_confine_false_matches_today(tmp_path):

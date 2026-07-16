@@ -14,15 +14,20 @@
       builder CLI was never spawned at all, not merely that it "failed").
 
   (b) LIVE (opt-in `DF_LIVE_CONFINE=1`, skipif unset OR the CLI is absent
-      from PATH): `df_confine.probe_confinement("claude", tmp)` and
-      `df_confine.probe_confinement("codex", tmp)` each call the REAL
-      installed CLI under its confinement profile and assert (True,
-      "verified") — the airtight, observable-side-effect evidence that a
-      denied tool (Bash for claude; MCP for codex) is actually blocked, not
-      merely that a flag was passed. These are slow (real model calls) and
-      cost tokens, so they are excluded from the default suite and run
-      during milestone acceptance (see the task report for the real
-      observed result of each run).
+      from PATH): `df_confine.probe_confinement("claude", tmp)` calls the REAL
+      installed claude CLI under its confinement profile and asserts (True,
+      "verified") — the airtight, observable-side-effect evidence that the
+      denied Bash tool is actually blocked (never loaded), not merely that a
+      flag was passed. Slow (real model calls) and costs tokens, so excluded
+      from the default suite; see the task report for the real observed
+      result.
+
+      codex has NO live-verified probe: M14's live probe FALSIFIED its
+      confinement (`-c mcp_servers={}` does not remove the desktop-app MCP
+      bridge — the probe created DENIED_PROOF via a real mcp__ tool), so codex
+      is `supported: False` and there is nothing to verify live. A
+      deterministic test below asserts `probe_confinement("codex", ...)`
+      fail-closes as unsupported, no live CLI needed.
 """
 import json
 import os
@@ -109,16 +114,20 @@ def test_live_probe_claude_blocks_bash(tmp_path):
     )
 
 
-@pytest.mark.skipif(not LIVE, reason="set DF_LIVE_CONFINE=1 to run the live confinement probe")
-@pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not on PATH")
-def test_live_probe_codex_blocks_mcp(tmp_path):
-    # codex's xhigh reasoning effort occasionally runs well past 180s on the
-    # denied-tool call (observed live during acceptance); 300s gives headroom
-    # without weakening the fail-closed contract -- a genuine hang still times
-    # out and reports (False, "probe spawn failed: ...timed out...").
-    ok, reason = df_confine.probe_confinement("codex", str(tmp_path), timeout_s=300)
-    assert (ok, reason) == (True, "verified"), (
-        f"codex confinement probe did not verify: ok={ok} reason={reason!r} "
-        f"workdir={tmp_path} allowed={os.path.exists(os.path.join(str(tmp_path), 'ALLOWED_PROOF'))} "
-        f"denied={os.path.exists(os.path.join(str(tmp_path), 'DENIED_PROOF'))}"
-    )
+def test_probe_codex_is_unsupported_fail_closed(tmp_path):
+    # DETERMINISTIC (no live CLI): codex is unsupported in M14 because the live
+    # probe falsified its confinement (the desktop-app MCP bridge survives
+    # `-c mcp_servers={}` — the probe repeatedly created DENIED_PROOF via a
+    # real mcp__ tool). probe_confinement must fail-close on the is_supported
+    # gate BEFORE ever spawning a CLI.
+    calls = []
+
+    def fake_runner(*a, **k):
+        calls.append((a, k))
+        raise AssertionError("must not spawn codex for an unsupported profile")
+
+    ok, reason = df_confine.probe_confinement("codex", str(tmp_path), runner=fake_runner)
+    assert ok is False
+    assert "unsupported" in reason
+    assert calls == []
+    assert df_confine.is_supported("codex") is False

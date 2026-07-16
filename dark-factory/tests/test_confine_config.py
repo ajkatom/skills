@@ -274,8 +274,10 @@ def test_not_required_unsupported_warns_and_converges_unconfined(tmp_path, monke
 def test_builder_confinement_present_on_generic_aborted_build_error(tmp_path, monkeypatch):
     # A build error UNRELATED to confinement (e.g. a real crash) must still
     # carry builder_confinement on its terminal manifest, and must NOT be
-    # mistaken for a confinement refusal.
-    cr = setup_control(tmp_path, "/usr/local/bin/codex", checkpoint="auto")
+    # mistaken for a confinement refusal. Uses claude (the one supported,
+    # probe-verified profile) so the confined field reflects a real enforced
+    # profile.
+    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="auto")
     _set_confine(cr, required=False)
 
     def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
@@ -364,6 +366,28 @@ def test_disabled_confine_false_and_manifest_field_disabled(tmp_path, monkeypatc
         "tool_allowlist": [],
         "probe": "n/a",
     }
+
+
+def test_confine_manifest_field_reflects_only_enforced_and_is_per_cli_distinguishable():
+    # The manifest's builder_confinement.tool_allowlist must reflect only what
+    # the CLI ACTUALLY enforces, so an auditor reading the machine-readable
+    # manifest can tell profiles apart and is never misled into thinking an
+    # un-enforced allowlist was applied.
+    enabled = {"enabled": True, "required": True, "profile": "standard"}
+    claude_field = supervisor._confine_manifest_field(enabled, "claude")
+    codex_field = supervisor._confine_manifest_field(enabled, "codex")
+
+    # claude: genuinely-enforced allowlist + mcp disabled.
+    assert claude_field["tool_allowlist"] == df_confine.BUILD_TOOLS
+    assert claude_field["mcp_disabled"] is True
+
+    # codex: unsupported profile -> honestly records NO enforced confinement
+    # (empty allowlist, mcp_disabled False), never claiming claude's allowlist.
+    assert codex_field["tool_allowlist"] == []
+    assert codex_field["mcp_disabled"] is False
+
+    # Distinguishable: a codex manifest is never byte-identical to a claude one.
+    assert claude_field != codex_field
 
 
 def test_disabled_confine_kwarg_never_passed_to_legacy_invoke_signature(tmp_path, monkeypatch):
