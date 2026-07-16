@@ -2,13 +2,57 @@
 
 `standard` runs the builder AND the candidate under an OS read-denial sandbox that
 cannot read the control root (scenarios/runs). Backends: macOS `sandbox-exec`
-(`(allow default)(deny file-read* (subpath control_root))`), Linux `bwrap`
-(masks the control root with a tmpfs). Windows: no backend yet → unsupported.
+(`(allow default)(deny file-read* (subpath control_root))(deny file-write* ...)`),
+Linux `bwrap` (masks the control root with a tmpfs, then **seals that mask
+read-only** with `--remount-ro`). Windows: no backend yet → unsupported.
+
+The Linux mask is two ordered steps: `--tmpfs <control_root>` shadows the real
+control-root content with an empty overlay (reads denied — the real scenarios/
+journal are gone from the wrapped view), and `--remount-ro <control_root>`
+remounts that overlay `MS_RDONLY` (writes denied — even a root process with
+`CAP_DAC_OVERRIDE` cannot write, because a read-only MOUNT is kernel-enforced
+regardless of permission bits or capabilities). This gives Linux the same
+read AND write denial macOS already had, satisfying M12's dual-denial probe on
+a real kernel. (A bare `--tmpfs` alone leaves an owner-writable overlay, so the
+write half of `probe_denial` would fail — the Linux backend would fail its own
+fail-closed startup probe and the tier would be unusable on Linux. The
+`--remount-ro` seal is what closes that gap.)
 
 A tier is claimed only when **probe-verified**: at startup a canary is planted in
-the control root and a wrapped process must fail to read it. If the backend is
+the control root and a wrapped process must fail to read it AND fail to write
+there (a fresh file, and a truncation of the canary). If the backend is
 missing or the probe fails, the run **fails closed** (exit 2) unless
 `--allow-downgrade` drops it to `cooperative` (unqualified) with a warning + a
-`DOWNGRADE` audit entry. The Linux backend ships code-complete but is unverified on
-the maintainer's macOS machine — the denial probe is the guarantee that it is never
+`DOWNGRADE` audit entry. The denial probe is the guarantee that a backend is never
 trusted without proof on the actual host.
+
+## Linux live-coverage harness
+
+The maintainer's daily machine is macOS, so the Linux `bwrap` backend was
+previously only *platform-skipped* unit coverage — never exercised on a real
+kernel. `dark-factory/tests/test_linux_harness.py` (skipped when no Docker
+daemon is present) closes that gap by running targeted probes
+(`dark-factory/scripts/df_linux_probes.py`) inside a real Linux kernel (Docker
+Desktop's linuxkit VM).
+
+**What it proves (live, on a real kernel):**
+- **bwrap read+write denial via the PRODUCTION code path.** The bwrap probe
+  imports `df_sandbox` and drives the real `BACKENDS["linux"]` +
+  `probe_denial` inside the container — not a reimplementation — so the live
+  PASS covers the exact code the standard tier runs on Linux. This is what
+  surfaced (and now guards against a regression of) the writable-tmpfs bug:
+  without `--remount-ro`, this probe FAILS its write half live.
+- **iptables egress denial** (`NET_ADMIN`) — an M17 enterprise-tier primitive —
+  with a mandatory non-vacuity half: the probe connects out BEFORE the DROP
+  rule (must succeed, else a dead network would make the "denial" meaningless)
+  and again AFTER (must fail).
+- **no-new-privs** self-application (`prctl(PR_SET_NO_NEW_PRIVS)`, confirmed by
+  re-read) — the other M17 primitive.
+
+**What it does NOT claim:** it is not a full native-Linux CI run of the suite
+(a real Linux host running the entire suite remains the gold standard; this
+harness is the honest *local* substitute for the Linux-only claims). The bwrap
+probe container needs `--cap-add SYS_ADMIN --security-opt seccomp=unconfined`
+purely so bwrap can create its namespaces inside Docker — this is a
+TEST-HARNESS posture only and is **never** a production isolation setting
+(`df_sandbox` itself requests no capabilities).
