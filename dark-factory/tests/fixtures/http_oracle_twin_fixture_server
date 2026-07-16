@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""A stdlib HTTP service fixture for the M20 Task 2 http+twin composition
+test (test_http_oracle.py). Proves an http scenario's service can itself
+call a twin, and that twin-delta evidence (`twin_observed`) is captured for
+an http scenario exactly like it is for a CLI one.
+
+Binds 127.0.0.1:$PORT, then serves:
+  GET /health          -> 200 "ok"
+  GET /call-twin/<name> -> calls http://$DF_TWIN_GREETER/greet/<name> and
+                            returns 200 JSON {"greeting": <twin response>}
+  anything else        -> 404 "not found"
+
+Distinctive basename (`http_oracle_twin_fixture_server`) so `pgrep -f` can
+confirm no orphan process remains after a test reaps it.
+"""
+import json
+import os
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class H(BaseHTTPRequestHandler):
+    def _write(self, status, body_bytes, content_type="text/plain"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._write(200, b"ok")
+        elif self.path.startswith("/call-twin/"):
+            name = self.path[len("/call-twin/"):]
+            endpoint = os.environ["DF_TWIN_GREETER"]
+            with urllib.request.urlopen(f"http://{endpoint}/greet/{name}", timeout=5) as resp:
+                greeting = resp.read().decode("utf-8")
+            payload = {"status": "ok", "greeting": greeting}
+            self._write(200, json.dumps(payload).encode("utf-8"), "application/json")
+        else:
+            self._write(404, b"not found")
+
+    def log_message(self, *a):  # quiet
+        pass
+
+
+def main():
+    port = int(os.environ["PORT"])
+    srv = HTTPServer(("127.0.0.1", port), H)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

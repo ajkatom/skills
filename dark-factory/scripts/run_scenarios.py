@@ -47,16 +47,24 @@ service check, alongside the existing `when.run` CLI check):
                                  "headers": {...}, "body": "..."}}}
 `then` for an http scenario uses `http_status` (int), `body_contains`
 (substring of the raw response body), `json_equals`/`json_contains` (a
-subset match against the parsed JSON body), and `json_path`
-({"a.b[0]": value} -- a dotted+indexed accessor, NOT full JSONPath).
-`evaluate_http` maps these onto the SAME fixed taxonomy vocabulary as CLI
-scenarios: no response at all -> "crash" (fail-closed -- a service that
-never becomes ready or dies before answering is never a vacuous pass);
-`http_status` mismatch -> "wrong_exit_code" (the http analogue of an exit
-code); a body/json/json_path mismatch -> "wrong_output". Load-time
-validation of `when.http`/http `then` shape is Task 2 scope; Task 1 wires
-execution (`_run_http_scenario`), the pure oracle (`evaluate_http`), and
-`run_all`/`run_scenario` dispatch only. Existing `when.run` scenarios are
+subset match against the parsed JSON body), `json_path`
+({"a.b[0]": value} -- a dotted+indexed accessor, NOT full JSONPath), and
+(M20 Task 2) `twin_observed` (composes with an http scenario exactly like
+it does with a CLI one -- `stdout_echoes_twin` has no http analogue and is
+CLI-only). `evaluate_http` maps these onto the SAME fixed taxonomy
+vocabulary as CLI scenarios: no response at all -> "crash" (fail-closed --
+a service that never becomes ready or dies before answering is never a
+vacuous pass); `http_status` mismatch -> "wrong_exit_code" (the http
+analogue of an exit code); a body/json/json_path mismatch ->
+"wrong_output"; a `twin_observed` mismatch -> "no_twin_evidence".
+
+M20 Task 2: `load_scenarios`/`_validate` now enforces, BEFORE any build,
+across all cohorts: a scenario's `when` has EXACTLY ONE of `run`/`http`
+(both or neither -> `OracleError` naming the id); an http scenario's `then`
+must use >=1 http key and no CLI-only key, and vice versa for a `when.run`
+scenario (mismatched then/when -> `OracleError`); `when.http` requires
+`start` (non-empty argv list) + `request` (method+path); `ir_version`
+accepts `"0.1"`/`"0.2"`/`"0.3"`. Existing `when.run` scenarios are
 completely unaffected (same code path, unchanged).
 """
 import glob
@@ -70,16 +78,21 @@ import subprocess
 import time
 
 IR_VERSION = "0.1"
+# M20 Task 2: ir_version 0.2/0.3 are additive bumps (twin evidence, then the
+# http scenario type) -- a control root written against any of them loads
+# unchanged. IR_VERSION is kept as the "current/default" constant other
+# modules may reference; IR_VERSIONS is the accepted set at load time.
+IR_VERSIONS = {"0.1", "0.2", "0.3"}
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
-ASSERT_KEYS = {
+CLI_ONLY_THEN_KEYS = {
     "exit_code",
     "stdout_equals",
     "stdout_contains",
     "stderr_equals",
     "stderr_contains",
-    "twin_observed",
-    "stdout_echoes_twin",
 }
+TWIN_THEN_KEYS = {"twin_observed", "stdout_echoes_twin"}
+ASSERT_KEYS = CLI_ONLY_THEN_KEYS | TWIN_THEN_KEYS
 
 
 class OracleError(ValueError):
@@ -111,9 +124,30 @@ def _validate_twin_then(then: dict, fname: str) -> None:
             raise OracleError(f"{fname}: stdout_echoes_twin.twin must be a non-empty string")
 
 
+def _validate_http_when(http_spec, fname: str, sc_id: str) -> None:
+    """Load-time shape validation for `when.http` (M20 Task 2). Requires
+    `start` (a non-empty argv list of strings) and `request` (an object
+    with a non-empty `method` + `path`); `port_env`/`ready_path`/
+    `timeout_s` are optional and NOT shape-checked here (execution fails
+    closed -- "crash"/"timeout" -- on anything malformed at runtime, same
+    discipline as an unreachable `when.run` command)."""
+    if not isinstance(http_spec, dict):
+        raise OracleError(f"{fname} ({sc_id}): when.http must be an object")
+    start = http_spec.get("start")
+    if not isinstance(start, list) or not start or not all(isinstance(x, str) for x in start):
+        raise OracleError(f"{fname} ({sc_id}): when.http.start must be a non-empty list of strings")
+    request = http_spec.get("request")
+    if not isinstance(request, dict):
+        raise OracleError(f"{fname} ({sc_id}): when.http.request must be an object")
+    if not isinstance(request.get("method"), str) or not request["method"]:
+        raise OracleError(f"{fname} ({sc_id}): when.http.request.method must be a non-empty string")
+    if not isinstance(request.get("path"), str) or not request["path"]:
+        raise OracleError(f"{fname} ({sc_id}): when.http.request.path must be a non-empty string")
+
+
 def _validate(sc: dict, fname: str) -> None:
-    if sc.get("ir_version") != IR_VERSION:
-        raise OracleError(f"{fname}: ir_version must be {IR_VERSION!r}")
+    if sc.get("ir_version") not in IR_VERSIONS:
+        raise OracleError(f"{fname}: ir_version must be one of {sorted(IR_VERSIONS)}")
     for key in ("id", "behavior_id", "title", "given", "when", "then"):
         if key not in sc:
             raise OracleError(f"{fname}: missing {key!r}")
@@ -121,12 +155,62 @@ def _validate(sc: dict, fname: str) -> None:
         raise OracleError(f"{fname}: invalid behavior_id {sc['behavior_id']!r}")
     if "cohort" in sc and sc["cohort"] not in ("dev", "final"):
         raise OracleError(f"{fname}: cohort must be 'dev' or 'final', got {sc['cohort']!r}")
-    run = sc["when"].get("run")
-    if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
-        raise OracleError(f"{fname}: when.run must be a non-empty list of strings")
+
+    sc_id = sc["id"]
+    when = sc["when"]
+    has_run = "run" in when
+    has_http = "http" in when
+    # M20 Task 2: a scenario has EXACTLY ONE of when.run / when.http -- both
+    # or neither is an oracle defect (ambiguous or dead scenario), caught
+    # BEFORE any build, naming the scenario id so it's unambiguous which
+    # scenario file is at fault even if several share similar filenames.
+    if has_run == has_http:
+        raise OracleError(
+            f"{fname} ({sc_id}): when must have EXACTLY ONE of 'run' or 'http', "
+            f"got run={has_run} http={has_http}"
+        )
+
     then = sc["then"]
-    if not isinstance(then, dict) or not (set(then) & ASSERT_KEYS) or set(then) - ASSERT_KEYS:
-        raise OracleError(f"{fname}: then needs >=1 known assertion key {sorted(ASSERT_KEYS)}")
+    if not isinstance(then, dict):
+        raise OracleError(f"{fname} ({sc_id}): then must be an object")
+    then_keys = set(then)
+
+    if has_http:
+        _validate_http_when(when["http"], fname, sc_id)
+        mismatched = then_keys & CLI_ONLY_THEN_KEYS
+        if mismatched:
+            raise OracleError(
+                f"{fname} ({sc_id}): then has CLI-only key(s) {sorted(mismatched)} on an "
+                f"http scenario -- mismatched then/when"
+            )
+        if not (then_keys & HTTP_ASSERT_KEYS):
+            raise OracleError(
+                f"{fname} ({sc_id}): an http scenario's then needs >=1 http assertion key "
+                f"{sorted(HTTP_ASSERT_KEYS)}"
+            )
+        # `twin_observed` composes with an http scenario (the started service
+        # may itself call a twin); `stdout_echoes_twin` does NOT (an http
+        # scenario has no "stdout" to echo into) and is intentionally
+        # excluded here -- it falls through to the "unknown key" error below.
+        allowed = HTTP_ASSERT_KEYS | {"twin_observed"}
+        if then_keys - allowed:
+            raise OracleError(
+                f"{fname} ({sc_id}): then has unknown key(s) {sorted(then_keys - allowed)} "
+                f"for an http scenario"
+            )
+    else:
+        run = when.get("run")
+        if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
+            raise OracleError(f"{fname} ({sc_id}): when.run must be a non-empty list of strings")
+        mismatched = then_keys & HTTP_ASSERT_KEYS
+        if mismatched:
+            raise OracleError(
+                f"{fname} ({sc_id}): then has http key(s) {sorted(mismatched)} on a CLI "
+                f"(when.run) scenario -- mismatched then/when"
+            )
+        if not (then_keys & ASSERT_KEYS) or then_keys - ASSERT_KEYS:
+            raise OracleError(f"{fname} ({sc_id}): then needs >=1 known assertion key {sorted(ASSERT_KEYS)}")
+
     _validate_twin_then(then, fname)
 
 
@@ -258,10 +342,19 @@ def evaluate_http(then: dict, observed: dict) -> str | None:
         mismatch -> "wrong_output". A json_* assertion against
         observed["json"] is None (body wasn't parseable JSON) is always a
         mismatch.
-    Priority: no-response, then status, then body/json, checked in that
-    order -- the first mismatch wins (mirrors evaluate_then's priority
-    discipline: a wrong status never reports "wrong_output" even if a
-    body assertion would also fail).
+      - (M20 Task 2) `twin_observed` mismatch -> "no_twin_evidence" --
+        composes with an http scenario exactly like it does with a CLI one
+        (`evaluate_then`): the http service the scenario started may itself
+        call a twin, and `observed["twin_observations"]` (populated by the
+        SAME offset-delta plumbing `run_scenario` uses) is checked here,
+        last in priority. `stdout_echoes_twin` has no http analogue (an
+        http scenario has no "stdout" to echo into) and is intentionally
+        NOT checked here -- load-time validation keeps it CLI-only.
+    Priority: no-response, then status, then body/json, then twin evidence
+    -- checked in that order, the first mismatch wins (mirrors
+    evaluate_then's priority discipline: a wrong status never reports
+    "wrong_output"/"no_twin_evidence" even if a later assertion would also
+    fail).
     """
     if observed.get("http_status") is None:
         return "crash"
@@ -287,6 +380,11 @@ def evaluate_http(then: dict, observed: dict) -> str | None:
                 return "wrong_output"
             if actual != expected:
                 return "wrong_output"
+    if "twin_observed" in then:
+        spec = then["twin_observed"]
+        lines = observed.get("twin_observations", {}).get(spec["twin"], [])
+        if not any(spec["contains"] in line for line in lines):
+            return "no_twin_evidence"
     return None
 
 

@@ -6,9 +6,11 @@ import pytest
 
 import df_gates
 import run_scenarios
+from test_twin_evidence_oracle import _LiveTwin
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "fixtures", "http_oracle_fixture_server")
+TWIN_SERVER = os.path.join(HERE, "fixtures", "http_oracle_twin_fixture_server")
 
 # `import time; time.sleep(30)` fixture that never binds a port -- proves
 # fail-closed behavior (no vacuous pass) for a service that never becomes
@@ -336,3 +338,106 @@ def test_is_discriminating_true_for_json_path_assertion():
 
 def test_is_discriminating_true_for_body_contains_real_assertion():
     assert df_gates.is_discriminating({"body_contains": "success"}) is True
+
+
+# ---------------------------------------------------------------------------
+# M20 Task 2 review coverage minor #1: an http scenario composes with a TWIN
+# -- observer_files set -> twin_observed works on an http scenario exactly
+# like it does on a CLI one (the service itself calls the twin; the delta
+# is attributed to this scenario's http request/response window).
+# ---------------------------------------------------------------------------
+
+
+def test_http_scenario_composes_with_twin_observed(tmp_path, monkeypatch):
+    with _LiveTwin(tmp_path) as twin:
+        sc = {
+            "id": "BHV-300-S1",
+            "behavior_id": "BHV-300",
+            "when": {
+                "http": {
+                    "start": ["python3", TWIN_SERVER],
+                    "port_env": "PORT",
+                    "ready_path": "/health",
+                    "request": {"method": "GET", "path": "/call-twin/Harriet"},
+                },
+                "timeout_s": 10,
+            },
+            "then": {
+                "http_status": 200,
+                "json_contains": {"status": "ok"},
+                "twin_observed": {"twin": "greeter", "contains": "/greet/Harriet"},
+            },
+            "cohort": "dev",
+        }
+        monkeypatch.setattr(run_scenarios, "load_scenarios", lambda *a, **k: [sc])
+        report = run_scenarios.run_all(
+            str(tmp_path), str(tmp_path),
+            env_extra=twin.env, observer_files=twin.ts.observer_files,
+        )
+        assert report["all_pass"] is True, report
+        result = report["results"][0]
+        assert result["taxonomy"] is None
+        assert result["observed"]["http_status"] == 200
+        assert any(
+            "/greet/Harriet" in line
+            for line in result["observed"]["twin_observations"]["greeter"]
+        ), "http scenario's twin_observed delta never saw the real twin call"
+
+
+def test_http_scenario_with_twin_observed_fails_closed_without_evidence(tmp_path, monkeypatch):
+    # The twin is live but this scenario's request never calls it -- the
+    # twin_observed assertion must still fail closed (no vacuous pass just
+    # because SOME http assertion passed).
+    with _LiveTwin(tmp_path) as twin:
+        sc = {
+            "id": "BHV-301-S1",
+            "behavior_id": "BHV-301",
+            "when": {
+                "http": {
+                    "start": ["python3", SERVER],  # plain fixture -- never calls the twin
+                    "port_env": "PORT",
+                    "ready_path": "/health",
+                    "request": {"method": "GET", "path": "/health"},
+                },
+                "timeout_s": 10,
+            },
+            "then": {
+                "http_status": 200,
+                "twin_observed": {"twin": "greeter", "contains": "/greet/Nobody"},
+            },
+            "cohort": "dev",
+        }
+        monkeypatch.setattr(run_scenarios, "load_scenarios", lambda *a, **k: [sc])
+        report = run_scenarios.run_all(
+            str(tmp_path), str(tmp_path),
+            env_extra=twin.env, observer_files=twin.ts.observer_files,
+        )
+        assert report["all_pass"] is False
+        assert report["results"][0]["taxonomy"] == "no_twin_evidence"
+
+
+# ---------------------------------------------------------------------------
+# M20 Task 2 review coverage minor #2: a MALFORMED json_path never raises --
+# evaluate_http always returns "wrong_output" for it, fail-closed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "a..b",       # empty segment in the middle
+        "x[9]",       # index out of range
+        "",           # empty path entirely
+        "a.b[",       # unterminated index bracket
+        "a[abc]",     # non-numeric index
+    ],
+)
+def test_evaluate_http_malformed_json_path_never_raises(bad_path):
+    observed = {
+        "http_status": 200,
+        "body": '{"a": {"b": 1}, "x": [1, 2, 3]}',
+        "json": {"a": {"b": 1}, "x": [1, 2, 3]},
+    }
+    then = {"json_path": {bad_path: "anything"}}
+    # must not raise -- always resolves to the "wrong_output" taxonomy
+    assert run_scenarios.evaluate_http(then, observed) == "wrong_output"
