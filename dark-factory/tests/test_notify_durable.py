@@ -244,6 +244,21 @@ def test_flush_spool_never_raises_on_malformed_sink(tmp_path):
     assert result == {"flushed": 0, "remaining": 1}
 
 
+def test_flush_spool_never_raises_on_non_utf8_spool_file(tmp_path):
+    # Byte-level corruption (disk bit rot / a stray non-UTF8 write) must NOT
+    # raise UnicodeDecodeError out of a fail-soft flush — it would crash the run.
+    spool_dir = str(tmp_path / ".notify-spool")
+    os.makedirs(spool_dir, exist_ok=True)
+    with open(os.path.join(spool_dir, "pending.ndjson"), "wb") as f:
+        f.write(json.dumps({"event": "OK"}).encode() + b"\n")
+        f.write(b"\xff\xfe not utf-8 at all \x00\n")  # corrupt line
+    result = df_notify.flush_spool("not a url at all", spool_dir)  # must not raise
+    # both lines kept (down sink): the valid one didn't deliver, the corrupt one
+    # can't JSON-parse — neither flushed, both retained.
+    assert result["flushed"] == 0
+    assert result["remaining"] == 2
+
+
 # ---------------------------------------------------------------------------
 # df_config: budget.notification_durable / budget.notification_attempts
 # ---------------------------------------------------------------------------

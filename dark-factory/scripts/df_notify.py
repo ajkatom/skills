@@ -154,7 +154,11 @@ def flush_spool(sink: str, spool_dir: str, *, timeout_s: int = 10, redactor=None
     """
     path = os.path.join(spool_dir, _SPOOL_FILE)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # errors="replace": a spool file corrupted at the byte level (disk bit
+        # rot, a stray non-UTF8 write) must NOT raise UnicodeDecodeError (a
+        # ValueError, not an OSError) out of a fail-soft flush — degrade the bad
+        # bytes to a line that simply won't JSON-parse (kept, not flushed).
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
     except OSError:
         return {"flushed": 0, "remaining": 0}
