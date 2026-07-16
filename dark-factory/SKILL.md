@@ -8,7 +8,7 @@ description: Use when the user wants to build a task/feature "dark-factory style
 Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 → isolated builder (spec-only) → verifier → deterministic ID feedback → loop →
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
-(Codex-approved). Three assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), and **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`). `hardened` is also the only tier that unlocks **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2). `enterprise` is not yet backed and is refused.
+(Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2).
 
 ## Workflow (create one todo per step)
 
@@ -127,8 +127,9 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      report before it's written to disk; the manifest's `credentials` field records
      only the source + allowlisted names, never a value. See
      `references/credentials.md` for the containment model and its honest limits (no
-     rotation; `-e` argv `ps`-visibility at `hardened`; bridge-network exfiltration is
-     out of scope until the enterprise credential proxy).
+     rotation; `-e` argv `ps`-visibility at `hardened`; at `enterprise` the host-side
+     credential proxy keeps the token out of the sandbox entirely and kernel-locks
+     egress to an allowlist — see `references/enterprise.md`).
 4a. **Off-box audit sink (optional, recommended for supply-chain integrity).** Every run
     already appends one linked entry to `<control_root>/audit-chain.jsonl` (M13, always-on —
     no config needed). To also ship each entry off-box, set `audit.sink.kind` to

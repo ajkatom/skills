@@ -77,12 +77,26 @@ supervisor.py df-custody attach <control_root> --run-dir <run_dir>
 
 - **≥K distinct valid approver signatures** → writes
   `<run_dir>/custody_attestation.json` =
-  `{manifest_sha256, threshold, approvers_satisfied, signatures, qualified: true, ts}`
-  **and** anchors it into the per-control-root hash chain (`audit-chain.jsonl`,
-  the M13 tamper-evident chain). Exit 0.
+  `{manifest_sha256, threshold, approvers_satisfied, signatures, qualified: true, ts}`,
+  anchors it into the per-control-root hash chain (`audit-chain.jsonl`,
+  the M13 tamper-evident chain), **and pushes it off-box** to the required audit
+  sink (fail-closed: a `required` sink that can't be reached aborts `attach` with
+  exit 3, so the single most security-relevant event — qualification — always
+  leaves the box). A `custody_sink_receipt.json` records the push. Exit 0.
 - **fewer than K** → prints PENDING, writes **no** attestation, exit 3.
 
 The manifest is never modified.
+
+**Config-binding — the custody policy is pinned to the run it gates.** Both
+`attach` and `verify-custody` first compare the manifest's sealed `config_sha256`
+(the hash of the canonical config in effect when the manifest was sealed) against
+the *current* `config.json`'s hash, and **refuse on any mismatch**. This closes
+the single-operator bypass where the operator who ran the build — who necessarily
+has control-root write access — edits `config.json`'s `custody` block *after* a
+legitimate K-of-2 run to declare themselves the sole approver at `threshold: 1`
+and self-signs: any edit to `config.json` changes `config_sha256`, so the
+attestation is refused. The custody policy that qualifies a run is exactly the one
+that ran it; changing it means re-running under the intended config.
 
 ### Confirming qualification
 
