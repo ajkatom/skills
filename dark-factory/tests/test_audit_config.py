@@ -7,7 +7,11 @@ from test_config import write_config
 def test_absent_audit_defaults_off(tmp_path):
     cr = tmp_path / "control"; write_config(cr)
     cfg = df_config.load_config(str(cr))
-    assert cfg["_audit"] == {"signing": False, "key_path": ""}
+    assert cfg["_audit"] == {
+        "signing": False,
+        "key_path": "",
+        "sink": {"kind": "none", "required": False},
+    }
 
 
 def test_signing_true_defaults_key_path_outside(tmp_path):

@@ -198,6 +198,75 @@ def load_config(control_root: str) -> dict:
                 "workspace_root (the signing key must never be reachable by a run)"
             )
 
+    # Optional `audit.sink` block -> cfg["_audit"]["sink"] (M13): an
+    # off-box append-only push target for each finalized chain entry.
+    # Absent -> {"kind": "none", "required": False}, byte-identical to
+    # today's behavior (no sink is ever pushed to).
+    sink_raw = audit_raw.get("sink", {})
+    if not isinstance(sink_raw, dict):
+        raise ConfigError("audit.sink must be a JSON object")
+
+    # Only env-var NAMES may travel through config.json -- a literal secret
+    # value inline would sit in a control-root file read by every run,
+    # get hashed into _config_sha256, and be trivially greppable. Reject
+    # eagerly rather than accept-and-leak; push() resolves actual values
+    # from os.environ at call time (df_audit_sink.py), never from config.
+    for _forbidden in ("secret_key", "access_key"):
+        if _forbidden in sink_raw:
+            raise ConfigError(
+                f"audit.sink.{_forbidden} is a raw secret value and is not "
+                f"allowed inline; use audit.sink.{_forbidden}_env to name an "
+                f"environment variable instead (must match "
+                f"{_CRED_NAME_RE.pattern!r})"
+            )
+
+    sink_kind = sink_raw.get("kind", "none")
+    if sink_kind not in ("none", "http-append", "s3-objectlock"):
+        raise ConfigError(
+            "audit.sink.kind must be none|http-append|s3-objectlock, "
+            f"got {sink_kind!r}"
+        )
+
+    sink_required = sink_raw.get("required", False)
+    if not isinstance(sink_required, bool):
+        raise ConfigError("audit.sink.required must be a bool")
+
+    cfg_sink = {"kind": sink_kind, "required": sink_required}
+
+    if sink_kind == "http-append":
+        sink_url = sink_raw.get("url")
+        if not isinstance(sink_url, str) or not re.match(r"^https?://\S+$", sink_url):
+            raise ConfigError(
+                "audit.sink.url is required for kind 'http-append' and must "
+                "be a http(s):// URL"
+            )
+        cfg_sink["url"] = sink_url
+    elif sink_kind == "s3-objectlock":
+        for _field in ("endpoint", "bucket", "region"):
+            _val = sink_raw.get(_field)
+            if not isinstance(_val, str) or not _val:
+                raise ConfigError(
+                    f"audit.sink.{_field} is required for kind 's3-objectlock'"
+                )
+            cfg_sink[_field] = _val
+
+        sink_prefix = sink_raw.get("prefix", "")
+        if not isinstance(sink_prefix, str):
+            raise ConfigError("audit.sink.prefix must be a str")
+        cfg_sink["prefix"] = sink_prefix
+
+        for _env_field, _default in (
+            ("access_key_env", "DF_AUDIT_S3_ACCESS_KEY"),
+            ("secret_key_env", "DF_AUDIT_S3_SECRET_KEY"),
+        ):
+            _env_name = sink_raw.get(_env_field, _default)
+            if not isinstance(_env_name, str) or not _CRED_NAME_RE.match(_env_name):
+                raise ConfigError(
+                    f"audit.sink.{_env_field} must be an environment variable "
+                    f"NAME matching {_CRED_NAME_RE.pattern!r} (never a raw secret)"
+                )
+            cfg_sink[_env_field] = _env_name
+
     budget_raw = raw.get("budget", {})
     if not isinstance(budget_raw, dict):
         raise ConfigError("budget must be a JSON object")
@@ -463,7 +532,11 @@ def load_config(control_root: str) -> dict:
     cfg["_checkpoint"] = checkpoint
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
-    cfg["_audit"] = {"signing": audit_signing, "key_path": audit_key_path if audit_signing else ""}
+    cfg["_audit"] = {
+        "signing": audit_signing,
+        "key_path": audit_key_path if audit_signing else "",
+        "sink": cfg_sink,
+    }
     cfg["_security"] = cfg_security
     cfg["_container"] = {
         "image": c_image, "network": c_network, "memory": c_memory, "pids": c_pids,
