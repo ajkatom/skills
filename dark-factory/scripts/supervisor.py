@@ -16,6 +16,7 @@ import df_audit
 import df_audit_chain
 import df_audit_sink
 import df_brownfield
+import df_confine
 import df_container
 import df_creds
 import df_gates
@@ -241,6 +242,35 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
         "max_calls": b["max_calls"],
         "enforced": bool(dollar_enforced or calls_enforced),
         "estimate_caveat": "estimated from per_call_usd; not metered usage",
+    }
+
+
+def _confine_manifest_field(confine_cfg, cli):
+    """builder_confinement manifest field (M14) for the CURRENT confine
+    state. `confine_cfg["enabled"]` reflects whether confinement is
+    ACTUALLY being applied to the builder for this manifest -- it can
+    differ from the configured value after a `required: false`
+    CONFINEMENT_WARN fallback flips it to False mid-run (never claim a
+    profile's properties were applied when they weren't). `mcp_disabled`/
+    `tool_allowlist` come from `df_confine.profile_for(cli)` only when
+    enabled; `probe` is `"unverified"` when enabled (M17 wires a real
+    startup probe) or `"n/a"` when not.
+    """
+    if not confine_cfg["enabled"]:
+        return {
+            "enabled": False,
+            "profile": confine_cfg["profile"],
+            "mcp_disabled": False,
+            "tool_allowlist": [],
+            "probe": "n/a",
+        }
+    profile = df_confine.profile_for(cli)
+    return {
+        "enabled": True,
+        "profile": confine_cfg["profile"],
+        "mcp_disabled": bool(profile.get("mcp_disabled", False)),
+        "tool_allowlist": list(profile.get("tool_allowlist", [])),
+        "probe": "unverified",
     }
 
 
@@ -488,19 +518,26 @@ def compose_prompt(spec_text: str, feedback) -> str:
 
 
 def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, timeout_s: int,
-                   exec_prefix=None, env_extra=None, env_full=None):
+                   exec_prefix=None, env_extra=None, env_full=None, confine=False):
     """`env_full`, if given, is used INSTEAD of the inherit+merge below — it is
     the exact env dict the subprocess gets (e.g. df_creds.launcher_scoped_env's
     output, which STRIPS vars from os.environ; env_extra's dict(os.environ,
     **env_extra) merge can only add, never remove, so it cannot express a
     strip). `env_extra` behavior is unchanged when `env_full` is None (the
-    verifier/twins path never sets env_full)."""
+    verifier/twins path never sets env_full).
+
+    `confine` (M14) is threaded into the request JSON as `confine`; adapters
+    honor `req.get("confine")` (Task 1). Defaults False, so every pre-M14
+    caller (and every test that monkeypatches this function with a
+    pre-M14 signature and never sees the kwarg — the builder call site
+    below only ever passes `confine=True` explicitly) is byte-identical."""
     req = {
         "adapter_protocol": "0.1",
         "role": role,
         "workdir": workdir,
         "prompt_file": prompt_file,
         "timeout_s": timeout_s,
+        "confine": bool(confine),
     }
     argv = (list(exec_prefix) if exec_prefix else []) + [adapter]
     if env_full is not None:
@@ -697,6 +734,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         return 2
     adapter = cfg["roles"]["builder"]["adapter"]
     timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
+    cli = os.path.basename(adapter)
 
     journal.write(
         "INIT",
@@ -738,6 +776,14 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
             "note": "not yet characterized (aborted before build)",
             "legacy_ignored": False,
         },
+        # Additive (M14): seeded here — like `credentials` — so EVERY terminal
+        # manifest carries builder_confinement, including every pre-build
+        # abort branch below. Unlike `mode`, this is fully knowable at
+        # config-load time (cfg["_confine"] + the adapter's cli basename),
+        # no "unknown" placeholder needed; a required+unsupported refusal or
+        # a not-required WARN fallback overrides it later via mb_clean once
+        # the builder is actually invoked (_run_loop).
+        "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -986,6 +1032,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     exec_prefix = exec_prefix or []
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
+    # M14: a per-run-loop copy of cfg["_confine"] — NOT cfg["_confine"] itself
+    # — so a required=False CONFINEMENT_WARN fallback (below) can flip
+    # `enabled` to False for the REST of this loop without mutating cfg
+    # (which could otherwise leak the downgrade across unrelated callers
+    # sharing the same cfg object).
+    confine_state = dict(cfg["_confine"])
+    cli = os.path.basename(adapter)
     # Regression tracking (green->red on dev, spec §6/§15.3): prev_dev_status maps
     # behavior_id -> did every dev scenario of that behavior pass LAST iteration.
     # regressed accumulates behavior-IDs that ever flip True->False across the run.
@@ -1179,8 +1232,54 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             _invoke_kwargs = {"exec_prefix": builder_prefix, "env_extra": builder_env}
             if builder_env_full is not None:
                 _invoke_kwargs["env_full"] = builder_env_full
+            # confine is only ever passed when actually enabled (M14) — same
+            # back-compat reason as env_full above: existing invoke_adapter
+            # callers/tests that predate `confine` and don't accept it as a
+            # kwarg keep working unchanged when builder_confinement is
+            # absent/disabled.
+            _confined_kwargs = dict(_invoke_kwargs)
+            if confine_state["enabled"]:
+                _confined_kwargs["confine"] = True
             resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                       **_invoke_kwargs)
+                                       **_confined_kwargs)
+
+            if (confine_state["enabled"] and err is None and resp is not None
+                    and resp.get("status") == "error"
+                    and "confinement unsupported" in (resp.get("detail") or "")):
+                if cfg["_confine"]["required"]:
+                    # Fail-closed (M14 Global Constraint): a tier that
+                    # REQUIRES confinement must NEVER run the builder
+                    # unconfined — refuse here, before any unconfined build
+                    # happens (this iteration's builder call already did
+                    # nothing but report the refusal; no artifact written).
+                    journal.write("CONFINEMENT_UNSUPPORTED", iteration=i,
+                                 detail=resp.get("detail", ""))
+                    mf = dict(mb_clean, outcome="CONFINEMENT_REFUSED", iterations=i,
+                             qualified=False,
+                             final_exam={"ran": False, "passed": None, "count": 0},
+                             regressions=sorted(regressed),
+                             budget=_budget_manifest_field(cfg["_budget"], builder_calls,
+                                                           estimated_usd))
+                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                digest, audit_key, journal)
+                    _clear_state()
+                    _kb_writeback(cfg, journal, mf, [])
+                    sys.stderr.write(
+                        f"dark-factory: confinement required but unsupported for this "
+                        f"builder adapter at iteration {i} — refusing (fail-closed); "
+                        f"the builder was never run unconfined\n")
+                    return anchor_exit or 2
+                # Not required: warn + fall back to an UNCONFINED call for
+                # the rest of this run (retrying confine=True every
+                # iteration would just keep re-hitting the same
+                # unsupported CLI — the result is deterministic).
+                journal.write("CONFINEMENT_WARN", iteration=i, detail=resp.get("detail", ""))
+                confine_state["enabled"] = False
+                mb_clean["builder_confinement"] = _confine_manifest_field(confine_state, cli)
+                resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
+                                           **_invoke_kwargs)
+
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -1434,6 +1533,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         scenarios_dir = os.path.join(control_root, "scenarios")
         adapter = cfg["roles"]["builder"]["adapter"]
         timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
+        cli = os.path.basename(adapter)
         manifest_base = {
             "invocation": os.path.basename(run_dir),
             "tier": cfg["assurance"],
@@ -1446,6 +1546,16 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             "credentials": ({"source": cfg["_credentials"]["source"],
                             "allowlist": list(cfg["_credentials"]["allowlist"])}
                            if cfg["_credentials"] else None),
+            # Additive (M14), same "fresh + resume" threading as `credentials`
+            # (M11) / `mode`+`characterization` (M15). NOTE: a mid-run
+            # required=False CONFINEMENT_WARN downgrade from BEFORE the pause
+            # is not recovered here (not persisted in state.json) — a resumed
+            # run re-attempts confine=True once more on its first iteration if
+            # cfg["_confine"]["enabled"] is still True, exactly like isolation
+            # being re-probed on every resume rather than trusted across a
+            # pause. Deterministic (same adapter => same unsupported result),
+            # so this just re-derives the same WARN, never silently skips it.
+            "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
         }
 
         # M7: coverage/oracle are deterministic from the control root +

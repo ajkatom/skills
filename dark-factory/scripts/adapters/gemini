@@ -2,11 +2,21 @@
 """Gemini builder adapter, protocol 0.1. Invokes the Gemini CLI headless with
 cwd = the build workspace. --yolo auto-approves file edits so the model can
 write the build; --prompt is the non-interactive form. The model sees only the
-prompt file content (spec + ID feedback) and the workspace directory."""
+prompt file content (spec + ID feedback) and the workspace directory.
+
+Gemini has no probe-verified confinement profile yet (df_confine.PROFILES
+marks it unsupported). When req["confine"] is true this adapter fails closed:
+it reports an error and returns WITHOUT spawning the CLI at all, even if the
+CLI is present and would otherwise run fine — a confinement-required caller
+must never fall back to an unconfined run."""
 import json
+import os
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import df_confine  # noqa: E402  (path must be set up first)
 
 
 def respond(status, detail=""):
@@ -22,12 +32,20 @@ def main():
     except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
         respond("error", f"bad adapter request: {e}")
         return
+    confine = bool(req.get("confine"))
+    if confine and not df_confine.is_supported("gemini"):
+        respond("error", "confinement unsupported for gemini")
+        return
     if shutil.which("gemini") is None:
         respond("error", "gemini CLI not found on PATH")
         return
+    if confine:
+        argv = df_confine.confinement_flags("gemini", prompt)
+    else:
+        argv = ["gemini", "--yolo", "--prompt", prompt]
     try:
         proc = subprocess.run(
-            ["gemini", "--yolo", "--prompt", prompt],
+            argv,
             cwd=req["workdir"],
             timeout=req.get("timeout_s", 600),
             capture_output=True,

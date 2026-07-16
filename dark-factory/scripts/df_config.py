@@ -526,6 +526,38 @@ def load_config(control_root: str) -> dict:
 
     cfg_brownfield = {"mode": bf_mode, "probes": bf_probes}
 
+    # Optional `builder_confinement` block -> cfg["_confine"] (M14): confines
+    # the BUILDER subprocess (the agentic CLI dark-factory spawns to write
+    # the workspace) to an explicit tool allowlist -- no MCP servers, no
+    # sub-agents, no web tools. Absent -> {"enabled": False, "required":
+    # False, "profile": "standard"}, byte-identical to today's behavior
+    # (confine=False on every builder invoke_adapter call; adapters unaware
+    # this block ever existed).
+    bc_raw = raw.get("builder_confinement", {})
+    if not isinstance(bc_raw, dict):
+        raise ConfigError("builder_confinement must be a JSON object")
+
+    bc_enabled = bc_raw.get("enabled", False)
+    if not isinstance(bc_enabled, bool):
+        raise ConfigError("builder_confinement.enabled must be a bool")
+
+    # `required` defaults to `enabled`: turning confinement ON defaults to
+    # REQUIRING it (fail-closed by default) -- an operator opts INTO the
+    # softer "warn and fall back unconfined" behavior explicitly, rather
+    # than opting out of a safety net by omission.
+    bc_required = bc_raw.get("required", bc_enabled)
+    if not isinstance(bc_required, bool):
+        raise ConfigError("builder_confinement.required must be a bool")
+
+    bc_profile = bc_raw.get("profile", "standard")
+    if bc_profile != "standard":
+        raise ConfigError(
+            f"builder_confinement.profile must be 'standard' (the only "
+            f"supported profile), got {bc_profile!r}"
+        )
+
+    cfg_confine = {"enabled": bc_enabled, "required": bc_required, "profile": bc_profile}
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -551,4 +583,5 @@ def load_config(control_root: str) -> dict:
     }
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield
+    cfg["_confine"] = cfg_confine
     return cfg
