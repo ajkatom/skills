@@ -33,7 +33,7 @@ import pytest
 
 import df_container
 import df_sandbox
-from test_supervisor import FAKE, MARKER, setup_control
+from test_supervisor import FAKE, MARKER, setup_control, terminal_state
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_SNOOP = os.path.join(HERE, "fixtures", "fake_builder_snoop")
@@ -207,7 +207,7 @@ def test_live_l5_lights_off_no_pause(tmp_path):
     entries = _journal(cr, run_id)
     states = [e["state"] for e in entries]
     assert "CHECKPOINT" not in states
-    assert states[-1] == "CONVERGED"
+    assert terminal_state(entries)["state"] == "CONVERGED"
     assert states.count("BUILD") == 2  # buggy then fixed, both unattended
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))

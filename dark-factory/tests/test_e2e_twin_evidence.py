@@ -17,7 +17,7 @@ import sys
 import pytest
 
 import df_sandbox
-from test_supervisor import setup_control
+from test_supervisor import setup_control, terminal_state
 from test_supervisor_twins import GREETER, _no_twin_orphans
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -129,7 +129,7 @@ def test_hardcoder_rejected_no_twin_evidence_cap_reached(tmp_path):
 
     entries, run_dir = _journal(cr)
     states = [e["state"] for e in entries]
-    assert states[-1] == "CAP_REACHED"
+    assert terminal_state(entries)["state"] == "CAP_REACHED"
     assert "CONVERGED" not in states
 
     workspace = _workspace_from_journal(entries)

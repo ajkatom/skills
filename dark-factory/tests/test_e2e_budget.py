@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 
-from test_supervisor import STUBBORN, setup_control
+from test_supervisor import STUBBORN, setup_control, terminal_state
 
 SUP = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "supervisor.py"
@@ -76,7 +76,7 @@ def test_api_budget_pause_then_raise_and_resume_counts_across_segments(tmp_path)
     entries2 = _journal(cr, run_id)
     states2 = [e["state"] for e in entries2]
     assert states2.count("BUDGET_PAUSE") == 1  # not re-triggered after the raise
-    assert states2[-1] == "CAP_REACHED"
+    assert terminal_state(entries2)["state"] == "CAP_REACHED"
     total_builds = states2.count("BUILD")
     assert total_builds > 1  # more calls happened after resume
 
@@ -104,7 +104,7 @@ def test_subscription_budget_never_pauses_with_stubborn_builder(tmp_path):
     entries = _journal(cr, run_id)
     states = [e["state"] for e in entries]
     assert "BUDGET_PAUSE" not in states
-    assert states[-1] == "CAP_REACHED"
+    assert terminal_state(entries)["state"] == "CAP_REACHED"
     assert states.count("BUILD") == 2  # both iterations ran; nothing was blocked
 
     manifest = json.loads(

@@ -2,7 +2,7 @@ import json
 import os
 
 import supervisor
-from test_supervisor import FAKE, setup_control, read_journal
+from test_supervisor import FAKE, setup_control, read_journal, terminal_state
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_REGRESS = os.path.join(HERE, "fixtures", "fake_builder_regress")
@@ -18,7 +18,7 @@ def test_regression_journaled_and_in_manifest(tmp_path):
     states = [e["state"] for e in entries]
     assert states.count("BUILD") == 2
     assert "CONVERGED" not in states
-    assert states[-1] == "CAP_REACHED"
+    assert terminal_state(entries)["state"] == "CAP_REACHED"
 
     regression_entries = [e for e in entries if e["state"] == "REGRESSION"]
     assert len(regression_entries) == 1

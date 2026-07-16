@@ -129,6 +129,18 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      `references/credentials.md` for the containment model and its honest limits (no
      rotation; `-e` argv `ps`-visibility at `hardened`; bridge-network exfiltration is
      out of scope until the enterprise credential proxy).
+4a. **Off-box audit sink (optional, recommended for supply-chain integrity).** Every run
+    already appends one linked entry to `<control_root>/audit-chain.jsonl` (M13, always-on —
+    no config needed). To also ship each entry off-box, set `audit.sink.kind` to
+    `"http-append"` (an append-only receiver, `df_audit_receiver.py`) or `"s3-objectlock"`
+    (a WORM S3-compatible bucket) and `audit.sink.required: true` to fail the run closed
+    (`AUDIT_SINK_FAILED`, nonzero exit) if the push fails, or `false` to only warn
+    (`AUDIT_SINK_WARN`) and let the run converge normally either way. **Honesty:** the chain
+    alone is tamper-evident, not tamper-proof — a local process that can rewrite the chain
+    can also forge a fresh, internally-consistent one over it. The genuine anchor is a sink
+    living in a DIFFERENT trust domain than the runner (a separate host/account); running
+    the reference receiver on the same box is a protocol demo, not the production
+    guarantee. See `references/audit.md` for the full model.
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
    - **Twin evidence (M12, optional, recommended when a behavior depends on genuinely calling a twin).** Add a scenario `then` assertion — `twin_observed: {twin, contains}` (the twin's own observation log, not the candidate's output, must show the call) or `stdout_echoes_twin: {twin}` (the candidate's stdout must echo a token the twin served *this pass*) — and set `"supports_variants": true` on the twin def to make the served token fresh and unpredictable every verify pass. Both assertions fail closed with taxonomy `no_twin_evidence` if the candidate never really invoked the twin (e.g. a hardcoded response) — catching teaching-to-the-test that plain output-matching would miss. See `references/digital-twins.md` for the observation contract, seed semantics, and honest scope (filesystem-authority channel; network-graph enforcement and off-box sinks remain deferred).
 4c. **Brownfield (optional, only relevant when `--project-src` points at an already-existing codebase).** Detection is automatic and fail-safe toward brownfield: `brownfield.mode` defaults to `"auto"`, which classifies the run as `brownfield` the moment `--project-src` has ≥1 file — an existing tree is never silently treated as greenfield. To actually GUARD existing behavior against regression, supply `brownfield.probes` — real, deterministic commands (e.g. `python3 app.py add 2 3`) run against the CURRENT artifact before the builder ever touches anything; each is frozen into a holdout `BHV-REGRESS-<n>` scenario the builder never sees, and a build that breaks one fails verification exactly like a missed new-behavior scenario. **A brownfield run with zero probes configured is a valid but UNGUARDED no-op** — the supervisor says so loudly (stderr WARN + a distinct `BROWNFIELD_UNGUARDED` journal entry + an unambiguous manifest note), so it is never mistaken for "regressions checked." Characterization guards only what the probes exercise, never full semantics — see `references/brownfield.md` for the incremental workflow, the reduced-guarantee honesty, and how to write good probes.
@@ -155,6 +167,12 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
      persist, no reset, no double-count). See `references/budget.md`.
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
    path, and `verify-manifest --run-dir <run_dir>`. State that cooperative tier is unqualified.
+   Every run — regardless of config — also appends one linked entry to
+   `<control_root>/audit-chain.jsonl`; check the WHOLE control root's chain with
+   `verify-chain <control_root> [--key-path <keyfile>]` (`OK: N entries` / exit 0, or the
+   first break / exit 1). If `audit.sink` is configured, also check `runs/<id>/audit_sink_receipt.json`
+   exists (its absence with `required: true` means the run already failed closed — see
+   `references/audit.md`).
 
 ## Hard rules
 
@@ -173,6 +191,7 @@ outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-de
   env var baked into the adapter script or config.
 - A **cooperative** run is always UNQUALIFIED — say so. A **standard** or **hardened** run is qualified ONLY when its startup probe(s) passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value. Note: `manifest.tier` always echoes the *configured* assurance, even on a downgraded run — read `qualified` plus the journal's `DOWNGRADE` entry for what actually happened.
 - Signed audit is opt-in at `cooperative`/`standard` (`audit.signing: true` in config) but **mandatory** at `hardened` (an explicit `audit.signing: false` is a `ConfigError`). Verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
+- Every run also chains its manifest into `<control_root>/audit-chain.jsonl` (always-on, M13); check it with `verify-chain <control_root> [--key-path <path>]`, which fails closed the same way — a chain carrying a signed entry, checked without `--key-path`, is UNVERIFIED, not OK. An optional `audit.sink` ships each entry off-box; see `references/audit.md` for what it does and does not prove.
 - `hardened` is fail-closed on **both** halves: a working Docker daemon + passing container probe, AND a working OS sandbox for the verifier. Either missing refuses (exit 2) unless `--allow-downgrade` is passed. See `references/hardened.md`.
 - Security gates are opt-in (`security_gates.enabled: true`) but, once enabled, mandatory and fail-closed: a `fail_on` finding on the converged artifact rejects it (`SECURITY_GATE_FAILED`, exit 3) even when every scenario passed. Report the manifest's `security` field honestly — `checked: false` means gates never ran, not that the artifact is clean.
 
@@ -200,6 +219,7 @@ in a session that will also drive the builder.
 ## References
 
 - `references/config-reference.md` — config schema
+- `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, deferred scope (M10)
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)

@@ -6,6 +6,7 @@ M1 walking skeleton, cooperative tier only. FSM:
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -13,6 +14,8 @@ import sys
 import uuid
 
 import df_audit
+import df_audit_chain
+import df_audit_sink
 import df_brownfield
 import df_container
 import df_creds
@@ -42,6 +45,12 @@ class LockError(RuntimeError):
 
 
 PAUSED = 10
+
+# M13: the only journal states _anchor_audit ever writes AFTER a manifest's
+# finalize -- see verify_manifest's journal_bytes prefix check.
+_AUDIT_ANCHOR_STATES = frozenset(
+    {"AUDIT_CHAINED", "AUDIT_SINK_OK", "AUDIT_SINK_WARN", "AUDIT_SINK_FAILED"}
+)
 
 
 def _now() -> str:
@@ -300,11 +309,25 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     stay consistent with the bytes actually on disk. `credentials` fields on
     the manifest are names/allowlist only and are never themselves subject to
     redaction (they contain no values).
+
+    `journal_bytes` (M13): recorded alongside `journal_sha256` as the exact
+    journal.jsonl size AT FINALIZE TIME. `_anchor_audit` (called immediately
+    after this function returns, on every terminal) journals AUDIT_CHAINED
+    (and, with a sink configured, AUDIT_SINK_*) into this SAME journal.jsonl
+    -- necessarily AFTER it was hashed here, since the chain entry binds the
+    manifest's own digest and can't be computed before the manifest exists.
+    Without `journal_bytes`, verify_manifest's whole-file journal hash would
+    go stale (TAMPERED) the instant those lines land. Recording the prefix
+    length lets verify_manifest hash only the bytes that existed AT finalize
+    -- exactly the tamper-evidence the check always meant (was journal
+    content UP TO the terminal state altered?) -- while legitimate,
+    expected post-finalize audit-chain appends don't trip it.
     """
     journal_path = os.path.join(run_dir, "journal.jsonl")
     manifest = dict(extra)
     manifest["manifest_version"] = "0.1"
     manifest["journal_sha256"] = sha256_file(journal_path)
+    manifest["journal_bytes"] = os.path.getsize(journal_path)
     manifest["finished_ts"] = _now()
     if audit_key is not None:
         manifest["audit_signing"] = True
@@ -315,6 +338,73 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
         sig = df_audit.sign(audit_key, text.encode("utf-8"))
         atomic_write(os.path.join(run_dir, "manifest.hmac"), sig + "\n")
     return digest
+
+
+def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, journal) -> int:
+    """Anchor one finalized manifest into the per-control-root hash chain
+    (M13), and — if a sink is configured — push the chain entry off-box.
+    Called exactly once per terminal, immediately after `finalize_manifest`
+    returns the manifest's digest.
+
+    DESIGN (avoids binding-circularity): the chain entry binds `digest` —
+    the manifest's ALREADY-finalized digest — so the chain/sink results
+    cannot live inside that same manifest (embedding them would change the
+    very digest the chain anchors). They are recorded as run_dir SIDECARS
+    (`audit_chain.json`, and — only when a sink is configured —
+    `audit_sink_receipt.json`) plus journal events, never as manifest
+    fields. `finalize_manifest` is never called a second time.
+
+    Returns 0 on the normal path: chain is always written (append-only,
+    additive, cheap — unconditional even with no sink configured); a sink
+    push that succeeds, or fails but isn't `required`, is still 0. Returns
+    3 ONLY when `audit.sink.required` is true and the push failed — the
+    manifest already on disk is untouched and correctly describes the run
+    outcome; the caller folds this 3 into ITS OWN exit code (fail-closed)
+    instead of the outcome's normal exit.
+    """
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    entry = df_audit_chain.append_entry(chain_path, invocation, digest, _now(), audit_key)
+    atomic_write(os.path.join(run_dir, "audit_chain.json"), canonical_json(entry))
+    journal.write("AUDIT_CHAINED", chain_hash=entry["chain_hash"], prev=entry["prev_chain_hash"])
+
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+    if sink.get("kind", "none") == "none":
+        return 0
+
+    try:
+        receipt = df_audit_sink.push(sink, invocation, json.dumps(entry).encode("utf-8"))
+    except df_audit_sink.SinkError as e:
+        if sink.get("required"):
+            journal.write("AUDIT_SINK_FAILED", kind=sink["kind"], error=str(e))
+            return 3
+        journal.write("AUDIT_SINK_WARN", kind=sink["kind"], error=str(e))
+        return 0
+
+    atomic_write(os.path.join(run_dir, "audit_sink_receipt.json"), canonical_json(receipt))
+    journal.write("AUDIT_SINK_OK", kind=sink["kind"], receipt=receipt)
+    return 0
+
+
+def verify_chain_cmd(control_root: str, key: bytes = None) -> bool:
+    """CLI body for `verify-chain`. Mirrors verify_manifest's fail-closed
+    semantics: a chain carrying ANY signed entry (an audit_key was
+    configured when it was written) verified WITHOUT --key-path is never
+    silently reported OK — the caller must prove the key to get a real
+    signature check, exactly like a signed manifest with no --key-path.
+    """
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError as e:
+        print(str(e))
+        return False
+    signed = any("sig" in e for e in entries)
+    if signed and key is None:
+        print("UNVERIFIED (signed chain; supply --key-path)")
+        return False
+    ok, msg = df_audit_chain.verify_chain(chain_path, audit_key=key)
+    print(msg)
+    return ok
 
 
 def _kb_writeback(cfg, journal, manifest_dict, failing):
@@ -353,7 +443,46 @@ def verify_manifest(run_dir: str, key: bytes = None) -> bool:
         print("TAMPERED (manifest.json does not match manifest.sha256)")
         return False
     manifest = json.loads(text)
-    if sha256_file(jp) != manifest.get("journal_sha256"):
+    # M13: journal.jsonl legitimately grows AFTER finalize (_anchor_audit
+    # journals AUDIT_CHAINED/AUDIT_SINK_* into this same file once the chain
+    # entry, which binds this manifest's digest, exists). `journal_bytes`
+    # (recorded alongside journal_sha256 at finalize time) lets this check
+    # hash only the PREFIX that existed at finalize -- content up to the
+    # terminal state must be byte-identical, exactly like the pre-M13 check.
+    # But a bare prefix check alone would go BLIND to anything appended
+    # afterward, including a forged line -- so every line AFTER the prefix
+    # must ALSO parse as ndjson whose "state" is one of the known audit-
+    # anchor events; anything else (unparseable, or a state outside that
+    # allowlist -- e.g. a hand-forged entry) is still TAMPERED. This does
+    # NOT vouch for the trailing entries' CONTENT (that's verify-chain's
+    # job against audit-chain.jsonl) -- only that nothing arbitrary was
+    # spliced into the journal after the terminal state. Absent (older/no
+    # journal_bytes) manifest -> today's whole-file hash, unchanged.
+    journal_bytes = manifest.get("journal_bytes")
+    if journal_bytes is not None:
+        with open(jp, "rb") as f:
+            prefix, suffix = f.read(journal_bytes), f.read()
+        journal_ok = hashlib.sha256(prefix).hexdigest() == manifest.get("journal_sha256")
+        if journal_ok and suffix:
+            try:
+                suffix_lines = suffix.decode("utf-8").splitlines()
+            except UnicodeDecodeError:
+                journal_ok = False
+                suffix_lines = []
+            for line in suffix_lines:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    journal_ok = False
+                    break
+                if not isinstance(entry, dict) or entry.get("state") not in _AUDIT_ANCHOR_STATES:
+                    journal_ok = False
+                    break
+    else:
+        journal_ok = sha256_file(jp) == manifest.get("journal_sha256")
+    if not journal_ok:
         print("TAMPERED (journal.jsonl does not match manifest)")
         return False
     hp = os.path.join(run_dir, "manifest.hmac")
@@ -654,10 +783,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: {e}\n")
-        return 2
+        return anchor_exit or 2
 
     # Mutation validation first (order matters: an inert oracle is a more
     # fundamental defect than a coverage gap, and coverage hasn't been
@@ -672,13 +803,15 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   coverage={"checked": False},
                   security={"checked": False}, container=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(
             f"dark-factory: pre-build gate FAILED — {len(inert)} inert (non-discriminating) "
             f"scenario oracle(s), no build was run: {', '.join(inert)}\n"
         )
-        return 2
+        return anchor_exit or 2
 
     try:
         behaviors = df_gates.load_behaviors(control_root)
@@ -698,13 +831,15 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       oracle={"mutation_validated": True, "inert": []}, coverage=cov,
                       security={"checked": False}, container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(
                 f"dark-factory: pre-build gate FAILED — coverage gap, no build was run: "
                 f"uncovered_dev={cov['uncovered_dev']} orphan_scenarios={cov['orphan_scenarios']}\n"
             )
-            return 2
+            return anchor_exit or 2
     else:
         cov = {"checked": False}
 
@@ -731,10 +866,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   container=None, twin_evidence=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: twin precondition failed: {e}\n")
-        return 2
+        return anchor_exit or 2
 
     workspace = os.path.join(cfg["workspace_root"], invocation)
     if project_src:
@@ -748,10 +885,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=[], container=None,
                       budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
-            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: {e}\n")
-            return 2
+            return anchor_exit or 2
     else:
         os.makedirs(workspace, exist_ok=True)
         manifest, snap_hash = {"manifest_version": "0.1", "files": []}, sha256_str(
@@ -897,11 +1036,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
-        return 2
+        return anchor_exit or 2
 
     twins_enabled = cfg["_twins"]["enabled"]
     ts = df_twins.TwinSet() if twins_enabled else None
@@ -1074,11 +1215,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
-                return 2
+                return anchor_exit or 2
             journal.write("BUILD", iteration=i)
             builder_calls = calls_after
             estimated_usd = est_after
@@ -1118,11 +1261,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: {e}\n")
-                return 2
+                return anchor_exit or 2
             last_report = report
             # verifier_report_iter_*.json carries raw builder-produced observed
             # stdout/stderr (spec: run_all's `observed` dict) — a real smuggle
@@ -1188,12 +1333,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                    finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                digest, audit_key, journal)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
                     print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
                           f"scenarios not disclosed). Run: {run_dir}")
-                    return 3
+                    return anchor_exit or 3
 
                 # dev converged AND (final passed OR no final cohort): mandatory
                 # security gates (M9) run HERE, on the converged artifact,
@@ -1207,12 +1354,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
                               security=sec_report,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                    finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                digest, audit_key, journal)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
                     print(f"dark-factory: security gate failed (artifact rejected): "
                           f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
-                    return 3
+                    return anchor_exit or 3
 
                 journal.write("CONVERGED", iteration=i)
                 eff = manifest_base.get("_effective_tier", "cooperative")
@@ -1220,14 +1369,16 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-                finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
                 _clear_state()
                 _kb_writeback(cfg, journal, mf, [])
                 note = "" if final_ran else " [no sealed final exam administered]"
                 print(f"dark-factory: CONVERGED "
                       f"({'qualified, ' + eff if eff in ('standard', 'hardened') else 'unqualified, cooperative'} tier). "
                       f"Workspace: {workspace}  Run: {run_dir}{note}")
-                return 0
+                return anchor_exit or 0
 
             feedback = project_feedback(report)
             # feedback_iter/*.json and workspace/feedback.json are structurally
@@ -1258,12 +1409,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
-        finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
         _clear_state()
         _kb_writeback(cfg, journal, mf, failing)
         print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
               f"Still failing: {', '.join(failing)}. Run: {run_dir}")
-        return 3
+        return anchor_exit or 3
     finally:
         if ts is not None:
             ts.stop()
@@ -1394,11 +1547,13 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))
-            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             sys.stderr.write(f"dark-factory: twin precondition failed: {e}\n")
-            return 2
+            return anchor_exit or 2
 
         if decision == "abort":
             journal.write("ABORTED_BY_HUMAN")
@@ -1411,11 +1566,13 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))
-            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ABORTED by human.")
-            return 2
+            return anchor_exit or 2
         if decision == "accept":
             journal.write("ACCEPTED_BY_HUMAN",
                           note="human accepted a non-passing build — waived/unverified")
@@ -1428,11 +1585,13 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))
-            finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
             os.unlink(os.path.join(run_dir, "state.json"))
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
-            return 0
+            return anchor_exit or 0
         # decision == "continue" — isolation cannot be trusted across a pause;
         # re-probe (and re-wrap) before re-entering the loop.
         try:
@@ -1484,6 +1643,11 @@ def main():
     p_ver.add_argument("--key-path", default=None,
                        help="path to the audit signing key; required to verify a "
                             "signed (manifest.hmac) run")
+    p_vc = sub.add_parser("verify-chain", help="check a control root's hash-chained audit log")
+    p_vc.add_argument("control_root")
+    p_vc.add_argument("--key-path", default=None,
+                      help="path to the audit signing key; required to verify a "
+                           "signed (any entry carrying 'sig') chain")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
@@ -1502,6 +1666,15 @@ def main():
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 sys.exit(2)
         sys.exit(0 if verify_manifest(args.run_dir, key=vkey) else 4)
+    elif args.cmd == "verify-chain":
+        vkey = None
+        if args.key_path:
+            try:
+                vkey = df_audit.load_key(args.key_path)
+            except df_audit.AuditKeyError as e:
+                sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+                sys.exit(2)
+        sys.exit(0 if verify_chain_cmd(args.control_root, key=vkey) else 1)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
 

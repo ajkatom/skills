@@ -2,7 +2,7 @@ import json
 import os
 
 import supervisor
-from test_supervisor import FAKE, setup_control, read_journal
+from test_supervisor import FAKE, setup_control, read_journal, terminal_state
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_FINAL = os.path.join(HERE, "fixtures", "fake_builder_final")
@@ -44,7 +44,7 @@ def test_dev_converges_then_final_passes_qualified_or_complete(tmp_path):
     fe_entry = next(e for e in entries if e["state"] == "FINAL_EXAM")
     assert fe_entry["data"]["ran"] is True
     assert fe_entry["data"]["passing"] == 1 and fe_entry["data"]["total"] == 1
-    assert states[-1] == "CONVERGED"
+    assert terminal_state(entries)["state"] == "CONVERGED"
 
     run_dir, _ = _run_dir_and_workspace(cr, run_id, tmp_path)
     m = json.load(open(run_dir / "manifest.json", encoding="utf-8"))
@@ -67,8 +67,8 @@ def test_final_failure_is_terminal_and_not_fed_back(tmp_path):
 
     entries, run_id = read_journal(cr)
     states = [e["state"] for e in entries]
-    assert states[-1] == "FINAL_EXAM_FAILED"
-    failed_entry = entries[-1]
+    assert terminal_state(entries)["state"] == "FINAL_EXAM_FAILED"
+    failed_entry = terminal_state(entries)
     assert failed_entry["data"]["failing"] == ["BHV-901"]
     # dev did converge before the sealed exam ran
     assert "CONVERGED" not in states  # CONVERGED is only journaled on true success
