@@ -37,6 +37,15 @@ def test_no_writeback_when_disabled(tmp_path):
 
 
 def test_writeback_failure_does_not_crash_run(tmp_path):
+    # This test induces a real filesystem-permission write failure via chmod.
+    # root bypasses DAC permission bits (CAP_DAC_OVERRIDE), so the chmod 0o500
+    # denial is a no-op when running as root (e.g. the in-container Linux CI) and
+    # the failure path can't be exercised. The monkeypatch-based
+    # test_kb_writeback_tolerates_any_exception covers the "write raises → run
+    # survives" invariant root-independently, so skipping here loses no coverage.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        import pytest
+        pytest.skip("chmod-based write denial is a no-op for root (in-container CI)")
     # point the wiki at a dir, then make the summary file unwritable by removing the dir mid-config:
     wiki = tmp_path / "wiki"; wiki.mkdir()
     cr = _wiki_cfg(tmp_path, FAKE, wiki)
