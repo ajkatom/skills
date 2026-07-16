@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Deterministic fake builder that NEVER converges, for the M20 Task 2
+http-oracle e2e test. Speaks adapter protocol 0.1.
+
+Always writes a `df_http_e2e_service.py` whose `/echo` route returns
+status 500 instead of the 200 the http scenario demands -- proves the
+http oracle actually discriminates end-to-end (the run must fail
+`wrong_exit_code` and hit CAP_REACHED, never a vacuous pass).
+"""
+import json
+import os
+import sys
+
+SERVICE_PY = '''\
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class H(BaseHTTPRequestHandler):
+    def _write(self, status, body_bytes, content_type="text/plain"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._write(200, b"ok")
+        elif self.path == "/echo":
+            payload = {"status": "ok", "data": {"value": 42}}
+            self._write(500, json.dumps(payload).encode("utf-8"), "application/json")
+        else:
+            self._write(404, b"not found")
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    port = int(os.environ["PORT"])
+    HTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "df_http_e2e_service.py"), "w", encoding="utf-8") as f:
+        f.write(SERVICE_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

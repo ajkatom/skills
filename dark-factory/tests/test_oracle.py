@@ -43,6 +43,14 @@ def test_load_rejects_bad_ir_version(tmp_path):
         run_scenarios.load_scenarios(str(d))
 
 
+@pytest.mark.parametrize("version", ["0.1", "0.2", "0.3"])
+def test_load_accepts_all_ir_versions(tmp_path, version):
+    d = tmp_path / "scen"
+    write_scenario(d, "a.json", ir_version=version)
+    scs = run_scenarios.load_scenarios(str(d))
+    assert scs[0]["ir_version"] == version
+
+
 def test_load_rejects_bad_behavior_id(tmp_path):
     d = tmp_path / "scen"
     write_scenario(d, "a.json", behavior_id="oops!")

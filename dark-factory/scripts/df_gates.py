@@ -24,8 +24,30 @@ class GateError(ValueError):
     pass
 
 
+_HTTP_THEN_KEYS = {"http_status", "body_contains", "json_equals", "json_contains", "json_path"}
+
+
+def _is_http_then(then: dict) -> bool:
+    return bool(set(then) & _HTTP_THEN_KEYS)
+
+
 def is_discriminating(then: dict) -> bool:
-    """True iff `then` rejects a constructed adversarial mutant observation."""
+    """True iff `then` rejects a constructed adversarial mutant observation.
+
+    M20 Task 1: an http `then` (detected by its key set -- `http_status`/
+    `body_contains`/`json_equals`/`json_contains`/`json_path`) is checked
+    against an adversarial HTTP mutant via `evaluate_http`, exactly like a
+    CLI `then` is checked via `evaluate_then` below -- same principle
+    (reject inert/tautological checks that would pass regardless of the
+    actual response), different oracle.
+    """
+    if _is_http_then(then):
+        mutant = {
+            "http_status": (then.get("http_status", 0) + 1) or 599,
+            "body": "\x00MUTANT",
+            "json": {"__mutant__": True},
+        }
+        return run_scenarios.evaluate_http(then, mutant) is not None
     mutant = {
         "exit_code": (then["exit_code"] + 1) if "exit_code" in then else 999999,
         "stdout": "\x00DF-MUTANT-\x00",
