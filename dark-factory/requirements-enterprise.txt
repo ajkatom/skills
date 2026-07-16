@@ -1,0 +1,10 @@
+# Enterprise assurance tier — the ONE non-stdlib dependency in dark-factory.
+#
+# Used exclusively by scripts/df_custody.py for ed25519 split-custody
+# signing/verification (K-of-N approver sign-off). No other module in this
+# codebase imports `cryptography`; the rest of dark-factory (cooperative,
+# standard, hardened tiers) runs on the Python standard library alone.
+#
+# Install only if you are running (or testing) the enterprise tier:
+#   pip install -r dark-factory/requirements-enterprise.txt
+cryptography>=42

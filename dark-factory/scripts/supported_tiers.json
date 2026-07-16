@@ -15,6 +15,11 @@
       "qualified": true,
       "backend": "container-docker",
       "note": "Builder in a Docker container; control root never mounted (denial by construction, probe-verified); verifier under host OS read-denial. Requires running Docker daemon + signed audit. Spec 7.2/2.2."
+    },
+    "enterprise": {
+      "qualified": true,
+      "backend": "container-enterprise",
+      "note": "Builder in a Docker container with kernel-locked egress-to-proxy (iptables default-deny egress, NET_ADMIN dropped for the child so the lock cannot be undone) + a restrictive seccomp profile, on top of every hardened guarantee. Requires split-custody sign-off (K-of-N ed25519 approvers), a required off-box audit sink, required builder confinement, and signed audit; qualified only once the custody threshold is met. Linux-container primitives (iptables, dropped-capability bounding set) are probe-verified live; any missing/weakened guarantee is a fail-closed ConfigError at load, and a failing egress/seccomp probe is a fail-closed refusal at run start. Spec 2.2/7.2-7.5."
     }
   }
 }

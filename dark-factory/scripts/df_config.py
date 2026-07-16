@@ -11,6 +11,7 @@ TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class ConfigError(ValueError):
@@ -73,35 +74,38 @@ def load_config(control_root: str) -> dict:
     adapter = builder.get("adapter")
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
-    if tier == "hardened":
-        # The adapter's DIRECTORY is bind-mounted ro into the builder container,
-        # so it must be pinned down at config time: a bare command name (e.g.
-        # "claude") would realpath against the process CWD (mounting whatever
-        # directory the operator happens to run from), and an adapter inside
-        # the control root would mount holdout content into the "isolated"
-        # builder. Both are mount-escape paths — reject at load.
+    if tier in ("hardened", "enterprise"):
+        # The adapter's DIRECTORY is bind-mounted ro into the builder container
+        # at both hardened AND enterprise (enterprise's container path IS the
+        # hardened container path, plus the egress lock + seccomp), so it must
+        # be pinned down at config time: a bare command name (e.g. "claude")
+        # would realpath against the process CWD (mounting whatever directory
+        # the operator happens to run from), and an adapter inside the control
+        # root would mount holdout content into the "isolated" builder. Both
+        # are mount-escape paths — reject at load.
         adapter_path = os.path.expanduser(adapter)
         if not os.path.isabs(adapter_path) or not os.path.isfile(adapter_path):
             raise ConfigError(
-                "hardened requires roles.builder.adapter to be an absolute path "
+                f"{tier} requires roles.builder.adapter to be an absolute path "
                 "to an existing file (its directory is mounted into the container)"
             )
         adapter_dir = os.path.dirname(os.path.realpath(adapter_path))
         if not _disjoint(adapter_dir, control_root):
             raise ConfigError(
-                "hardened requires the roles.builder.adapter directory to be "
+                f"{tier} requires the roles.builder.adapter directory to be "
                 "disjoint from the control root (it would be mounted into the "
                 "builder container)"
             )
 
     # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
-    # (lights-off) is available only with a conforming hardened backend.
+    # (lights-off) is available only with a conforming hardened (or, being
+    # strictly stronger, enterprise) backend.
     autonomy = raw.get("autonomy", 4)
     if not isinstance(autonomy, int) or isinstance(autonomy, bool) or autonomy not in (4, 5):
         raise ConfigError("autonomy must be an int, 4 or 5")
-    if autonomy == 5 and tier != "hardened":
+    if autonomy == 5 and tier not in ("hardened", "enterprise"):
         raise ConfigError(
-            "autonomy 5 (lights-off) requires assurance: hardened (spec 2.2)"
+            "autonomy 5 (lights-off) requires assurance: hardened or enterprise (spec 2.2)"
         )
 
     checkpoint = raw.get("checkpoint")
@@ -111,12 +115,14 @@ def load_config(control_root: str) -> dict:
         raise ConfigError("checkpoint must be 'pause' or 'auto'")
 
     # hardened tier: optional `hardened` block -> cfg["_container"]. The block
-    # is meaningless (and rejected) outside assurance: hardened; injected with
-    # defaults regardless of tier so downstream code can read cfg["_container"]
-    # unconditionally (mirrors _security/_budget/_twins).
+    # is meaningless (and rejected) outside assurance: hardened|enterprise
+    # (enterprise's container path IS the hardened container path, so the
+    # SAME block configures image/network/memory/pids there too); injected
+    # with defaults regardless of tier so downstream code can read
+    # cfg["_container"] unconditionally (mirrors _security/_budget/_twins).
     hardened_raw = raw.get("hardened")
-    if hardened_raw is not None and tier != "hardened":
-        raise ConfigError("hardened block requires assurance: hardened")
+    if hardened_raw is not None and tier not in ("hardened", "enterprise"):
+        raise ConfigError("hardened block requires assurance: hardened (or enterprise)")
     if hardened_raw is None:
         hardened_raw = {}
     if not isinstance(hardened_raw, dict):
@@ -177,15 +183,16 @@ def load_config(control_root: str) -> dict:
     audit_raw = raw.get("audit", {})
     if not isinstance(audit_raw, dict):
         raise ConfigError("audit must be a JSON object")
-    # hardened => signed audit (spec 7): default signing to True at hardened
-    # (absent means "on"); an explicit false is a hard rejection, not a quiet
-    # downgrade — a hardened run whose manifest isn't signed is not hardened.
-    audit_signing = audit_raw.get("signing", tier == "hardened")
+    # hardened|enterprise => signed audit (spec 7): default signing to True at
+    # hardened or enterprise (absent means "on"); an explicit false is a hard
+    # rejection, not a quiet downgrade — a hardened/enterprise run whose
+    # manifest isn't signed is not hardened/enterprise.
+    audit_signing = audit_raw.get("signing", tier in ("hardened", "enterprise"))
     if not isinstance(audit_signing, bool):
         raise ConfigError("audit.signing must be a bool")
-    if tier == "hardened" and not audit_signing:
+    if tier in ("hardened", "enterprise") and not audit_signing:
         raise ConfigError(
-            "hardened requires signed audit manifests (audit.signing: true)"
+            f"{tier} requires signed audit manifests (audit.signing: true)"
         )
     audit_key_path = audit_raw.get("key_path", "")
     if audit_signing:
@@ -558,6 +565,190 @@ def load_config(control_root: str) -> dict:
 
     cfg_confine = {"enabled": bc_enabled, "required": bc_required, "profile": bc_profile}
 
+    # Optional `custody` block -> cfg["_custody"] (M17 Task 1): the K-of-N
+    # split-custody approver allowlist + threshold. Absent -> None (byte-
+    # identical to pre-M17 behavior at every tier). Only the BLOCK SHAPE is
+    # validated here -- approvers are ed25519 public keys as raw-32-byte hex
+    # (64 hex chars), unique; threshold an int in 1..len(approvers). This
+    # module never imports `cryptography` (df_custody.py is the sole,
+    # guarded import site) and never checks whether a hex string is a valid
+    # *curve point* -- verify_custody rejects a bad key at verify time,
+    # returning False rather than crashing. Enforcing custody as REQUIRED at
+    # assurance: "enterprise" is Task 3 (the enterprise tier doesn't exist
+    # in supported_tiers.json until then); here an absent block at ANY tier,
+    # including a future enterprise, is still None.
+    custody_raw = raw.get("custody")
+    if custody_raw is not None:
+        if not isinstance(custody_raw, dict):
+            raise ConfigError("custody must be a JSON object")
+
+        custody_approvers = custody_raw.get("approvers")
+        if not isinstance(custody_approvers, list) or not custody_approvers:
+            raise ConfigError("custody.approvers must be a non-empty list")
+        seen_approvers = set()
+        canonical_approvers = []
+        for entry in custody_approvers:
+            if not isinstance(entry, str) or not _HEX64_RE.match(entry):
+                raise ConfigError(
+                    "custody.approvers entries must be 64-hex-char ed25519 "
+                    f"public keys, got {entry!r}"
+                )
+            # Canonicalize to lowercase BEFORE the uniqueness check: two
+            # entries that differ only in hex case are the SAME public key,
+            # so they must collide as a duplicate here — never silently kept
+            # as two "distinct" approvers that verify_custody would then also
+            # canonicalize into one, quietly shrinking N below what the
+            # operator configured.
+            canonical = entry.lower()
+            if canonical in seen_approvers:
+                raise ConfigError(
+                    f"custody.approvers has a duplicate entry (approvers must be unique): {entry!r}"
+                )
+            seen_approvers.add(canonical)
+            canonical_approvers.append(canonical)
+
+        custody_threshold = custody_raw.get("threshold")
+        if (
+            not isinstance(custody_threshold, int)
+            or isinstance(custody_threshold, bool)
+            or not (1 <= custody_threshold <= len(custody_approvers))
+        ):
+            raise ConfigError(
+                "custody.threshold must be an int in 1.."
+                f"{len(custody_approvers)} (the number of approvers)"
+            )
+
+        cfg_custody = {
+            "approvers": canonical_approvers,
+            "threshold": custody_threshold,
+        }
+    else:
+        cfg_custody = None
+
+    # Optional `credential_proxy` block -> cfg["_proxy"] (M17 Task 2): a
+    # host-side allowlist credential proxy (see scripts/df_proxy.py). The
+    # provider token is NEVER accepted inline here -- only the NAME of an
+    # env var the proxy reads host-side at request time, mirroring the
+    # M11/M13 inline-secret rejection (credentials.*, audit.sink.*). Absent
+    # -> {"enabled": False}, byte-identical to pre-M17 behavior at every
+    # tier (the enterprise tier's REQUIRED credential_proxy.enabled:true
+    # gate is Task 3 -- this module validates only the block's shape).
+    proxy_raw = raw.get("credential_proxy", {})
+    if not isinstance(proxy_raw, dict):
+        raise ConfigError("credential_proxy must be a JSON object")
+
+    if "token" in proxy_raw:
+        raise ConfigError(
+            "credential_proxy.token is a raw secret value and is not "
+            "allowed inline; use credential_proxy.token_env to name an "
+            f"environment variable instead (must match {_CRED_NAME_RE.pattern!r})"
+        )
+
+    proxy_header = proxy_raw.get("header", "authorization")
+    if proxy_header not in ("authorization", "x-api-key"):
+        raise ConfigError(
+            "credential_proxy.header must be 'authorization' or "
+            f"'x-api-key', got {proxy_header!r}"
+        )
+
+    proxy_enabled = proxy_raw.get("enabled", False)
+    if not isinstance(proxy_enabled, bool):
+        raise ConfigError("credential_proxy.enabled must be a bool")
+
+    if proxy_enabled:
+        proxy_allowlist = proxy_raw.get("allowlist")
+        if not isinstance(proxy_allowlist, list) or not proxy_allowlist:
+            raise ConfigError(
+                "credential_proxy.allowlist must be a non-empty list of "
+                "hostnames when credential_proxy.enabled is true"
+            )
+        for entry in proxy_allowlist:
+            if not isinstance(entry, str) or not entry:
+                raise ConfigError(
+                    "credential_proxy.allowlist entries must be non-empty "
+                    f"hostname strings, got {entry!r}"
+                )
+
+        proxy_token_env = proxy_raw.get("token_env")
+        if not isinstance(proxy_token_env, str) or not _CRED_NAME_RE.match(proxy_token_env):
+            raise ConfigError(
+                "credential_proxy.token_env must be an environment "
+                f"variable NAME matching {_CRED_NAME_RE.pattern!r}, got "
+                f"{proxy_token_env!r}"
+            )
+
+        cfg_proxy = {
+            "enabled": True,
+            "allowlist": list(proxy_allowlist),
+            "token_env": proxy_token_env,
+            "header": proxy_header,
+        }
+    else:
+        cfg_proxy = {"enabled": False}
+
+    # Enterprise composition (M17 Task 3): assurance:"enterprise" REQUIRES
+    # every enterprise-only guarantee to be explicitly present and
+    # unweakened — split custody (Task 1), the credential proxy actually
+    # ENABLED (Task 2), a REQUIRED off-box audit sink (M13), REQUIRED
+    # builder confinement (M14), and signed audit (already defaulted+
+    # enforced above via the `tier in ("hardened", "enterprise")` checks,
+    # re-asserted here so every enterprise-required guarantee is named in
+    # ONE place). Any missing/weakened piece is a ConfigError NAMING the
+    # missing guarantee — fail-closed at LOAD time, before any run starts.
+    # cfg["_enterprise"] carries only the seccomp profile PATH (never a
+    # secret) for the supervisor to pass to df_container.build_enterprise_argv.
+    if tier == "enterprise":
+        if cfg_custody is None:
+            raise ConfigError(
+                "enterprise requires a `custody` block (split-custody K-of-N "
+                "sign-off; spec 2.2/7.3) — none was configured"
+            )
+        if not cfg_proxy["enabled"]:
+            raise ConfigError(
+                "enterprise requires `credential_proxy.enabled: true` (the "
+                "host-side allowlist credential proxy; spec 7.3) — the raw "
+                "provider token must never enter the sandbox"
+            )
+        if not sink_required:
+            raise ConfigError(
+                "enterprise requires `audit.sink.required: true` (a REQUIRED "
+                "off-box audit sink; spec 7.5) — sink.kind='none' or "
+                "sink.required=false is a weakened enterprise config"
+            )
+        if not bc_required:
+            raise ConfigError(
+                "enterprise requires `builder_confinement.required: true` "
+                "(spec 7.4) — confinement.enabled without required, or "
+                "confinement absent, is a weakened enterprise config"
+            )
+        if not audit_signing:
+            raise ConfigError(
+                "enterprise requires signed audit manifests (audit.signing: true)"
+            )
+        # Token-collision guard (M17 Task 3 review): the whole point of the
+        # credential proxy is that the raw provider token NEVER enters the
+        # sandbox — the proxy injects it host-side. If the operator ALSO lists
+        # the proxy's token_env in `credentials.allowlist` (M11), df_creds
+        # would resolve that env var and bake its VALUE into the enterprise
+        # container as a `-e` var, silently putting the token right back into
+        # the sandbox and defeating the guarantee. Refuse at load. (Belt-and-
+        # suspenders: the supervisor also passes NO credential env into the
+        # enterprise container at all — the proxy is the sole credential
+        # path — but a config that even expresses this contradiction is
+        # fail-closed here rather than quietly ignored.)
+        if cfg_credentials is not None:
+            proxy_token_env_name = cfg_proxy["token_env"]
+            if proxy_token_env_name in cfg_credentials["allowlist"]:
+                raise ConfigError(
+                    f"enterprise: credential_proxy.token_env ({proxy_token_env_name!r}) must "
+                    "NOT also appear in credentials.allowlist — that would bake the provider "
+                    "token into the container as a -e var, defeating the proxy's "
+                    "token-never-in-sandbox guarantee"
+                )
+        cfg_enterprise = {"seccomp": df_container.DEFAULT_SECCOMP_PATH}
+    else:
+        cfg_enterprise = None
+
     cfg = dict(raw)
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
@@ -584,4 +775,7 @@ def load_config(control_root: str) -> dict:
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield
     cfg["_confine"] = cfg_confine
+    cfg["_custody"] = cfg_custody
+    cfg["_proxy"] = cfg_proxy
+    cfg["_enterprise"] = cfg_enterprise
     return cfg
