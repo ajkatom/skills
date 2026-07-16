@@ -414,12 +414,87 @@ def load_config(control_root: str) -> dict:
             "require_license": sg_license_require,
         }
 
+        # Optional `dependency_audit` sub-block (M23 Task 2) -> cfg["_security"]
+        # ["dependency_audit"]: an opt-in OSV CVE check over the artifact's
+        # PINNED dependencies (df_depaudit.parse_installed + query_osv_api/
+        # query_osv_snapshot). Absent block (or enabled: false) is
+        # byte-identical to pre-M23 -- no dependency_audit gate ever runs,
+        # zero network calls, ever.
+        #
+        # TIER POLICY (the point of M23): `source: "osv-api"` makes a LIVE
+        # network call to api.osv.dev, egressing dependency names+versions
+        # -- forbidden by ConfigError at hardened/enterprise, whose whole
+        # guarantee is no/controlled egress. `source: "osv-snapshot"`
+        # queries a pre-provisioned local snapshot with ZERO run-time
+        # network egress -- allowed at every tier, including
+        # hardened/enterprise. Net effect: every tier can get a CVE check,
+        # and no tier's egress promise is broken.
+        sg_depaudit_raw = sg_raw.get("dependency_audit", {})
+        if not isinstance(sg_depaudit_raw, dict):
+            raise ConfigError("security_gates.dependency_audit must be a JSON object")
+        sg_depaudit_enabled = sg_depaudit_raw.get("enabled", False)
+        if not isinstance(sg_depaudit_enabled, bool):
+            raise ConfigError("security_gates.dependency_audit.enabled must be a bool")
+
+        sg_depaudit_ecosystems_raw = sg_depaudit_raw.get("ecosystems", [])
+        if not isinstance(sg_depaudit_ecosystems_raw, list) or not all(
+            isinstance(x, str) and x.strip() for x in sg_depaudit_ecosystems_raw
+        ):
+            raise ConfigError(
+                "security_gates.dependency_audit.ecosystems must be a list of "
+                "non-empty strings"
+            )
+
+        sg_depaudit_timeout_s = sg_depaudit_raw.get("timeout_s", 20)
+        if (
+            not isinstance(sg_depaudit_timeout_s, int)
+            or isinstance(sg_depaudit_timeout_s, bool)
+            or not (1 <= sg_depaudit_timeout_s <= 300)
+        ):
+            raise ConfigError(
+                "security_gates.dependency_audit.timeout_s must be an int in 1..300"
+            )
+
+        sg_depaudit_source = None
+        sg_depaudit_snapshot_path = None
+        if sg_depaudit_enabled:
+            sg_depaudit_source = sg_depaudit_raw.get("source")
+            if sg_depaudit_source not in ("osv-api", "osv-snapshot"):
+                raise ConfigError(
+                    "security_gates.dependency_audit.source is required when "
+                    "enabled and must be 'osv-api' or 'osv-snapshot'"
+                )
+            if sg_depaudit_source == "osv-api" and tier in ("hardened", "enterprise"):
+                raise ConfigError(
+                    f"{tier} forbids uncontrolled network egress; use source: "
+                    "osv-snapshot for security_gates.dependency_audit"
+                )
+            if sg_depaudit_source == "osv-snapshot":
+                sg_depaudit_snapshot_path = sg_depaudit_raw.get("snapshot_path")
+                if (
+                    not isinstance(sg_depaudit_snapshot_path, str)
+                    or not sg_depaudit_snapshot_path
+                    or not os.path.isdir(sg_depaudit_snapshot_path)
+                ):
+                    raise ConfigError(
+                        "security_gates.dependency_audit.snapshot_path must be "
+                        "an existing directory when source is 'osv-snapshot'"
+                    )
+
+        cfg_depaudit = {
+            "enabled": sg_depaudit_enabled,
+            "source": sg_depaudit_source,
+            "snapshot_path": sg_depaudit_snapshot_path,
+            "ecosystems": list(sg_depaudit_ecosystems_raw),
+            "timeout_s": sg_depaudit_timeout_s,
+        }
+
         sg_external_raw = sg_raw.get("external", [])
         if not isinstance(sg_external_raw, list):
             raise ConfigError("security_gates.external must be a list")
         sg_external = []
         external_names = set()
-        _reserved = {"secret_scan", "dangerous_scan", "sbom", "license"}
+        _reserved = {"secret_scan", "dangerous_scan", "sbom", "license", "dependency_audit"}
         for entry in sg_external_raw:
             if not isinstance(entry, dict):
                 raise ConfigError("security_gates.external entries must be objects")
@@ -454,7 +529,9 @@ def load_config(control_root: str) -> dict:
             isinstance(n, str) for n in sg_fail_on_raw
         ):
             raise ConfigError("security_gates.fail_on must be a list of str")
-        known_gates = {"secret_scan", "dangerous_scan", "sbom", "license"} | external_names
+        known_gates = {
+            "secret_scan", "dangerous_scan", "sbom", "license", "dependency_audit",
+        } | external_names
         for name in sg_fail_on_raw:
             if name not in known_gates:
                 raise ConfigError(
@@ -471,6 +548,7 @@ def load_config(control_root: str) -> dict:
             "fail_on": list(sg_fail_on_raw),
             "strict_unavailable": sg_strict_unavailable,
             "license": cfg_license,
+            "dependency_audit": cfg_depaudit,
         }
     else:
         cfg_security = {"enabled": False}
