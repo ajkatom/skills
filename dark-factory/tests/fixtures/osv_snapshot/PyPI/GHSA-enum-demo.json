@@ -1,0 +1,10 @@
+{
+  "id": "GHSA-enum-demo",
+  "summary": "Demo enumerated-version vulnerability in demo-pkg",
+  "affected": [
+    {
+      "package": {"ecosystem": "PyPI", "name": "demo-pkg"},
+      "versions": ["1.0.0", "1.0.1"]
+    }
+  ]
+}
