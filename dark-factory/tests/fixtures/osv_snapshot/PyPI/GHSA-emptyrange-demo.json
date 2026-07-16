@@ -1,0 +1,12 @@
+{
+  "id": "GHSA-emptyrange-demo",
+  "summary": "Demo record for weirdpkg whose only range has empty events (no version data)",
+  "affected": [
+    {
+      "package": {"ecosystem": "PyPI", "name": "weirdpkg"},
+      "ranges": [
+        {"type": "ECOSYSTEM", "events": []}
+      ]
+    }
+  ]
+}

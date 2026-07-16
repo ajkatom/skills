@@ -116,6 +116,103 @@ available (Python 3.11+), falling back to the same tolerant best-effort
 line/regex scan style `sbom()` already uses for its `[project]
 dependencies` array, for interpreters where `tomllib` doesn't exist.
 
+### `dependency_audit` (M23)
+
+Spec residue #6 (network dependency/CVE analysis), added as a **tier-aware**
+gate: `df_depaudit.parse_installed(workspace)` extracts the artifact's
+PINNED dependencies (`requirements.txt` `name==version`, `package.json`
+exact versions, best-effort `pyproject.toml`, vendored `*.dist-info` /
+`node_modules/<pkg>` installs), then each `{name, version, ecosystem}` is
+checked against the **OSV vulnerability database** for known CVEs. Opt-in
+via `security_gates.dependency_audit.enabled` (default `false`, absent
+block → no gate at all, byte-identical to pre-M23 — zero network calls,
+ever). A finding is `{"name", "version", "ecosystem", "vuln_ids", "source"}`
+— package identity + OSV vuln IDs only, never artifact source or secrets.
+
+**Two backends, selected by `security_gates.dependency_audit.source`, and
+a TIER POLICY that keeps every tier's egress promise intact:**
+
+| `source` | What it does | Network egress | Allowed tiers |
+|---|---|---|---|
+| `osv-api` | POSTs each `{name, version, ecosystem}` **live** to `api.osv.dev` | **Yes** — sends dependency names+versions to `api.osv.dev` over the network, every run | `cooperative`, `standard` only. **`ConfigError` at `hardened`/`enterprise`** at config load: *"`<tier>` forbids uncontrolled network egress; use source: osv-snapshot"* |
+| `osv-snapshot` | Matches pinned versions against a **pre-provisioned local OSV export**, fully offline | **None, ever** — no fetcher parameter exists on this code path; it cannot reach the network by construction | **Every tier**, including `hardened`/`enterprise` |
+
+Net effect: every tier can get a CVE check, and no tier's egress guarantee
+is ever broken by turning this gate on.
+
+**PROMINENT EGRESS CAVEAT (`osv-api`):** this is the **one** place in the
+built-in security gates where turning on a config flag makes an outbound
+network call during a run. It is opt-in, off by default, and sends ONLY
+dependency **names and versions** (never source code, secrets, or any
+other artifact content) to Google's `api.osv.dev`. If you need a CVE
+check with zero run-time egress — including at `cooperative`/`standard`,
+not just where it's mandatory — use `osv-snapshot` instead.
+
+**Offline snapshot provisioning (`osv-snapshot`):** the snapshot is never
+fetched during a sealed run. An operator runs
+`df_depaudit.fetch_snapshot(ecosystem, dest_dir)` **out-of-band**, ahead of
+time (the same posture as building the hardened Docker image — a
+provisioning step outside any run), which downloads OSV's published
+per-ecosystem export (`https://osv-vulnerabilities.storage.googleapis.com/
+<ecosystem>/all.zip`) and unzips its `*.json` records into
+`dest_dir/<ecosystem>/`. **Freshness of the snapshot is the operator's
+documented responsibility** — `dependency_audit` never re-fetches it, and
+an unrefreshed snapshot will not know about CVEs published after it was
+taken. Re-run `fetch_snapshot` on whatever cadence your risk posture
+requires.
+
+**Honest matching scope (`osv-snapshot`), reliably matches:**
+
+- A package version **enumerated** in an OSV record's
+  `affected[].versions` list — an exact match.
+- A version falling inside a **simple** `introduced`/`fixed` range (one
+  `introduced` event, one `fixed` event, cleanly-parsed dotted-numeric
+  versions — packaging-style release-tuple compare for PyPI, semver-ish
+  tuple compare for npm).
+
+**Under-matches, relative to the live API, on:**
+
+- Complex range expressions (multiple `introduced`/`fixed` pairs, a
+  `limit`/`last_affected` event, or an unparseable version string in a
+  range) on a package whose **name** still matches a snapshot record.
+
+The matcher deliberately **errs toward flagging**: any of the above
+ambiguous cases is reported as a finding with a `"range-uncertain"` note
+rather than silently dropped — a false negative (missing a real vuln) is
+the dangerous direction, and a false positive here just costs a human a
+look at an over-cautious finding, exactly the same trade-off the other
+built-in gates make. If your snapshot data trips this often, cross-check
+suspicious packages with `osv-api` at a lower tier, or keep the snapshot
+current.
+
+**Fail-closed unavailable, both backends:** any backend error — `osv-api`
+network failure/timeout/non-200/bad JSON on any package, or a missing/
+empty/corrupt `osv-snapshot` directory — makes the gate `status:
+"unavailable"`, never a silent pass. Under `fail_on` + `strict_unavailable`
+(the default), an unavailable `dependency_audit` gate counts as a run
+failure, same as every other mandatory gate.
+
+**Not covered (honest, deferred):**
+
+- Routing the live `osv-api` query through the enterprise
+  credential-proxy allowlist, which would let `hardened`/`enterprise` use
+  the live API under governed egress instead of the offline snapshot —
+  real plumbing (the gate runs host-side, not inside the builder
+  container) that the offline snapshot covers the need for today.
+- A full, ecosystem-correct version-range solver — the offline matcher is
+  intentionally best-effort (see above), not a reimplementation of each
+  ecosystem's real version-comparison semantics (PEP 440, semver, etc. in
+  full).
+- Non-OSV vulnerability sources / commercial SCA tooling — plug one in
+  via the external-gate interface below if you need it.
+- Snapshot auto-refresh/caching policy — `fetch_snapshot` is
+  operator-run, on whatever schedule the operator chooses; there is no
+  built-in staleness check or auto-refresh.
+- Audits **declared/pinned** dependencies (+ pinned transitives shipped
+  in a lockfile/vendored tree) — like `sbom`/`license`, not a from-scratch
+  dependency solve of everything that would be installed from an
+  unpinned manifest.
+
 ## Honest scope — heuristic and a floor, not a full SAST engine
 
 **These built-ins are pattern-based, not a real static-analysis or
@@ -176,7 +273,8 @@ capture_output=True, text=True, timeout=300)`:
 ```
 
 - `name` must be unique and must not collide with a built-in name
-  (`secret_scan`, `dangerous_scan`, `sbom`, `license` are reserved).
+  (`secret_scan`, `dangerous_scan`, `sbom`, `license`, `dependency_audit`
+  are reserved).
 - **Probed, not assumed.** Before running, `shutil.which(cmd[0])` checks
   the command is actually on `PATH`. Missing → `status: "unavailable"`
   (never a silent pass). A spawn error or a 300s timeout is also
@@ -194,8 +292,8 @@ capture_output=True, text=True, timeout=300)`:
 
 `fail_on` (default `["secret_scan", "dangerous_scan"]` when
 `security_gates.enabled`) is the list of gate names that are **mandatory**
-— `secret_scan`/`dangerous_scan`/`sbom`/`license` or a declared
-`external[].name`.
+— `secret_scan`/`dangerous_scan`/`sbom`/`license`/`dependency_audit` or a
+declared `external[].name`.
 A gate not listed in `fail_on` can still run and appear in the report, but
 a finding on it never rejects the run (it's recorded, not enforced —
 useful for `sbom` or an external gate you want visibility into before
@@ -270,7 +368,8 @@ report:
     "secret_scan": {"status": "pass", "findings": []},
     "dangerous_scan": {"status": "pass", "findings": []},
     "sbom": {"status": "pass", "sbom": {"declared": {...}, "count": 3, "unpinned": []}},
-    "license": {"status": "pass", "findings": []}
+    "license": {"status": "pass", "findings": []},
+    "dependency_audit": {"status": "pass", "findings": []}
   },
   "failed": []
 }
@@ -296,9 +395,12 @@ never gate-checked.
   built-ins plus the external-gate interface to plug in `bandit`,
   `semgrep`, `trufflehog`, or similar — it does not vendor one of those
   tools itself.
-- **Resolved transitive dependency graphs + CVE lookup.** `sbom` is a
-  declared-dependency inventory (from manifest files), not a resolved
-  graph, and does no network calls (no CVE database lookup).
+- **Resolved transitive dependency graphs.** `sbom` is a declared-dependency
+  inventory (from manifest files), not a resolved graph, and still does no
+  network calls itself. **CVE lookup against PINNED dependencies** is now
+  covered by the opt-in `dependency_audit` gate (M23, see above) — but it
+  audits pinned/vendored deps only, not a from-scratch resolve of an
+  unpinned manifest's full transitive tree.
 - **License resolution for un-vendored transitive dependencies.** `license`
   (M18) enforces an allowlist against licenses declared in manifests and
   vendored metadata physically present in the artifact; it does not (and,

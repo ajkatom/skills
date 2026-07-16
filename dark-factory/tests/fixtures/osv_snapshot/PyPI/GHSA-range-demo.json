@@ -1,0 +1,15 @@
+{
+  "id": "GHSA-range-demo",
+  "summary": "Demo simple range vulnerability in rangepkg (fixed in 2.0.0)",
+  "affected": [
+    {
+      "package": {"ecosystem": "PyPI", "name": "rangepkg"},
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"fixed": "2.0.0"}]
+        }
+      ]
+    }
+  ]
+}

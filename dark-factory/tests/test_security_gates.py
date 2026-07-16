@@ -46,6 +46,13 @@ def test_enabled_applies_defaults(tmp_path):
         "fail_on": ["secret_scan", "dangerous_scan"],
         "strict_unavailable": True,
         "license": {"enabled": False, "allowlist": [], "require_license": False},
+        "dependency_audit": {
+            "enabled": False,
+            "source": None,
+            "snapshot_path": None,
+            "ecosystems": [],
+            "timeout_s": 20,
+        },
     }
 
 
@@ -73,6 +80,13 @@ def test_explicit_valid_config_round_trips(tmp_path):
         "fail_on": ["secret_scan", "bandit"],
         "strict_unavailable": False,
         "license": {"enabled": False, "allowlist": [], "require_license": False},
+        "dependency_audit": {
+            "enabled": False,
+            "source": None,
+            "snapshot_path": None,
+            "ecosystems": [],
+            "timeout_s": 20,
+        },
     }
 
 

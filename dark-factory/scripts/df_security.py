@@ -25,6 +25,8 @@ import re
 import shutil
 import subprocess
 
+import df_depaudit
+
 try:
     import tomllib
 except ImportError:  # pragma: no cover - < 3.11 fallback path
@@ -539,6 +541,62 @@ def _run_external_gate(workspace: str, cmd: list) -> dict:
     return {"status": "fail", "detail": output}
 
 
+def _run_dependency_audit_gate(workspace: str, depaudit_cfg: dict) -> dict:
+    """Run the `dependency_audit` gate (M23 Task 2): OSV CVE check over the
+    artifact's PINNED dependencies, via whichever backend
+    `depaudit_cfg["source"]` selects.
+
+    `osv-api` calls `df_depaudit.query_osv_api` (the ONE backend that
+    leaves the box -- live network to api.osv.dev); `osv-snapshot` loads
+    the pre-provisioned local snapshot at `depaudit_cfg["snapshot_path"]`
+    and calls `df_depaudit.query_osv_snapshot`, which makes NO network
+    call by construction. Either way: any backend error/timeout, or a
+    missing/corrupt snapshot, is `status: "unavailable"` -- fail-closed,
+    never a silent pass. A clean tree is `"pass"`; any package with one or
+    more vulns is `"fail"`, with findings `{name, version, ecosystem,
+    vuln_ids, source}` -- names/versions/vuln-ids only, nothing about
+    artifact content. Never raises.
+    """
+    try:
+        pkgs = df_depaudit.parse_installed(workspace)
+    except Exception as e:  # never let a bad manifest crash the run
+        return {"status": "unavailable", "detail": f"parse_installed failed: {e}"}
+
+    ecosystems = depaudit_cfg.get("ecosystems") or []
+    if ecosystems:
+        pkgs = [p for p in pkgs if p.get("ecosystem") in ecosystems]
+
+    source = depaudit_cfg.get("source")
+    if source == "osv-snapshot":
+        try:
+            snapshot = df_depaudit.load_snapshot(depaudit_cfg.get("snapshot_path"))
+        except df_depaudit.DepAuditError as e:
+            return {"status": "unavailable", "detail": str(e)}
+        result = df_depaudit.query_osv_snapshot(pkgs, snapshot)
+    else:  # "osv-api"
+        result = df_depaudit.query_osv_api(pkgs, timeout_s=depaudit_cfg.get("timeout_s", 20))
+
+    if result.get("unavailable"):
+        return {"status": "unavailable", "detail": result.get("reason", "")}
+
+    findings = []
+    for r in result.get("results", []):
+        vulns = r.get("vulns") or []
+        if not vulns:
+            continue
+        findings.append(
+            {
+                "name": r["name"],
+                "version": r["version"],
+                "ecosystem": r["ecosystem"],
+                "vuln_ids": [v["id"] for v in vulns if isinstance(v, dict) and v.get("id")],
+                "source": result.get("source"),
+            }
+        )
+
+    return {"status": "fail" if findings else "pass", "findings": findings}
+
+
 def run_gates(workspace: str, sec: dict) -> dict:
     """Run the enabled built-in + external gates over `workspace`.
 
@@ -577,6 +635,10 @@ def run_gates(workspace: str, sec: dict) -> dict:
             "status": "fail" if findings else "pass",
             "findings": findings,
         }
+
+    depaudit_cfg = sec.get("dependency_audit") or {}
+    if depaudit_cfg.get("enabled"):
+        gates["dependency_audit"] = _run_dependency_audit_gate(workspace, depaudit_cfg)
 
     for entry in sec.get("external", []):
         gates[entry["name"]] = _run_external_gate(workspace, entry["cmd"])

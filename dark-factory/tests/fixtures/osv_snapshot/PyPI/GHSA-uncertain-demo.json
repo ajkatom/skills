@@ -1,0 +1,15 @@
+{
+  "id": "GHSA-uncertain-demo",
+  "summary": "Demo unparseable-range vulnerability in fuzzypkg",
+  "affected": [
+    {
+      "package": {"ecosystem": "PyPI", "name": "fuzzypkg"},
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"fixed": "not-a-real-version"}]
+        }
+      ]
+    }
+  ]
+}
