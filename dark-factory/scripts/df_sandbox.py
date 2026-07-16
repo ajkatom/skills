@@ -55,7 +55,18 @@ class _LinuxBackend:
             "--ro-bind", "/", "/",       # whole fs read-only baseline
             "--dev", "/dev",
             "--proc", "/proc",
-            "--tmpfs", real_deny,        # mask the control root → contents unreadable
+            "--tmpfs", real_deny,        # mask the control root → real contents unreadable
+            "--remount-ro", real_deny,   # SEAL the mask read-only (MS_RDONLY): the fresh
+                                         # tmpfs is otherwise owner-writable, and a root
+                                         # process has CAP_DAC_OVERRIDE so permission BITS
+                                         # (chmod) would not stop it — only a read-only
+                                         # MOUNT is kernel-enforced regardless of caps.
+                                         # bwrap applies args in order, so tmpfs-then-
+                                         # remount-ro yields an empty, read-only mount:
+                                         # reads denied (empty, shadows real content),
+                                         # writes denied (MS_RDONLY). This is what makes
+                                         # M12's write-denial half of probe_denial hold on
+                                         # a real Linux kernel.
             "--bind", real_ws, real_ws,  # workspace read-write
             "--chdir", real_ws,
             "--die-with-parent",
