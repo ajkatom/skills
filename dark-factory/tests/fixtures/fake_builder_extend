@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Fake builder for the M15-3 e2e "honest builder converges" proof
+(test_e2e_brownfield.py). Speaks adapter protocol 0.1.
+
+The honest counterpart to `fake_builder_break`: implements the NEW `double
+N` subcommand the spec asks for WITHOUT touching the pre-existing `add`
+behavior -- `add` still computes the correct sum. Same control root, same
+brownfield probes, same spec as the break variant; only this file's output
+differs, so (a) vs (b) is a real A/B on the builder alone.
+
+Never reads the snapshotted `app.py`, scenarios, or feedback.json (same
+information barrier as fake_builder) -- its output is unconditional and
+correct on the very first call, so the run converges in one iteration.
+"""
+import json
+import os
+import sys
+
+APP_PY = (
+    "import sys\n"
+    "\n"
+    "\n"
+    "def main(argv):\n"
+    "    if len(argv) == 3 and argv[0] == 'add':\n"
+    "        try:\n"
+    "            a, b = int(argv[1]), int(argv[2])\n"
+    "        except ValueError:\n"
+    "            sys.stderr.write('legacy_app: add requires two integers\\n')\n"
+    "            return 2\n"
+    "        print(a + b)\n"
+    "        return 0\n"
+    "    if len(argv) == 2 and argv[0] == 'double':\n"
+    "        try:\n"
+    "            n = int(argv[1])\n"
+    "        except ValueError:\n"
+    "            sys.stderr.write('app: double requires an integer\\n')\n"
+    "            return 2\n"
+    "        print(n * 2)\n"
+    "        return 0\n"
+    "    sys.stderr.write('legacy_app: unknown or bad args\\n')\n"
+    "    return 2\n"
+    "\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main(sys.argv[1:]))\n"
+)
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "app.py"), "w", encoding="utf-8") as f:
+        f.write(APP_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()
