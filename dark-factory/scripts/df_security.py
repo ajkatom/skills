@@ -1,20 +1,34 @@
-"""Stdlib security scanners over a directory (M9 Task 1).
+"""Stdlib security scanners over a directory (M9 Task 1, M18 Task 2).
 
-Pure functions: `secret_scan`, `dangerous_scan`, `sbom`. All walk a
-directory deterministically (sorted, skip `.git`, skip symlinks, skip
-binary files detected by a NUL byte in the first read chunk), use only
-stdlib (`re`, `os`, `json`), do no network I/O, and return sorted,
-deterministic output.
+Pure functions: `secret_scan`, `dangerous_scan`, `sbom`, `license_scan`.
+All walk a directory deterministically (sorted, skip `.git`, skip
+symlinks, skip binary files detected by a NUL byte in the first read
+chunk), use only stdlib (`re`, `os`, `json`, `tomllib` when available),
+do no network I/O, and return sorted, deterministic output.
 
 Honest scope: these are heuristic, pattern-based scanners — a floor,
 not a full SAST/secret-detection engine. `secret_scan` findings record
-the RULE NAME ONLY, never the matched secret value.
+the RULE NAME ONLY, never the matched secret value. `license_scan`
+(M18) covers licenses DECLARED in manifests and metadata that are
+PHYSICALLY PRESENT in the artifact tree (pyproject.toml, package.json,
+vendored node_modules/*/package.json, vendored *.dist-info/METADATA);
+it does NOT resolve the license of an un-vendored transitive
+dependency — that would require a network lookup or a bundled license
+database, both out of scope for an offline, stdlib-only tool. An
+un-vendored dependency is simply invisible to this scanner (not
+silently reported as compliant) — this is documented in
+references/security-gates.md, not faked.
 """
 import json
 import os
 import re
 import shutil
 import subprocess
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - < 3.11 fallback path
+    tomllib = None
 
 # --- secret_scan -----------------------------------------------------------
 
@@ -226,6 +240,275 @@ def sbom(root: str) -> dict:
     return result
 
 
+# --- license_scan (M18 Task 2) ------------------------------------------
+
+_PYPROJECT_LICENSE_STR_RE = re.compile(r'''^\s*license\s*=\s*["']([^"']+)["']\s*$''')
+_PYPROJECT_LICENSE_TABLE_TEXT_RE = re.compile(
+    r'''^\s*license\s*=\s*\{[^}]*\btext\s*=\s*["']([^"']+)["']'''
+)
+_PYPROJECT_NAME_RE = re.compile(r'''^\s*name\s*=\s*["']([^"']+)["']\s*$''')
+_PYPROJECT_CLASSIFIERS_ARRAY_RE = re.compile(r"^\s*classifiers\s*=\s*\[\s*$")
+_PYPROJECT_CLASSIFIER_LINE_RE = re.compile(r'''^\s*["'](License ::[^"']*)["']\s*,?\s*$''')
+
+_METADATA_NAME_RE = re.compile(r"^Name:\s*(.+)$", re.IGNORECASE)
+_METADATA_LICENSE_RE = re.compile(r"^License:\s*(.+)$", re.IGNORECASE)
+_METADATA_CLASSIFIER_RE = re.compile(r"^Classifier:\s*(License ::.*)$", re.IGNORECASE)
+
+
+def _classifier_license_name(classifier: str) -> str:
+    """`License :: OSI Approved :: MIT License` -> `MIT License`."""
+    return classifier.split("::")[-1].strip()
+
+
+def _pyproject_license_fallback(path: str):
+    """Best-effort, tolerant line scan of `[project]` for `license` +
+    `License ::` classifiers, mirroring sbom()'s `_parse_pyproject_toml`
+    fallback style — used only when tomllib is unavailable or fails to
+    parse the file.
+    """
+    name = None
+    declared = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return name, declared
+
+    in_project = False
+    in_classifiers = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_project = stripped == "[project]"
+            in_classifiers = False
+            continue
+        if not in_project:
+            continue
+        if in_classifiers:
+            if stripped.startswith("]"):
+                in_classifiers = False
+                continue
+            m = _PYPROJECT_CLASSIFIER_LINE_RE.match(line)
+            if m:
+                seg = _classifier_license_name(m.group(1))
+                if seg:
+                    declared.append(seg)
+            continue
+        if _PYPROJECT_CLASSIFIERS_ARRAY_RE.match(line):
+            in_classifiers = True
+            continue
+        m = _PYPROJECT_NAME_RE.match(line)
+        if m and name is None:
+            name = m.group(1).strip()
+            continue
+        m = _PYPROJECT_LICENSE_STR_RE.match(line)
+        if m:
+            declared.append(m.group(1).strip())
+            continue
+        m = _PYPROJECT_LICENSE_TABLE_TEXT_RE.match(line)
+        if m:
+            declared.append(m.group(1).strip())
+            continue
+    return name, declared
+
+
+def _pyproject_name_and_licenses(path: str):
+    """Returns (project_name_or_None, [declared_license_strings]).
+
+    Prefers stdlib `tomllib` (available 3.11+) for a real parse; falls
+    back to a tolerant line/regex scan (mirroring sbom()'s pyproject
+    parser) when tomllib is unavailable or the file fails to parse.
+    `license = {file = ...}` alone contributes no textual license value
+    (there is nothing to check against the allowlist without reading
+    an arbitrary referenced file) — it is not treated as "declared".
+    """
+    if tomllib is not None:
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+            # tomllib.load does a STRICT utf-8 decode before parsing, so a
+            # manifest with invalid encoding raises UnicodeDecodeError (NOT
+            # TOMLDecodeError) — catch it too and fall through to the
+            # tolerant regex fallback (which reads errors="ignore"), so a
+            # malformed manifest is benign here rather than an uncaught
+            # exception escaping license_scan -> run_gates -> the run.
+            data = None
+        if isinstance(data, dict):
+            project = data.get("project")
+            name = None
+            declared = []
+            if isinstance(project, dict):
+                name_val = project.get("name")
+                if isinstance(name_val, str) and name_val.strip():
+                    name = name_val.strip()
+                lic = project.get("license")
+                if isinstance(lic, str) and lic.strip():
+                    declared.append(lic.strip())
+                elif isinstance(lic, dict):
+                    text = lic.get("text")
+                    if isinstance(text, str) and text.strip():
+                        declared.append(text.strip())
+                classifiers = project.get("classifiers")
+                if isinstance(classifiers, list):
+                    for c in classifiers:
+                        if isinstance(c, str) and c.startswith("License ::"):
+                            seg = _classifier_license_name(c)
+                            if seg:
+                                declared.append(seg)
+            return name, declared
+    return _pyproject_license_fallback(path)
+
+
+def _package_json_licenses(data: dict) -> list:
+    declared = []
+    lic = data.get("license")
+    if isinstance(lic, str) and lic.strip():
+        declared.append(lic.strip())
+    elif isinstance(lic, dict):
+        t = lic.get("type")
+        if isinstance(t, str) and t.strip():
+            declared.append(t.strip())
+    legacy = data.get("licenses")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if isinstance(entry, dict):
+                t = entry.get("type")
+                if isinstance(t, str) and t.strip():
+                    declared.append(t.strip())
+            elif isinstance(entry, str) and entry.strip():
+                declared.append(entry.strip())
+    return declared
+
+
+def _dist_info_package_name(relpath: str) -> str:
+    """`.../foo-1.2.3.dist-info/METADATA` -> `foo` (used only when the
+    METADATA file itself has no `Name:` header)."""
+    dist_dir = relpath.split("/")[-2]
+    base = dist_dir[: -len(".dist-info")] if dist_dir.endswith(".dist-info") else dist_dir
+    m = re.match(r"^(.+)-[^-]+$", base)
+    return m.group(1) if m else base
+
+
+def _parse_dist_info_metadata(path: str):
+    """Scan the RFC822-style header block of a `*.dist-info/METADATA`
+    file for `Name:`, `License:`, and `Classifier: License :: ...`.
+    Stops at the first blank line (end of headers, start of the free-
+    text description) so description text can never spuriously match.
+    """
+    name = None
+    declared = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return name, declared
+    for line in lines:
+        if not line.strip():
+            break
+        m = _METADATA_NAME_RE.match(line)
+        if m:
+            name = m.group(1).strip()
+            continue
+        m = _METADATA_LICENSE_RE.match(line)
+        if m:
+            val = m.group(1).strip()
+            if val:
+                declared.append(val)
+            continue
+        m = _METADATA_CLASSIFIER_RE.match(line)
+        if m:
+            seg = _classifier_license_name(m.group(1))
+            if seg:
+                declared.append(seg)
+    return name, declared
+
+
+def _record_license_findings(findings, relpath, package, declared, allowed, require_license):
+    if not declared:
+        if require_license:
+            findings.append(
+                {"file": relpath, "package": package, "license": None, "rule": "missing-license"}
+            )
+        return
+    seen = set()
+    for lic in declared:
+        key = lic.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if key not in allowed:
+            findings.append(
+                {"file": relpath, "package": package, "license": lic, "rule": "disallowed-license"}
+            )
+
+
+def license_scan(root: str, allowlist: list, *, require_license: bool = False) -> list:
+    """Scan `root` for licenses declared in manifests / vendored metadata
+    physically present in the tree.
+
+    Sources: pyproject.toml `[project].license` (string or {text=}) + a
+    `License ::` trove classifier; package.json `"license"` (SPDX str) /
+    legacy `"licenses"` array; vendored `node_modules/*/package.json`
+    `"license"`; vendored `*.dist-info/METADATA` `License:` /
+    `Classifier: License :: ...`.
+
+    A declared license NOT in `allowlist` (matched case-insensitively)
+    -> `"disallowed-license"`. A discovered package with NO declared
+    license AND `require_license` -> `"missing-license"`. An empty
+    allowlist disallows every declared license (the operator must list
+    them explicitly). Returns findings `{"file","package","license",
+    "rule"}`, deterministic (sorted). Skips `.git`, binary files, and
+    symlinks like the other scanners (via `_walk_files`).
+
+    Honest scope: this does NOT resolve the license of a dependency
+    declared in a manifest but not physically vendored anywhere in
+    `root` — such a dependency is invisible to this function (no
+    finding either way), not silently treated as compliant.
+    """
+    allowed = {a.strip().lower() for a in allowlist}
+    findings = []
+
+    for abspath, relpath in _walk_files(root):
+        parts = relpath.split("/")
+        name = parts[-1]
+
+        if name == "pyproject.toml":
+            pkg_name, declared = _pyproject_name_and_licenses(abspath)
+            package = pkg_name or (
+                parts[-2] if len(parts) > 1 else os.path.basename(os.path.normpath(root)) or "."
+            )
+            _record_license_findings(findings, relpath, package, declared, allowed, require_license)
+
+        elif name == "package.json":
+            try:
+                with open(abspath, "r", encoding="utf-8", errors="ignore") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                data = None
+            if isinstance(data, dict):
+                declared = _package_json_licenses(data)
+                if "node_modules" in parts:
+                    idx = len(parts) - 1 - parts[::-1].index("node_modules")
+                    package = "/".join(parts[idx + 1 : -1]) or "?"
+                else:
+                    pkg_name = data.get("name")
+                    package = (
+                        pkg_name
+                        if isinstance(pkg_name, str) and pkg_name
+                        else (parts[-2] if len(parts) > 1 else "<project>")
+                    )
+                _record_license_findings(findings, relpath, package, declared, allowed, require_license)
+
+        elif name == "METADATA" and len(parts) >= 2 and parts[-2].endswith(".dist-info"):
+            meta_name, declared = _parse_dist_info_metadata(abspath)
+            package = meta_name or _dist_info_package_name(relpath)
+            _record_license_findings(findings, relpath, package, declared, allowed, require_license)
+
+    findings.sort(key=lambda f: (f["file"], f["package"], f["license"] or "", f["rule"]))
+    return findings
+
+
 # --- run_gates -----------------------------------------------------------
 
 _EXTERNAL_TIMEOUT_S = 300
@@ -282,6 +565,18 @@ def run_gates(workspace: str, sec: dict) -> dict:
 
     if sec.get("sbom"):
         gates["sbom"] = {"status": "pass", "sbom": sbom(workspace)}
+
+    license_cfg = sec.get("license") or {}
+    if license_cfg.get("enabled"):
+        findings = license_scan(
+            workspace,
+            license_cfg.get("allowlist", []),
+            require_license=license_cfg.get("require_license", False),
+        )
+        gates["license"] = {
+            "status": "fail" if findings else "pass",
+            "findings": findings,
+        }
 
     for entry in sec.get("external", []):
         gates[entry["name"]] = _run_external_gate(workspace, entry["cmd"])

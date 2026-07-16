@@ -38,7 +38,7 @@ def test_valid_api_budget_with_estimate_injected(tmp_path):
             "per_call_usd": 0.5,
             "max_calls": 10,
             "alert_at": 0.9,
-            "notification_sink": "slack://ops",
+            "notification_sink": "https://ops.example.com/hook",
         },
     )
     cfg = df_config.load_config(str(cr))
@@ -48,7 +48,7 @@ def test_valid_api_budget_with_estimate_injected(tmp_path):
         "per_call_usd": 0.5,
         "max_calls": 10,
         "alert_at": 0.9,
-        "notification_sink": "slack://ops",
+        "notification_sink": "https://ops.example.com/hook",
     }
 
 

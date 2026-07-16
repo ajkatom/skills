@@ -45,6 +45,7 @@ def test_enabled_applies_defaults(tmp_path):
         "external": [],
         "fail_on": ["secret_scan", "dangerous_scan"],
         "strict_unavailable": True,
+        "license": {"enabled": False, "allowlist": [], "require_license": False},
     }
 
 
@@ -71,6 +72,7 @@ def test_explicit_valid_config_round_trips(tmp_path):
         "external": [{"name": "bandit", "cmd": ["bandit", "-r", "."]}],
         "fail_on": ["secret_scan", "bandit"],
         "strict_unavailable": False,
+        "license": {"enabled": False, "allowlist": [], "require_license": False},
     }
 
 

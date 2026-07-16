@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import urllib.parse
 
 import df_container
 from df_common import canonical_json, sha256_str
@@ -307,6 +308,21 @@ def load_config(control_root: str) -> dict:
     notification_sink = budget_raw.get("notification_sink", "")
     if not isinstance(notification_sink, str):
         raise ConfigError("budget.notification_sink must be a str")
+    if notification_sink:
+        _ns = urllib.parse.urlsplit(notification_sink)
+        if _ns.scheme in ("http", "https"):
+            pass
+        elif _ns.scheme == "file":
+            if _ns.netloc or not _ns.path or not os.path.isabs(_ns.path):
+                raise ConfigError(
+                    "budget.notification_sink file:// URLs must carry an "
+                    "absolute path with no host component (file:///abs/path)"
+                )
+        else:
+            raise ConfigError(
+                "budget.notification_sink must be http://, https://, or "
+                f"file://<abs path> (got {notification_sink!r})"
+            )
 
     sg_raw = raw.get("security_gates", {})
     if not isinstance(sg_raw, dict):
@@ -328,12 +344,41 @@ def load_config(control_root: str) -> dict:
         sg_sbom = _bool_default("sbom", True)
         sg_strict_unavailable = _bool_default("strict_unavailable", True)
 
+        # Optional `license` sub-block (M18 Task 2) -> cfg["_security"]
+        # ["license"]. Unlike secret_scan/dangerous_scan/sbom (plain bool
+        # flags), license carries its own allowlist + require_license, so
+        # it is a nested object. Absent -> {"enabled": False, "allowlist":
+        # [], "require_license": False}, byte-identical to pre-M18 (no
+        # license gate runs; run_gates reads sec.get("license") defensively
+        # for sec dicts built before this block existed at all).
+        sg_license_raw = sg_raw.get("license", {})
+        if not isinstance(sg_license_raw, dict):
+            raise ConfigError("security_gates.license must be a JSON object")
+        sg_license_enabled = sg_license_raw.get("enabled", False)
+        if not isinstance(sg_license_enabled, bool):
+            raise ConfigError("security_gates.license.enabled must be a bool")
+        sg_license_allowlist_raw = sg_license_raw.get("allowlist", [])
+        if not isinstance(sg_license_allowlist_raw, list) or not all(
+            isinstance(x, str) and x.strip() for x in sg_license_allowlist_raw
+        ):
+            raise ConfigError(
+                "security_gates.license.allowlist must be a list of non-empty strings"
+            )
+        sg_license_require = sg_license_raw.get("require_license", False)
+        if not isinstance(sg_license_require, bool):
+            raise ConfigError("security_gates.license.require_license must be a bool")
+        cfg_license = {
+            "enabled": sg_license_enabled,
+            "allowlist": list(sg_license_allowlist_raw),
+            "require_license": sg_license_require,
+        }
+
         sg_external_raw = sg_raw.get("external", [])
         if not isinstance(sg_external_raw, list):
             raise ConfigError("security_gates.external must be a list")
         sg_external = []
         external_names = set()
-        _reserved = {"secret_scan", "dangerous_scan", "sbom"}
+        _reserved = {"secret_scan", "dangerous_scan", "sbom", "license"}
         for entry in sg_external_raw:
             if not isinstance(entry, dict):
                 raise ConfigError("security_gates.external entries must be objects")
@@ -368,7 +413,7 @@ def load_config(control_root: str) -> dict:
             isinstance(n, str) for n in sg_fail_on_raw
         ):
             raise ConfigError("security_gates.fail_on must be a list of str")
-        known_gates = {"secret_scan", "dangerous_scan", "sbom"} | external_names
+        known_gates = {"secret_scan", "dangerous_scan", "sbom", "license"} | external_names
         for name in sg_fail_on_raw:
             if name not in known_gates:
                 raise ConfigError(
@@ -384,6 +429,7 @@ def load_config(control_root: str) -> dict:
             "external": sg_external,
             "fail_on": list(sg_fail_on_raw),
             "strict_unavailable": sg_strict_unavailable,
+            "license": cfg_license,
         }
     else:
         cfg_security = {"enabled": False}

@@ -22,6 +22,7 @@ import df_creds
 import df_custody
 import df_gates
 import df_kb
+import df_notify
 import df_proxy
 import df_sandbox
 import df_security
@@ -266,6 +267,34 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
         "enforced": bool(dollar_enforced or calls_enforced),
         "estimate_caveat": "estimated from per_call_usd; not metered usage",
     }
+
+
+def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
+                    builder_calls):
+    """M18: best-effort delivery of a BUDGET_ALERT/BUDGET_PAUSE event to
+    `budget.notification_sink`, when one is configured. FAIL-SOFT by
+    construction — df_notify.deliver() never raises, and this function never
+    affects control flow either way: a down alert channel journals
+    NOTIFY_FAILED and the run proceeds exactly as it would have with no sink
+    configured at all. Absent notification_sink, deliver() is never called
+    (byte-identical to pre-M18 behavior)."""
+    b = cfg["_budget"]
+    sink = b["notification_sink"]
+    if not sink:
+        return
+    event = {
+        "event": trigger,
+        "invocation": invocation,
+        "estimated_usd": estimated_usd,
+        "builder_calls": builder_calls,
+        "cap": {"max_usd": b["max_usd"], "max_calls": b["max_calls"]},
+        "ts": _now(),
+    }
+    ok, reason = df_notify.deliver(sink, event, redactor=redactor)
+    if ok:
+        journal.write("NOTIFY_SENT", event=trigger)
+    else:
+        journal.write("NOTIFY_FAILED", event=trigger, reason=reason)
 
 
 def _confine_manifest_field(confine_cfg, cli):
@@ -1537,6 +1566,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     sys.stderr.write(
                         f"dark-factory: BUDGET ALERT — {b['alert_at']:.0%} of budget cap "
                         f"reached (estimated_usd={estimated_usd}, builder_calls={builder_calls}).\n")
+                    _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
+                                   "BUDGET_ALERT", estimated_usd, builder_calls)
                     budget_alerted = True
 
             if (b["billing"] == "subscription" and not dollar_enforced and not calls_enforced
@@ -1553,6 +1584,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
                               builder_calls=builder_calls, cap_usd=b["max_usd"],
                               max_calls=b["max_calls"])
+                _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
+                               "BUDGET_PAUSE", estimated_usd, builder_calls)
                 save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
