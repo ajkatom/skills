@@ -393,11 +393,11 @@ class _RecordingTwinSet:
         self.observer_files = {}
         self.env = {"DF_TWIN_GREETER": "127.0.0.1:9"}
 
-    def start(self, defs, run_dir, timeout, extra_env=None):
+    def start(self, defs, run_dir, timeout, extra_env=None, phase="build"):
         _RecordingTwinSet.START_CALLS.append(dict(extra_env or {}))
         return self.env
 
-    def reset(self, defs, run_dir, timeout, extra_env=None):
+    def reset(self, defs, run_dir, timeout, extra_env=None, phase="verify"):
         _RecordingTwinSet.RESET_CALLS.append(dict(extra_env or {}))
         return self.env
 

@@ -1226,6 +1226,40 @@ def _twin_manifest_field(cfg, scenarios):
     }
 
 
+def _twins_manifest_field(cfg):
+    """Compute the additive `twins` manifest field (M21), or None if twins
+    aren't enabled. Loads twin defs FRESH (cheap, pure, read-only) --
+    same "fresh + resume, every terminal" threading as `twin_evidence`
+    (M12): computed right alongside it into manifest_base on both the
+    fresh-run and resume paths, so it rides every subsequent
+    `dict(mb_clean/manifest_base, ...)` terminal for free. Raises
+    df_twins.TwinError exactly like `_twin_manifest_field` if twins are
+    enabled but the defs don't load -- the caller handles it the same way
+    (the existing twin-precondition abort).
+
+    Each entry is `{"name", "fidelity", "verify_only_impl", "supports_variants"}`,
+    sorted by name -- names/labels/flags only, straight from the def files;
+    no twin response data (the barrier: twin behavior/responses never reach
+    the builder, but names/labels/flags are plain audit metadata on the
+    control-plane manifest).
+    """
+    if not cfg["_twins"]["enabled"]:
+        return None
+    defs = df_twins.load_defs(os.path.join(cfg["_control_root"], "twins"))
+    return sorted(
+        (
+            {
+                "name": d["name"],
+                "fidelity": d.get("fidelity") or "",
+                "verify_only_impl": bool(d.get("verify_launch")),
+                "supports_variants": bool(d.get("supports_variants")),
+            }
+            for d in defs
+        ),
+        key=lambda t: t["name"],
+    )
+
+
 def _variant_seed_extra(twin_defs):
     """A fresh per-pass DF_TWIN_VARIANT_SEED extra_env dict, ONLY when at
     least one twin def declares supports_variants -- else None, which makes
@@ -1418,12 +1452,15 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # build/verify loop, just caught before any build is attempted.
     try:
         manifest_base["twin_evidence"] = _twin_manifest_field(cfg, scenarios)
+        # M21: `twins` (name/fidelity/verify_only_impl/supports_variants)
+        # computed alongside `twin_evidence`, same fail-closed handling below.
+        manifest_base["twins"] = _twins_manifest_field(cfg)
     except df_twins.TwinError as e:
         journal.write("TWIN_ERROR", iteration=0, detail=str(e))
         mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0, qualified=False,
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
-                  container=None, twin_evidence=None,
+                  container=None, twin_evidence=None, twins=None,
                   budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
@@ -1652,7 +1689,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             if twins_enabled:
                 if not twins_started:
                     try:
-                        build_env_extra = ts.start(twin_defs, run_dir, twin_timeout)
+                        build_env_extra = ts.start(twin_defs, run_dir, twin_timeout, phase="build")
                         twins_started = True
                     except df_twins.TwinError as e:
                         return _twin_error_abort(i, e)
@@ -1904,7 +1941,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             if twins_enabled:
                 try:
                     verify_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
-                                                 extra_env=_variant_seed_extra(twin_defs))
+                                                 extra_env=_variant_seed_extra(twin_defs),
+                                                 phase="verify")
                 except df_twins.TwinError as e:
                     return _twin_error_abort(i, e)
 
@@ -1979,7 +2017,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     if seed_extra is not None:
                         try:
                             final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
-                                                        extra_env=seed_extra)
+                                                        extra_env=seed_extra, phase="verify")
                         except df_twins.TwinError as e:
                             return _twin_error_abort(i, e)
                 final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
@@ -2284,6 +2322,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         # honestly falls back to 0 rather than raising here too.
         try:
             manifest_base["twin_evidence"] = _twin_manifest_field(cfg, gate_scenarios or [])
+            # M21: `twins`, recomputed fresh on every resume, same as
+            # `twin_evidence` -- deterministic from cfg + the control root's
+            # twins/*.json.
+            manifest_base["twins"] = _twins_manifest_field(cfg)
         except df_twins.TwinError as e:
             journal.write("TWIN_ERROR", detail=str(e))
             mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR",
@@ -2291,7 +2333,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       sandbox_backend=None, denial_probe_passed=False, container=None,
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=sorted(state.get("regressions", [])),
-                      twin_evidence=None,
+                      twin_evidence=None, twins=None,
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
                           state.get("estimated_usd", 0.0)))

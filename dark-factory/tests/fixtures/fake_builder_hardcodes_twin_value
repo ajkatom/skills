@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""M21 Task 2 e2e: the OVERFIT reference builder. Speaks adapter protocol
+0.1, single (unconditional) response -- it writes a value.py that HARDCODES
+the build-phase twin's fixed marker value (as if the builder observed the
+build-time twin's response once and overfit that exact string) instead of
+calling the twin. It NEVER touches DF_TWIN_VALUEGEN at all.
+
+This value.py always prints the BUILD marker, regardless of feedback, so a
+run against it never converges once the verify pass swaps in a DIFFERENT
+verify-phase twin instance (verify_launch): the scenario expects the VERIFY
+marker, gets the BUILD marker, fails wrong_output every iteration, until the
+cap is reached. This is the whole point of verify_launch -- a builder can't
+overfit a mock it never sees at verify. Keep BUILD_MARKER identical to the
+constant the test module uses for the twin def's `launch` argv."""
+import json
+import sys
+
+# Must match test_e2e_verifier_twin.BUILD_MARKER exactly.
+BUILD_MARKER = "TWIN-BUILD-FIXED-b7e2a1"
+
+VALUE_PY = f"print({BUILD_MARKER!r})\n"
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(f"{wd}/value.py", "w", encoding="utf-8") as f:
+        f.write(VALUE_PY)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

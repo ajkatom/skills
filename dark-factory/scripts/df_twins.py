@@ -32,6 +32,20 @@ DF_ENDPOINT_FILE=..., DF_OBSERVER_FILE=..., **(extra_env or {}))`), so an
 or observer wiring for that twin process. The supervisor is the only caller
 of `start`/`reset` with a non-None `extra_env`, and it must pass ONLY
 `DF_TWIN_VARIANT_SEED` -- never `DF_ENDPOINT_FILE` or `DF_OBSERVER_FILE`.
+
+Verifier-only twin implementations (M21): a def may declare an optional
+`verify_launch` (same shape/validation as `launch`) -- a separate,
+author-supplied, spec-conformant mock used ONLY during verify passes.
+`TwinSet.start`/`reset` take a `phase` ("build" or "verify"); the argv used
+for a def is `verify_launch` iff `phase == "verify"` AND the def has a
+truthy `verify_launch`, else `launch` is always reused (fully additive: a
+def with no `verify_launch` behaves identically at both phases). This
+generalizes the M12 variant-seed idea from "same process, unpredictable
+per-request tokens" to "a different process entirely", so a builder that
+overfits the specific build-time twin's behavior fails at verify. Composes
+with variant seeds: `extra_env` still flows to whichever impl is running.
+`TwinSet.phase_launched` records, per twin name, which impl ("build" or
+"verify") actually ran on the most recent `start`/`reset` call.
 """
 import glob
 import json
@@ -64,6 +78,10 @@ def load_defs(twins_dir: str) -> list:
         launch = d.get("launch")
         if not isinstance(launch, list) or not launch or not all(isinstance(x, str) for x in launch):
             raise TwinError(f"{name}: launch must be a non-empty list of strings")
+        if "verify_launch" in d:
+            verify_launch = d["verify_launch"]
+            if not isinstance(verify_launch, list) or not verify_launch or not all(isinstance(x, str) for x in verify_launch):
+                raise TwinError(f"{name}: verify_launch must be a non-empty list of strings")
         d.setdefault("env_var", "DF_TWIN_" + name.upper())
         supports_variants = d.setdefault("supports_variants", False)
         if not isinstance(supports_variants, bool):
@@ -77,11 +95,12 @@ class TwinSet:
         self._procs = []      # list[(subprocess.Popen, def, pgid)]
         self.env = {}
         self.observer_files = {}
+        self.phase_launched = {}   # {name: "build"|"verify"} -- which impl actually ran
 
-    def start(self, defs, run_dir: str, timeout_s: int, extra_env: dict = None) -> dict:
+    def start(self, defs, run_dir: str, timeout_s: int, extra_env: dict = None, phase: str = "build") -> dict:
         twdir = os.path.join(run_dir, "twins")
         os.makedirs(twdir, exist_ok=True)
-        env_map, obs_map, pending = {}, {}, []
+        env_map, obs_map, phase_map, pending = {}, {}, {}, []
         try:
             for d in defs:
                 ep_file = os.path.join(twdir, d["name"] + ".endpoint")
@@ -91,7 +110,10 @@ class TwinSet:
                 child_env = dict(os.environ, DF_ENDPOINT_FILE=ep_file,
                                   DF_OBSERVER_FILE=obs_file, **(extra_env or {}))
                 obs_map[d["name"]] = obs_file
-                proc = subprocess.Popen(d["launch"], cwd=run_dir, env=child_env,
+                use_verify = phase == "verify" and bool(d.get("verify_launch"))
+                argv = d["verify_launch"] if use_verify else d["launch"]
+                phase_map[d["name"]] = "verify" if use_verify else "build"
+                proc = subprocess.Popen(argv, cwd=run_dir, env=child_env,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                         start_new_session=True)
                 # start_new_session=True makes proc the session/process-group
@@ -128,11 +150,12 @@ class TwinSet:
                 time.sleep(0.05)
         self.env = env_map
         self.observer_files = obs_map
+        self.phase_launched = phase_map
         return env_map
 
-    def reset(self, defs, run_dir: str, timeout_s: int, extra_env: dict = None) -> dict:
+    def reset(self, defs, run_dir: str, timeout_s: int, extra_env: dict = None, phase: str = "verify") -> dict:
         self.stop()
-        return self.start(defs, run_dir, timeout_s, extra_env=extra_env)
+        return self.start(defs, run_dir, timeout_s, extra_env=extra_env, phase=phase)
 
     def stop(self) -> None:
         # pgid is captured at start() time (see start()), while each child was
@@ -200,3 +223,4 @@ class TwinSet:
         self._procs = []
         self.env = {}
         self.observer_files = {}
+        self.phase_launched = {}
