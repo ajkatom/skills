@@ -564,12 +564,20 @@ def test_resume_threads_twin_evidence_and_fresh_seed_across_pause(tmp_path, monk
     reset_calls_before_resume = len(_RecordingTwinSet.RESET_CALLS)
     assert reset_calls_before_resume >= 1
 
+    # M36b: the rebuild+converge resume performs its own fresh reset(s), then
+    # pauses before ship. The ship-resume seals WITHOUT rebuilding, so it adds
+    # NO further twin reset.
     rc2 = supervisor.resume(str(cr), "continue")
-    assert rc2 == 0
+    assert rc2 == supervisor.PAUSED  # converge -> AWAIT_SHIP
     assert len(_RecordingTwinSet.RESET_CALLS) > reset_calls_before_resume, \
         "resume must perform its OWN fresh reset(s), not reuse the pre-pause one"
     seeds = [r.get("DF_TWIN_VARIANT_SEED") for r in _RecordingTwinSet.RESET_CALLS]
     assert len(set(seeds)) == len(seeds), "every reset across the pause/resume boundary is unique"
+    resets_at_ship = len(_RecordingTwinSet.RESET_CALLS)
+
+    rc3 = supervisor.resume(str(cr), "continue")  # seal-reentry: no rebuild, no reset
+    assert rc3 == 0
+    assert len(_RecordingTwinSet.RESET_CALLS) == resets_at_ship
 
     run_id = os.listdir(cr / "runs")[0]
     manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())

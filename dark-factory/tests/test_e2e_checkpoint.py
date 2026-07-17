@@ -31,8 +31,13 @@ def test_pause_then_resume_converges_without_leaking_holdout(tmp_path):
         if name.startswith(("prompt_iter_", "feedback_iter_", "checkpoint_iter_")) or name == "state.json":
             assert MARKER not in (run_dir / name).read_text(encoding="utf-8"), name
 
+    # M36b: H2 converges into a before-ship pause; a second resume seals.
     p2 = _run(cr, "resume", "--decision", "continue")
-    assert p2.returncode == 0, p2.stderr            # converged after resume
+    assert p2.returncode == 10, p2.stderr           # converged -> AWAIT_SHIP pause
+    assert (run_dir / "checkpoint_ship.md").exists()
+    assert MARKER not in (run_dir / "checkpoint_ship.md").read_text(encoding="utf-8")
+    p3 = _run(cr, "resume", "--decision", "continue")
+    assert p3.returncode == 0, p3.stderr            # seal-reentry (no rebuild)
     assert not (run_dir / "state.json").exists()
     manifest = json.loads((run_dir / "manifest.json").read_text())
     assert manifest["outcome"] == "COMPLETE_UNQUALIFIED"

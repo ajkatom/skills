@@ -531,3 +531,41 @@ def freeze(src_dir: str, object_store: str) -> str:
     finally:
         if not published and os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# materialize (M36b Part B): check out a frozen object into a fresh workspace
+# ---------------------------------------------------------------------------
+
+
+def materialize_object(object_store: str, object_id: str, dest_dir: str) -> None:
+    """Copy the frozen object `object_id`'s tree into `dest_dir` (a spec-fork's
+    fresh child workspace), VALIDATE-BEFORE-MATERIALIZE.
+
+    Fail-closed: `verify_object` is run FIRST and materialization is refused
+    (SealError) unless the published object still matches its own sidecar — a
+    fork must never seed a child from a drifted/tampered/absent parent object.
+    `dest_dir` MUST already exist and be empty (the caller creates the child
+    workspace); a non-empty dest is refused rather than merged into (a fork
+    starts FROM the parent artifact, not blended with pre-existing files).
+
+    The copy reuses the same fd-safe, hostile-rejecting reader as `freeze`
+    (`_copy_tree_fd_safe`): even reading back OUR OWN object store, we never
+    follow a symlink/special file that a same-privilege actor might have
+    planted into the object dir since it was sealed. File permissions are
+    normalized to 0o600 + the recorded owner-exec bit (the object's canonical
+    identity carries only the exec-bit triplet, so a materialized workspace is
+    writable by the builder that will now extend it)."""
+    if not _OBJECT_ID_RE.match(object_id or ""):
+        raise SealError(f"refusing to materialize a non-sha256 object_id: {object_id!r}")
+    if not verify_object(object_store, object_id):
+        raise SealError(
+            f"object {object_id} failed identity verification; refusing to materialize "
+            "(fail-closed: never seed a fork from a drifted/absent parent object)")
+    if not os.path.isdir(dest_dir):
+        raise SealError(f"materialize destination is not an existing directory: {dest_dir}")
+    if os.listdir(dest_dir):
+        raise SealError(f"materialize destination is not empty: {dest_dir}")
+    obj_path = os.path.join(os.path.abspath(object_store), "objects", object_id)
+    _copy_tree_fd_safe(obj_path, os.path.abspath(dest_dir))
+    _fsync_tree_dirs(os.path.abspath(dest_dir))

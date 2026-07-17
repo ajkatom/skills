@@ -292,3 +292,54 @@ across a pause. It is explicitly NOT forgery-resistance against a same-user
 process that can rewrite both `fsm_chain.jsonl` and `state.json`'s head together
 (exactly the detection-grade scope of the manifest sha256 sidecar; a
 signed/off-box anchor is the hardened+ story — see "Honest limits" above).
+
+## Resume overrides, spec-fork lineage, before-ship pause (M36b)
+
+**Signed resume overrides** (`df_override`). Raising a BUDGET-PAUSE'd run's
+budget ceiling at resume is a policy change and must be authorized, not silent.
+A `resume_overrides: {approvers:[pubkey_hex,...], threshold:int}` config block
+governs it (absent ⇒ threshold 0 ⇒ no override accepted — fail-closed). An
+override file is `{claim, signatures:[{approver,sig}]}` where the canonical,
+signed claim is
+
+```
+{override_version:"1", run_id, override_type:"budget_ceiling",
+ params:{new_usd_ceiling}, issued_at, expires_at, nonce}
+```
+
+`resume --override <file>` verifies it BEFORE any builder call, reusing
+`df_custody` ed25519 (distinct-approver-by-pubkey counting). Every gate is
+fail-closed: `override_version` schema pin, `run_id` binding (an override for
+run A can't apply to run B), `issued_at <= now < expires_at` against a live
+clock, `≥ threshold` distinct allowlisted approver signatures, and **replay
+protection via the append-only `<control_root>/override-nonces.json` ledger** —
+a used nonce is rejected, so an override authorizes exactly ONE resume,
+independent of the supervisor HMAC. A valid override journals `OVERRIDE_APPLIED`
+(type, params, distinct signer count, nonce, prev/new cap) and raises this
+resume's effective `budget.max_usd`; anything invalid/expired/replayed/
+short-threshold journals `OVERRIDE_REJECTED` and refuses (exit 2). A non-empty
+policy REQUIRES `audit.signing` so the sealed `config_sha256` pinning the
+approver allowlist is HMAC-protected. Credential-VALUE refresh needs NO override
+(resume already re-resolves credentials every time under the sealed policy).
+
+**Spec-fork lineage** (`df-fork`). `df-fork <cr> --parent-run <run_dir>` starts a
+NEW run seeded from a PARENT run's sealed artifact object instead of an empty
+workspace. The parent must verify clean (`verify-manifest` == OK) and bind an
+`artifact.object_id`; its frozen object is materialized (`df_seal`,
+validate-before-materialize) into the child's fresh workspace. The child's
+manifest records `lineage = {parent_run_id, parent_artifact_object_id,
+parent_manifest_sha256, forked_at}` (journaled `FORKED`), and the parent is
+marked superseded: `<parent_run_dir>/superseded_by.json` + a `SUPERSEDED` event
+in the parent's **unhashed** `audit_events.jsonl` (never its sealed
+`journal.jsonl`, which would break the parent's journal seal). A superseded
+parent STILL verifies clean — supersession is provenance, not tampering — but
+`verify-manifest` PRINTS the supersession so a stale artifact isn't shipped
+unknowingly.
+
+**`SHIP_DECLINED`** (before-ship pause). Under H1/H2 a converged, frozen artifact
+pauses at `AWAIT_SHIP` for a human ship approval (see `references/modes.md`).
+`resume --decision continue` seals via seal-reentry (re-verify the frozen object,
+re-run gates, seal via `df_qualify.derive`) with NO builder re-dispatch
+(`SHIP_RESUME` journaled). `resume --decision abort` from `AWAIT_SHIP` seals a
+distinct **`SHIP_DECLINED`** terminal (qualified `False`) that still binds the
+frozen artifact object, so the declined candidate stays auditable.

@@ -90,12 +90,16 @@ def test_auto_mode_runs_to_convergence_without_pausing(tmp_path):
 
 
 def test_resume_continue_converges(tmp_path):
-    cr = setup_control(tmp_path, FAKE)  # pause mode
+    cr = setup_control(tmp_path, FAKE)  # pause mode (H2)
     assert supervisor.run(str(cr), None) == 10          # paused after iter 1
-    assert supervisor.resume(str(cr), "continue") == 0  # iter 2 converges
+    # M36b: H2 now pauses BEFORE ship on convergence — iter 2 converges but
+    # pauses at AWAIT_SHIP, and a SECOND resume seals it (no rebuild).
+    assert supervisor.resume(str(cr), "continue") == 10  # converged; before-ship pause
+    assert supervisor.resume(str(cr), "continue") == 0   # seals (seal-reentry)
     entries, run_id = read_journal(cr)
     states = [e["state"] for e in entries]
     assert states.count("BUILD") == 2 and "CONVERGED" in states
+    assert "SHIP_RESUME" in states
     assert not (cr / "runs" / run_id / "state.json").exists()  # cleared at terminal
     assert (cr / "runs" / run_id / "manifest.json").exists()
 
@@ -157,7 +161,10 @@ def test_resume_emits_cooperative_banner_on_stderr(tmp_path, capsys):
     cr = setup_control(tmp_path, FAKE)  # pause mode, cooperative tier
     assert supervisor.run(str(cr), None) == 10
     capsys.readouterr()  # clear
-    assert supervisor.resume(str(cr), "continue") == 0
+    # M36b: H2 pauses before ship; a second resume seals. The cooperative banner
+    # is re-emitted on every resume (isolation re-probed each time).
+    assert supervisor.resume(str(cr), "continue") == 10  # before-ship pause
+    assert supervisor.resume(str(cr), "continue") == 0   # seals
     err = capsys.readouterr().err
     assert "COOPERATIVE MODE" in err
 
@@ -169,7 +176,9 @@ def test_resume_manifest_preserves_snapshot_sha256(tmp_path):
     (src / "seed.txt").write_text("hi", encoding="utf-8")
     cr = setup_control(tmp_path, FAKE)
     assert supervisor.run(str(cr), str(src)) == 10       # paused after iter 1
-    assert supervisor.resume(str(cr), "continue") == 0   # converges
+    # M36b: converge pauses before ship; a second resume seals.
+    assert supervisor.resume(str(cr), "continue") == 10  # before-ship pause
+    assert supervisor.resume(str(cr), "continue") == 0   # seals
     run_id = os.listdir(cr / "runs")[0]
     manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     # find the SNAPSHOT journal value and confirm the manifest matches (not None)

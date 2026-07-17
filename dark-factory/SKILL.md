@@ -270,7 +270,24 @@ unchanged below.
    - **Twin evidence (M12, optional, recommended when a behavior depends on genuinely calling a twin).** Add a scenario `then` assertion — `twin_observed: {twin, contains}` (the twin's own observation log, not the candidate's output, must show the call) or `stdout_echoes_twin: {twin}` (the candidate's stdout must echo a token the twin served *this pass*) — and set `"supports_variants": true` on the twin def to make the served token fresh and unpredictable every verify pass. Both assertions fail closed with taxonomy `no_twin_evidence` if the candidate never really invoked the twin (e.g. a hardcoded response) — catching teaching-to-the-test that plain output-matching would miss. See `references/digital-twins.md` for the observation contract, seed semantics, and honest scope (filesystem-authority channel; network-graph enforcement and off-box sinks remain deferred).
 4c. **Brownfield (optional, only relevant when `--project-src` points at an already-existing codebase).** Detection is automatic and fail-safe toward brownfield: `brownfield.mode` defaults to `"auto"`, which classifies the run as `brownfield` the moment `--project-src` has ≥1 file — an existing tree is never silently treated as greenfield. To actually GUARD existing behavior against regression, supply `brownfield.probes` — real, deterministic commands (e.g. `python3 app.py add 2 3`) run against the CURRENT artifact before the builder ever touches anything; each is frozen into a holdout `BHV-REGRESS-<n>` scenario the builder never sees, and a build that breaks one fails verification exactly like a missed new-behavior scenario. **A brownfield run with zero probes configured is a valid but UNGUARDED no-op** — the supervisor says so loudly (stderr WARN + a distinct `BROWNFIELD_UNGUARDED` journal entry + an unambiguous manifest note), so it is never mistaken for "regressions checked." Characterization guards only what the probes exercise, never full semantics — see `references/brownfield.md` for the incremental workflow, the reduced-guarantee honesty, and how to write good probes.
 4d. **Builder confinement (optional, recommended, largest value at `cooperative`/`standard`).** Set `builder_confinement.enabled: true` to confine the BUILDER subprocess (not this orchestrating session) to an explicit build-tool allowlist — no MCP servers, no sub-agents, no web tools — enforced at the adapter boundary and **probe-verified**, not just flag-asserted. Only **claude** is supported/probe-verified today (its Bash tool is provably not loaded under the confinement flags). **codex** is UNSUPPORTED as of M14: the live probe caught that `-c mcp_servers={}` does NOT actually close codex's MCP surface on installs where the ChatGPT desktop-app runtime injects an `mcp__` tool bridge (the probe created a denied-tool proof file via a real `mcp__` tool), so codex fail-closes like gemini — this is the airtight probe doing its job, refusing rather than trusting a flag that doesn't hold. `builder_confinement.required` defaults to `.enabled` (turning confinement on defaults to REQUIRING it): a builder CLI with no probe-verified profile (`codex`, `gemini`) then refuses the run fail-closed (`CONFINEMENT_UNSUPPORTED` journaled, terminal manifest `outcome: "CONFINEMENT_REFUSED"`, exit 2, the builder CLI never spawned) rather than running it unconfined. Set `required: false` to instead warn (`CONFINEMENT_WARN`) and fall back to an unconfined run for that CLI. So today: pick **claude** as the builder to run confined; codex/gemini can only run unconfined (`enabled: false`, or `required: false` to auto-downgrade). See `references/builder-confinement.md` for the threat, claude's exact flags and what the live probe proved (Bash never loaded), the full codex-unsupported finding, and the honest note that `hardened`'s container barrier already confines heavily via `hardened.network: "none"` — so this config block's biggest win is at tiers without that barrier.
+4e. **Resume overrides (optional, M36b).** If ops needs a *governed* way to raise a
+    BUDGET-PAUSE'd run's budget ceiling at resume (an authorized policy change, not a raw
+    `config.json` edit), set `resume_overrides: {approvers:[pubkey_hex,...], threshold:N}`.
+    Approvers are ed25519 public keys (`df-override keygen`); a paused run is then cleared
+    with `df-override sign --run-dir <run_dir> --new-usd-ceiling <x> --expires <iso>` →
+    `resume --override <file>`. Each override is bound to one `run_id`, expires, and is
+    single-use (a `<control_root>/override-nonces.json` nonce ledger refuses replays). A
+    non-empty policy REQUIRES `audit.signing: true`. Absent the block, no override is ever
+    accepted (fail-closed). Credential-value refresh needs NO override — resume re-resolves
+    credentials every time. See `references/budget.md`.
 5. **Run.** `python3 <skill_dir>/scripts/supervisor.py run --control-root <control_root> [--project-src <dir>]`
+   - **Spec-fork from a prior artifact (optional, M36b).** To iterate on a shipped artifact
+     rather than rebuild from scratch, adjust `spec.md`/scenarios and start the child run
+     with `supervisor.py df-fork <control_root> --parent-run <parent_run_dir>` instead of
+     `run`. The parent must verify clean and bind an artifact; its frozen object seeds the
+     child workspace, the child manifest records `lineage`, and the parent is marked
+     superseded (still verifies, but `verify-manifest` prints the supersession so a stale
+     artifact isn't shipped unknowingly). See `references/audit.md`.
    Exit 0 = converged/accepted · 3 = a non-converged terminal a human must evaluate
    (`CAP_REACHED`, `FINAL_EXAM_FAILED`, or **`SECURITY_GATE_FAILED`** — the converged
    artifact tripped a mandatory security gate, see `references/security-gates.md`) ·
@@ -298,7 +315,14 @@ unchanged below.
      terminal: raise `budget.max_usd` and/or `budget.max_calls` in `config.json`, then
      `supervisor.py resume --control-root <cr> --decision continue` — the run re-reads
      the raised cap and continues from where it paused (builder-call/estimate counts
-     persist, no reset, no double-count). See `references/budget.md`.
+     persist, no reset, no double-count). For a **governed** ceiling raise, configure a
+     `resume_overrides: {approvers, threshold}` policy (M36b) and pass a signed
+     `resume --override <file>` (`df-override sign`) instead of a raw config edit.
+     See `references/budget.md`.
+   - **At a before-ship pause (exit 10, journal `CHECKPOINT` phase `AWAIT_SHIP`; H1/H2 only).**
+     The build converged and the artifact is frozen; a human approves the ship.
+     `resume --decision continue` seals it WITHOUT rebuilding (no builder call);
+     `resume --decision abort` seals `SHIP_DECLINED` (not shipped). See `references/modes.md`.
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
    path, and `verify-manifest --run-dir <run_dir>`. `verify-manifest` (DF-01/M28a) now also
    re-verifies the manifest's bound artifact object against the content-addressed store at

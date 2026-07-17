@@ -46,10 +46,19 @@ def test_chain_built_on_pause_and_verified_on_resume(tmp_path):
     assert state["fsm_chain_head"] == lines[0]["entry_hash"]
     assert lines[0]["bound_ids"]["scenario_set_sha256"]
 
-    # resume validates the chain (FSM_CHAIN_VERIFIED journaled) and converges.
+    # resume validates the chain (FSM_CHAIN_VERIFIED journaled), converges, and
+    # M36b appends an AWAIT_SHIP transition (the chain EXTENDS, not breaks).
+    assert supervisor.resume(str(cr), "continue") == 10  # converge -> AWAIT_SHIP
+    lines2 = [json.loads(l) for l in chain.read_text().splitlines()]
+    assert lines2[-1]["phase"] == "AWAIT_SHIP"
+    assert lines2[-1]["seq"] == len(lines2) - 1 and lines2[-1]["prev_chain"] == lines2[-2]["entry_hash"]
+    # the AWAIT_SHIP transition binds the frozen artifact object_id.
+    assert lines2[-1]["bound_ids"]["artifact_object_id"]
+    # a second resume re-validates the extended chain and seals (no rebuild).
     assert supervisor.resume(str(cr), "continue") == 0
     st = _states(cr)
     assert "FSM_CHAIN_VERIFIED" in st
+    assert "SHIP_RESUME" in st
     assert st[-1] == "CONVERGED"
 
 
@@ -117,8 +126,12 @@ def test_legacy_0_1_state_resumes_without_chain(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(state))
     (run_dir / "fsm_chain.jsonl").unlink()
 
-    assert supervisor.resume(str(cr), "continue") == 0  # legacy path still resumes
+    # Legacy path resumes + rebuilds; M36b then pauses before ship (a fresh 0.2
+    # AWAIT_SHIP checkpoint), and a second resume seals it.
+    assert supervisor.resume(str(cr), "continue") == 10  # legacy path -> converge -> AWAIT_SHIP
     st = _states(cr)
     assert "FSM_CHAIN_ABSENT_LEGACY" in st
     assert "FSM_CHAIN_CORRUPT" not in st
+    assert supervisor.resume(str(cr), "continue") == 0   # seal-reentry (now a 0.2 chain)
+    st = _states(cr)
     assert st[-1] == "CONVERGED"

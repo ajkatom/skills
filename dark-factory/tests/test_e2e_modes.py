@@ -61,10 +61,18 @@ def test_h1_pauses_before_build_2_then_converges(tmp_path):
     # only ONE build so far -- the before-build pause is BEFORE the dispatch.
     assert _states(cr).count("BUILD") == 1
 
-    assert supervisor.resume(str(cr), "continue") == 0   # approved build -> converge
+    # M36b: build 2 converges but H1 pauses BEFORE ship (AWAIT_SHIP); a final
+    # resume seals WITHOUT rebuilding.
+    assert supervisor.resume(str(cr), "continue") == 10  # approved build -> converge -> ship pause
+    assert _states(cr).count("BUILD") == 2               # no duplicate dispatch
+    ship_phase = [e["data"].get("phase") for e in read_journal(cr)[0]
+                  if e["state"] == "CHECKPOINT"][-1]
+    assert ship_phase == "AWAIT_SHIP"
+    assert supervisor.resume(str(cr), "continue") == 0   # seal-reentry
     st = _states(cr)
     assert st[-1] == "CONVERGED"
-    assert st.count("BUILD") == 2                         # no duplicate dispatch
+    assert st.count("BUILD") == 2                         # STILL no extra dispatch
+    assert "SHIP_RESUME" in st
     m = json.loads((run_dir / "manifest.json").read_text())
     assert m["intervention_mode"] == "H1"
 
@@ -77,13 +85,16 @@ def test_h2_pauses_after_verify_only(tmp_path):
 
     assert supervisor.run(str(cr), None) == 10
     assert _states(cr)[-1] == "CHECKPOINT"
-    # H2 does NOT gate the rebuild: one resume converges straight to seal (no
-    # before-build pause, no before-ship pause).
-    assert supervisor.resume(str(cr), "continue") == 0
+    # H2 does NOT gate the rebuild (no before-build pause), but M36b DOES pause
+    # before ship on convergence: one resume rebuilds+converges into AWAIT_SHIP,
+    # a second seals.
+    assert supervisor.resume(str(cr), "continue") == 10  # converge -> before-ship pause
+    assert supervisor.resume(str(cr), "continue") == 0   # seal-reentry
     st = _states(cr)
     assert st[-1] == "CONVERGED"
-    assert "AWAIT_BUILD_2" not in [
-        e["data"].get("phase") for e in read_journal(cr)[0] if e["state"] == "CHECKPOINT"]
+    phases = [e["data"].get("phase") for e in read_journal(cr)[0] if e["state"] == "CHECKPOINT"]
+    assert "AWAIT_BUILD_2" not in phases          # H2 never gates the build
+    assert "AWAIT_SHIP" in phases                 # but it does gate the ship
 
 
 # --- H3 guarded -------------------------------------------------------------

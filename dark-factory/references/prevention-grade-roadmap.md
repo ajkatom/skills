@@ -178,28 +178,53 @@ shipped answer, and should be reported as such rather than oversold.
 - `references/credentials.md` — the `-e` argv/`ps`-visibility residual,
   another same-user-privilege limit in the same family
 
-## M36b residuals (deferred from M36a, documented)
+## M36 — fully landed (M36a + M36b)
 
 M36a landed the four intervention modes, the single qualification state
 machine (folding `host_isolation` into `qualified`), and the phase-aware
-hash-chained FSM checkpoint. The following were deliberately deferred:
+hash-chained FSM checkpoint. **M36b landed the three deferred operator-workflow
+pieces**, so the audit-remediation program's M36 is now complete:
 
-- **Signed resume overrides.** A budget-ceiling raise or credential-VALUE
-  refresh at resume is not yet gated by an approver allowlist/threshold with a
-  canonical payload + replay protection independent of the supervisor HMAC.
-  Today raising `budget.max_usd` and `resume`-ing is an unauthenticated local
-  edit (detection-grade, like the rest of the single-user posture).
-- **Spec-fork lineage.** A parent run's sealed artifact object is not yet
-  consumable as a child run's input snapshot with recorded lineage +
-  superseded-parent marking.
+- **Signed resume overrides (`df_override`).** A budget-ceiling raise at resume
+  is now gated by a `resume_overrides.{approvers,threshold}` allowlist with a
+  canonical signed payload (`override_version, run_id, override_type, params,
+  issued_at, expires_at, nonce`), verified by reused `df_custody` ed25519
+  (distinct-signer counting), with **replay protection via an append-only
+  `<control_root>/override-nonces.json` ledger** independent of the supervisor
+  HMAC, run-id binding, and fail-closed expiry. A non-empty policy REQUIRES
+  `audit.signing` (mirroring M33a waivers), so the sealed `config_sha256` that
+  pins the approver allowlist is HMAC-protected. Credential-VALUE refresh needs
+  no override — `resume` re-resolves credentials every time under the sealed
+  policy (source/allowlist unchanged), so a changed value is picked up
+  automatically; only a budget-ceiling raise (a real policy change) is gated.
+- **Spec-fork lineage (`df-fork`).** A parent run's sealed artifact object is now
+  consumable as a child run's input (materialized via `df_seal`), with
+  `lineage = {parent_run_id, parent_artifact_object_id, parent_manifest_sha256,
+  forked_at}` on the child manifest and the parent marked superseded
+  (`superseded_by.json` + a post-seal `SUPERSEDED` event; `verify-manifest`
+  still verifies a superseded parent but PRINTS the supersession). Fork requires
+  a clean-verifying, artifact-bound parent (validate-before-materialize).
+- **The before-ship (approve-ship) pause.** `pauses_before_ship()` is now True
+  for H1/H2; convergence persists an `AWAIT_SHIP` FSM checkpoint and seals on
+  resume via **seal-reentry** — re-verify the frozen object, re-run gates, seal
+  via the same `df_qualify.derive` path, **no builder re-dispatch** (preserving
+  the M35 crash-dispatch invariant). `abort` from `AWAIT_SHIP` seals
+  `SHIP_DECLINED`. See `references/modes.md`.
+
+Still deferred (documented, not part of M36b scope):
+
 - **Interactive `WAIVER_PENDING` pause.** Security-gate waivers remain
-  attach-time (`df-waiver attach`); M36a adds `WAIVER_PENDING` as a first-class
-  FSM phase name but does NOT add a new interactive waiver pause.
-- **The before-ship (approve-ship) pause.** Deferred for both back-compat and
-  mechanism reasons — see `references/modes.md`. The `AWAIT_SHIP` phase and the
-  `pauses_before_ship()` predicate exist (returning False) for a future
-  milestone that designs seal-reentry.
+  attach-time (`df-waiver attach`); the `WAIVER_PENDING` FSM phase name exists
+  but there is no interactive waiver pause.
+- **Multi-parent / DAG lineage.** `df-fork` records a single parent only.
 
-The **FSM chain is corruption-detection, not forgery-proof** — a same-user
-process that rewrites both `fsm_chain.jsonl` and the recorded head together is
-out of scope, exactly as for the manifest/audit-chain hashes above.
+**Same-user residual (detection-grade, not prevention).** The resume-override
+signatures and nonce ledger raise the bar (multi-party authorization + replay
+protection), but a single operator who holds BOTH a signer private key AND
+control-root write can mint+apply an override and, absent an out-of-band anchor,
+could edit `config.json`'s approver allowlist (requiring `audit.signing`
+HMAC-pins the sealed `config_sha256`, so this is detectable, not prevented) or
+rewrite the nonce ledger. This is exactly the same single-user residual the FSM
+chain and the manifest/audit-chain hashes carry: **corruption/tamper DETECTION,
+not forgery-resistance against a same-user process.** A signed/off-box anchor
+(hardened+ audit sink, split-custody) remains the prevention-grade story.

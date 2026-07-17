@@ -30,6 +30,7 @@ import df_init
 import df_kb
 import df_modes
 import df_notify
+import df_override
 import df_proxy
 import df_qualify
 import df_sandbox
@@ -48,6 +49,7 @@ from df_config import (
 )
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
+import snapshot_source
 from snapshot_source import SnapshotError, snapshot
 
 # M17 Task 3: the hostname the enterprise builder container uses to reach the
@@ -264,7 +266,7 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
               redactor=None, builder_input_tokens=0, builder_output_tokens=0,
               usage_known=False, phase=None, chain_append=False,
               scenario_set_sha256=None, artifact_object_id=None,
-              build_approved_through=0):
+              build_approved_through=0, ship_meta=None):
     # M36a Task 3: state_version 0.2 additionally records the FSM `phase` and
     # the head of the per-run hash chain. Genuine resumable pause transitions
     # (chain_append=True: the checkpoint / budget / before-build pauses) append
@@ -303,6 +305,11 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             "phase": phase,
             "fsm_chain_head": chain_head,
             "build_approved_through": build_approved_through,
+            # M36b Part C: the post-convergence data an AWAIT_SHIP pause needs to
+            # SEAL on resume WITHOUT rebuilding — the frozen artifact object_id +
+            # its manifest field, the sealed final-exam result, and the converged
+            # iteration. None for every other pause (which resumes by rebuilding).
+            "ship_meta": ship_meta,
             # M25 Task 1: authoritative token totals, additive alongside the
             # M8 estimated_usd/builder_calls fields above -- never read by the
             # estimated_usd admission/alert/pause path, only accumulated and
@@ -339,6 +346,9 @@ def load_state(run_dir):
     state.setdefault("phase", None)
     state.setdefault("fsm_chain_head", None)
     state.setdefault("build_approved_through", 0)
+    # M36b Part C: only an AWAIT_SHIP pause records this; every other state has
+    # None (they resume by rebuilding, not sealing).
+    state.setdefault("ship_meta", None)
     return state
 
 
@@ -483,6 +493,38 @@ def write_build_checkpoint_report(run_dir, iteration, feedback, redactor=None):
         "",
     ]
     path = os.path.join(run_dir, f"checkpoint_build_{iteration}.md")
+    _redacted_write(path, "\n".join(lines), redactor)
+    return path
+
+
+def write_ship_checkpoint_report(run_dir, iteration, fe, sec_report, object_id, redactor=None):
+    """M36b Part C: the human-review surface for a BEFORE-SHIP (H1/H2) pause.
+
+    At this point dev converged, the sealed final exam PASSED, the security
+    gates PASSED, and the artifact was frozen (object_id) — the run is one
+    approval away from sealing COMPLETE_QUALIFIED. Barrier-safe: only pass/fail
+    counts + the content-addressed object_id reach this surface, never scenario
+    content. `continue` seals (no rebuild); `abort` seals SHIP_DECLINED."""
+    passed = fe.get("passed")
+    fe_line = (f"**{'PASS' if passed else 'FAIL'}** ({fe.get('count', 0)} held-out scenarios)"
+               if fe.get("ran") else "not administered")
+    failed_gates = (sec_report or {}).get("failed") or []
+    lines = [
+        f"# Before-ship checkpoint — iteration {iteration}",
+        "",
+        "Dev converged and the artifact is frozen. This is the final human gate "
+        "before it seals as a qualified ship-candidate.",
+        "",
+        f"- Final exam: {fe_line}",
+        f"- Security gates: **{'PASS' if not failed_gates else 'FAIL: ' + ', '.join(failed_gates)}**",
+        f"- Frozen artifact object_id: `{object_id}`",
+        "",
+        "Decide: `resume --decision continue` (approve the ship — seals without "
+        "rebuilding) · `resume --decision abort` (decline — seals SHIP_DECLINED, "
+        "not shipped).",
+        "",
+    ]
+    path = os.path.join(run_dir, "checkpoint_ship.md")
     _redacted_write(path, "\n".join(lines), redactor)
     return path
 
@@ -1830,11 +1872,145 @@ def _verify_manifest_status(run_dir: str, key: bytes = None, object_store: str =
     status = _check_manifest_artifact(manifest, store)
     if status == _ARTIFACT_OK:
         print("OK")
+        # M36b Part B: a superseded parent STILL verifies OK (supersession is
+        # provenance, not tampering), but surface it so a stale artifact is not
+        # shipped unknowingly. Printed after OK, never changing the status.
+        sb_path = os.path.join(run_dir, SUPERSEDED_BY_FILE)
+        if os.path.isfile(sb_path):
+            try:
+                with open(sb_path, encoding="utf-8") as f:
+                    sb = json.load(f)
+                print(f"SUPERSEDED by child run {sb.get('child_run_id')} "
+                      f"(at {sb.get('ts')}) — this artifact was forked; a newer child "
+                      "run exists.")
+            except (OSError, json.JSONDecodeError):
+                print("SUPERSEDED (superseded_by.json present but unreadable)")
     return status
 
 
 def verify_manifest(run_dir: str, key: bytes = None, object_store: str = None) -> bool:
     return _verify_manifest_status(run_dir, key=key, object_store=object_store) == _ARTIFACT_OK
+
+
+# ---------------------------------------------------------------------------
+# M36b Part B: spec-fork lineage + parent supersession.
+# ---------------------------------------------------------------------------
+
+SUPERSEDED_BY_FILE = "superseded_by.json"
+
+
+def _supersede_parent(control_root, parent_run_id, child_run_id, redactor):
+    """Mark a parent run superseded by a child spec-fork.
+
+    Writes `<parent_run_dir>/superseded_by.json = {child_run_id, ts}` and appends
+    a SUPERSEDED event to the parent's UNHASHED post-seal `audit_events.jsonl`
+    (NEVER its sealed `journal.jsonl` — the parent's journal_sha256 is frozen in
+    its manifest, so an append there would break the parent's verify-manifest).
+    Supersession is provenance, not tampering: the parent still verifies clean
+    (verify-manifest surfaces the supersession as a printed line, never a
+    failure). Idempotent-ish: re-superseding overwrites the sidecar with the
+    latest child (single-parent, single-supersessor model — the newest fork
+    wins; the audit_events log keeps every SUPERSEDED for the full trail)."""
+    parent_run_dir = os.path.join(control_root, "runs", parent_run_id)
+    ts = _now()
+    _redacted_write(os.path.join(parent_run_dir, SUPERSEDED_BY_FILE),
+                    {"child_run_id": child_run_id, "ts": ts}, redactor)
+    events_path = os.path.join(parent_run_dir, "audit_events.jsonl")
+    data = {"child_run_id": child_run_id}
+    if redactor is not None:
+        data = redactor.redact_obj(data)
+    line = canonical_json({"ts": ts, "state": "SUPERSEDED", "data": data})
+    with open(events_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def fork_cmd(control_root: str, parent_run: str, allow_downgrade: bool = False) -> int:
+    """`df-fork` — start a NEW run seeded FROM a PARENT run's sealed artifact
+    object (M36b Part B), rather than an empty/greenfield workspace.
+
+    Validate-before-materialize, fail-closed:
+      - the parent must live under THIS control root's runs/ (its object lives in
+        this control root's object store);
+      - the parent's manifest must verify clean (`_verify_manifest_status` == OK
+        — byte-integrity AND a bound artifact object that re-verifies by
+        identity); a superseded parent still verifies OK, so a parent can be
+        re-forked, but a tampered/unbound one is refused;
+      - the parent must bind an artifact `object_id`.
+    On success it records lineage on the child's manifest and marks the parent
+    superseded (both handled inside the normal run path via `fork_seed`)."""
+    control_root = os.path.abspath(control_root)
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    cfg["_control_root"] = control_root
+
+    parent_run_dir = os.path.abspath(parent_run)
+    # The parent MUST be a run under this control root (its frozen object is in
+    # this control root's object store; a cross-root fork has no object to
+    # materialize). Enforce the <control_root>/runs/<id> layout.
+    expected_parent = os.path.abspath(_control_root_from_run_dir(parent_run_dir) or "")
+    if expected_parent != control_root:
+        sys.stderr.write(
+            f"dark-factory: --parent-run must be a run under {control_root}/runs "
+            f"(got {parent_run_dir})\n")
+        return 2
+    parent_run_id = os.path.basename(parent_run_dir.rstrip(os.sep))
+
+    mp = os.path.join(parent_run_dir, "manifest.json")
+    if not os.path.isfile(mp):
+        sys.stderr.write(f"dark-factory: parent run has no sealed manifest: {mp}\n")
+        return 2
+    try:
+        with open(mp, encoding="utf-8") as f:
+            parent_manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"dark-factory: cannot read parent manifest: {e}\n")
+        return 2
+
+    # Verify the parent clean. If the parent's manifest is signed, load the audit
+    # key so verification is a real signature check (not UNVERIFIED). Object
+    # store is this control root's.
+    vkey = None
+    if parent_manifest.get("audit_signing"):
+        try:
+            vkey = df_audit.load_key(cfg["_audit"]["key_path"])
+        except df_audit.AuditKeyError as e:
+            sys.stderr.write(
+                f"dark-factory: parent manifest is signed but its audit key could not be "
+                f"loaded to verify it: {e}\n")
+            return 2
+    status = _verify_manifest_status(
+        parent_run_dir, key=vkey, object_store=_object_store_root(control_root))
+    if status != _ARTIFACT_OK:
+        sys.stderr.write(
+            f"dark-factory: refusing to fork — parent run does not verify clean "
+            f"(status: {status}). A fork must start from a verified parent artifact.\n")
+        return 2
+
+    artifact = parent_manifest.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        sys.stderr.write(
+            "dark-factory: refusing to fork — parent manifest binds no artifact object_id "
+            "(nothing to materialize).\n")
+        return 2
+
+    _pm_bytes, parent_manifest_sha256 = _read_manifest_bytes(parent_run_dir)
+    fork_seed = {
+        "parent_run_id": parent_run_id,
+        "parent_artifact_object_id": artifact["object_id"],
+        "parent_manifest_sha256": parent_manifest_sha256,
+        "forked_at": _now(),
+    }
+    print(f"dark-factory: forking from parent {parent_run_id} "
+          f"(artifact {artifact['object_id'][:12]}…); starting child run.")
+    # A fork is a fresh run with a seeded workspace + recorded lineage; reuse the
+    # whole normal run path (gates, isolation, build/verify loop). project_src is
+    # None: the workspace comes from the parent object, not a source tree.
+    return run(control_root, None, allow_downgrade=allow_downgrade, fork_seed=fork_seed)
 
 
 def compose_prompt(spec_text: str, feedback) -> str:
@@ -2587,7 +2763,8 @@ def init_cmd(control_root: str, answers_path: str, force: bool = False, force_ke
     return 0
 
 
-def run(control_root: str, project_src, allow_downgrade: bool = False) -> int:
+def run(control_root: str, project_src, allow_downgrade: bool = False,
+        fork_seed=None) -> int:
     control_root = os.path.abspath(control_root)
     try:
         cfg = load_config(control_root)
@@ -2602,7 +2779,7 @@ def run(control_root: str, project_src, allow_downgrade: bool = False) -> int:
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
     try:
-        return _run_locked(control_root, project_src, cfg, allow_downgrade)
+        return _run_locked(control_root, project_src, cfg, allow_downgrade, fork_seed=fork_seed)
     finally:
         release_lock(lock)
 
@@ -2695,7 +2872,8 @@ def _variant_seed_extra(twin_defs):
     return None
 
 
-def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False) -> int:
+def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False,
+                fork_seed=None) -> int:
     creds, redactor, creds_err = _resolve_credentials(cfg)
     if creds_err is not None:
         sys.stderr.write(f"dark-factory: credentials: {creds_err}\n")
@@ -2828,6 +3006,12 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # SECURITY_GATE_FAILED) — never on ARTIFACT_UNHASHABLE or any
         # earlier terminal, where no trustworthy object_id exists yet.
         "artifact": None,
+        # Additive (M36b Part B): spec-fork lineage. None for an ordinary
+        # (non-forked) run; set below from `fork_seed` to
+        # {parent_run_id, parent_artifact_object_id, parent_manifest_sha256,
+        # forked_at} so EVERY terminal manifest of a forked child records its
+        # provenance.
+        "lineage": fork_seed if fork_seed else None,
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -2972,7 +3156,46 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         return anchor_exit or 2
 
     workspace = os.path.join(cfg["workspace_root"], invocation)
-    if project_src:
+    if fork_seed:
+        # M36b Part B: a spec-fork seeds the child workspace FROM the parent's
+        # frozen, content-addressed artifact object (validate-before-materialize
+        # inside df_seal.materialize_object: it re-verifies the object against
+        # its sidecar and refuses on any drift). The parent was already verified
+        # clean by fork_cmd BEFORE the lock; this re-verify is the fail-closed
+        # net for any drift since. `snapshot_sha256` is computed over the
+        # materialized tree so the child's provenance is auditable. Parent
+        # supersession is recorded only AFTER a successful materialize (the fork
+        # genuinely happened) — into the parent's UNHASHED post-seal event log +
+        # a sidecar, never its sealed journal.jsonl (which would break the
+        # parent's verify-manifest).
+        os.makedirs(workspace, exist_ok=True)
+        try:
+            df_seal.materialize_object(
+                _object_store_root(control_root),
+                fork_seed["parent_artifact_object_id"], workspace)
+            manifest = snapshot_source.build_manifest(workspace)
+            snap_hash = sha256_str(canonical_json(manifest))
+        except (df_seal.SealError, SnapshotError) as e:
+            journal.write("FORK_MATERIALIZE_FAILED", detail=str(e),
+                          parent_run_id=fork_seed.get("parent_run_id"))
+            mf = dict(manifest_base, outcome="ABORTED_BUILD_ERROR", iterations=0,
+                      snapshot_sha256=None, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False,
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=[], container=None,
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                      usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(f"dark-factory: fork materialize failed: {e}\n")
+            return anchor_exit or 2
+        _supersede_parent(control_root, fork_seed["parent_run_id"], invocation, redactor)
+        journal.write("FORKED", parent_run_id=fork_seed["parent_run_id"],
+                      parent_artifact_object_id=fork_seed["parent_artifact_object_id"],
+                      parent_manifest_sha256=fork_seed["parent_manifest_sha256"])
+    elif project_src:
         try:
             manifest, snap_hash = snapshot(project_src, workspace)
         except SnapshotError as e:
@@ -3142,7 +3365,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False,
               creds=None, redactor=None, extra_scenarios_dir=None,
               builder_input_tokens=0, builder_output_tokens=0, usage_known=False,
-              build_approved_through=0):
+              build_approved_through=0, resume_ship=False, ship_meta=None):
     exec_prefix = exec_prefix or []
     # M27 Task 2: candidate_prefix is the CANDIDATE/verifier-only wrapper
     # (run_all below); exec_prefix above stays the builder's. A caller that
@@ -3238,6 +3461,258 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         print(f"dark-factory: ARTIFACT UNHASHABLE (artifact rejected, not qualified): "
               f"{detail}. Run: {run_dir}")
         return anchor_exit or 3
+
+    def _finalize_converged(i, object_id, artifact_field, fe, gate_target, allow_pause):
+        """M36b Part C: the post-final-exam SEAL tail, shared by the straight-
+        through convergence AND the AWAIT_SHIP seal-reentry resume.
+
+        Runs mandatory security gates over `gate_target` (the live `workspace`
+        on the straight path; the frozen object dir on ship-resume), re-verifies
+        the frozen object by identity, folds the five substates through the SAME
+        `df_qualify.derive`, and seals. When `allow_pause` and the mode pauses
+        before ship (H1/H2) at a non-enterprise tier, it persists an AWAIT_SHIP
+        checkpoint and returns PAUSED INSTEAD of sealing — the ONLY new pause
+        point. Reads builder_calls/estimated_usd/etc. from the enclosing scope
+        (their post-convergence values on the straight path; the resumed state's
+        values on ship-resume), so NO builder dispatch happens on ship-resume."""
+        # Mandatory security gates (M9) on the converged/frozen artifact,
+        # independent of scenario pass — a clean scenario run with a planted
+        # secret still must not ship. Re-run (not trusted from the pause) on
+        # ship-resume: the artifact is immutable so the verdict is stable, but
+        # re-running is the honest fail-closed choice.
+        sec_report = _run_security_gates(cfg, journal, run_dir, gate_target, redactor=redactor)
+        if sec_report.get("failed"):
+            journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
+            # A SECURITY_GATE_FAILED run becomes shippable ONLY via a SEPARATE,
+            # signed df-waiver attestation (never a manifest rewrite). The sealed
+            # security block carries gate_policy_digest + waiver_policy so attach
+            # can recompute every binding digest from these bytes alone.
+            mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
+                      qualified=False, app_security_qualified=False,
+                      final_exam=fe, regressions=sorted(regressed),
+                      security=sec_report, artifact=artifact_field,
+                      budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                      usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                  builder_input_tokens, builder_output_tokens))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
+            _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
+            print(f"dark-factory: security gate failed (artifact rejected): "
+                  f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
+            _wpol = sec_report.get("waiver_policy", {"threshold": 0})
+            if _wpol.get("threshold", 0) >= 1:
+                manifest_path = os.path.join(run_dir, "manifest.json")
+                print(
+                    f"dark-factory: a waiver policy is configured "
+                    f"({_wpol['threshold']} of {len(_wpol.get('signers', []))} signers). "
+                    f"To accept a specific finding: list them with\n"
+                    f"  supervisor.py df-waiver findings --manifest {manifest_path}\n"
+                    f"have signers sign each with `df-waiver sign`, collect the entries "
+                    f"into {os.path.join(cfg['_control_root'], 'waiver-signatures.json')}, "
+                    f"then:\n"
+                    f"  supervisor.py df-waiver attach {cfg['_control_root']} --run-dir {run_dir}"
+                )
+            return anchor_exit or 3
+
+        # DF-01/M28a belt-and-suspenders: re-verify the frozen object still
+        # matches its own sidecar (object-store integrity drift -> fail closed,
+        # never seal a drifted object). This is also the ship-resume drift net.
+        if not df_seal.verify_object(_object_store_root(cfg["_control_root"]), object_id):
+            return _artifact_unhashable_abort(
+                i, f"frozen object {object_id} failed post-final-exam re-verification "
+                   "(object store integrity drift)", fe=fe, sec_report=sec_report)
+
+        eff = effective
+
+        # M33a fail-closed: at a mandatory tier the gates MUST have run.
+        if eff in MANDATORY_TIERS and not sec_report.get("checked"):
+            journal.write("SECURITY_GATES_MISSING", tier=eff)
+            mf = dict(mb_clean, outcome="SECURITY_GATES_MISSING", iterations=i,
+                      qualified=False, app_security_qualified=False,
+                      final_exam=fe, regressions=sorted(regressed),
+                      security=sec_report, artifact=artifact_field,
+                      budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                      usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                  builder_input_tokens, builder_output_tokens))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
+            _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
+            print(f"dark-factory: mandatory security gates did not run at tier {eff} "
+                  f"(fail-closed, not qualified). Run: {run_dir}")
+            return anchor_exit or 3
+
+        app_security_qualified = (eff not in MANDATORY_TIERS) or (
+            bool(sec_report.get("checked")) and not sec_report.get("failed"))
+
+        # M36b Part C: the before-ship approval pause. Fires only on the
+        # straight-through path (allow_pause), at a non-enterprise tier (an
+        # enterprise run's ship gate is the SEPARATE K-of-N custody attestation,
+        # not a human pause), when the mode pauses before ship (H1/H2). The
+        # frozen artifact + final-exam result are persisted so resume seals
+        # WITHOUT rebuilding. H4 can never reach here (it never pauses), but the
+        # lights-out invariant is asserted for defense in depth.
+        if allow_pause and eff != "enterprise" and df_modes.pauses_before_ship(mode):
+            if _lights_out:
+                raise df_sandbox.SandboxError(
+                    "H4 lights-out invariant violated: before-ship pause reached")
+            write_ship_checkpoint_report(run_dir, i, fe, sec_report, object_id, redactor=redactor)
+            save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                       dev_status=prev_dev_status, regressions=regressed,
+                       builder_calls=builder_calls, estimated_usd=estimated_usd,
+                       budget_alerted=budget_alerted, reason="ship",
+                       phase="AWAIT_SHIP", chain_append=True,
+                       scenario_set_sha256=scenario_set_sha256,
+                       artifact_object_id=object_id,
+                       build_approved_through=build_approved_through, redactor=redactor,
+                       builder_input_tokens=builder_input_tokens,
+                       builder_output_tokens=builder_output_tokens,
+                       usage_known=usage_known,
+                       ship_meta={"object_id": object_id, "artifact_field": artifact_field,
+                                  "final_exam": fe, "converged_iteration": i})
+            journal.write("CHECKPOINT", iteration=i, phase="AWAIT_SHIP",
+                          artifact_object_id=object_id)
+            print(f"dark-factory: PAUSED before ship (iteration {i}). Review "
+                  f"{run_dir}/checkpoint_ship.md, then `supervisor.py resume --control-root "
+                  f"{cfg.get('_control_root', '<CR>')} --decision continue` to SEAL (no rebuild) "
+                  f"or `--decision abort` to decline (SHIP_DECLINED).")
+            return PAUSED
+
+        custody_field = None
+        proxy_field = None
+        egress_field = None
+        seccomp_field = None
+
+        if eff == "enterprise":
+            # M17: an enterprise run with required custody ALWAYS seals
+            # CUSTODY_PENDING (qualified False) — the signable artifact must
+            # never self-qualify; shipping needs the SEPARATE K-of-N custody
+            # attestation. (Enterprise never reaches the before-ship pause
+            # above, so this path is unchanged from M36a.)
+            outcome, qualified = "CUSTODY_PENDING", False
+            qualification = _qualification_field(
+                mb_clean, eff, app_security=app_security_qualified,
+                waiver_validity=True, artifact_field=artifact_field)
+            proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
+            egress_field = enterprise_egress_result
+            seccomp_field = {
+                "profile": os.path.basename(cfg["_enterprise"]["seccomp"]),
+                "probe": "verified",
+            }
+            custody_field = {
+                "required_k": cfg["_custody"]["threshold"],
+                "approvers": len(cfg["_custody"]["approvers"]),
+                "satisfied": False,
+                "note": "enterprise run sealed CUSTODY_PENDING; qualification requires a "
+                        "valid K-of-N custody_attestation.json over these exact manifest "
+                        "bytes (df-custody attach)",
+            }
+            journal.write("CUSTODY_PENDING", iteration=i,
+                          required_k=cfg["_custody"]["threshold"],
+                          approvers=len(cfg["_custody"]["approvers"]))
+        else:
+            journal.write("CONVERGED", iteration=i)
+            # M36a Task 2: the SINGLE qualification SM — barrier ∧ host_isolation
+            # ∧ control_plane ∧ app_security ∧ waiver_validity. Unchanged by
+            # M36b; the ship pause simply gates WHEN this runs on H1/H2.
+            qualification = df_qualify.derive(
+                barrier=eff in _QUALIFYING_TIERS,
+                host_isolation=bool((mb_clean.get("host_isolation") or {}).get("qualified")),
+                control_plane=bool(isinstance(artifact_field, dict)
+                                   and artifact_field.get("object_id")),
+                app_security=app_security_qualified,
+                waiver_validity=True)
+            qualified = qualification["qualified"]
+            if qualified:
+                outcome = "COMPLETE_QUALIFIED"
+            elif eff not in _QUALIFYING_TIERS:
+                outcome = "COMPLETE_UNQUALIFIED"
+            else:
+                outcome = qualification["code"]
+
+        mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
+                  regressions=sorted(regressed), security=sec_report, qualified=qualified,
+                  app_security_qualified=app_security_qualified,
+                  qualification=qualification,
+                  artifact=artifact_field,
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                              builder_input_tokens, builder_output_tokens),
+                  custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
+                  enterprise_seccomp=seccomp_field)
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, [])
+
+        if outcome == "CUSTODY_PENDING":
+            manifest_path = os.path.join(run_dir, "manifest.json")
+            print(
+                f"dark-factory: CUSTODY PENDING — build converged, but shipping requires "
+                f"K-of-N split-custody sign-off ({custody_field['required_k']} of "
+                f"{custody_field['approvers']} approvers). The sealed manifest is the "
+                f"signable artifact:\n"
+                f"  manifest: {manifest_path}\n"
+                f"  sha256:   {digest}\n"
+                f"Have K-of-N approvers sign these exact bytes:\n"
+                f"  supervisor.py df-custody sign --manifest {manifest_path} --key-file <privkey>\n"
+                f"collect the {{approver,sig}} entries into "
+                f"{os.path.join(cfg['_control_root'], 'custody-signatures.json')}, then attach:\n"
+                f"  supervisor.py df-custody attach {cfg['_control_root']} --run-dir {run_dir}"
+            )
+            return anchor_exit or 3
+
+        note = "" if fe.get("ran") else " [no sealed final exam administered]"
+        print(f"dark-factory: CONVERGED "
+              f"({'qualified, ' + eff if qualified else 'unqualified, cooperative'} tier). "
+              f"Workspace: {workspace}  Run: {run_dir}{note}")
+        return anchor_exit or 0
+
+    def _resume_ship_seal():
+        """M36b Part C seal-reentry: resume from an AWAIT_SHIP pause and SEAL
+        WITHOUT re-dispatching a builder. Re-verify the frozen object matches
+        its sidecar (fail-closed on drift), then run gates over the frozen
+        object + seal via the SAME `_finalize_converged` path. The build
+        for-loop below is NEVER entered on this path, so `builder_calls` is
+        provably unchanged across the ship-resume."""
+        meta = ship_meta or {}
+        object_id = meta.get("object_id")
+        artifact_field = meta.get("artifact_field")
+        fe = meta.get("final_exam") or {"ran": False, "passed": None, "count": 0}
+        ci = meta.get("converged_iteration", start_iter)
+        object_store = _object_store_root(cfg["_control_root"])
+        journal.write("SHIP_RESUME", converged_iteration=ci, artifact_object_id=object_id)
+        # M36b hardening: `ship_meta` rides in state.json (not the FSM chain), so
+        # a hand-edited state.json could point the seal at a DIFFERENT,
+        # individually-valid object than the one this pause committed to. The
+        # AWAIT_SHIP transition already bound the object_id into the hash chain's
+        # head `bound_ids` (resume() re-validated the whole chain above), so
+        # cross-check them and REFUSE fail-closed on any disagreement — the
+        # chain-bound id is the authoritative one. Raising SandboxError routes to
+        # resume()'s exit-2 refusal (never a silent seal), mirroring
+        # FSM_CHAIN_CORRUPT: the run stays paused for the operator to reconcile.
+        chain_lines = _fsm_chain_lines(run_dir)
+        chain_bound_id = (chain_lines[-1].get("bound_ids", {}).get("artifact_object_id")
+                          if chain_lines else None)
+        if object_id != chain_bound_id:
+            journal.write("SHIP_META_MISMATCH", ship_object_id=object_id,
+                          chain_object_id=chain_bound_id)
+            raise df_sandbox.SandboxError(
+                "ship-resume: ship_meta.object_id "
+                f"{object_id!r} disagrees with the AWAIT_SHIP chain-bound "
+                f"artifact_object_id {chain_bound_id!r} (state.json tampered/corrupt); "
+                "refusing to seal (fail-closed)")
+        if not object_id or not df_seal.verify_object(object_store, object_id):
+            return _artifact_unhashable_abort(
+                ci, f"ship-resume: frozen object {object_id} failed re-verification "
+                    "(drift since the AWAIT_SHIP pause)", fe=fe)
+        object_dir = os.path.join(object_store, "objects", object_id)
+        return _finalize_converged(ci, object_id, artifact_field, fe, object_dir,
+                                   allow_pause=False)
 
     twins_enabled = cfg["_twins"]["enabled"]
     ts = df_twins.TwinSet() if twins_enabled else None
@@ -3335,6 +3810,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     f"invoked). detail: {egress_detail}\n")
                 return anchor_exit or 2
             journal.write("EGRESS_PROBE_PASSED", policy_digest=policy_digest)
+
+        # M36b Part C: an AWAIT_SHIP resume seals the ALREADY-frozen artifact
+        # here and returns BEFORE the build for-loop — the loop is the only
+        # place a builder is dispatched, so this reentry provably makes zero
+        # builder calls (asserted by the ship-pause e2e's builder_calls check).
+        if resume_ship:
+            return _resume_ship_seal()
 
         last_report = None
         for i in range(start_iter, cfg["max_iterations"] + 1):
@@ -3967,246 +4449,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           f"scenarios not disclosed). Run: {run_dir}")
                     return anchor_exit or 3
 
-                # dev converged AND (final passed OR no final cohort): mandatory
-                # security gates (M9) run HERE, on the converged artifact,
-                # independent of scenario pass — a clean scenario run with a
-                # planted secret still must not ship. AFTER the final exam,
-                # BEFORE CONVERGED is declared.
-                sec_report = _run_security_gates(cfg, journal, run_dir, workspace, redactor=redactor)
-                if sec_report.get("failed"):
-                    journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
-                    # M33a (DF-06): app_security_qualified is False here by
-                    # construction (a fail_on gate failed). The run stays
-                    # not-qualified in the sealed manifest; a
-                    # SECURITY_GATE_FAILED run becomes shippable ONLY via a
-                    # SEPARATE, signed df-waiver attestation (never a manifest
-                    # rewrite) — exactly the split-custody attach model. The
-                    # sealed security block already carries gate_policy_digest
-                    # + waiver_policy (see _run_security_gates), so attach can
-                    # recompute every binding digest from these bytes alone.
-                    mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
-                              qualified=False, app_security_qualified=False,
-                              final_exam=fe, regressions=sorted(regressed),
-                              security=sec_report, artifact=artifact_field,
-                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                          builder_input_tokens, builder_output_tokens))
-                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                digest, audit_key, journal)
-                    _clear_state()
-                    _kb_writeback(cfg, journal, mf, [])
-                    print(f"dark-factory: security gate failed (artifact rejected): "
-                          f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
-                    # Surface the signed-waiver path when a waiver policy is in
-                    # force (>=1 allowlisted signer) — an accepted-risk finding
-                    # can be signed off without ever weakening the gate.
-                    _wpol = sec_report.get("waiver_policy", {"threshold": 0})
-                    if _wpol.get("threshold", 0) >= 1:
-                        manifest_path = os.path.join(run_dir, "manifest.json")
-                        print(
-                            f"dark-factory: a waiver policy is configured "
-                            f"({_wpol['threshold']} of {len(_wpol.get('signers', []))} signers). "
-                            f"To accept a specific finding: list them with\n"
-                            f"  supervisor.py df-waiver findings --manifest {manifest_path}\n"
-                            f"have signers sign each with `df-waiver sign`, collect the entries "
-                            f"into {os.path.join(cfg['_control_root'], 'waiver-signatures.json')}, "
-                            f"then:\n"
-                            f"  supervisor.py df-waiver attach {cfg['_control_root']} --run-dir {run_dir}"
-                        )
-                    return anchor_exit or 3
-
-                # DF-01/M28a belt-and-suspenders: re-verify the object frozen
-                # above still matches its own sidecar now that the final exam
-                # + security gates have run (see the ENGINEERING NOTE where
-                # freeze() was called). In normal operation this is a cheap,
-                # always-true confirmation (nothing between freeze() and here
-                # writes into the object store); it exists to fail closed,
-                # rather than silently bind a stale/wrong object_id, if the
-                # object store was ever touched out from under this run.
-                if not df_seal.verify_object(_object_store_root(cfg["_control_root"]), object_id):
-                    return _artifact_unhashable_abort(
-                        i, f"frozen object {object_id} failed post-final-exam re-verification "
-                           "(object store integrity drift)", fe=fe, sec_report=sec_report)
-
-                eff = manifest_base.get("_effective_tier", "cooperative")
-
-                # M33a (DF-06) fail-closed: at a mandatory tier the security
-                # gates MUST have actually run (Task 2 forces secret_scan +
-                # dangerous_scan on at standard+). Reaching CONVERGED with
-                # `checked` False there would mean the mandatory gates silently
-                # didn't execute — refuse to qualify with a DISTINCT terminal
-                # rather than emit a COMPLETE_QUALIFIED whose gates never ran.
-                # This should be unreachable in normal operation; it exists so
-                # a future refactor that breaks the forcing fails loud, not
-                # silent.
-                if eff in MANDATORY_TIERS and not sec_report.get("checked"):
-                    journal.write("SECURITY_GATES_MISSING", tier=eff)
-                    mf = dict(mb_clean, outcome="SECURITY_GATES_MISSING", iterations=i,
-                              qualified=False, app_security_qualified=False,
-                              final_exam=fe, regressions=sorted(regressed),
-                              security=sec_report, artifact=artifact_field,
-                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                          builder_input_tokens, builder_output_tokens))
-                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                digest, audit_key, journal)
-                    _clear_state()
-                    _kb_writeback(cfg, journal, mf, [])
-                    print(f"dark-factory: mandatory security gates did not run at tier {eff} "
-                          f"(fail-closed, not qualified). Run: {run_dir}")
-                    return anchor_exit or 3
-
-                # M33a (DF-06): the app-security dimension of qualification.
-                # True iff the tier does not mandate gates (cooperative), OR
-                # the gates ran AND nothing in fail_on failed. Past the
-                # SECURITY_GATE_FAILED early-return above, `failed` is empty
-                # here, so at a mandatory tier this is True exactly when
-                # `checked` is True (guaranteed by the guard just above) — but
-                # we compute it from first principles so the manifest field is
-                # honest regardless of how we arrived.
-                app_security_qualified = (eff not in MANDATORY_TIERS) or (
-                    bool(sec_report.get("checked")) and not sec_report.get("failed"))
-
-                custody_field = None
-                proxy_field = None
-                egress_field = None
-                seccomp_field = None
-
-                if eff == "enterprise":
-                    # M17 Task 3 (redesigned): an enterprise run with required
-                    # custody ALWAYS terminates CUSTODY_PENDING (qualified
-                    # False). The manifest this seals IS the immutable,
-                    # signable artifact — it must NEVER self-qualify (that is
-                    # the whole point of split custody: no single process or
-                    # operator can ship). Qualification is a SEPARATE
-                    # attestation (custody_attestation.json), produced later by
-                    # `attach_custody` ONLY once >=K distinct approvers have
-                    # signed these exact sealed bytes — see the two-phase-ship
-                    # contract in references/enterprise.md. So there is no
-                    # in-loop custody "gate" that could pretend to qualify;
-                    # there is only this honest pending terminal.
-                    outcome, qualified = "CUSTODY_PENDING", False
-                    # M36a: the qualification SM's 5-substate posture is still
-                    # sealed for auditability, but it is ORTHOGONAL to split
-                    # custody -- an enterprise run can have all five substates
-                    # green yet still (correctly) seal qualified=False here,
-                    # because shipping needs the SEPARATE K-of-N custody
-                    # attestation. `qualification.qualified` therefore describes
-                    # the security substates only; the authoritative ship gate
-                    # is `qualified` (False) + the custody field.
-                    qualification = _qualification_field(
-                        mb_clean, eff, app_security=app_security_qualified,
-                        waiver_validity=True, artifact_field=artifact_field)
-                    proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
-                    # DF-05/M32: `enterprise_egress_result` was computed once,
-                    # above, by `_verify_enterprise_egress` BEFORE the first
-                    # builder call — a run only ever reaches this CONVERGED
-                    # branch at eff=="enterprise" if that probe already
-                    # PASSED (a failing probe returns EGRESS_PROBE_FAILED
-                    # long before any builder call, let alone convergence).
-                    # So {"probed": True, "passed": True, ...} here is
-                    # genuinely "verified THIS run", not merely configured —
-                    # see _verify_enterprise_egress's docstring for the
-                    # honest scope of exactly what was (and was not) proven.
-                    egress_field = enterprise_egress_result
-                    # Unlike egress_field, "verified" (not "unverified") is
-                    # honest here: resolve_isolation only ever returns
-                    # "enterprise" once df_container.probe_seccomp already
-                    # ran, live, against THIS run's image + resolved profile,
-                    # and passed -- so by the time we're here it genuinely
-                    # was proven on a real kernel this run, not merely
-                    # configured.
-                    seccomp_field = {
-                        "profile": os.path.basename(cfg["_enterprise"]["seccomp"]),
-                        "probe": "verified",
-                    }
-                    custody_field = {
-                        "required_k": cfg["_custody"]["threshold"],
-                        "approvers": len(cfg["_custody"]["approvers"]),
-                        "satisfied": False,
-                        "note": "enterprise run sealed CUSTODY_PENDING; qualification requires a "
-                                "valid K-of-N custody_attestation.json over these exact manifest "
-                                "bytes (df-custody attach)",
-                    }
-                    journal.write("CUSTODY_PENDING", iteration=i,
-                                  required_k=cfg["_custody"]["threshold"],
-                                  approvers=len(cfg["_custody"]["approvers"]))
-                else:
-                    journal.write("CONVERGED", iteration=i)
-                    # M36a Task 2 (THE SECURITY FIX): the SINGLE qualification
-                    # SM. Pre-M36a this was
-                    #   qualified = (eff in _QUALIFYING_TIERS) and app_security_qualified
-                    # which left host_isolation (sealed by M29b) OUT of the
-                    # top-level `qualified` -- so a standard run downgraded to
-                    # allow_host_read still sealed COMPLETE_QUALIFIED. Now every
-                    # dimension AND-s in ONE place (df_qualify.derive): barrier
-                    # (the tier gate, unchanged) ∧ host_isolation (NEWLY folded
-                    # in) ∧ control_plane (a real artifact object_id is bound,
-                    # always true here post-seal) ∧ app_security (M33a) ∧
-                    # waiver_validity (True in-loop; a waiver only ever comes
-                    # into play on the SEPARATE SECURITY_GATE_FAILED->df-waiver
-                    # path). Because the two booleans the old expression used are
-                    # exactly barrier+app_security and we only ADD conjuncts, a
-                    # run the old code passed can only NEWLY FAIL, never newly
-                    # pass -- fail-closed superset. cooperative keeps its
-                    # COMPLETE_UNQUALIFIED naming; a standard+ run that fails
-                    # ONLY on host_isolation seals the distinct
-                    # HOST_ISOLATION_LIMITED outcome.
-                    qualification = df_qualify.derive(
-                        barrier=eff in _QUALIFYING_TIERS,
-                        host_isolation=bool((mb_clean.get("host_isolation") or {}).get("qualified")),
-                        control_plane=bool(isinstance(artifact_field, dict)
-                                           and artifact_field.get("object_id")),
-                        app_security=app_security_qualified,
-                        waiver_validity=True)
-                    qualified = qualification["qualified"]
-                    if qualified:
-                        outcome = "COMPLETE_QUALIFIED"
-                    elif eff not in _QUALIFYING_TIERS:
-                        outcome = "COMPLETE_UNQUALIFIED"
-                    else:
-                        outcome = qualification["code"]
-
-                mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
-                          regressions=sorted(regressed), security=sec_report, qualified=qualified,
-                          app_security_qualified=app_security_qualified,
-                          qualification=qualification,
-                          artifact=artifact_field,
-                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                      builder_input_tokens, builder_output_tokens),
-                          custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
-                          enterprise_seccomp=seccomp_field)
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                            digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-
-                if outcome == "CUSTODY_PENDING":
-                    manifest_path = os.path.join(run_dir, "manifest.json")
-                    print(
-                        f"dark-factory: CUSTODY PENDING — build converged, but shipping requires "
-                        f"K-of-N split-custody sign-off ({custody_field['required_k']} of "
-                        f"{custody_field['approvers']} approvers). The sealed manifest is the "
-                        f"signable artifact:\n"
-                        f"  manifest: {manifest_path}\n"
-                        f"  sha256:   {digest}\n"
-                        f"Have K-of-N approvers sign these exact bytes:\n"
-                        f"  supervisor.py df-custody sign --manifest {manifest_path} --key-file <privkey>\n"
-                        f"collect the {{approver,sig}} entries into "
-                        f"{os.path.join(cfg['_control_root'], 'custody-signatures.json')}, then attach:\n"
-                        f"  supervisor.py df-custody attach {cfg['_control_root']} --run-dir {run_dir}"
-                    )
-                    return anchor_exit or 3
-
-                note = "" if final_ran else " [no sealed final exam administered]"
-                print(f"dark-factory: CONVERGED "
-                      f"({'qualified, ' + eff if qualified else 'unqualified, cooperative'} tier). "
-                      f"Workspace: {workspace}  Run: {run_dir}{note}")
-                return anchor_exit or 0
+                # M36b Part C: the whole post-final-exam SEAL tail (mandatory
+                # gates -> object re-verify -> before-ship pause -> seal) lives
+                # in `_finalize_converged` so the AWAIT_SHIP seal-reentry resume
+                # can reuse the IDENTICAL df_qualify.derive path with NO builder
+                # dispatch. The straight-through path runs gates over `workspace`
+                # and allows the before-ship pause; the ship-resume path runs
+                # them over the frozen object and never re-pauses.
+                return _finalize_converged(i, object_id, artifact_field, fe,
+                                           workspace, allow_pause=True)
 
             feedback = project_feedback(report)
             # feedback_iter/*.json and workspace/feedback.json are structurally
@@ -4269,7 +4520,98 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             proxy_httpd.server_close()
 
 
-def resume(control_root, decision="continue", allow_downgrade: bool = False):
+def _apply_resume_override(cfg, run_dir, journal, override_file):
+    """M36b (Part A): verify a signed resume override and, if valid, APPLY it —
+    raising THIS resume's effective budget hard ceiling in `cfg["_budget"]`.
+
+    Runs in `resume` BEFORE any builder call (before _run_loop). Returns
+    `(applied: bool, exit_code)`: on a valid override, `(True, None)` after
+    journaling OVERRIDE_APPLIED + recording the nonce; on ANY failure
+    (unreadable file, absent/short policy, wrong run, expired, replayed,
+    threshold-short), `(False, 2)` after journaling OVERRIDE_REJECTED — never a
+    silent proceed. The nonce is recorded to the append-only ledger the MOMENT
+    the override is accepted (before the loop re-enters), so an override
+    authorizes EXACTLY ONE resume even if that resume later fails.
+    """
+    run_id = os.path.basename(run_dir.rstrip(os.sep))
+    control_root = cfg["_control_root"]
+    policy = cfg.get("_resume_overrides", {"approvers": [], "threshold": 0})
+
+    if not os.path.exists(override_file):
+        journal.write("OVERRIDE_REJECTED", reason="override file not found", path=override_file)
+        sys.stderr.write(f"dark-factory: override file not found: {override_file}\n")
+        return False, 2
+    try:
+        with open(override_file, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        journal.write("OVERRIDE_REJECTED", reason=f"unreadable override file: {e}")
+        sys.stderr.write(f"dark-factory: cannot read override file: {e}\n")
+        return False, 2
+    if not isinstance(doc, dict):
+        journal.write("OVERRIDE_REJECTED", reason="override file is not a JSON object")
+        sys.stderr.write("dark-factory: override file must be a JSON object "
+                         "{claim, signatures:[{approver,sig}]}\n")
+        return False, 2
+    claim = doc.get("claim")
+    signatures = doc.get("signatures")
+    if not isinstance(signatures, list):
+        journal.write("OVERRIDE_REJECTED", reason="override file has no signatures list")
+        sys.stderr.write("dark-factory: override file must carry a 'signatures' list\n")
+        return False, 2
+
+    # Replay-protection store is fail-closed: a corrupt ledger refuses, never
+    # "assume no nonces used".
+    try:
+        used = df_override.load_used_nonces(control_root)
+    except df_override.OverrideError as e:
+        journal.write("OVERRIDE_REJECTED", reason=str(e))
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return False, 2
+
+    satisfied, reason, count, nonce = df_override.verify_override(
+        claim=claim, signatures=signatures,
+        approvers=policy.get("approvers", []), threshold=policy.get("threshold", 0),
+        run_id=run_id,
+        now=datetime.datetime.now(datetime.timezone.utc),
+        used_nonces=used,
+    )
+    if not satisfied:
+        journal.write("OVERRIDE_REJECTED", reason=reason, run_id=run_id,
+                      distinct_signers=count)
+        sys.stderr.write(f"dark-factory: resume override REJECTED — {reason}\n")
+        return False, 2
+
+    # Accepted. Record the nonce FIRST (the point of no return for replay
+    # protection), then apply. A record failure fails the override closed.
+    override_type = claim.get("override_type")
+    params = claim.get("params", {})
+    try:
+        df_override.record_nonce(control_root, nonce, run_id=run_id,
+                                 override_type=override_type, applied_at=_now())
+    except df_override.OverrideError as e:
+        journal.write("OVERRIDE_REJECTED", reason=f"nonce record failed: {e}", run_id=run_id)
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return False, 2
+
+    # Apply: raise this resume's effective budget hard ceiling. The change is
+    # in-memory only (cfg is per-invocation); config.json on disk is untouched,
+    # so a FRESH run re-reads the original cap. The budget admission loop reads
+    # cfg["_budget"]["max_usd"] each iteration, so lifting it here lets the
+    # paused run clear the cap it stalled on.
+    new_ceiling = float(params["new_usd_ceiling"])
+    prev_ceiling = cfg["_budget"].get("max_usd")
+    cfg["_budget"]["max_usd"] = new_ceiling
+    journal.write("OVERRIDE_APPLIED", override_type=override_type, params=params,
+                  distinct_signers=count, nonce=nonce, run_id=run_id,
+                  prev_cap_usd=prev_ceiling, new_cap_usd=new_ceiling)
+    print(f"dark-factory: resume override APPLIED — budget ceiling raised "
+          f"{prev_ceiling} -> {new_ceiling} USD ({count} distinct approver signature(s)).")
+    return True, None
+
+
+def resume(control_root, decision="continue", allow_downgrade: bool = False,
+           override_file=None):
     control_root = os.path.abspath(control_root)
     try:
         cfg = load_config(control_root)
@@ -4326,6 +4668,17 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         audit_key, audit_err = _load_audit_key(cfg, journal)
         if audit_err is not None:
             return audit_err
+
+        # M36b (Part A): a signed resume override is verified + applied BEFORE
+        # any builder call. On success it raises this resume's effective budget
+        # ceiling (cfg["_budget"]) so a BUDGET-PAUSE'd run can clear the cap it
+        # stalled on; on ANY failure the run REFUSES (exit 2), never a silent
+        # proceed. Applied only on the loop-re-entering decisions; abort/accept
+        # seal a terminal without building, so an override there is meaningless.
+        if override_file is not None and decision in ("continue", "reconcile"):
+            _applied, _ov_exit = _apply_resume_override(cfg, run_dir, journal, override_file)
+            if _ov_exit is not None:
+                return _ov_exit
 
         spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
         scenarios_dir = os.path.join(control_root, "scenarios")
@@ -4464,6 +4817,40 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             return anchor_exit or 2
 
         if decision == "abort":
+            # M36b Part C: aborting from an AWAIT_SHIP pause is a SHIP DECLINE,
+            # not a generic human abort — the artifact converged and froze; the
+            # human chose not to ship it. Seal a distinct SHIP_DECLINED terminal
+            # (qualified False) that BINDS the frozen artifact object (so the
+            # declined candidate is auditable), rather than ABORTED_BY_HUMAN.
+            ship_meta = state.get("ship_meta")
+            if state.get("phase") == "AWAIT_SHIP" and isinstance(ship_meta, dict):
+                journal.write("SHIP_DECLINED",
+                              converged_iteration=ship_meta.get("converged_iteration"),
+                              artifact_object_id=(ship_meta.get("artifact_field") or {}).get("object_id"))
+                mf = dict(manifest_base, outcome="SHIP_DECLINED",
+                          iterations=ship_meta.get("converged_iteration",
+                                                   state["next_iter"] - 1),
+                          qualified=False,
+                          sandbox_backend=None, denial_probe_passed=False, container=None,
+                          final_exam=ship_meta.get("final_exam")
+                          or {"ran": False, "passed": None, "count": 0},
+                          artifact=ship_meta.get("artifact_field"),
+                          regressions=sorted(state.get("regressions", [])),
+                          budget=_budget_manifest_field(
+                              cfg["_budget"], state.get("builder_calls", 0),
+                              state.get("estimated_usd", 0.0)),
+                          usage=_usage_manifest_field(
+                              cfg["_budget"], state.get("usage_known", False),
+                              state.get("builder_input_tokens", 0),
+                              state.get("builder_output_tokens", 0)))
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
+                os.unlink(os.path.join(run_dir, "state.json"))
+                _kb_writeback(cfg, journal, mf, [])
+                print("dark-factory: SHIP DECLINED — converged artifact not shipped "
+                      "(sealed SHIP_DECLINED, not qualified).")
+                return anchor_exit or 2
             journal.write("ABORTED_BY_HUMAN")
             mf = dict(manifest_base, outcome="ABORTED_BY_HUMAN",
                       iterations=state["next_iter"] - 1,
@@ -4596,6 +4983,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                 build_approved_through=(
                     state["next_iter"] if state.get("reason") == "build"
                     else state.get("build_approved_through", 0)),
+                # M36b Part C: resuming FROM an AWAIT_SHIP pause seals the frozen
+                # artifact WITHOUT re-entering the build loop (no builder call).
+                resume_ship=(state.get("phase") == "AWAIT_SHIP"),
+                ship_meta=state.get("ship_meta"),
             )
         except df_sandbox.SandboxError as e:
             # In-loop fail-closed guards exit 2, not an unhandled traceback.
@@ -4714,6 +5105,21 @@ def main():
     p_res.add_argument("--allow-downgrade", action="store_true",
                        help="if standard tier is unavailable/probe fails on re-probe, "
                             "downgrade to cooperative (unqualified) instead of failing closed")
+    p_res.add_argument("--override", default=None, dest="override_file",
+                       help="M36b: path to a signed resume-override file "
+                            "{claim, signatures:[{approver,sig}]} (df-override sign) — "
+                            "raises this resume's budget ceiling before any builder call")
+    p_fork = sub.add_parser(
+        "df-fork",
+        help="M36b: start a NEW run seeded from a PARENT run's sealed artifact object "
+             "(records lineage; marks the parent superseded)")
+    p_fork.add_argument("control_root")
+    p_fork.add_argument("--parent-run", required=True,
+                        help="the parent run_dir (under <control_root>/runs) whose verified, "
+                             "artifact-bound sealed manifest the child forks from")
+    p_fork.add_argument("--allow-downgrade", action="store_true",
+                        help="if standard tier is unavailable/probe fails, downgrade to "
+                             "cooperative (unqualified) instead of failing closed")
     p_mig = sub.add_parser(
         "df-migrate-config",
         help="rewrite a legacy autonomy/checkpoint config.json to the equivalent "
@@ -4786,6 +5192,38 @@ def main():
     dw_verify.add_argument("control_root")
     dw_verify.add_argument("--run-dir", required=True)
 
+    # `df-override` — the M36b (Part A) signed resume-override operator CLI,
+    # structurally a mirror of df-waiver but for RAISING a BUDGET-PAUSE'd run's
+    # budget ceiling at resume. keygen -> sign -> (collect for K>1) -> the file
+    # is passed to `resume --override`. See references/budget.md.
+    p_do = sub.add_parser("df-override",
+                          help="signed resume budget-ceiling overrides (keygen / sign)")
+    do_sub = p_do.add_subparsers(dest="override_cmd", required=True)
+    do_keygen = do_sub.add_parser("keygen",
+                                  help="generate a fresh override-approver ed25519 keypair")
+    do_keygen.add_argument("--out-prefix", default=None,
+                           help="if given, write <prefix>.key (private) + <prefix>.pub (public); "
+                                "otherwise print both to stdout")
+    do_sign = do_sub.add_parser(
+        "sign", help="build + sign a resume-override claim for a paused run; prints a ready "
+                     "{claim, signatures:[{approver,sig}]} file (merge signatures for K>1)")
+    do_sign.add_argument("--run-dir", required=True,
+                         help="the PAUSED run's run_dir; run_id is recomputed from its basename")
+    do_sign.add_argument("--type", default="budget_ceiling", dest="override_type",
+                         choices=list(df_override.OVERRIDE_TYPES),
+                         help="override type (M36b: budget_ceiling only)")
+    do_sign.add_argument("--new-usd-ceiling", type=float, default=None,
+                         help="budget_ceiling: the new max_usd ceiling to authorize (> 0)")
+    do_sign.add_argument("--expires", required=True,
+                         help="ISO-8601 UTC expiry, e.g. 2026-09-01T00:00:00Z (override is void "
+                              "at/after this instant; re-checked at resume against a live clock)")
+    do_sign.add_argument("--key-file", required=True,
+                         help="path to the approver's private key (raw-32-byte hex)")
+    do_sign.add_argument("--claim", default=None, dest="claim_file",
+                         help="for K>1: sign an EXISTING claim (a prior sign's output or a bare "
+                              "claim) instead of minting a new one, so every approver signs the "
+                              "identical nonce/bytes; merge the resulting signatures lists")
+
     args = ap.parse_args()
     if args.cmd == "init":
         sys.exit(init_cmd(args.control_root, args.answers, force=args.force,
@@ -4826,7 +5264,11 @@ def main():
                 sys.exit(2)
         sys.exit(0 if verify_chain_cmd(args.control_root, key=vkey) else 1)
     elif args.cmd == "resume":
-        sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
+        sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade,
+                        override_file=args.override_file))
+    elif args.cmd == "df-fork":
+        sys.exit(fork_cmd(args.control_root, args.parent_run,
+                          allow_downgrade=args.allow_downgrade))
     elif args.cmd == "df-migrate-config":
         sys.exit(migrate_config_cmd(args.control_root))
     elif args.cmd == "verify-custody":
@@ -4836,6 +5278,111 @@ def main():
         sys.exit(_df_custody_cli(args))
     elif args.cmd == "df-waiver":
         sys.exit(_df_waiver_cli(args))
+    elif args.cmd == "df-override":
+        sys.exit(_df_override_cli(args))
+
+
+def _df_override_cli(args) -> int:
+    """Dispatch for the `df-override` operator CLI (keygen / sign). keygen
+    delegates to df_custody (an approver key IS an ed25519 keypair). sign
+    recomputes run_id FROM the paused run's run_dir basename (never a
+    user-supplied run_id) and either mints a fresh claim (with a random nonce)
+    or signs an EXISTING claim (--claim, for K>1 so every approver signs the
+    identical nonce/bytes)."""
+    if args.override_cmd == "keygen":
+        try:
+            priv, pub = df_custody.generate_keypair()
+        except df_custody.CustodyError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        if args.out_prefix:
+            atomic_write(args.out_prefix + ".key", priv + "\n")
+            os.chmod(args.out_prefix + ".key", 0o600)
+            atomic_write(args.out_prefix + ".pub", pub + "\n")
+            print(f"dark-factory: wrote {args.out_prefix}.key (private, 0600) + "
+                  f"{args.out_prefix}.pub (public: {pub})")
+        else:
+            print(json.dumps({"private": priv, "public": pub}))
+        return 0
+
+    if args.override_cmd == "sign":
+        run_dir = os.path.abspath(args.run_dir)
+        run_id = os.path.basename(run_dir.rstrip(os.sep))
+        try:
+            with open(args.key_file, encoding="utf-8") as f:
+                private_hex = f.read().strip()
+        except OSError as e:
+            sys.stderr.write(f"dark-factory: cannot read key file: {e}\n")
+            return 2
+
+        if args.claim_file is not None:
+            # Additional approver: sign the SAME claim (identical nonce/bytes).
+            try:
+                with open(args.claim_file, encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except (OSError, ValueError) as e:
+                sys.stderr.write(f"dark-factory: cannot read --claim file: {e}\n")
+                return 2
+            claim = loaded.get("claim") if isinstance(loaded, dict) and "claim" in loaded else loaded
+            if not isinstance(claim, dict):
+                sys.stderr.write("dark-factory: --claim file has no signable claim object\n")
+                return 2
+            if claim.get("run_id") != run_id:
+                sys.stderr.write(
+                    f"dark-factory: --claim run_id {claim.get('run_id')!r} does not match this "
+                    f"run_dir's run_id {run_id!r}\n")
+                return 2
+        else:
+            # First approver: mint the claim (validate expiry + params here so a
+            # dead-on-arrival or malformed override is caught at sign time).
+            expires_dt = df_override._parse_ts(args.expires)
+            if expires_dt is None:
+                sys.stderr.write(
+                    f"dark-factory: --expires is not a valid ISO-8601 UTC timestamp: "
+                    f"{args.expires!r}\n")
+                return 2
+            issued_at = _now()
+            issued_dt = df_override._parse_ts(issued_at)
+            if not (issued_dt < expires_dt):
+                sys.stderr.write(
+                    f"dark-factory: --expires {args.expires!r} is not after the issue time "
+                    f"{issued_at!r}; the override would be dead on arrival.\n")
+                return 2
+            if args.override_type == "budget_ceiling" and args.new_usd_ceiling is None:
+                sys.stderr.write(
+                    "dark-factory: budget_ceiling requires --new-usd-ceiling\n")
+                return 2
+            params = {"new_usd_ceiling": args.new_usd_ceiling}
+            try:
+                df_override.validate_params(args.override_type, params)
+            except df_override.OverrideError as e:
+                sys.stderr.write(f"dark-factory: {e}\n")
+                return 2
+            claim = {
+                "override_version": df_override.OVERRIDE_VERSION,
+                "run_id": run_id,
+                "override_type": args.override_type,
+                "params": params,
+                "issued_at": issued_at,
+                "expires_at": args.expires,
+                "nonce": uuid.uuid4().hex,
+            }
+
+        try:
+            signed = df_override.override_signing_bytes(claim)
+            sig = df_custody.sign_manifest(private_hex, signed)
+            approver = df_custody.public_from_private(private_hex)
+        except (df_custody.CustodyError, df_override.OverrideError) as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        # Print a ready-to-use single-signer override file. For K>1, each
+        # approver runs `sign --claim <this>` and the operator merges the
+        # `signatures` lists (the claim is byte-identical across them).
+        print(json.dumps({"claim": claim, "signatures": [{"approver": approver, "sig": sig}]},
+                         indent=2, sort_keys=True))
+        return 0
+
+    return 2
 
 
 def _df_waiver_cli(args) -> int:

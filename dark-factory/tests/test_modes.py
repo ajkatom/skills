@@ -43,9 +43,12 @@ def test_pause_point_sets_are_the_authoritative_table():
     assert df_modes.pauses_after_verify("H3") is False
     assert df_modes.pauses_after_verify("H4") is False
 
-    # before_ship deferred -> False for ALL modes (see df_modes docstring).
-    for m in df_modes.INTERVENTION_MODES:
-        assert df_modes.pauses_before_ship(m) is False
+    # M36b: before_ship pauses on H1 + H2 (both supervised/directed modes gate
+    # the ship on convergence); H3 (guarded) + H4 (lights-out) never do.
+    assert df_modes.pauses_before_ship("H1") is True
+    assert df_modes.pauses_before_ship("H2") is True
+    assert df_modes.pauses_before_ship("H3") is False
+    assert df_modes.pauses_before_ship("H4") is False
 
     assert df_modes.pauses_on_budget_guard("H1") is True
     assert df_modes.pauses_on_budget_guard("H2") is True
