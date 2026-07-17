@@ -173,3 +173,72 @@ def test_api_anthropic_container_run_key_absent_even_on_adapter_error(tmp_path):
         assert TEST_KEY not in proc.stderr
     finally:
         _stop_stub(stub_proc)
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN paid live run against the REAL Anthropic API. Skipped unless the
+# operator explicitly opts in AND supplies a real key -- so it never runs (and
+# never costs) in a normal suite. The one thing the stub cannot prove: that
+# this exact container/network/parse/write path works against the real
+# provider. Set DF_LIVE_PAID_ANTHROPIC=1 and ANTHROPIC_API_KEY (optionally
+# DF_API_MODEL) to run it.
+# ---------------------------------------------------------------------------
+
+_PAID_OPT_IN = os.environ.get("DF_LIVE_PAID_ANTHROPIC") == "1"
+_HAS_ANTHROPIC_KEY = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+@pytest.mark.skipif(
+    not (DOCKER_LIVE and _PAID_OPT_IN and _HAS_ANTHROPIC_KEY),
+    reason="opt-in paid live test: set DF_LIVE_PAID_ANTHROPIC=1 + ANTHROPIC_API_KEY (and have docker)",
+)
+def test_api_anthropic_paid_live_in_container(tmp_path):
+    """A REAL, paid api_anthropic build inside the container against the real
+    Anthropic API (no ANTHROPIC_BASE_URL override -> the adapter's default
+    https://api.anthropic.com). Proves the real-provider path end-to-end;
+    costs a few tokens, hence opt-in only."""
+    real_key = os.environ["ANTHROPIC_API_KEY"]
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ws_real = os.path.realpath(str(workspace))
+
+    prompt_file = workspace / "DARK_FACTORY_PROMPT.md"
+    prompt_file.write_text(
+        "Build a single Python file greet.py that, run as "
+        "`python greet.py <name>`, prints exactly `Hello, <name>!`. "
+        "If no argument is given, use World.",
+        encoding="utf-8",
+    )
+
+    env = {"ANTHROPIC_API_KEY": real_key}
+    if os.environ.get("DF_API_MODEL"):
+        env["DF_API_MODEL"] = os.environ["DF_API_MODEL"]
+
+    adapter_ro_dir = os.path.dirname(ADAPTER)
+    docker_argv = df_container.build_argv(
+        IMAGE, ws_real, ro_mounts=[adapter_ro_dir], network="bridge", env=env,
+    )
+    req = {
+        "adapter_protocol": "0.1", "role": "builder", "workdir": ws_real,
+        "prompt_file": str(prompt_file), "timeout_s": 120, "confine": False,
+    }
+    proc = subprocess.run(
+        docker_argv + [ADAPTER], input=json.dumps(req),
+        capture_output=True, text=True, timeout=180,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    resp = json.loads(proc.stdout)
+    assert resp["status"] == "ok", resp.get("detail")
+    assert resp["usage"]["known"] is True
+    assert resp["usage"]["input_tokens"] > 0
+
+    greet = workspace / "greet.py"
+    assert greet.exists(), "the real model did not write greet.py into the workspace"
+
+    assert real_key not in proc.stdout
+    assert real_key not in proc.stderr
+    for root, _dirs, files in os.walk(ws_real):
+        for fn in files:
+            content = open(os.path.join(root, fn), encoding="utf-8", errors="replace").read()
+            assert real_key not in content

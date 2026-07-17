@@ -164,13 +164,19 @@ family).
 **Proven live.** `dark-factory/tests/test_openai_adapter.py` drives this
 adapter end-to-end (subprocess, protocol 0.1) against a local stub Chat
 Completions endpoint (`tests/fixtures/stub_chat_api`) — deterministic, no
-paid calls, runs in the suite. Unlike `api_anthropic`, this adapter does
-**not** yet have an in-container e2e test or a real-paid-model live proof —
-that is a deliberate, honest scope boundary (not deferred silently): the
-container-level mechanism (`df_container.build_argv` + `host.docker.internal`
-reaching a host-side stub or the real API) is identical to what
-`test_e2e_api_container.py` already proves for `api_anthropic`, so the
-residual risk is low, but it has not been separately exercised for this
-adapter. An operator with an `OPENAI_API_KEY` can run it live the same way
-`api_anthropic` was proven live (point `roles.builder.adapter` at
-`scripts/adapters/api_openai`, set `DF_API_MODEL` if the default doesn't fit).
+paid calls, runs in the suite. `dark-factory/tests/test_e2e_openai_container.py`
+additionally proves it **in-container** — the adapter running to completion
+inside a real `python:3.12-alpine` Docker container (the same
+`df_container.build_argv` shape the hardened tier uses, `network: bridge`,
+reaching a host-side stub via `host.docker.internal`), stub-brained and
+deterministic, running in the suite — exactly parallel to what
+`test_e2e_api_container.py` proves for `api_anthropic`.
+
+**Opt-in paid live proof.** A real-paid-model in-container run isn't wired
+into the normal suite (it costs tokens), but it's a first-class opt-in test,
+not a manual chore: `test_e2e_openai_container.py::test_api_openai_paid_live_in_container`
+runs a real build against the actual OpenAI API inside the container when you
+set `DF_LIVE_PAID_OPENAI=1` and `OPENAI_API_KEY` (optionally `DF_API_MODEL`);
+it skips otherwise, so a default run never pays. (`api_anthropic` has the
+symmetric `DF_LIVE_PAID_ANTHROPIC=1` opt-in test in
+`test_e2e_api_container.py`.)
