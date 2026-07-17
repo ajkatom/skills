@@ -15,6 +15,7 @@ import pytest
 
 import df_config
 import df_container
+import df_creds
 import df_sandbox
 import supervisor
 from test_config import write_config
@@ -541,6 +542,68 @@ def test_dep_cache_dir_unset_hardened_ro_mounts_and_env_unchanged(tmp_path, monk
     run_id = os.listdir(cr / "runs")[0]
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["container"]["dep_cache_dir"] is None
+
+
+def test_dep_cache_env_merges_with_creds_env_hardened(tmp_path, monkeypatch):
+    # Coverage gap closed: M11 credentials and M26 dep_cache_dir are each
+    # tested alone, but supervisor.py's hardened branch does
+    # `merged_env = dict(creds) if creds else {}` then
+    # `merged_env.update(dep_cache_env)` — nothing proves BOTH sets of `-e`
+    # flags survive together when both features are configured at once.
+    cr = _hardened_control(tmp_path)
+
+    secret = "supersecretvalue-9f8e7d6c5b4a"
+    cfg_dict = json.loads((cr / "config.json").read_text())
+    cfg_dict["credentials"] = {"source": "env", "allowlist": ["FOO_API_KEY"]}
+    dep_cache = tmp_path / "depcache"
+    (dep_cache / "pypi").mkdir(parents=True)
+    (dep_cache / "npm-cache").mkdir(parents=True)
+    cfg_dict["hardened"] = {"dep_cache_dir": str(dep_cache)}
+    (cr / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
+
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    def _fake_load_credentials(spec):
+        return {name: secret for name in spec["allowlist"]}
+    monkeypatch.setattr(supervisor.df_creds, "load_credentials", _fake_load_credentials)
+
+    captured = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                    exec_prefix=None, env_extra=None, env_full=None):
+        captured.append(list(exec_prefix) if exec_prefix else [])
+        with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+            f.write(GREET_PY)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    assert captured, "builder invoke_adapter was never called"
+
+    argv = captured[0]
+    dep_cache_real = os.path.realpath(str(dep_cache))
+    v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+    assert any(spec == f"{dep_cache_real}:{dep_cache_real}:ro" for spec in v_specs), v_specs
+
+    e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
+    # credential env survives the merge (would fail if dep_cache_env.update()
+    # replaced merged_env instead of updating it, or if creds were dropped)
+    assert f"FOO_API_KEY={secret}" in e_pairs
+    # all four dep-cache env vars survive alongside the credential (would
+    # fail if `dict(creds) if creds else {}` were seeded fresh and never
+    # updated with dep_cache_env, dropping the cache vars silently)
+    assert "PIP_NO_INDEX=1" in e_pairs
+    assert f"PIP_FIND_LINKS={os.path.join(dep_cache_real, 'pypi')}" in e_pairs
+    assert f"npm_config_cache={os.path.join(dep_cache_real, 'npm-cache')}" in e_pairs
+    assert "npm_config_offline=true" in e_pairs
+
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["container"]["dep_cache_dir"] == dep_cache_real
+    manifest_text = (cr / "runs" / run_id / "manifest.json").read_text()
+    assert secret not in manifest_text
 
 
 # ---------------------------------------------------------------------------
