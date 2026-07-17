@@ -45,10 +45,23 @@ open for the builder wrapper are MEASURED CLOSED here on this backend:
 `bootstrap_look_up("com.apple.dnssd.service")` (DNS resolution) both fail
 inside the wrapper, and `getaddrinfo()` errors immediately instead of
 reaching mDNSResponder. `probe_candidate_confinement` live-proves all of it
-per run, fail-closed, before any scenario relies on it. The Linux bwrap
-backend keeps its LEGACY candidate behavior (ro-bind / + tmpfs mask: the
-whole host stays readable) until M29c and says so honestly via
-`mode="legacy_allow_host_read"` — never a fake default-deny claim.
+per run, fail-closed, before any scenario relies on it.
+
+M29c (DF-02 Linux host-read half): the Linux bwrap `wrap_candidate_prefix`
+is now a REAL default-deny mount+PID namespace built from EXPLICIT minimal
+binds (private /proc, /dev, /tmp; ro /usr /bin /sbin /lib[64] /etc; rw
+workspace + scratch; `--cap-drop ALL`; `--die-with-parent`;
+`--unshare-pid/ipc/uts`, plus `--unshare-net` at `network=="deny"`) — NO
+`--ro-bind / /`, so the control root, $HOME and the rest of the host are
+ABSENT from the namespace, unreadable by construction. The denial mechanism
+differs from macOS: absence, not a policy line, so an in-namespace ENOENT IS
+the denial (the probe plants host-confirmed canaries to tell real denial
+from a setup bug). Linux has no Mach services, so the keychain/DNS channels
+do not exist; DNS at `deny` is closed by `--unshare-net`. `loopback` on
+bwrap is still deferred (M29c-2: netns-local twins). The macOS backend is
+unchanged. `probe_candidate_confinement` live-proves the Linux profile per
+run under a real kernel (privileged-CI; self-skips where bwrap cannot create
+a namespace) — never a fake default-deny claim.
 """
 import ctypes
 import os
@@ -517,19 +530,177 @@ class _LinuxBackend:
         argv.append("--")
         return argv
 
-    # M29b: honest legacy passthrough — bwrap's ro-bind / keeps the whole
-    # host READABLE by the candidate, and pretending otherwise would be a
-    # fake claim. M29c replaces this with a real mount+PID-namespace
-    # default-deny; until then the supervisor reports
-    # host_isolation.mode="legacy_allow_host_read" for this backend.
-    supports_default_deny = False
+    # M29c (DF-02 Linux host-read half): the candidate wrapper is now a REAL
+    # default-deny mount+PID namespace (explicit minimal binds, NO
+    # `--ro-bind / /`), so this backend advertises the same capability the
+    # supervisor gates on as the macOS one. The control root, $HOME, and every
+    # other host path are simply ABSENT from the namespace → unreadable by
+    # construction, and `probe_candidate_confinement` live-proves it per run
+    # before any scenario relies on it.
+    supports_default_deny = True
 
     def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
                               allowed_loopback_ports=None, scratch_dirs=()):
-        # allowed_loopback_ports/scratch_dirs are accepted for signature
-        # parity but meaningless here: the legacy argv has no per-port
-        # network filtering (network is all-or-nothing via --unshare-net).
-        return self.wrap_prefix(deny_root, workspace, network=network)
+        """CANDIDATE-only DEFAULT-DENY wrapper (M29c). Unlike `wrap_prefix`'s
+        M12 builder path (`--ro-bind / /` + a tmpfs mask over deny_root, which
+        leaves the WHOLE host readable), this builds a mount+PID+IPC+UTS
+        namespace from EXPLICIT minimal binds only. There is NO `--ro-bind / /`,
+        so the operator's $HOME, /root, other users' homes, /var, /run, and the
+        CONTROL ROOT are not in the namespace at all — a candidate open() of any
+        of them returns ENOENT (denial by ABSENCE, not by a policy line). Every
+        bind below was developed LIVE under `docker run --privileged
+        ubuntu:24.04` (bwrap 0.9.0) by iterating until python3 started, the
+        workspace read+wrote, and planted $HOME / control-root canaries were
+        unreadable — each carries its measured reason.
+        """
+        if network not in _NETWORK_MODES:
+            raise SandboxError(
+                f"unknown candidate_network mode {network!r} "
+                f"(expected one of {_NETWORK_MODES!r})"
+            )
+        if network == "loopback":
+            # DEFERRED to M29c-2 (netns-local verifier + twins): --unshare-net's
+            # namespace has its OWN empty loopback, so a host-bound twin on
+            # 127.0.0.1 is unreachable from inside; there is no port-pinned
+            # host-loopback passthrough on bwrap the way sandbox-exec has one.
+            # Fail closed (same refusal wrap_prefix gives) rather than pretend.
+            raise SandboxError(
+                "candidate_network 'loopback' is not supported by the bwrap "
+                "backend yet (M29c-2): --unshare-net gives the namespace its own "
+                "loopback, so host-bound twins are unreachable; use 'deny' (no "
+                "twins/http) or run the loopback/HTTP scenarios on macOS")
+        # Validate ports for signature parity + fail-closed on garbage even
+        # though they are UNUSED until M29c-2 lands loopback: deny/unrestricted
+        # do no per-port filtering (network is all-or-nothing via --unshare-net).
+        for p in (allowed_loopback_ports or ()):
+            if isinstance(p, bool) or not isinstance(p, int) or not (1 <= p <= 65535):
+                raise SandboxError(
+                    f"allowed_loopback_ports entries must be ints in 1..65535, got {p!r}")
+
+        real_deny = os.path.realpath(deny_root)
+        real_ws = os.path.realpath(workspace)
+        real_scratch = sorted({os.path.realpath(s) for s in scratch_dirs})
+
+        # Read-only SYSTEM binds — the minimum a runtime needs to START, proven
+        # by removal live: /usr (binaries + libs), /bin /sbin (PATH entries;
+        # symlinks into /usr on merged-usr distros, harmless to bind), /lib (the
+        # ELF loader — without it every dynamic binary dies "execvp: No such
+        # file", measured), the /lib{64,32,x32} variants that EXIST on this host
+        # (merged-usr Ubuntu ships none of them), and /etc (resolv.conf,
+        # nsswitch, ld.so.cache, localtime — a candidate reading /etc is
+        # standard and mirrors the macOS profile's /private/etc allow; /etc is
+        # system config, NOT the operator's $HOME secrets — and its sensitive
+        # leaves like /etc/shadow + /etc/ssl/private are masked below).
+        # Deliberately NOT
+        # bound: /root /home /var /run /tmp /mnt /media /srv /opt — all host
+        # data channels; their absence is the host-read denial.
+        system_ro = ["/usr", "/bin", "/sbin", "/lib"]
+        for variant in ("/lib64", "/lib32", "/libx32"):
+            if os.path.exists(variant):
+                system_ro.append(variant)
+        system_ro.append("/etc")
+
+        # The verifier interpreter's OWN runtime prefixes (venv/base install):
+        # the wrapped child IS that interpreter, so if it lives outside /usr
+        # (e.g. a .venv under the project) its prefix must be ro-bound or the
+        # wrap cannot even launch. Binding just the venv path exposes the
+        # interpreter, NOT the rest of $HOME (the $HOME canary check still fails
+        # closed because $HOME itself is unbound). Drop any prefix already
+        # covered by a system bind or the workspace to avoid a duplicate-dest
+        # bwrap error.
+        covered_roots = system_ro + [real_ws] + real_scratch
+
+        def _covered(path):
+            return any(path == r or path.startswith(r.rstrip("/") + "/")
+                       for r in covered_roots)
+
+        runtime_ro = [p for p in _candidate_runtime_prefixes() if not _covered(p)]
+
+        # Disjointness gate: the control root is protected by ABSENCE, which
+        # only holds if no bind re-introduces it. If deny_root sits under any
+        # bind (or a bind sits under deny_root) the subtree would be exposed —
+        # refuse fail-closed rather than mount it. (Normal layout: control root
+        # and workspace are siblings, both disjoint from the system dirs.)
+        for b in system_ro + runtime_ro + [real_ws] + real_scratch:
+            if b == real_deny or b.startswith(real_deny.rstrip("/") + "/") \
+                    or real_deny.startswith(b.rstrip("/") + "/"):
+                raise SandboxError(
+                    f"refusing default-deny candidate wrap: bind {b!r} would "
+                    f"expose the control root {real_deny!r} (not disjoint)")
+
+        argv = [
+            "bwrap",
+            "--unshare-pid",   # private PID ns: candidate cannot see or signal
+                               # host processes (and gets a clean pid space)
+            "--unshare-ipc",   # private SysV IPC / POSIX shm
+            "--unshare-uts",   # private hostname/domainname
+            # NO --clearenv: the sanitized candidate_env allowlist (M29a) is
+            # passed through the process environment; clearing it here would
+            # drop it and break the candidate's configured runtime.
+            "--proc", "/proc", # PRIVATE proc for the new PID ns — NOT a host
+                               # --ro-bind, which would leak every host
+                               # process's cmdline/environ/root via /proc/<pid>.
+            "--dev", "/dev",   # minimal private devtmpfs (null/zero/urandom/
+                               # tty/…); host disks and other ttys stay absent.
+            "--tmpfs", "/tmp", # private empty /tmp: host /tmp (other processes'
+                               # scratch files and unix sockets) is unreadable.
+        ]
+        for d in system_ro:
+            argv += ["--ro-bind", d, d]
+        for d in runtime_ro:
+            argv += ["--ro-bind", d, d]
+
+        # Sensitive DATA leaves that fall INSIDE the broad /usr and /etc
+        # ro-binds above but are operator SECRETS, not runtime code — the Linux
+        # parallel of the macOS profile's system_read_carveouts (which denies
+        # /Library/Keychains, /opt/homebrew/etc|var, /usr/local/etc|var). Without
+        # this a Linux run would qualify on strictly WEAKER isolation than macOS
+        # for the identical layout. bwrap is last-apply-wins, so masking AFTER
+        # the ro-bind shadows the real content. Guarded on host existence: a
+        # --tmpfs/--ro-bind needs its dest to already exist under the ro-bind
+        # (creating a mountpoint on a read-only parent fails). Directories → an
+        # empty tmpfs; single secret FILES → /dev/null (source is the host's,
+        # always present) so a read returns EMPTY — the real bytes are gone.
+        #   /usr/local/etc /usr/local/var — service confs (redis requirepass,
+        #     pg/mysql) + live DB data: EXACTLY the macOS /usr/local carve-out.
+        #   /etc/ssl/private            — TLS private keys.
+        #   /etc/kubernetes /etc/rancher — cluster admin creds (admin.conf,
+        #     k3s.yaml), proven readable through the full /etc bind.
+        #   /etc/shadow /etc/gshadow(+ -backups) — password hashes; readable as
+        #     euid 0 and privileged CI runs as ROOT, so DAC would not save it.
+        # None of these are needed to START a runtime (python uses /etc/passwd,
+        # not shadow; /etc/ssl/certs, not private) — verified live.
+        dir_masks = [d for d in ("/usr/local/etc", "/usr/local/var",
+                                 "/etc/ssl/private", "/etc/kubernetes", "/etc/rancher")
+                     if os.path.exists(d)]
+        file_masks = [f for f in ("/etc/shadow", "/etc/gshadow",
+                                  "/etc/shadow-", "/etc/gshadow-") if os.path.exists(f)]
+        for d in dir_masks:
+            argv += ["--tmpfs", d]
+        for f in file_masks:
+            argv += ["--ro-bind", "/dev/null", f]
+
+        argv += ["--bind", real_ws, real_ws]  # workspace read-write
+        for s in real_scratch:
+            argv += ["--bind", s, s]           # writable scratch dirs
+        argv += [
+            "--chdir", real_ws,
+            "--cap-drop", "ALL",  # drop ALL caps: no CAP_SYS_ADMIN, so the
+                                  # candidate cannot mount/remount/pivot_root to
+                                  # re-expose the host (proven live: mount(
+                                  # MS_REMOUNT) → EPERM). This is the second
+                                  # lock behind namespace absence.
+            "--die-with-parent",  # candidate is reaped if the supervisor dies —
+                                  # no orphaned process outliving the sandbox.
+        ]
+        if network == "deny":
+            argv.append("--unshare-net")  # new net ns with no configured
+                                          # interfaces → all egress denied
+                                          # (external connect → ENETUNREACH,
+                                          # measured); also closes the DNS
+                                          # channel (no route to any resolver).
+        argv.append("--")
+        return argv
 
 
 BACKENDS = {"darwin": _MacOSBackend(), "linux": _LinuxBackend()}
@@ -782,6 +953,281 @@ def _bootstrap_look_up(service_name):
     return libc.bootstrap_look_up(bootstrap_port, service_name.encode(), ctypes.byref(port))
 
 
+def _probe_linux_candidate_confinement(backend, deny_root, workspace, network,
+                                       scratch_dirs=()):
+    """Linux (bwrap) DEFAULT-DENY confinement proof (M29c). Fail-closed live
+    proof, same {mode, network, checks, residuals, detail} contract the
+    supervisor folds into the manifest, but shaped for how Linux denies:
+
+    - Denial is ABSENCE FROM THE MOUNT NAMESPACE, so a candidate open() of the
+      control root / $HOME / any outside-workspace path returns ENOENT. ENOENT
+      IS denial here (unlike macOS, where the path still exists and only a
+      policy line blocks it). To keep ENOENT from MASKING a probe-SETUP bug
+      (canary never planted → also ENOENT), the parent plants each canary and
+      CONFIRMS it is readable UNWRAPPED first; only a canary that provably
+      exists on the host yet is unreadable inside the wrapper counts.
+    - No Mach services exist on Linux, so the macOS keychain/DNS IPC channels
+      are not measured. DNS at network=='deny' is closed by --unshare-net (the
+      net ns has no route to any resolver) — noted, not a residual.
+    - The extra Linux proof is the CAP_SYS_ADMIN remount-escape: with
+      --cap-drop ALL the candidate cannot mount(MS_REMOUNT) a read-only system
+      bind (measured EPERM), so it cannot manipulate mounts to re-expose the
+      host.
+    - No RESIDUAL_METADATA: there is no broad metadata allow — paths outside
+      the namespace are absent, not stat-visible — so a passing Linux deny run
+      has NO hard residuals and qualifies.
+    """
+    home = os.path.expanduser("~")
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        return False, {"mode": "default_deny", "network": network, "checks": {},
+                       "residuals": [],
+                       "detail": f"cannot resolve an absolute $HOME to probe ({home!r})"}
+
+    # Non-vacuity: at a denying network mode the environment itself must have
+    # real egress, else "denied inside" proves nothing. (loopback never reaches
+    # here — wrap_candidate_prefix raises for it below.)
+    if network == "deny":
+        try:
+            baseline = socket.create_connection(
+                (_NET_PROBE_EXTERNAL_HOST, _NET_PROBE_EXTERNAL_PORT), timeout=3)
+            baseline.close()
+        except OSError as exc:
+            return False, {"mode": "default_deny", "network": network, "checks": {},
+                           "residuals": [],
+                           "detail": (f"baseline connect to {_NET_PROBE_EXTERNAL_HOST}:"
+                                      f"{_NET_PROBE_EXTERNAL_PORT} failed — probe "
+                                      f"environment unusable ({exc})")}
+
+    canary_token = "DF-CANARY-" + uuid.uuid4().hex
+    deny_canary = os.path.join(deny_root, ".confine-canary-" + uuid.uuid4().hex)
+    outside_dir = tempfile.mkdtemp(prefix="df-confine-probe-")  # under /tmp → unbound
+    outside_canary = os.path.join(outside_dir, "canary.txt")
+    outside_write = os.path.join(outside_dir, "leak.txt")
+    # $HOME canary is a temp-named FILE planted DIRECTLY in $HOME (not a listdir):
+    # robust even when a bound runtime prefix lives under $HOME (which leaves a
+    # skeleton dir that would make a listdir spuriously "succeed"). The file
+    # itself is never bound → absent inside → denied.
+    home_canary = os.path.join(home, ".df-confine-home-canary-" + uuid.uuid4().hex)
+    ws_probe = os.path.join(workspace, ".confine-ws-probe-" + uuid.uuid4().hex)
+    # A ro system bind guaranteed present in the wrap; a successful rw remount
+    # of it proves CAP_SYS_ADMIN was NOT dropped (the mount-manipulation escape).
+    remount_target = "/usr"
+    planted_sysdata = []  # defined before the try so the finally can always clean up
+    try:
+        try:
+            for path in (deny_canary, outside_canary, home_canary):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(canary_token)
+        except OSError as exc:
+            return False, {"mode": "default_deny", "network": network, "checks": {},
+                           "residuals": [], "detail": f"could not plant canaries: {exc}"}
+        # Confirm each canary is READABLE UNWRAPPED — this is what turns an
+        # in-wrapper ENOENT from "ambiguous" into "namespace denial": a file the
+        # parent just read yet the child cannot see was removed by the sandbox,
+        # not merely never created.
+        for path in (deny_canary, outside_canary, home_canary):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    if f.read() != canary_token:
+                        raise OSError("canary content mismatch")
+            except OSError as exc:
+                return False, {"mode": "default_deny", "network": network, "checks": {},
+                               "residuals": [],
+                               "detail": f"planted canary not readable unwrapped ({path}): {exc}"}
+
+        # System-data carve-out targets (parity with the macOS
+        # system_read_carveouts): prove the sensitive leaves inside /usr and
+        # /etc that the wrapper MASKS are actually DENIED, so the masks can't
+        # silently regress. Both kinds are NON-VACUOUS — the parent confirms
+        # real secret content exists unwrapped first:
+        #   (a) planted canaries inside the masked DIRS we can write to
+        #       (/usr/local/etc, /etc/ssl/private, …); a working tmpfs mask
+        #       makes them absent inside;
+        #   (b) the real password-hash FILES (/etc/shadow, /etc/gshadow) when
+        #       readable unwrapped (root — which privileged CI is); a working
+        #       /dev/null mask makes them read back EMPTY inside.
+        # A target the parent CANNOT write/read (e.g. non-root, no /usr/local)
+        # is simply skipped — never a false pass.
+        sysdata_targets = []
+        for d in ("/usr/local/etc", "/usr/local/var", "/etc/ssl/private",
+                  "/etc/kubernetes", "/etc/rancher"):
+            if not os.path.isdir(d):
+                continue
+            c = os.path.join(d, ".df-sysdata-canary-" + uuid.uuid4().hex)
+            try:
+                with open(c, "w", encoding="utf-8") as f:
+                    f.write(canary_token)
+            except OSError:
+                continue
+            planted_sysdata.append(c)
+            sysdata_targets.append(c)
+        for real_secret in ("/etc/shadow", "/etc/gshadow"):
+            try:
+                with open(real_secret, "rb") as fh:
+                    if fh.read(64).strip():   # real hashes present + readable unwrapped
+                        sysdata_targets.append(real_secret)
+            except OSError:
+                pass
+
+        # No loopback ports are pinned on Linux until M29c-2 (loopback deferred);
+        # deny/unrestricted do no per-port filtering.
+        try:
+            prefix = backend.wrap_candidate_prefix(
+                deny_root, workspace, network=network,
+                allowed_loopback_ports=(), scratch_dirs=scratch_dirs)
+        except SandboxError as exc:
+            # e.g. network=='loopback' on Linux (deferred) → clean fail-closed.
+            return False, {"mode": "default_deny", "network": network, "checks": {},
+                           "residuals": [], "detail": f"wrap_candidate_prefix raised: {exc}"}
+
+        code = (
+            "import ctypes, os, socket, subprocess, sys\n"
+            "deny_canary, outside_canary, home_canary, outside_write, ws_probe = sys.argv[1:6]\n"
+            "network, ext_host, ext_port, remount_target = sys.argv[6], sys.argv[7], int(sys.argv[8]), sys.argv[9]\n"
+            "out = []\n"
+            "def read_denied(path):\n"
+            "    try:\n"
+            "        if os.path.isdir(path):\n"
+            "            os.listdir(path)\n"
+            "        else:\n"
+            "            open(path, 'rb').read(1)\n"
+            "        return 'DF-READ-LEAKED'\n"
+            "    except OSError:\n"           # ENOENT (absent from ns) OR EACCES → both denial on Linux
+            "        return 'DF-READ-DENIED'\n"
+            "out.append(read_denied(deny_canary))\n"
+            "out.append(read_denied(outside_canary))\n"
+            "out.append(read_denied(home_canary))\n"
+            "try:\n"
+            "    open(ws_probe, 'w').write('DF-WS-CONTENT')\n"
+            "    out.append('DF-WS-WRITE-OK')\n"
+            "except OSError:\n"
+            "    out.append('DF-WS-WRITE-DENIED')\n"
+            "try:\n"
+            "    open(outside_write, 'w').write('leak')\n"
+            "    out.append('DF-WRITE-LEAKED')\n"
+            "except OSError:\n"
+            "    out.append('DF-WRITE-DENIED')\n"
+            "try:\n"
+            "    p = subprocess.run([sys.executable, '-c', 'print(\"spawned\")'],\n"
+            "                       capture_output=True, text=True, timeout=15)\n"
+            "    out.append('DF-SPAWN-OK' if p.stdout.strip() == 'spawned' else 'DF-SPAWN-DENIED')\n"
+            "except Exception:\n"
+            "    out.append('DF-SPAWN-DENIED')\n"
+            # CAP_SYS_ADMIN remount-escape: rc==0 means caps present → the seal
+            # can be broken → escape → leak. EPERM (rc!=0) → denied.
+            "try:\n"
+            "    libc = ctypes.CDLL(None, use_errno=True)\n"
+            "    MS_REMOUNT = 32\n"
+            "    rc = libc.mount(b'none', remount_target.encode(), b'', MS_REMOUNT, None)\n"
+            "    out.append('DF-REMOUNT-LEAKED' if rc == 0 else 'DF-REMOUNT-DENIED')\n"
+            "except Exception:\n"
+            "    out.append('DF-REMOUNT-DENIED')\n"
+            "def conn(host, port):\n"
+            "    try:\n"
+            "        socket.create_connection((host, port), timeout=3).close()\n"
+            "        return True\n"
+            "    except OSError:\n"
+            "        return False\n"
+            "if network == 'deny':\n"
+            "    out.append('DF-NET-EXTERNAL-LEAKED' if conn(ext_host, ext_port) else 'DF-NET-EXTERNAL-DENIED')\n"
+            "else:\n"
+            "    out.append('DF-NET-SKIP')\n"   # unrestricted: egress open by design of the mode
+            # System-data carve-outs: a target LEAKS iff it can be opened AND
+            # yields non-whitespace bytes. A working tmpfs mask makes the planted
+            # canary absent (open fails); a working /dev/null mask makes shadow
+            # read back empty (b'' → stripped → len 0). Only real secret content
+            # read back inside is a leak.
+            "def secret_leaked(path):\n"
+            "    try:\n"
+            "        data = open(path, 'rb').read(4096)\n"
+            "    except OSError:\n"
+            "        return False\n"
+            "    return len(data.strip()) > 0\n"
+            "sysdata = [p for p in sys.argv[10].split(chr(10)) if p]\n"
+            "if not sysdata:\n"
+            "    out.append('DF-SYSDATA-SKIP')\n"
+            "else:\n"
+            "    leaked = [p for p in sysdata if secret_leaked(p)]\n"
+            "    out.append('DF-SYSDATA-DENIED' if not leaked else 'DF-SYSDATA-LEAKED:' + ','.join(leaked))\n"
+            "sys.stdout.write(chr(10).join(out))\n"
+        )
+        argv = prefix + [sys.executable, "-c", code,
+                         deny_canary, outside_canary, home_canary, outside_write, ws_probe,
+                         network, _NET_PROBE_EXTERNAL_HOST, str(_NET_PROBE_EXTERNAL_PORT),
+                         remount_target, "\n".join(sysdata_targets)]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  errors="replace", timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return False, {"mode": "default_deny", "network": network, "checks": {},
+                           "residuals": [],
+                           "detail": "wrapped confinement-probe process failed to launch or timed out"}
+
+        lines = [l.strip() for l in proc.stdout.split("\n")]
+        if proc.returncode != 0 or len(lines) < 9:
+            return False, {"mode": "default_deny", "network": network, "checks": {},
+                           "residuals": [],
+                           "detail": (f"confinement probe transcript malformed "
+                                      f"(rc={proc.returncode}, lines={len(lines)}): "
+                                      f"stdout={proc.stdout!r} stderr={proc.stderr[:500]!r}")}
+
+        # Physical evidence beats transcript in both directions.
+        outside_leaked = os.path.exists(outside_write)
+        try:
+            with open(ws_probe, encoding="utf-8") as f:
+                ws_written = f.read() == "DF-WS-CONTENT"
+        except OSError:
+            ws_written = False
+
+        checks = {
+            "control_root_read": lines[0],
+            "outside_read": lines[1],
+            "home_read": lines[2],
+            "workspace_write": lines[3],
+            "outside_write": lines[4],
+            "subprocess_spawn": lines[5],
+            "remount_escape": lines[6],
+            "net_external": lines[7],
+            "system_data_carveout": lines[8],
+        }
+        core_ok = (
+            lines[0] == "DF-READ-DENIED"
+            and lines[1] == "DF-READ-DENIED"
+            and lines[2] == "DF-READ-DENIED"
+            and lines[3] == "DF-WS-WRITE-OK" and ws_written
+            and lines[4] == "DF-WRITE-DENIED" and not outside_leaked
+            and lines[5] == "DF-SPAWN-OK"
+            and lines[6] == "DF-REMOUNT-DENIED"
+        )
+        if network == "deny":
+            net_ok = lines[7] == "DF-NET-EXTERNAL-DENIED"
+            residuals = []            # --unshare-net closes DNS too: no residual
+        else:  # unrestricted
+            net_ok = lines[7] == "DF-NET-SKIP"
+            residuals = [RESIDUAL_NET_UNRESTRICTED]
+
+        # System-data carve-outs (masked /usr/local + /etc secret leaves): a
+        # real readable-unwrapped target read back inside is a hard LEAK. SKIP
+        # (no provable target on this host — e.g. non-root, no /usr/local) is OK.
+        sysdata_line = lines[8]
+        sysdata_ok = sysdata_line in ("DF-SYSDATA-DENIED", "DF-SYSDATA-SKIP")
+        if sysdata_line.startswith("DF-SYSDATA-LEAKED"):
+            residuals.append(RESIDUAL_SYSTEM_DATA_OPEN)
+
+        ok = bool(core_ok and net_ok and sysdata_ok)
+        detail = "all Linux default-deny confinement checks passed" if ok else (
+            f"confinement checks failed: {checks!r}")
+        return ok, {"mode": "default_deny", "network": network,
+                    "checks": checks, "residuals": residuals, "detail": detail}
+    finally:
+        for path in [deny_canary, home_canary, ws_probe] + planted_sysdata:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        shutil.rmtree(outside_dir, ignore_errors=True)
+
+
 def probe_candidate_confinement(backend, deny_root, workspace, network,
                                 allowed_loopback_ports=None, scratch_dirs=()):
     """Fail-closed live proof of the M29b default-deny CANDIDATE profile.
@@ -843,6 +1289,16 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
                        f"network probe: {net_reason}"),
         }
         return bool(legacy_ok and net_ok), report
+
+    # M29c: the Linux (bwrap) default-deny body is STRUCTURALLY different from
+    # the macOS one — the denial mechanism is ABSENCE FROM THE MOUNT NAMESPACE,
+    # not a policy deny, and there are no Mach services (no keychain/DNS IPC
+    # channels to measure). Branch to the Linux-specific proof before the
+    # macOS-only Mach baselines below (which would fail on Linux where the
+    # `bootstrap_port` symbol does not exist).
+    if sys.platform.startswith("linux"):
+        return _probe_linux_candidate_confinement(
+            backend, deny_root, workspace, network, scratch_dirs)
 
     home = os.path.expanduser("~")
     if not os.path.isabs(home) or not os.path.isdir(home):
