@@ -15,11 +15,14 @@ does and what each reference doc covers, if `SKILL.md` and this README are
 too technical: [`OVERVIEW.md`](OVERVIEW.md).
 
 ("Level-5" above is the industry-generic term for fully-autonomous coding,
-not dark-factory's own config. Inside dark-factory, "level" means two
-separate things: four **assurance tiers** — cooperative/standard/hardened/
-enterprise, isolation strength — and two **autonomy modes** — L4
-checkpoint-per-iteration vs. L5 unattended lights-off, gated to
-`hardened`/`enterprise` only. See "Assurance tiers" below.)
+not dark-factory's own config. Inside dark-factory, two separate axes
+control a run: four **assurance tiers** (cooperative/standard/hardened/
+enterprise — how strongly the barrier is enforced; see "Assurance tiers"
+below) and four **intervention modes** (H1–H4 — how much a human is in the
+loop; see "Intervention modes" below). The legacy `autonomy` (4/5) +
+`checkpoint` (pause/auto) fields still work and map onto the modes;
+`supervisor.py df-migrate-config` rewrites an old config to the new
+`intervention_mode` field.)
 
 ## Why "dark factory"
 
@@ -73,13 +76,43 @@ Four tiers, each strictly stronger than the last, chosen per run via
 | Tier | Isolation mechanism | Qualification |
 |---|---|---|
 | `cooperative` | Honor-system — the builder is asked not to look, nothing stops it | Every run is explicitly **unqualified** |
-| `standard` | OS-level read/write-denial sandbox (macOS `sandbox-exec` / Linux `bwrap`), verified by a fail-closed startup denial probe | A converged run is **qualified** |
-| `hardened` | Builder runs inside a Docker container that **never has the control root mounted** — denial by construction, not a deny-rule — still probe-verified | Qualified; unlocks fully unattended `autonomy: 5` (lights-off) runs |
+| `standard` | OS-level read/write-denial sandbox (macOS `sandbox-exec` / Linux `bwrap`), verified by a fail-closed startup denial probe. The **candidate** (built artifact under test) additionally runs under a **default-deny** profile so it can't read the operator's host (`~/.ssh`, cloud creds, other repos) or reach non-allowlisted loopback ports | A converged run is **qualified** — if every sub-state holds (see "Qualification") |
+| `hardened` | Builder runs inside a Docker container that **never has the control root mounted** — denial by construction, not a deny-rule — still probe-verified | Qualified; unlocks the unattended `H4` (lights-off) intervention mode |
 | `enterprise` | `hardened` + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off** (K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship) | Qualified only via the separate custody attestation step |
 
-See `references/isolation.md` (standard), `references/hardened.md`
-(hardened), and `references/enterprise.md` (enterprise) for the mechanism
-and honest scope of each.
+See `references/isolation.md` (standard + default-deny candidate),
+`references/hardened.md` (hardened), and `references/enterprise.md`
+(enterprise) for the mechanism and honest scope of each.
+
+## Intervention modes
+
+Orthogonal to the tier, `intervention_mode` sets how much a human is in the
+loop. All four are pause-point *sets* over one mechanism (persist a
+checkpoint and exit; a human resumes) — no live prompting.
+
+| Mode | Pauses at | For |
+|---|---|---|
+| `H1` Directed | before each rebuild, after each verify, before ship | tight, step-by-step human direction |
+| `H2` Supervised (default) | after each verify, before ship | review progress between attempts |
+| `H3` Guarded-autonomous | only at guard conditions (e.g. budget soft-alert) | runs on its own, stops if something needs a decision |
+| `H4` Lights-out | never — any human-needed condition is a deterministic fail-closed terminal, never a silent proceed | fully unattended; `hardened`/`enterprise` only |
+
+See `references/modes.md` for the full state-transition table (approval
+points, failure handling, timeouts, qualification consequences).
+
+## Qualification
+
+A run's `qualified` flag is one authoritative AND over derived sub-states —
+`barrier` (probe-proven isolation) ∧ `host_isolation` (candidate default-deny
+held) ∧ `control_plane` (signed manifest + bound artifact) ∧ `app_security`
+(mandatory gates passed or every finding waived) ∧ `waiver_validity`. When
+one is false the run seals a **distinct** non-qualified code (e.g.
+`HOST_ISOLATION_LIMITED`, `SECURITY_GATE_FAILED`), never an ambiguous partial
+"qualified." At `standard`+ the security gates are **mandatory** (a converged
+artifact with a planted secret is rejected); an accepted-risk finding can be
+cleared only by a separate **signed, scoped, expiring waiver** (`df-waiver`),
+never by weakening the gate. See `references/audit.md` and
+`references/security-gates.md`.
 
 ## Cross-model builders
 
@@ -108,14 +141,27 @@ dark-factory/
     df_confine.py           # per-adapter builder capability confinement
     df_gates.py, df_security.py, df_depaudit.py  # security/dependency gates
     df_custody.py            # enterprise split-custody attestation
+    df_modes.py, df_qualify.py  # intervention modes + single qualification state machine
+    df_waiver.py, df_override.py  # signed gate waivers + signed resume overrides
     df_proxy.py               # host-side credential forwarding proxy
     df_twins.py, df_kb.py, df_audit*.py, df_creds.py, df_notify.py, ...
     adapters/               # protocol-0.1 builder adapters (one per model)
     run_scenarios.py, id_feedback.py, snapshot_source.py  # the oracle
   references/              # one topic-focused doc per subsystem (~20 files)
   examples/kv-service/       # a complete, copyable worked example
-  tests/                       # ~1100+ tests, `pytest dark-factory/tests`
+  tests/                       # ~1490 tests, `pytest dark-factory/tests`
 ```
+
+## Run lifecycle beyond a single run
+
+- **Resume** a paused run with `supervisor.py resume`; the phase-aware
+  checkpoint is hash-chain-validated on every resume (fail-closed on
+  corruption). A `BUDGET_PAUSE` can be lifted only with a **signed resume
+  override** (`df-override`, approver-allowlisted, replay-protected) — a
+  budget-ceiling raise is a policy change, not a silent edit.
+- **Fork** a run with `df-fork`: a new run starts from a parent's *sealed
+  artifact object* as its input snapshot, records lineage, and marks the
+  parent superseded (the parent still verifies, but says so).
 
 ## Testing
 

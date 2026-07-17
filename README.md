@@ -27,10 +27,16 @@ Runs a StrongDM-style "dark factory" loop: you write a spec, an isolated
 builder agent implements it without ever seeing the hidden acceptance
 scenarios, a verifier runs them, and only behavior-ID + failure-taxonomy
 feedback crosses back until convergence. Four assurance tiers ship —
-cooperative, standard (OS sandbox), hardened (Docker, denial by
-construction), and enterprise (+ locked egress + split-custody sign-off) —
-plus cross-model builders (claude/codex/gemini CLIs, or a stdlib HTTP
-adapter straight to the Anthropic/OpenAI APIs, no CLI required).
+cooperative, standard (OS sandbox + default-deny candidate isolation),
+hardened (Docker, denial by construction), and enterprise (+ locked egress
++ split-custody sign-off) — crossed with four intervention modes (H1
+Directed … H4 Lights-out) for how much a human is in the loop. Security
+gates are mandatory at standard+ (a converged artifact with a planted secret
+is rejected, cleared only by a signed, expiring waiver), and `qualified` is
+one authoritative state machine over isolation + host-read + control-plane +
+app-security + waiver validity. Cross-model builders too: claude/codex/gemini
+CLIs, or a stdlib HTTP adapter straight to the Anthropic/OpenAI APIs, no CLI
+required.
 
 - README (quickstart, tiers, layout): [`dark-factory/README.md`](dark-factory/README.md)
 - Plain-language overview: [`dark-factory/OVERVIEW.md`](dark-factory/OVERVIEW.md)
