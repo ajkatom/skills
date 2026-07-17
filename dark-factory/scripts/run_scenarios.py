@@ -162,9 +162,9 @@ def candidate_env(env_extra: dict | None) -> dict:
     filtering -- it must still reach the candidate, and scrubbing it would
     break the twin/credential wiring this runner depends on. A denylisted
     name showing up in env_extra would mean the supervisor itself injected
-    something it shouldn't have, so that's asserted against defensively
-    rather than silently dropped (silently dropping could mask a real bug in
-    the caller).
+    something it shouldn't have, so that raises a ValueError defensively
+    rather than silently dropping it (silently dropping could mask a real bug
+    in the caller; a raise -- unlike an assert -- also holds under python -O).
     """
     env = {}
     for name, value in os.environ.items():
