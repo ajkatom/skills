@@ -21,6 +21,23 @@ real mcp__ tool), so it fail-closes exactly like `gemini`, which never had a
 profile. This is the airtight anchor working as designed: where the probe
 can't produce proof, callers at confinement-required tiers refuse rather than
 trust an unverified flag set. See references/builder-confinement.md.
+
+`api_anthropic` (M24) is also `supported: True`, but on STRUCTURAL grounds
+rather than a live tool-denial probe: it is a plain stdlib HTTP client (one
+`urllib` POST to a fixed, supervisor-configured endpoint) with no agentic
+tool/MCP/sub-agent surface at all — there is nothing in-band for a denied-
+tool probe to attempt, unlike claude/codex/gemini, which are agentic CLIs
+that could in principle reach a Bash shell or an MCP bridge. Confinement for
+this adapter IS the env the supervisor hands it (the API key + base URL;
+at enterprise the credential proxy governs egress instead), and that env is
+fully constructed by the supervisor's own argv/env-building code, never
+chosen by the adapter. `profile["structural"]` marks this so both
+`confinement_flags` and `probe_confinement` short-circuit for it below
+(`confinement_flags` returns `[]` — there is no CLI argv concept for a
+protocol-0.1 adapter invoked over stdin JSON — and `probe_confinement`
+returns a trivial pass without spawning anything, since there is no denied
+tool to probe for). See references/builder-confinement.md ("api_anthropic —
+structural confinement").
 """
 import json
 import os
@@ -90,6 +107,22 @@ PROFILES = {
         "supported": False,
         "reason": "no probe-verified confinement profile yet",
     },
+    # M24: a plain stdlib HTTP client (api_anthropic) has no agentic tool/MCP/
+    # sub-agent surface to strip in the first place — the model only ever
+    # gets to hand back a {"files": {...}} JSON reply, never a shell or a
+    # tool call. `structural: True` marks that this profile's `supported:
+    # True` rests on that structural argument, not a live ALLOWED/DENIED
+    # tool-denial probe like claude's (see module docstring + PROFILES
+    # comment above and references/builder-confinement.md). No
+    # `tool_allowlist` applies (there are no tools to allow-list) and no
+    # `flags_fn` applies (there is no CLI argv to build — see
+    # `confinement_flags`'s structural branch below).
+    "api_anthropic": {
+        "supported": True,
+        "structural": True,
+        "mcp_disabled": True,
+        "tool_allowlist": [],
+    },
 }
 
 
@@ -106,11 +139,18 @@ def confinement_flags(cli: str, prompt: str) -> list:
     """Return the FULL confined argv (minus cwd) for `cli`, or raise
     ConfineError if there is no conforming profile. The exact flag names are
     validated by the live probe (probe_confinement / Task 3); if a flag is
-    wrong the probe fails and the CLI is refused — fail-closed by design."""
+    wrong the probe fails and the CLI is refused — fail-closed by design.
+
+    A `structural` profile (api_anthropic — see PROFILES) has no CLI argv
+    concept at all (its adapter is invoked via protocol-0.1 JSON on stdin,
+    never a prompt baked into argv), so there are no flags to add: this
+    returns `[]` rather than raising or looking up a nonexistent `flags_fn`."""
     profile = profile_for(cli)
     if not profile.get("supported"):
         reason = profile.get("reason", "no confinement profile")
         raise ConfineError(f"confinement unsupported for {cli}: {reason}")
+    if profile.get("structural"):
+        return []
     return profile["flags_fn"](prompt)
 
 
@@ -233,9 +273,27 @@ def probe_confinement(cli: str, workdir: str, *, timeout_s: int = 120,
     stand-in is supplied — it never calls the real model unless the default
     `subprocess.run` runner is used against a live CLI (Task 3, opt-in via
     DF_LIVE_CONFINE=1).
+
+    A `structural` profile (api_anthropic — see PROFILES) skips the live
+    ALLOWED/DENIED dance entirely and returns a trivial (True, <reason>)
+    WITHOUT spawning `runner` at all: there is no denied tool to attempt in
+    the first place (a plain HTTP client has no agentic tool/MCP surface),
+    so a live probe would have nothing to prove that the structural argument
+    doesn't already establish. This is the one path through this function
+    that is a genuine pass without an observable side-effect check — every
+    other profile still requires the full live proof below.
     """
     if not is_supported(cli):
         return False, f"confinement unsupported for {cli}"
+    profile = profile_for(cli)
+    if profile.get("structural"):
+        return True, (
+            "structural: no in-band agentic tool/MCP surface exists for "
+            f"{cli} to escape through (a plain HTTP client to a fixed, "
+            "supervisor-configured endpoint) — argv/env are fully "
+            "controlled by the supervisor, not a live-probed CLI flag set; "
+            "see references/builder-confinement.md"
+        )
     try:
         allowed_argv = confinement_flags(cli, _ALLOWED_PROBE_PROMPT)
         denied_argv = confinement_flags(cli, _denied_probe_prompt(cli))

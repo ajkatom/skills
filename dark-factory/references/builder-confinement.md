@@ -39,7 +39,8 @@ the CLI unconfined. This is why `gemini` ships **unsupported** (see below):
 shipping an unverified profile that *looks* like it constrains the CLI, but
 hasn't been proven to, would be worse than shipping nothing.
 
-## Per-CLI profiles (claude verified; codex + gemini unsupported/refused)
+## Per-CLI profiles (claude verified; codex + gemini unsupported/refused;
+## api_anthropic supported on structural grounds)
 
 ### claude — verified: Bash tool blocked entirely
 
@@ -120,6 +121,62 @@ would otherwise run fine (`dark-factory/tests/test_e2e_confinement.py`'s
 deterministic refusal test proves exactly this — no workspace artifact ever
 appears). A tier that requires confinement then refuses fail-closed rather
 than silently running gemini unconfined.
+
+### api_anthropic — structural confinement (no live probe needed)
+
+`df_confine.PROFILES["api_anthropic"] = {"supported": True, "structural":
+True, "mcp_disabled": True, "tool_allowlist": []}`. This profile is
+`supported: True` too, but for a categorically different reason than
+claude's live-verified flags: **there is nothing in-band for a confinement
+probe to test in the first place.**
+
+claude/codex/gemini are agentic CLIs — general-purpose tool-using programs
+that, unconfined, can reach a shell, an MCP bridge, a sub-agent, or the web.
+Confining them means proving a *specific* tool got closed off, which is
+exactly what `probe_confinement`'s ALLOWED_PROOF/DENIED_PROOF dance verifies.
+`api_anthropic` (M24) is not that kind of program: it is a single stdlib
+`urllib` POST to one fixed, supervisor-configured endpoint
+(`ANTHROPIC_BASE_URL`), and its only possible output is a `{"files": {...}}`
+JSON reply that the adapter itself parses and writes under strict
+path-safety (`references/role-adapters.md`). There is no MCP client, no
+sub-agent spawner, no shell, no web browser inside this adapter for a model
+to reach through — the model's entire capability surface, whatever it might
+"want" to do, is bounded by what a plain-text HTTP response can express, and
+the adapter never executes anything the model returns as code or a command.
+
+Confinement for `api_anthropic` is therefore not a flag set to verify — it
+**is** the env the supervisor hands it: the API key, the base URL (at
+enterprise, the credential-proxy endpoint instead of the provider directly,
+so egress stays governed), and nothing else. That env is fully constructed
+by the supervisor's own `df_container.build_argv`/credential-handling code
+(`references/credentials.md`), never chosen or extended by the adapter
+itself — the same "argv/env fully controlled by the caller" property that
+makes the hardened container barrier itself airtight (`references/
+hardened.md`).
+
+Concretely, both `confinement_flags` and `probe_confinement` short-circuit
+for a `structural` profile rather than pretending to run the claude-style
+dance against a program that has no denied tool to attempt:
+
+- `confinement_flags("api_anthropic", prompt)` returns `[]` — there is no
+  CLI argv to build in the first place (the adapter is invoked via
+  protocol-0.1 JSON on stdin, not a prompt baked into a command line), so
+  "no flags to add" is the honest answer, not an omission.
+- `probe_confinement("api_anthropic", workdir)` returns `(True, "structural:
+  ...")` **without spawning anything** — there is no denied-tool call to
+  make, so a live probe would only be theater around an argument the
+  structural analysis above already settles.
+
+This is a deliberately narrower, more conservative bar than "unsupported":
+`api_anthropic` isn't marked unsupported the way `gemini` is (no evidence
+either way) or the way `codex` is (a live probe *falsified* its candidate
+profile) — it is supported because the class of thing a live probe checks
+for (an escapable in-band tool) provably does not exist in this adapter's
+design. If a future version of this adapter grows any agentic capability
+(tool use, code execution, an MCP client), this structural argument stops
+holding and the profile must be re-derived, probe-verified like claude's, or
+withdrawn — `structural: True` is a claim about *this* adapter's shape, not
+a blanket exemption from ever needing a probe.
 
 ## The airtight-probe rationale
 
@@ -311,4 +368,6 @@ at the strongest tier.
   probe test (`DF_LIVE_CONFINE=1`) that is the airtight evidence for claude
 - `references/config-reference.md` — `builder_confinement.*` config schema
 - `references/hardened.md` — the container barrier's own MCP-closing effect
-  via `hardened.network: "none"`
+  via `hardened.network: "none"`, and the `api_anthropic` in-container e2e
+- `references/role-adapters.md` — the `api_anthropic` adapter itself (protocol,
+  output contract, path-safety, key handling)
