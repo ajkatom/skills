@@ -242,6 +242,120 @@ allowlist + threshold (so a forged attestation, or one carrying rogue approvers
 or a lowered threshold, fails). Prints `QUALIFIED` (exit 0) or a
 `PENDING`/`INVALID` reason (exit 1).
 
+## API-adapter proxy mode (M30/DF-03)
+
+M17 shipped the credential proxy (`df_proxy.py`) and, separately, the two
+stdlib API adapters (`api_anthropic`/`api_openai`, M24) that let a real model
+build inside the enterprise container with no CLI baked into the image. An
+audit (DF-03, High) found the two were never actually wired to work
+**together**: enterprise passes `env=None` into the builder container (the
+proxy is supposed to inject the provider key host-side), but the adapters (a)
+exited immediately when their own key env var was absent, and (b) always set
+their own `x-api-key`/`Authorization` header — which blocks `df_proxy`'s
+injection (it only injects when the header is *absent*). Even fixing just
+those two would not have been enough: an HTTPS target reached through
+`HTTP(S)_PROXY` (which is all `urllib` — what these adapters use — respects)
+is **CONNECT-tunneled**, and `df_proxy.do_CONNECT` is a documented 501 stub
+(an opaque tunnel cannot be credential-injected at all — see `df_proxy.py`'s
+module docstring). So the enterprise real-model API-adapter path could not
+operate as shipped, at any of these three layers.
+
+**The fix — proxy mode.** When the supervisor sets `DF_PROXY_DESCRIPTOR` (a
+JSON object) in the builder container's environment, `api_anthropic`/
+`api_openai` switch from their normal direct-to-provider request to a
+different transport instead of trying to route around the CONNECT problem:
+
+```json
+{
+  "endpoint": "http://127.0.0.1:PORT",
+  "provider": "anthropic",
+  "target_base_url": "https://api.anthropic.com",
+  "capability_token": "<unguessable per-run token>"
+}
+```
+
+- `endpoint` — the **local** `df_proxy`, always plaintext HTTP (`http://`);
+  the adapter refuses a descriptor whose endpoint isn't `http://host:port`.
+- `provider` — `"anthropic"` or `"openai"`; must match the adapter reading
+  it (`api_anthropic` requires `"anthropic"`, and vice versa) — a mismatch
+  is refused before any network call, defense-in-depth against a
+  misconfigured/misrouted descriptor.
+- `target_base_url` — the **real** provider (`https://api.anthropic.com` /
+  `https://api.openai.com`), never contacted directly by the adapter; only
+  `df_proxy` opens a connection to it.
+- `capability_token` — the LOCAL workload credential this adapter presents
+  to `df_proxy` via `Proxy-Authorization: Bearer <token>` (see below) —
+  completely distinct from the provider credential; never sent to the
+  provider.
+
+In proxy mode the adapter:
+1. **Skips the "no api key" exit** — `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is
+   neither required nor read; the credential never enters this process.
+2. **Never sets its own auth header** — no `x-api-key`/`Authorization` is
+   added, so `df_proxy`'s "inject only when absent" check fires.
+3. **Sends the request as plaintext HTTP to the LOCAL proxy, with the REAL
+   provider's absolute `https://` URL as the request TARGET** — `df_proxy`'s
+   forward-proxy form (`POST https://api.anthropic.com/v1/messages HTTP/1.1`
+   addressed to the *local* `endpoint`), built directly with
+   `http.client.HTTPConnection`, **not** `urllib` + `HTTP(S)_PROXY`. This is
+   the crux of why it works where the naive approach doesn't: it is a plain
+   HTTP forward request whose *target* happens to be an `https://` URL —
+   there is no CONNECT tunnel to refuse, because nothing ever asks for one.
+   `df_proxy` parses that absolute-URI target, checks it against its
+   allowlist, and opens the *real* TLS connection to the provider itself,
+   injecting the credential on that leg — exactly the flow `df_proxy.py`'s
+   module docstring describes, now actually reachable by an adapter.
+4. **Presents `Proxy-Authorization: Bearer <capability_token>`** — see
+   "Hardened proxy: capability token" below.
+
+When `DF_PROXY_DESCRIPTOR` is unset, both adapters behave byte-identically
+to before this milestone (direct request, own key, own header) — proxy mode
+is strictly additive.
+
+**Hardened proxy (M30 Part B).** `df_proxy.serve()` gained three fail-closed
+checks on top of the M17 shape, all enforced BEFORE any upstream connection:
+
+- **Capability token** — every forwarded request must present
+  `Proxy-Authorization: Bearer <token>` matching the proxy's, or it's
+  refused (407), nothing forwarded. This is a *workload* credential (who
+  may use the injecting proxy at all) — distinct from, and never sent
+  anywhere near, the *provider* credential the proxy injects. `serve()`
+  accepts an explicit token, a `capability_token_env` to read one from, or
+  (if neither given) generates one and exposes it as `httpd.capability_token`
+  — a token is always enforced, never optional.
+- **Exact origin match** — the allowlist used to match hostname only (ANY
+  port, ANY scheme); it now resolves to a `(scheme, host, port)` set via
+  `df_proxy.parse_allowlist_entry`, and a request must match exactly. A bare
+  hostname entry now permits only the two default ports (80/443), not "any
+  port on that host".
+- **Provider method/path lock** — `serve(provider="anthropic"|"openai", ...)`
+  (or a custom `allowed_method_path`) restricts requests that are about to
+  receive an INJECTED credential to that provider's one expected
+  method+path (`POST /v1/messages` / `POST /v1/chat/completions`), so a
+  capability token can ride the proxy only to the endpoint it was scoped
+  for — not to arbitrary provider APIs. A client-supplied auth header
+  (never the injection path) is unaffected by this lock.
+
+**Config-load coherence (M30 Part C).** `df_config.py` validates, at config
+LOAD time (before any run starts), that when `roles.builder.adapter` is one
+of the two API adapters and `credential_proxy.enabled` is true, the
+`credential_proxy.header`/`.allowlist` actually match that adapter's
+provider (`api_anthropic` → `x-api-key` + `api.anthropic.com` in the
+allowlist; `api_openai` → `authorization` + `api.openai.com`). A wrong
+pairing is a `ConfigError` naming the mismatch, not a mystery failure the
+first time a real enterprise run tries to reach the provider.
+
+**Deferred.** The supervisor's own wiring of `DF_PROXY_DESCRIPTOR` into the
+enterprise builder container (reading `httpd.capability_token` back off the
+`serve()` call and writing the descriptor JSON into the container's env) is
+a separate follow-up milestone, kept out of this one to avoid touching
+`supervisor.py` mid-flight of a parallel change to that same file. This
+milestone makes the proxy and the adapters *compatible* and proves the full
+chain end-to-end in isolation (`tests/test_proxy_transport.py`); the last
+mile — the supervisor actually generating and injecting the descriptor at
+enterprise run time — is the next step to make a live enterprise run with a
+real API adapter fully operable without manual wiring.
+
 ## Token never in the sandbox
 
 The enterprise container is passed **no credential env at all** — the credential

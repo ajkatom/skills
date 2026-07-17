@@ -31,11 +31,30 @@ file -- not even when the request/response fails. Fail-closed: no key, non-2xx
 HTTP, an unparseable reply, a wrong-shaped reply, or an unsafe path all
 produce a clean {"status":"error","detail":"<short>"} -- this adapter never
 raises uncaught and never exits non-zero (the caller always gets a
-protocol-shaped response on stdout)."""
+protocol-shaped response on stdout).
+
+Enterprise proxy mode (M30/DF-03): when $DF_PROXY_DESCRIPTOR is set (a JSON
+object the enterprise supervisor writes -- see references/enterprise.md's
+"API-adapter proxy mode"), this adapter does NOT require $OPENAI_API_KEY and
+does NOT set its own Authorization header -- the local df_proxy injects the
+real provider credential host-side, so the credential never enters this
+(untrusted, sandboxed) process at all. The request is sent as PLAINTEXT HTTP
+to the LOCAL proxy endpoint, with the REAL provider's absolute https:// URL
+as the request TARGET (df_proxy's forward-proxy form: `POST
+https://api.openai.com/v1/chat/completions HTTP/1.1` sent to the proxy's
+own host:port) -- built directly with `http.client.HTTPConnection`, NEVER
+via urllib + HTTP(S)_PROXY, which would CONNECT-tunnel an https:// target
+and hit df_proxy's 501 stub (opaque CONNECT tunneling cannot be credential-
+injected -- see df_proxy.py's module docstring). A `Proxy-Authorization:
+Bearer <capability_token>` header authenticates this workload to the LOCAL
+proxy (never the provider) -- like the provider key, this token is never
+logged, never written to a file, and never appears in a response detail."""
+import http.client
 import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _SYSTEM_PROMPT = """You are the code-generation backend of an automated, \
@@ -165,6 +184,76 @@ def _call_chat_api(base_url, api_key, model, prompt, timeout_s):
         return None, None, f"api request failed: {type(e).__name__}"
 
 
+def _parse_proxy_descriptor(raw):
+    """Parse+validate $DF_PROXY_DESCRIPTOR into (proxy_host, proxy_port,
+    target_base_url, capability_token). Raises ValueError/TypeError/KeyError/
+    json.JSONDecodeError with a short, VALUE-free detail on any problem --
+    field NAMES only, never a field's actual value (the descriptor may carry
+    the capability token, and a malformed-JSON error can otherwise echo a
+    snippet of the very text that contains it)."""
+    descriptor = json.loads(raw)
+    if not isinstance(descriptor, dict):
+        raise ValueError("proxy descriptor must be a JSON object")
+    if descriptor.get("provider") != "openai":
+        raise ValueError("proxy descriptor provider must be 'openai'")
+    endpoint = descriptor["endpoint"]
+    target_base_url = descriptor["target_base_url"]
+    capability_token = descriptor["capability_token"]
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("proxy descriptor endpoint must be a non-empty string")
+    if not isinstance(target_base_url, str) or not target_base_url:
+        raise ValueError("proxy descriptor target_base_url must be a non-empty string")
+    if not isinstance(capability_token, str) or not capability_token:
+        raise ValueError("proxy descriptor capability_token must be a non-empty string")
+    ep = urllib.parse.urlsplit(endpoint)
+    if ep.scheme != "http" or not ep.hostname or ep.port is None:
+        # The LOCAL proxy is always reached over plaintext HTTP -- an https
+        # endpoint here would be a misconfiguration (there is no TLS leg
+        # between this adapter and its own local proxy by design).
+        raise ValueError("proxy descriptor endpoint must be an http://host:port URL")
+    return ep.hostname, ep.port, target_base_url, capability_token
+
+
+def _call_chat_api_via_proxy(proxy_host, proxy_port, target_base_url,
+                              capability_token, model, prompt, timeout_s):
+    """POST the Chat Completions API THROUGH the local df_proxy (enterprise
+    proxy mode, M30/DF-03): plaintext HTTP to the proxy's (host, port), with
+    the REAL provider's absolute https:// URL as the request TARGET --
+    df_proxy's forward-proxy form, NOT urllib+HTTP(S)_PROXY (which would
+    CONNECT-tunnel and never reach df_proxy's injection path; see this
+    file's module docstring). No Authorization header is set here -- df_proxy
+    injects the real provider key on its own TLS leg to the target; only
+    Proxy-Authorization (the LOCAL capability token, never the provider
+    credential) is sent. Same (status_or_none, body_bytes_or_none,
+    error_detail_or_none) contract as _call_chat_api; never raises."""
+    target_uri = target_base_url.rstrip("/") + "/v1/chat/completions"
+    body = json.dumps({
+        "model": model,
+        "max_tokens": _MAX_TOKENS,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "Proxy-Authorization": f"Bearer {capability_token}",
+    }
+    conn = http.client.HTTPConnection(proxy_host, proxy_port, timeout=timeout_s)
+    try:
+        conn.request("POST", target_uri, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read(), None
+    except (OSError, http.client.HTTPException, TimeoutError) as e:
+        return None, None, f"proxy request failed: {type(e).__name__}"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _extract_files(resp_body):
     """Parse a Chat Completions response body into a ({relpath: content},
     usage) pair, or raise ValueError with a short, key-free detail message.
@@ -238,15 +327,35 @@ def _run():
         respond("error", f"bad adapter request: {e}")
         return
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        respond("error", "no api key: OPENAI_API_KEY not set")
-        return
-
-    base_url = os.environ.get("OPENAI_BASE_URL") or _DEFAULT_BASE_URL
     model = os.environ.get("DF_API_MODEL") or _DEFAULT_MODEL
+    proxy_descriptor_raw = os.environ.get("DF_PROXY_DESCRIPTOR")
 
-    status, resp_body, err = _call_chat_api(base_url, api_key, model, prompt, timeout_s)
+    if proxy_descriptor_raw:
+        # Enterprise proxy mode: no provider key is required (or read) from
+        # this process's environment at all -- the local df_proxy injects it
+        # host-side. See _parse_proxy_descriptor / _call_chat_api_via_proxy.
+        try:
+            proxy_host, proxy_port, target_base_url, capability_token = (
+                _parse_proxy_descriptor(proxy_descriptor_raw)
+            )
+        except json.JSONDecodeError:
+            respond("error", "bad proxy descriptor: invalid JSON")
+            return
+        except (KeyError, TypeError, ValueError) as e:
+            respond("error", f"bad proxy descriptor: {e}")
+            return
+        status, resp_body, err = _call_chat_api_via_proxy(
+            proxy_host, proxy_port, target_base_url, capability_token,
+            model, prompt, timeout_s,
+        )
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            respond("error", "no api key: OPENAI_API_KEY not set")
+            return
+        base_url = os.environ.get("OPENAI_BASE_URL") or _DEFAULT_BASE_URL
+        status, resp_body, err = _call_chat_api(base_url, api_key, model, prompt, timeout_s)
+
     if err is not None:
         respond("error", err)
         return

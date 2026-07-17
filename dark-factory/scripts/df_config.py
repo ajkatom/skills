@@ -5,6 +5,7 @@ import re
 import urllib.parse
 
 import df_container
+import df_proxy
 from df_common import canonical_json, sha256_str
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +61,54 @@ def _disjoint(a: str, b: str) -> bool:
     a = os.path.realpath(a)
     b = os.path.realpath(b)
     return not (a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep))
+
+
+# M30 (DF-03) Part C: the shipped API adapters each expect ONE specific
+# (injection header, provider host) pairing -- see scripts/adapters/
+# api_anthropic and api_openai. A credential_proxy configured with the WRONG
+# header for the adapter in use (or an allowlist that never names that
+# provider's host) cannot possibly work: the proxy would inject the token
+# under a header the adapter/provider never looks at, or refuse the request
+# outright as off-allowlist. This is exactly the class of enterprise-real-
+# model-path breakage DF-03 found -- catching the wrong PAIRING at config
+# LOAD time (a ConfigError naming the mismatch) is strictly better than
+# discovering it only when a real enterprise run's API call inexplicably
+# fails at request time.
+_PROXY_PROVIDER_RULES = {
+    "anthropic": {"header": "x-api-key", "host": "api.anthropic.com"},
+    "openai": {"header": "authorization", "host": "api.openai.com"},
+}
+
+
+def _adapter_provider(adapter_path):
+    """basename-based provider inference for the two shipped API adapters
+    (api_anthropic/api_openai) -- None for any other adapter (the CLI
+    adapters don't read DF_PROXY_DESCRIPTOR at all, so the credential_proxy
+    coherence check below doesn't apply to them)."""
+    name = os.path.basename(adapter_path)
+    if name == "api_anthropic":
+        return "anthropic"
+    if name == "api_openai":
+        return "openai"
+    return None
+
+
+def _allowlist_entry_host(entry):
+    """Read the HOST component back out of one credential_proxy.allowlist
+    entry, using df_proxy's own canonical-origin parser (parse_allowlist_entry)
+    so config-load-time validation agrees exactly with what df_proxy will
+    actually match at request time -- one parser, not two definitions of
+    "the same" allowlist shape that could quietly drift apart. Raises
+    ConfigError (not AllowlistError) so the caller doesn't need to know
+    df_proxy's exception type."""
+    try:
+        origins = df_proxy.parse_allowlist_entry(entry)
+    except df_proxy.AllowlistError as e:
+        raise ConfigError(f"credential_proxy.allowlist entry invalid: {e}") from e
+    # Every origin df_proxy.parse_allowlist_entry derives from ONE entry
+    # shares the same host (only scheme/port vary) -- any element's host is
+    # the entry's host.
+    return next(iter(origins))[1]
 
 
 def load_config(control_root: str) -> dict:
@@ -915,6 +964,35 @@ def load_config(control_root: str) -> dict:
             "token_env": proxy_token_env,
             "header": proxy_header,
         }
+
+        # M30 (DF-03) Part C: adapter <-> provider host <-> allowlist <->
+        # injection header coherence -- only meaningful when the configured
+        # builder is one of the two API adapters (a CLI adapter never reads
+        # DF_PROXY_DESCRIPTOR, so credential_proxy's shape is irrelevant to
+        # it). `adapter` was already read above (roles.builder.adapter);
+        # basename inference doesn't require it to be an absolute/existing
+        # path, so this fires at every tier, not only hardened/enterprise.
+        cp_provider = _adapter_provider(adapter)
+        if cp_provider is not None:
+            rules = _PROXY_PROVIDER_RULES[cp_provider]
+            if proxy_header != rules["header"]:
+                raise ConfigError(
+                    f"credential_proxy.header is {proxy_header!r}, but "
+                    f"roles.builder.adapter ({adapter!r}) is the {cp_provider} "
+                    f"API adapter, which expects the {rules['header']!r} header "
+                    "-- a mismatched header means df_proxy would inject the "
+                    "credential under a header this adapter/provider never "
+                    "looks at"
+                )
+            allow_hosts = {_allowlist_entry_host(h) for h in proxy_allowlist}
+            if rules["host"] not in allow_hosts:
+                raise ConfigError(
+                    f"credential_proxy.allowlist does not include "
+                    f"{rules['host']!r}, required for roles.builder.adapter "
+                    f"({adapter!r}), the {cp_provider} API adapter -- a proxy "
+                    "that never allowlists the provider it's meant to reach "
+                    "would refuse every real request"
+                )
     else:
         cfg_proxy = {"enabled": False}
 
