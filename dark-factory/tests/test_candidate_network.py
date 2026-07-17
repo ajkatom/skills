@@ -251,6 +251,38 @@ def _patch_standard_backend(monkeypatch, network_ok=True, network_reason="ok"):
                         lambda *a, **k: (network_ok, network_reason))
 
 
+class _FakeMacBackend:
+    """Same rationale as `_FakeNetworkBackend` (host-independent, `available()`
+    forced True, `wrap_prefix` delegates to a REAL backend's pure-Python argv
+    construction) but delegates to `_MacOSBackend` instead of `_LinuxBackend`.
+    Needed specifically for `candidate_network: "loopback"`: the real
+    `_LinuxBackend.wrap_prefix` intentionally RAISES SandboxError for
+    "loopback" (bwrap's own network namespace has no stable loopback
+    semantics -- see df_sandbox.py / test_linux_deny_adds_unshare_net_and_
+    loopback_raises above), whereas sandbox-exec's SBPL profile can express
+    it. Using the macOS backend's real (if-unreachable-on-this-host) logic
+    keeps this a genuine argv, not a fake sentinel, while staying host-
+    independent (no @skipif needed)."""
+    name = "fake-macos-backend"
+
+    def __init__(self):
+        self._real = df_sandbox._MacOSBackend()
+
+    def available(self):
+        return True
+
+    def wrap_prefix(self, deny_root, workspace, network="unrestricted"):
+        return self._real.wrap_prefix(deny_root, workspace, network=network)
+
+
+def _patch_standard_macos_backend(monkeypatch, network_ok=True, network_reason="ok"):
+    monkeypatch.setattr(supervisor.df_sandbox, "current_backend",
+                        lambda: _FakeMacBackend())
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: True)
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_network_denial",
+                        lambda *a, **k: (network_ok, network_reason))
+
+
 def _standard_control(tmp_path, **cfg_overrides):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     cfg = json.loads((cr / "config.json").read_text())
@@ -377,3 +409,110 @@ def test_candidate_network_deny_plus_http_scenario_gate_refused(tmp_path, monkey
     run_id = os.listdir(cr / "runs")[0]
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "GATE_FAILED"
+
+
+def test_candidate_network_loopback_plus_http_scenario_passes_gate(tmp_path, monkeypatch):
+    """M27 Task 2 pre-build gate (supervisor.py ~1560): ONLY candidate_network
+    == "deny" refuses a run with an http scenario -- "deny" blocks 127.0.0.1
+    too, but "loopback" keeps 127.0.0.1 reachable (where the candidate's own
+    http server binds), so a loopback + http combo must run PAST the gate.
+    Mirrors test_candidate_network_deny_plus_http_scenario_gate_refused above
+    but flips deny -> loopback and expects the run to proceed into the build
+    stage instead of being refused with CANDIDATE_NETWORK_GATE_FAILED.
+    """
+    cr = _standard_control(tmp_path, candidate_network="loopback")
+    http_sc = {
+        "ir_version": "0.3", "id": "BHV-501-S1", "behavior_id": "BHV-501",
+        "title": f"{MARKER} http", "given": f"{MARKER} service",
+        "when": {
+            "http": {
+                "start": ["python3", "svc.py"],
+                "port_env": "PORT",
+                "ready_path": "/health",
+                "request": {"method": "GET", "path": "/echo"},
+            },
+            "timeout_s": 10,
+        },
+        "then": {"http_status": 200, "body_contains": "ok"},
+    }
+    (cr / "scenarios" / "http.json").write_text(json.dumps(http_sc), encoding="utf-8")
+
+    # Use the macOS-delegating fake backend (not the Linux one): the real
+    # Linux bwrap backend refuses to build a "loopback" argv at all, which
+    # would confound this test with an unrelated SandboxError. The gate
+    # under test (supervisor.py ~1560) only inspects cfg["candidate_network"]
+    # and scenario content -- it never touches the backend -- so which real
+    # backend's wrap_prefix logic we delegate to is immaterial to what this
+    # test proves.
+    _patch_standard_macos_backend(monkeypatch)
+    captured_builder, captured_verify = [], []
+    monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke_capture(captured_builder))
+    monkeypatch.setattr(supervisor, "run_all", _fake_run_all_capture(captured_verify))
+
+    rc = supervisor.run(str(cr), None)
+
+    run_id = os.listdir(cr / "runs")[0]
+    entries = [json.loads(l) for l in
+               (cr / "runs" / run_id / "journal.jsonl").read_text().splitlines()]
+    states = [e["state"] for e in entries]
+    assert "CANDIDATE_NETWORK_GATE_FAILED" not in states, (
+        "loopback + http must NOT trigger the deny+http pre-build gate")
+    assert captured_builder, (
+        "builder must have been invoked -- loopback+http should run past the gate "
+        "into the build stage, not be refused before it")
+    assert rc == 0
+
+
+def test_candidate_network_restricted_downgrade_to_cooperative_fails_closed(tmp_path, monkeypatch):
+    """M27 Task 2 runtime-downgrade fail-closed guard (resolve_candidate_prefix,
+    supervisor.py ~1148-1154, called from both the fresh-run (~1721) and
+    resume (~2746) call sites): a run CONFIGURED with a RESTRICTED
+    candidate_network ("deny") at a CONFIGURED standard assurance tier can
+    still resolve to the EFFECTIVE "cooperative" tier at RUNTIME when
+    --allow-downgrade is set and the standard-tier OS sandbox probe fails.
+    df_config's static load-time validation forbids restricted + configured-
+    cooperative, but it cannot see a runtime downgrade reached AFTER load --
+    and cooperative has no sandbox to enforce "deny", so the guard must fail
+    closed (SandboxError -> clean exit 2), NEVER silently run the candidate
+    unrestricted under an unqualified cooperative tier.
+
+    Forces the standard->cooperative downgrade the same way
+    test_standard_tier.py::test_standard_downgrades_with_flag does: fail the
+    denial probe and hand back a real (if platform-mismatched) backend
+    object, so resolve_isolation's `ok` check is False and --allow-downgrade
+    takes the cooperative branch.
+    """
+    cr = _standard_control(tmp_path, candidate_network="deny")
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: False)
+    monkeypatch.setattr(supervisor.df_sandbox, "current_backend",
+                        lambda: df_sandbox.BACKENDS["linux"])
+    # Force the CANDIDATE network probe to pass so the only thing that can
+    # possibly refuse this run is the runtime-downgrade guard under test --
+    # not an incidental probe failure from running a Linux bwrap backend
+    # object on a non-Linux test host (BACKENDS["linux"] here is a real
+    # backend object used only to make resolve_isolation's initial `ok`
+    # check False, per test_standard_tier.py's own pattern; it is not meant
+    # to be live-probed).
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_network_denial",
+                        lambda *a, **k: (True, "forced-ok-for-guard-isolation"))
+    called = []
+
+    def fake_invoke(*a, **k):
+        called.append(1)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None, allow_downgrade=True)
+    assert rc == 2
+    assert called == [], ("builder must never be invoked when the candidate_network "
+                          "runtime-downgrade guard fires (no build under an "
+                          "unrestricted/unenforced candidate)")
+
+    run_id = os.listdir(cr / "runs")[0]
+    entries = [json.loads(l) for l in
+               (cr / "runs" / run_id / "journal.jsonl").read_text().splitlines()]
+    states = [e["state"] for e in entries]
+    assert "DOWNGRADE" in states, "standard -> cooperative downgrade should have happened first"
+    assert "PROBE_FAILED" in states, ("the candidate_network guard's fail-closed refusal "
+                                      "should have journaled PROBE_FAILED")
