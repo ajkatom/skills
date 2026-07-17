@@ -98,10 +98,12 @@ M33 are explicit, documented residuals — each depends on unbuilt milestones or
 the off-host infrastructure above:
 
 - **Security-gate execution inside a default-deny sandbox / digest-pinned
-  container.** Gates run host-side today; running them under the M29b
-  default-deny host sandbox (standard) / pinned container (hardened+) is
-  deferred to **M29b**. A gate that runs host-side shares the runner's trust
-  domain — the same detection-grade boundary as the rest of this doc.
+  container.** Gates run host-side today. M29b landed the default-deny
+  candidate profile itself (next section) but applies it to SCENARIO/
+  characterize execution only — running the security gates under it
+  (standard) / a pinned container (hardened+) remains deferred (M29c+). A
+  gate that runs host-side shares the runner's trust domain — the same
+  detection-grade boundary as the rest of this doc.
 - **A resumable in-loop `WAIVER_PENDING` pause phase.** M33a supplies waivers
   **after** a `SECURITY_GATE_FAILED` run via a separate signed attestation
   (the attach model, mirroring split-custody), decoupled from the phase-aware
@@ -113,6 +115,33 @@ the off-host infrastructure above:
   different artifact or a changed finding set). The unforgeable-"when" closure
   is the **signed-timestamp service** already listed above under "An
   authenticated remote WORM sink + signed-timestamp service."
+
+## DF-02 candidate containment status (M29a env half + M29b host-read half)
+
+DF-02 ("the candidate inherits the operator's host") is being closed in
+honest, probe-verified slices — and unlike most of this doc, the M29b slice
+IS prevention-grade against its stated adversary (the CONFINED candidate
+process), because the OS kernel, not an application check, does the
+denying:
+
+- **Env + process half — merged (M29a):** minimal allowlisted candidate
+  environment + full process-group teardown at every tier
+  (`references/isolation.md`, "Candidate process + env containment").
+- **Host-read half — merged (M29b), standard-macOS:** the candidate runs
+  under a `(deny default)` `sandbox-exec` profile — host reads (`~/.ssh`,
+  dotfiles, other repos) OS-denied, workspace-only writes, loopback pinned
+  to the run's exact twin ports, and the keychain/DNS Mach side channels
+  measured CLOSED — live-probed fail-closed per run and sealed into the
+  manifest as `host_isolation` (`references/isolation.md`, "Default-deny
+  candidate host isolation"). Scope notes: this confines the candidate the
+  VERIFIER runs; the builder (which needs HOME/keychain/DNS) is the
+  hardened/enterprise container's job, and a candidate needing host reads
+  can opt out visibly (`candidate_host_read: "allow_host_read"`,
+  `qualified: false`).
+- **Linux default-deny + per-scenario PID-namespace reaping + netns-local
+  verifier/twins → M29c**; Linux today honestly reports
+  `host_isolation.mode: "legacy_allow_host_read"`.
+- **Copy-on-run scratch per scenario → M29d.**
 
 ## Framing this correctly
 

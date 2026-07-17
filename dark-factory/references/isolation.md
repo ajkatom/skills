@@ -131,7 +131,12 @@ profile) — a documented limit, not silently ignored. Linux's
 `--unshare-net` has neither gap: the namespace has no route to the resolver
 or anything else. UDP and other socket types are denied by the same
 `network*` primitive by construction on macOS but are not separately probed
-(only TCP connects are).
+(only TCP connects are). **M29b update:** this limit now applies only to the
+`(allow default)` wrapper (the builder's, and the candidate's under the
+`allow_host_read` opt-out / Linux legacy path) — the M29b default-deny
+CANDIDATE profile default-denies Mach IPC, which was measured to CLOSE the
+resolver channel for the candidate at `deny`/`loopback` (see "Default-deny
+candidate host isolation" below).
 
 **Honest limit — Linux `loopback` is unsupported, not silently degraded.**
 `bwrap --unshare-net` gives the candidate its own private network
@@ -201,18 +206,130 @@ still gets killed. Applies identically to CLI scenarios (`run_scenario`) and
 HTTP scenarios (`_run_http_scenario`, which additionally reaps the started
 service regardless of whether it ever became ready or answered the request).
 
-**Honest scope.** This is the env/IPC + process half of DF-02, not the whole
-of it. What it does NOT do: a `standard`-tier candidate can still **read**
-host files today — the current sandbox profile (top of this doc) is
-allow-default with the control root denied, not a default-deny profile that
-would also block reads of the operator's home directory, dotfiles, etc.
+**Honest scope.** This is the env/IPC + process half of DF-02. The host-READ
+half — a candidate reading the operator's home directory, dotfiles, other
+repos — is closed by M29b's default-deny candidate profile on macOS (next
+section); Linux keeps the legacy allow-read candidate wrapper until M29c.
 Copy-on-run scratch per scenario (so a candidate's writes never touch a
-shared workspace across scenarios) and a network-namespace egress topology
-finer than `candidate_network`'s three modes (§7.4 above) are likewise not
-delivered by this work. All three are tracked for M29b/M29c. What IS closed
-by Tasks 1-2: a candidate can no longer read the operator's ambient secrets
-via environment variables, and a candidate can no longer leave a surviving
-background/daemon process behind after its scenario ends.
+shared workspace across scenarios) remains tracked for M29d. What IS closed
+by M29a Tasks 1-2: a candidate can no longer read the operator's ambient
+secrets via environment variables, and a candidate can no longer leave a
+surviving background/daemon process behind after its scenario ends.
+
+## Default-deny candidate host isolation (M29b, DF-02 host-read half)
+
+Everything above wraps the candidate in `(allow default)` + deny-control-root
+— which still lets the least-trusted code in the system (the BUILT ARTIFACT
+under test) read `~/.ssh`, browser profiles, cloud credentials, keychain
+files, brew service configs, other repos,
+and, in `loopback` mode, reach EVERY host loopback service. M29b replaces the
+CANDIDATE wrapper (builder wrapper untouched — CLI builders legitimately need
+HOME/keychain/DNS; their isolation story is the hardened/enterprise
+container) with a **default-deny** profile on macOS:
+`df_sandbox.wrap_candidate_prefix` builds `(version 1)(deny default)` + an
+empirically developed minimal allowlist. Config: `candidate_host_read:
+"default_deny" | "allow_host_read"`, **default `default_deny` at standard+**
+(the remediation is the default; existing configs get the stronger behavior
+automatically); `allow_host_read` is the explicit, honest opt-out for
+candidates that genuinely need host reads — allowed, but the manifest marks
+`host_isolation.qualified: false`.
+
+**What the profile allows, and why** (each measured live on macOS 26.5;
+SBPL is last-match-wins, so clause ORDER is load-bearing — see the profile
+builder's comments for the full experiment notes):
+- system runtime reads: `/usr /bin /sbin /usr/local /opt/homebrew /System
+  /Library /private/etc /private/var/db/timezone /dev`, plus
+  `file-read-data` on `/` itself (dyld reads the root dir; SIGABRT in
+  `dyld4::CacheFinder` without it) and the active Xcode/CLT developer
+  bundle (the `/usr/bin/python3`-style xcrun shims dlopen `libxcrun` and
+  sibling frameworks out of it) — then a last-match-wins **carve-out deny**
+  of the sensitive DATA leaves that sit inside those broad roots but are not
+  `$HOME` (so the `$HOME` deny misses them) and not runtime code:
+  `/Library/Keychains` (System/apsd keychain FILES — the Mach keychain
+  channel is closed but the files are world-readable root-owned data),
+  `/opt/homebrew/etc` + `/opt/homebrew/var` and the Intel `/usr/local`
+  equivalents (brew service configs like `redis.conf requirepass` and live
+  DB data). Both leaks were proven readable pre-carve-out; the per-run probe
+  now reads back whichever of these exist and asserts DENIED, so the
+  carve-outs can't silently regress;
+- broad `file-read-metadata` (PATH search + exec-time `realpath()` break
+  outright without it) — metadata is stat/existence only, contents stay
+  denied, and `$HOME`/control-root metadata is still denied by their later
+  `file-read*` denies; the leftover stat-visibility outside `$HOME` is
+  surfaced honestly as the `file_metadata_outside_home` residual;
+- a belt-and-suspenders `$HOME` read+write deny, then (after it — last
+  match wins) the workspace (read+write+exec), the verifier interpreter's
+  own realpath'd prefixes (a venv may live under `$HOME`), and any
+  characterize scratch dir;
+- process plumbing: fork; exec on the system/runtime/workspace paths;
+  `file-map-executable`; `sysctl-read`; `signal`/`process-info*` scoped
+  `(target same-sandbox)` (`self` broke `subprocess.run(timeout=...)`
+  killing its own child); `/dev/null` + `/dev/dtracehelper` write;
+  `mach-lookup com.apple.bsd.dirhelper` (per-user dir resolution —
+  `confstr` fails without it and every xcrun shim degrades) and the
+  `xcrun_db*` toolchain cache paths (tool-name→path map, no user data —
+  never the whole per-user temp dir).
+- network per `candidate_network` mode: `deny` → nothing; `loopback` →
+  `network-outbound` pinned to **exact run-specific ports** (this run's twin
+  ports, re-derived per verify pass since twins bind fresh ephemeral ports
+  on every reset — never `localhost:*`), plus `network-bind`/
+  `network-inbound` on localhost so an M20 HTTP-oracle candidate can still
+  LISTEN (bind/inbound specifically — the `(allow network* (local ip ...))`
+  form was measured in M27 to re-open external egress); `unrestricted` →
+  `(allow network*)` plus a `com.apple.dnssd.service` mach-lookup so DNS
+  works (unchanged network semantics; files stay default-deny).
+- DEAD LAST: the control-root read+write denies, so nothing can override
+  them.
+
+**Side channels measured CLOSED.** Because `(deny default)` also
+default-denies Mach IPC, the two channels M27 documented as open are closed
+for the candidate on this backend, measured via `bootstrap_look_up` (kr=0
+reachable unwrapped, kr=1100 denied wrapped): **keychain**
+(`com.apple.SecurityServer` — note `security find-generic-password` exit
+codes cannot prove this: measured rc 44 "not found" both wrapped and
+unwrapped) and **DNS** (`com.apple.dnssd.service` — `getaddrinfo()` errors
+immediately instead of reaching the resolver daemon, so the DNS-exfil
+residual documented for the builder wrapper above does NOT apply to the
+candidate at `deny`/`loopback`).
+
+**Per-run fail-closed probe.** `probe_candidate_confinement` runs before the
+first verify pass (and on every resume): a wrapped child must be DENIED
+reading a control-root canary, an outside-workspace canary (temp-dir
+stand-in for `~/.ssh` — the real `~/.ssh` is ENOENT-ambiguous when absent,
+so the unambiguous check is a LISTING of `$HOME` itself), and `$HOME`; must
+SUCCEED writing the workspace and spawning a subprocess (non-vacuity: a
+sandbox that denies everything would "pass" every denial check); must be
+DENIED writing outside; keychain/DNS Mach lookups per the measured-closed
+expectations; DENIED reading the real sensitive system-data files
+(keychains, brew service dir — non-vacuously: each is asserted readable
+UNWRAPPED first); and in `loopback` mode the port-pinning is proven
+non-vacuous against two LIVE listeners (allowed port reachable AND a second
+live-but-unallowed listener denied). Probe failure refuses the run
+(`CANDIDATE_CONFINEMENT_PROBE_FAILED`, exit 2); `--allow-downgrade` falls
+back to the legacy wrapper as `mode: "allow_host_read_downgrade"`
+(journaled, unqualified). A keychain-OPEN measurement is treated as a LEAK
+(probe fails); a DNS-OPEN measurement at `deny`/`loopback` is recorded as
+the `dns_mach_ipc_open` residual and disqualifies without refusing (file
+isolation is independently proven — measured truth over aspiration).
+
+**Manifest.** Every terminal manifest carries `host_isolation: {mode,
+probed, passed, residuals, qualified}` (sealed alongside
+`candidate_network`); `qualified` is true only for `default_deny` +
+probe-passed + no disqualifying residuals (`file_metadata_outside_home` and
+`network_unrestricted_open` are the two structural, non-disqualifying ones).
+M36's qualification FSM will fold this into the overall `qualified` boolean.
+
+**Honest limits.** (a) Linux keeps the LEGACY candidate wrapper (bwrap
+ro-binds `/`, so the whole host stays readable) and reports
+`mode: "legacy_allow_host_read"` — flagged, fixed in M29c, never a fake
+default-deny claim. (b) Candidates using an interpreter/runtime outside the
+system paths + the verifier interpreter's prefixes need the
+`allow_host_read` opt-out — the honest tradeoff, not a silent widening.
+(c) `network-bind`/`network-inbound` on localhost are port-wildcarded (the
+HTTP oracle assigns the candidate's own port per scenario); LISTENING on a
+loopback port is not a host-read/exfil channel, and outbound pinning is
+what protects host loopback services. (d) stat/existence metadata outside
+`$HOME` stays visible (see the residual above).
 
 ## Linux live-coverage harness
 
