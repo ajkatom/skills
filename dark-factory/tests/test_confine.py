@@ -54,7 +54,11 @@ def test_unknown_cli_confinement_flags_raise():
 @pytest.mark.parametrize("cli,expected", [
     # codex is False in M14: unsupported after the live probe falsified its
     # confinement (desktop-app MCP bridge survives the flags).
+    # api_anthropic is True in M24: a plain HTTP client has no agentic tool
+    # surface to escape through in the first place (structural, not
+    # live-probe-verified — see PROFILES["api_anthropic"]).
     ("claude", True), ("codex", False), ("gemini", False), ("unknown-cli", False),
+    ("api_anthropic", True),
 ])
 def test_is_supported_matrix(cli, expected):
     assert df_confine.is_supported(cli) is expected
@@ -279,3 +283,51 @@ def test_gemini_adapter_confine_absent_matches_today(tmp_path):
     assert resp["status"] == "ok"
     argv = argv_out.read_text(encoding="utf-8").splitlines()
     assert argv == ["--yolo", "--prompt", "Build greet.py per SPEC."]
+
+
+# ---------- api_anthropic profile (M24 Task 2): structural, non-live-probe ----------
+#
+# api_anthropic is a plain stdlib HTTP client (urllib POST to a fixed
+# configured endpoint) -- it has no agentic tool/MCP/sub-agent surface at
+# all, so there is nothing for a confinement flag to strip and nothing for a
+# live tool-denial probe (probe_confinement's ALLOWED_PROOF/DENIED_PROOF
+# dance) to meaningfully exercise: there is no "denied tool" to attempt.
+# Confinement for this adapter IS the env the supervisor hands it (key +
+# base URL; at enterprise the credential proxy governs egress) -- fully
+# controlled by argv/env the supervisor itself constructs, never by the
+# adapter choosing what to invoke. See PROFILES["api_anthropic"] and
+# references/builder-confinement.md.
+
+def test_api_anthropic_is_supported_true():
+    assert df_confine.is_supported("api_anthropic") is True
+
+
+def test_api_anthropic_profile_marked_structural_no_agentic_tools():
+    profile = df_confine.profile_for("api_anthropic")
+    assert profile["supported"] is True
+    assert profile["structural"] is True
+    # No MCP surface exists at all (not merely "disabled"), and no tool
+    # allowlist applies -- this adapter is not an agentic CLI.
+    assert profile["mcp_disabled"] is True
+    assert profile["tool_allowlist"] == []
+
+
+def test_api_anthropic_confinement_flags_no_flags_to_add():
+    # Unlike claude/codex/gemini, there is no CLI argv to construct (the
+    # adapter's own invocation is protocol-0.1 JSON on stdin, not a prompt
+    # baked into argv) -- confinement_flags returns an empty list rather
+    # than raising, honestly reflecting "no flags to add".
+    assert df_confine.confinement_flags("api_anthropic", "PROMPT") == []
+
+
+def test_api_anthropic_probe_confinement_structural_pass_without_spawning():
+    # The structural justification means probe_confinement must NEVER spawn
+    # anything for this profile -- a live ALLOWED/DENIED probe call doesn't
+    # apply when there's no denied tool to attempt in the first place.
+    def fake_runner(*a, **k):
+        raise AssertionError("must not spawn a subprocess for a structural profile")
+
+    ok, reason = df_confine.probe_confinement(
+        "api_anthropic", "/nonexistent/workdir", runner=fake_runner)
+    assert ok is True
+    assert "structural" in reason.lower()

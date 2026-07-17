@@ -121,11 +121,13 @@ mechanism is unconditionally safe.
 
 M10's own live verification uses a stock `python:3.12-alpine` image running
 the repo's fake builder fixtures — no CLI, no credentials, no network needed.
-A **real** cross-model builder (the `claude`/`codex`/`gemini` adapters) needs
-a **user-supplied image** (`hardened.image`) with that model's CLI installed
-and its credentials baked in or otherwise available inside the container —
-dark-factory does not build or publish such an image. Two direct
-consequences:
+A **real** cross-model builder using the `claude`/`codex`/`gemini` adapters
+needs a **user-supplied image** (`hardened.image`) with that model's CLI
+installed and its credentials baked in or otherwise available inside the
+container — dark-factory does not build or publish such an image. The
+`api_anthropic` adapter (M24, below) removes this requirement entirely for
+Anthropic models: no image customization needed at all. Two direct
+consequences for the CLI adapters:
 
 - **Network egress.** `hardened.network` defaults to `"none"` — the
   strongest posture is the default, not something you opt into. A real
@@ -144,6 +146,76 @@ consequences:
   inject or scrub secrets into/out of the container. A proper credential
   broker with scoped, rotated, non-baked-in tokens is **not built yet** —
   that is M11.
+
+## `api_anthropic`: real-model-in-container without a custom image (M24)
+
+The "Image requirements for real builders" section above is the gap M24
+closes for Anthropic models. `claude`/`codex`/`gemini` all shell out to a
+CLI binary that the stock `python:3.12-alpine` image doesn't have — inside
+the container they fail closed with "CLI not found on PATH", so a real
+in-container build with one of them needed a hand-built image. `scripts/
+adapters/api_anthropic` (`references/role-adapters.md`) needs nothing but
+`python3` stdlib (`urllib`): it POSTs the Anthropic Messages API directly
+instead of invoking a CLI. The stock image already has everything this
+adapter needs — **no custom image, no baked-in CLI, no baked-in credentials.**
+
+### The operator step: from proven mechanism to a live paid model
+
+`dark-factory/tests/test_e2e_api_container.py` proves the full mechanism
+live — the adapter running inside a real Docker container, reaching an HTTP
+endpoint over the network, parsing a response, and writing the result into
+the mounted workspace — against a **local stub** Messages endpoint (no paid
+calls, deterministic, safe for CI). Going from that proven mechanism to a
+**live, paid** model in the container is a configuration change, not new
+code:
+
+1. Set `roles.builder.adapter` to `scripts/adapters/api_anthropic`.
+2. Set `hardened.network: "bridge"` — like any other real builder CLI that
+   calls out to its provider, `api_anthropic` needs egress; hardened's
+   default `network: "none"` is correct for a builder with no network need
+   at all, but this adapter's entire job is one outbound HTTP call.
+3. Provide `ANTHROPIC_API_KEY` (via the M11 credential allowlist —
+   `references/credentials.md` — so the raw key is injected as a container
+   `-e` flag baked into `df_container.build_argv`'s own invocation, never
+   via the docker CLIENT process's env) and, at **enterprise**, add
+   `api.anthropic.com` to the credential proxy's allowlist
+   (`credential_proxy.allowlist`) instead of `network: bridge` directly, so
+   egress stays routed through the governed proxy exactly like any other
+   enterprise-tier credential (`references/enterprise.md`).
+4. Point `ANTHROPIC_BASE_URL` at the real API (its default,
+   `https://api.anthropic.com`, needs no override at all unless routing
+   through the enterprise proxy).
+
+That's the whole step. No new adapter code, no new container flags, no new
+confinement wiring — `df_confine.PROFILES["api_anthropic"]` (`references/
+builder-confinement.md`) already marks this adapter `supported: True` for
+the hardened/enterprise confinement gate on structural grounds (a plain HTTP
+client has no agentic tool surface to strip).
+
+### Honest scope
+
+`test_e2e_api_container.py` stubs **only the model's brain** — a canned
+Messages API response. Every other layer it exercises is the real thing,
+running live: the Docker container (`df_container.build_argv`, the same
+argv shape `_run_loop` builds for every hardened builder call), the network
+hop out of the container to the stub server on the host (via
+`host.docker.internal`, the same pattern `test_enterprise_config.py`'s live
+egress-proxy probe already proves on this Docker install), the real HTTP
+POST and response parse, and the path-safe write into the bind-mounted
+workspace. Going from that to a real paid model changes exactly one thing:
+what answers the HTTP request — everything downstream (container, network,
+parse, write, verify, security gates, signed audit) is unchanged and already
+proven.
+
+**A real live run was also performed in development** (not part of the
+automated suite, so it costs nothing to run the tests): a real
+`claude-sonnet-5`, called through this exact adapter, built a small
+key-value-store app **inside** a `python:3.12-alpine` container over the real
+Anthropic Messages API, and the built app passed all 12 of that milestone's
+hidden acceptance scenarios. That run is the existence proof that the
+mechanism works end-to-end with a real model, not only a stub; the suite's
+own `test_e2e_api_container.py` deliberately uses the deterministic stub
+instead so CI never makes a paid API call.
 
 ## Twins at hardened
 
@@ -195,3 +267,9 @@ them:
   `probe_container` implementation
 - `dark-factory/tests/test_e2e_hardened.py` — the live convergence + barrier
   proof, L5 lights-off, and docker-less refusal tests
+- `dark-factory/tests/test_e2e_api_container.py` — the live `api_anthropic`
+  in-container proof (M24): stub-brained, real container + network + parse +
+  write
+- `references/role-adapters.md` — the `api_anthropic` adapter itself
+- `references/builder-confinement.md` — `api_anthropic`'s structural
+  (non-live-probe) confinement justification
