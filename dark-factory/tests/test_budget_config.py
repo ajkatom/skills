@@ -27,6 +27,7 @@ def test_absent_budget_block_gets_defaults(tmp_path):
         "notification_sink": "",
         "notification_durable": False,
         "notification_attempts": 3,
+        "token_pricing": {},
     }
 
 
@@ -53,6 +54,7 @@ def test_valid_api_budget_with_estimate_injected(tmp_path):
         "notification_sink": "https://ops.example.com/hook",
         "notification_durable": False,
         "notification_attempts": 3,
+        "token_pricing": {},
     }
 
 

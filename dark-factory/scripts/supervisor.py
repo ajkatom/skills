@@ -140,7 +140,8 @@ def _redacted_write(path: str, payload, redactor) -> str:
 
 def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint",
-              redactor=None):
+              redactor=None, builder_input_tokens=0, builder_output_tokens=0,
+              usage_known=False):
     # state.json must NEVER carry a credential value: it holds only control-
     # plane bookkeeping (iteration counters, ID/taxonomy feedback, paths), but
     # it goes through the same redaction choke point as every other artifact
@@ -159,6 +160,13 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             "estimated_usd": estimated_usd,
             "budget_alerted": budget_alerted,
             "reason": reason,
+            # M25 Task 1: authoritative token totals, additive alongside the
+            # M8 estimated_usd/builder_calls fields above -- never read by the
+            # estimated_usd admission/alert/pause path, only accumulated and
+            # carried across a pause/resume like the rest of this state.
+            "builder_input_tokens": builder_input_tokens,
+            "builder_output_tokens": builder_output_tokens,
+            "usage_known": usage_known,
         },
         redactor,
     )
@@ -173,6 +181,12 @@ def load_state(run_dir):
     state.setdefault("estimated_usd", 0.0)
     state.setdefault("budget_alerted", False)
     state.setdefault("reason", "checkpoint")
+    # Additive (M25 Task 1): default 0/0/False for a pre-M25 state.json so an
+    # old paused run resumes cleanly with a fresh (zeroed) token count --
+    # never double-counted, never backfilled from thin air.
+    state.setdefault("builder_input_tokens", 0)
+    state.setdefault("builder_output_tokens", 0)
+    state.setdefault("usage_known", False)
     return state
 
 
@@ -268,6 +282,37 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
         "max_calls": b["max_calls"],
         "enforced": bool(dollar_enforced or calls_enforced),
         "estimate_caveat": "estimated from per_call_usd; not metered usage",
+    }
+
+
+def _usage_manifest_field(b, usage_known, input_tokens, output_tokens):
+    """M25 Task 2: authoritative usage (known/input_tokens/output_tokens --
+    accumulated in _run_loop from adapter-reported `resp["usage"]`, e.g.
+    api_anthropic) plus an OPERATOR-priced `actual_usd`, threaded onto every
+    terminal manifest exactly like `_budget_manifest_field` (fresh + resume,
+    every outcome branch).
+
+    `actual_usd` is computed ONLY when usage_known AND `budget.token_pricing`
+    carries a "default" entry -- the run's builder model name isn't visible
+    to the supervisor (DF_API_MODEL is adapter-side env, never returned in
+    the protocol response), so per-model pricing keys are accepted and
+    validated by df_config for forward-compat/documentation but selection is
+    default-entry-only today (see references/budget.md). Absent pricing or
+    unknown usage -> actual_usd is None; tokens are still recorded honestly
+    (0/False when never reported). This is RECORDED truth, never admission-
+    gating -- estimated_usd (above) alone drives the M8 admission/alert/
+    pause path, unchanged.
+    """
+    pricing = (b.get("token_pricing") or {}).get("default")
+    actual_usd = None
+    if usage_known and pricing is not None:
+        actual_usd = (input_tokens / 1e6 * pricing["input_per_mtok"]
+                      + output_tokens / 1e6 * pricing["output_per_mtok"])
+    return {
+        "known": bool(usage_known),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "actual_usd": actual_usd,
     }
 
 
@@ -1435,7 +1480,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   security={"checked": False}, container=None,
-                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                  usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                     digest, audit_key, journal)
@@ -1455,7 +1501,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   oracle={"mutation_validated": False, "inert": inert},
                   coverage={"checked": False},
                   security={"checked": False}, container=None,
-                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                  usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                     digest, audit_key, journal)
@@ -1483,7 +1530,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                       oracle={"mutation_validated": True, "inert": []}, coverage=cov,
                       security={"checked": False}, container=None,
-                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                      usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
             digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                         digest, audit_key, journal)
@@ -1521,7 +1569,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
                   final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
                   container=None, twin_evidence=None, twins=None,
-                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+                  budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                  usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                     digest, audit_key, journal)
@@ -1540,7 +1589,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                       sandbox_backend=None, denial_probe_passed=False,
                       final_exam={"ran": False, "passed": None, "count": 0},
                       regressions=[], container=None,
-                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0))
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                      usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
             digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                         digest, audit_key, journal)
@@ -1666,7 +1716,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
               audit_key=None, prev_dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False,
-              creds=None, redactor=None, extra_scenarios_dir=None):
+              creds=None, redactor=None, extra_scenarios_dir=None,
+              builder_input_tokens=0, builder_output_tokens=0, usage_known=False):
     exec_prefix = exec_prefix or []
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
@@ -1698,7 +1749,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
-                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                              builder_input_tokens, builder_output_tokens))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                     digest, audit_key, journal)
@@ -1823,7 +1876,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="budget", redactor=redactor)
+                          budget_alerted=budget_alerted, reason="budget", redactor=redactor,
+                          builder_input_tokens=builder_input_tokens,
+                          builder_output_tokens=builder_output_tokens,
+                          usage_known=usage_known)
                 print(f"dark-factory: PAUSED — budget cap reached (estimated_usd={estimated_usd}, "
                       f"builder_calls={builder_calls}). Raise budget.max_usd (or max_calls) in "
                       f"config.json and run: supervisor.py resume --control-root "
@@ -1952,7 +2008,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                              final_exam={"ran": False, "passed": None, "count": 0},
                              regressions=sorted(regressed),
                              budget=_budget_manifest_field(cfg["_budget"], builder_calls,
-                                                           estimated_usd))
+                                                           estimated_usd),
+                             usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                         builder_input_tokens, builder_output_tokens))
                     digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                                 digest, audit_key, journal)
@@ -1978,7 +2036,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
-                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens, builder_output_tokens))
                 digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                             digest, audit_key, journal)
@@ -1986,9 +2046,32 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
                 return anchor_exit or 2
-            journal.write("BUILD", iteration=i)
             builder_calls = calls_after
             estimated_usd = est_after
+            # M25 Task 1: authoritative token accounting, additive alongside
+            # the M8 estimate above -- reads resp["usage"] (an adapter that
+            # can report real Messages-API token counts, e.g. api_anthropic)
+            # and accumulates RUN totals. Fail-soft by construction: any
+            # shape other than {"known": True, "input_tokens": <int-able>,
+            # "output_tokens": <int-able>} — absent, {"known": False}, or a
+            # malformed "known": True block — leaves the totals untouched and
+            # NEVER raises; it never affects estimated_usd or the admission/
+            # alert/pause path above, which already ran and decided on the
+            # pre-call estimate alone.
+            usage = resp.get("usage")
+            if isinstance(usage, dict) and usage.get("known") is True:
+                try:
+                    call_input_tokens = int(usage["input_tokens"])
+                    call_output_tokens = int(usage["output_tokens"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    builder_input_tokens += call_input_tokens
+                    builder_output_tokens += call_output_tokens
+                    usage_known = True
+            journal.write("BUILD", iteration=i, usage_known=usage_known,
+                          builder_input_tokens=builder_input_tokens,
+                          builder_output_tokens=builder_output_tokens)
 
             # M12: the dev-cohort verify pass gets a FRESH twin reset with a
             # fresh per-pass seed (only when a twin def supports_variants --
@@ -2025,7 +2108,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
                           final_exam={"ran": False, "passed": None, "count": 0},
                           regressions=sorted(regressed),
-                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens, builder_output_tokens))
                 digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                 anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                             digest, audit_key, journal)
@@ -2097,7 +2182,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                   if not r["pass"]}))
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
-                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                          builder_input_tokens, builder_output_tokens))
                     digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                                 digest, audit_key, journal)
@@ -2118,7 +2205,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
                               security=sec_report,
-                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                          builder_input_tokens, builder_output_tokens))
                     digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                                 digest, audit_key, journal)
@@ -2187,6 +2276,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report, qualified=qualified,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens, builder_output_tokens),
                           custody=custody_field, proxy=proxy_field, enterprise_egress=egress_field,
                           enterprise_seccomp=seccomp_field)
                 digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
@@ -2232,7 +2323,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="checkpoint", redactor=redactor)
+                          budget_alerted=budget_alerted, reason="checkpoint", redactor=redactor,
+                          builder_input_tokens=builder_input_tokens,
+                          builder_output_tokens=builder_output_tokens,
+                          usage_known=usage_known)
                 journal.write("CHECKPOINT", iteration=i,
                               failing=[f["behavior_id"] for f in feedback["failures"]])
                 print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
@@ -2246,7 +2340,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         mf = dict(mb_clean, outcome="CAP_REACHED", iterations=cfg["max_iterations"], qualified=False,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed),
-                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd))
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                              builder_input_tokens, builder_output_tokens))
         digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
         anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                     digest, audit_key, journal)
@@ -2412,7 +2508,11 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       twin_evidence=None, twins=None,
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
-                          state.get("estimated_usd", 0.0)))
+                          state.get("estimated_usd", 0.0)),
+                      usage=_usage_manifest_field(
+                          cfg["_budget"], state.get("usage_known", False),
+                          state.get("builder_input_tokens", 0),
+                          state.get("builder_output_tokens", 0)))
             digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                         digest, audit_key, journal)
@@ -2431,7 +2531,11 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       regressions=sorted(state.get("regressions", [])),
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
-                          state.get("estimated_usd", 0.0)))
+                          state.get("estimated_usd", 0.0)),
+                      usage=_usage_manifest_field(
+                          cfg["_budget"], state.get("usage_known", False),
+                          state.get("builder_input_tokens", 0),
+                          state.get("builder_output_tokens", 0)))
             digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                         digest, audit_key, journal)
@@ -2450,7 +2554,11 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                       regressions=sorted(state.get("regressions", [])),
                       budget=_budget_manifest_field(
                           cfg["_budget"], state.get("builder_calls", 0),
-                          state.get("estimated_usd", 0.0)))
+                          state.get("estimated_usd", 0.0)),
+                      usage=_usage_manifest_field(
+                          cfg["_budget"], state.get("usage_known", False),
+                          state.get("builder_input_tokens", 0),
+                          state.get("builder_output_tokens", 0)))
             digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
             anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                         digest, audit_key, journal)
@@ -2486,6 +2594,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                 estimated_usd=state.get("estimated_usd", 0.0),
                 budget_alerted=state.get("budget_alerted", False),
                 creds=creds, redactor=redactor, extra_scenarios_dir=extra_scenarios_dir,
+                builder_input_tokens=state.get("builder_input_tokens", 0),
+                builder_output_tokens=state.get("builder_output_tokens", 0),
+                usage_known=state.get("usage_known", False),
             )
         except df_sandbox.SandboxError as e:
             # In-loop fail-closed guards exit 2, not an unhandled traceback.
