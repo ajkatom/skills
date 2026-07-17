@@ -152,6 +152,15 @@ the OpenAI-specific field names.
 the same structural grounds as `api_anthropic` — a plain HTTP client has no
 agentic tool/MCP/sub-agent surface to strip or probe.
 
+**Model-naming caveat.** The request body sends `max_tokens` (the
+long-standing Chat Completions parameter). Some newer reasoning-tuned
+OpenAI models expect `max_completion_tokens` instead and will reject
+`max_tokens` with an HTTP 400 — the adapter still fails closed cleanly on
+that (`"api returned HTTP 400"`), it just won't build. If pinning
+`DF_API_MODEL` to such a model, verify it accepts `max_tokens` first (or
+expect this adapter to need a small follow-up change for that model
+family).
+
 **Proven live.** `dark-factory/tests/test_openai_adapter.py` drives this
 adapter end-to-end (subprocess, protocol 0.1) against a local stub Chat
 Completions endpoint (`tests/fixtures/stub_chat_api`) — deterministic, no
