@@ -252,6 +252,14 @@ unchanged below.
    - **accept** (stop, waived/unverified) → `resume --decision accept`
    - **abort** → `resume --decision abort`
    Repeat until exit 0/2/3.
+   - **At an UNKNOWN_OUTCOME crash-recovery halt (exit 11, journal `UNKNOWN_OUTCOME`, M35/DF-08).**
+     If the supervisor was hard-killed (SIGKILL/OOM/power loss) DURING a model dispatch,
+     the crashed call's outcome is unknown and its reserved spend is already counted (never
+     understated). A plain `resume --decision continue` fail-closes here (exit 11) rather
+     than silently re-issuing a possibly-already-charged paid call. To proceed, reconcile
+     explicitly: `resume --decision reconcile` re-dispatches that iteration (accepting
+     possible duplicate spend — journaled `DISPATCH_RECONCILED`), or `--decision abort`
+     to stop. See `references/budget.md`.
    - **At a budget pause (exit 10, journal `BUDGET_PAUSE`).** This is resumable, not
      terminal: raise `budget.max_usd` and/or `budget.max_calls` in `config.json`, then
      `supervisor.py resume --control-root <cr> --decision continue` — the run re-reads
