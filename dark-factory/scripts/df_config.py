@@ -9,6 +9,11 @@ from df_common import canonical_json, sha256_str
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
+# M27 Task 2 (spec §7.4): candidate-network authority modes. Mirrors
+# df_sandbox._NETWORK_MODES exactly -- kept as its own constant here (rather
+# than importing df_sandbox) because config validation must never depend on
+# platform-specific sandbox backends being importable/available.
+_CANDIDATE_NETWORK_MODES = ("unrestricted", "deny", "loopback")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
@@ -217,6 +222,31 @@ def load_config(control_root: str) -> dict:
         tdir = os.path.join(control_root, "twins")
         if not os.path.isdir(tdir) or not [n for n in os.listdir(tdir) if n.endswith(".json")]:
             raise ConfigError("twins.enabled is true but no twins/*.json definitions found")
+
+    # M27 Task 2 (spec §7.4): candidate_network -- the OPTIONAL candidate-ONLY
+    # network-restriction mode. Config load never reads scenarios (that check
+    # -- deny + an http scenario -- belongs to the supervisor's pre-build
+    # gate, where scenarios are already loaded); this is a pure shape +
+    # cross-field check, same posture as every other top-level field here.
+    candidate_network = raw.get("candidate_network", "unrestricted")
+    if candidate_network not in _CANDIDATE_NETWORK_MODES:
+        # Membership on a tuple of strings already rejects a bool (True/False
+        # never equal any of these strings) as well as any other type/value,
+        # so no separate isinstance check is needed.
+        raise ConfigError(
+            f"candidate_network must be one of {_CANDIDATE_NETWORK_MODES!r}, "
+            f"got {candidate_network!r}"
+        )
+    if candidate_network != "unrestricted" and tier not in ("standard", "hardened", "enterprise"):
+        raise ConfigError(
+            "candidate_network requires assurance: standard or above "
+            "(cooperative has no sandbox to enforce it)"
+        )
+    if candidate_network == "deny" and tw_enabled:
+        raise ConfigError(
+            "candidate_network 'deny' would make configured twins unreachable; "
+            "use 'loopback' (macOS) or remove twins"
+        )
 
     audit_raw = raw.get("audit", {})
     if not isinstance(audit_raw, dict):
@@ -980,6 +1010,7 @@ def load_config(control_root: str) -> dict:
     cfg["_checkpoint"] = checkpoint
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
+    cfg["candidate_network"] = candidate_network
     cfg["_audit"] = {
         "signing": audit_signing,
         "key_path": audit_key_path if audit_signing else "",

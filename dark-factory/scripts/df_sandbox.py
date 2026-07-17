@@ -8,9 +8,33 @@ this OS or None (unsupported). No backend is trusted without a passing
 read denial (a planted canary is unreadable) and write denial (a fresh file
 cannot be created, and the canary cannot be truncated) before anything relies
 on the sandbox.
+
+`wrap_prefix`'s `network` parameter (default `"unrestricted"`, byte-identical
+to the pre-M27 profile) additionally restricts a wrapped process's NETWORK
+access — `"deny"` blocks all network I/O including loopback; `"loopback"`
+blocks everything except localhost (so host-bound twin servers stay
+reachable while real network egress is cut off). `probe_network_denial`
+mirrors `probe_denial`'s fail-closed, non-vacuous discipline for this new
+axis.
+
+Honest residual scope (macOS): `(deny network*)` denies the wrapped
+process's OWN socket-level network operations, and the probe proves that
+for TCP connects. Two channels are outside what this profile (built on
+`(allow default)`) restricts or the probe measures: (a) UDP/other socket
+types are denied by the same `network*` primitive by construction but are
+not separately probed; (b) DNS RESOLUTION — `getaddrinfo()` is serviced by
+`mDNSResponder`, a separate, unconfined system daemon reached over Mach
+IPC (not a `network*` operation by the wrapped process), so the daemon may
+issue real DNS queries on the candidate's behalf even under `deny`. A
+hostile candidate could therefore exfiltrate bits via DNS query names
+despite the socket-level denial. Closing that requires denying Mach IPC
+to the resolver (a much broader, app-breaking profile) — documented limit,
+not silently ignored. Linux `--unshare-net` has neither gap (the namespace
+has no route to the resolver or anything else).
 """
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import uuid
@@ -22,6 +46,30 @@ class SandboxError(RuntimeError):
 
 _READ_DENIAL_MARKER = "DF-READ-DENIED"
 _WRITE_DENIAL_MARKER = "DF-WRITE-DENIED"
+_NET_EXTERNAL_DENIAL_MARKER = "DF-NET-EXTERNAL-DENIED"
+_NET_LOOPBACK_DENIAL_MARKER = "DF-NET-LOOPBACK-DENIED"
+
+_NETWORK_MODES = ("unrestricted", "deny", "loopback")
+
+# Real, stable external TCP target used to prove genuine egress denial (not
+# just "an address that happens to be this host"). Same convention already
+# used by df_linux_probes.probe_egress_denial for the M17 iptables primitive.
+# On macOS this choice is load-bearing, not cosmetic: a listener bound to
+# this host's OWN non-loopback address (e.g. its LAN IP, discovered via the
+# classic "UDP connect to a black-hole address" trick) is USELESS as a
+# "must be denied" probe target, because macOS routes traffic to any of the
+# host's own addresses via lo0 (confirmed with `route get <own-lan-ip>` →
+# `interface: lo0`) — the kernel treats it as intra-host before sandbox
+# policy is even consulted, and sandbox-exec's `(remote ip "localhost:*")`
+# filter matches it exactly like literal 127.0.0.1. So "connect to my own
+# LAN IP" and "connect to 127.0.0.1" are indistinguishable to both the
+# kernel and the sandbox on macOS; only a connection to a genuinely
+# different host proves real-egress denial. A real external target requires
+# actual internet reachability, which is exactly what the baseline
+# non-vacuity check below is for: no reachability → fail closed, never a
+# false pass.
+_NET_PROBE_EXTERNAL_HOST = "1.1.1.1"
+_NET_PROBE_EXTERNAL_PORT = 443
 
 
 class _MacOSBackend:
@@ -30,7 +78,12 @@ class _MacOSBackend:
     def available(self):
         return shutil.which("sandbox-exec") is not None
 
-    def wrap_prefix(self, deny_root, workspace):
+    def wrap_prefix(self, deny_root, workspace, network="unrestricted"):
+        if network not in _NETWORK_MODES:
+            raise SandboxError(
+                f"unknown candidate_network mode {network!r} "
+                f"(expected one of {_NETWORK_MODES!r})"
+            )
         real = os.path.realpath(deny_root)
         profile = (
             "(version 1)"
@@ -38,6 +91,21 @@ class _MacOSBackend:
             f'(deny file-read* (subpath "{real}"))'
             f'(deny file-write* (subpath "{real}"))'
         )
+        if network == "deny":
+            profile += "(deny network*)"
+        elif network == "loopback":
+            # Hand-verified against a real external host (1.1.1.1:443) and a
+            # real loopback listener (see module docstring / task report for
+            # the experiment transcript): `(remote ip "localhost:*")` alone
+            # denies genuine external egress while allowing 127.0.0.1.
+            #
+            # NOTE: the seemingly-more-thorough form that ALSO adds
+            # `(allow network* (local ip "localhost:*"))` was tried and
+            # measured to be a SECURITY REGRESSION on this macOS version —
+            # it allowed the wrapped process to reach a real external host
+            # (1.1.1.1:443), defeating the deny entirely. Do not add it back
+            # without re-verifying live against a real external target.
+            profile += '(deny network*)(allow network* (remote ip "localhost:*"))'
         return ["sandbox-exec", "-p", profile]
 
 
@@ -47,10 +115,22 @@ class _LinuxBackend:
     def available(self):
         return shutil.which("bwrap") is not None
 
-    def wrap_prefix(self, deny_root, workspace):
+    def wrap_prefix(self, deny_root, workspace, network="unrestricted"):
+        if network not in _NETWORK_MODES:
+            raise SandboxError(
+                f"unknown candidate_network mode {network!r} "
+                f"(expected one of {_NETWORK_MODES!r})"
+            )
+        if network == "loopback":
+            raise SandboxError(
+                "candidate_network 'loopback' is not supported by the bwrap "
+                "backend: --unshare-net's namespace has its own loopback, so "
+                "host-bound twins would be unreachable; use 'deny' (no "
+                "twins/http) or run on macOS"
+            )
         real_deny = os.path.realpath(deny_root)
         real_ws = os.path.realpath(workspace)
-        return [
+        argv = [
             "bwrap",
             "--ro-bind", "/", "/",       # whole fs read-only baseline
             "--dev", "/dev",
@@ -80,8 +160,15 @@ class _LinuxBackend:
             "--bind", real_ws, real_ws,  # workspace read-write
             "--chdir", real_ws,
             "--die-with-parent",
-            "--",
         ]
+        if network == "deny":
+            argv.append("--unshare-net")  # new net namespace, no interfaces
+                                           # configured (not even a usable
+                                           # loopback) → all network I/O
+                                           # denied, including to the host's
+                                           # own loopback.
+        argv.append("--")
+        return argv
 
 
 BACKENDS = {"darwin": _MacOSBackend(), "linux": _LinuxBackend()}
@@ -209,3 +296,113 @@ def probe_denial(backend, deny_root, workspace):
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def probe_network_denial(backend, deny_root, workspace, network):
+    """Fail-closed live proof that `network` mode is actually enforced.
+
+    `"unrestricted"` short-circuits to (True, ...) without spawning anything
+    (no restriction is asked for, so there is nothing to prove). For `"deny"`
+    and `"loopback"` the wrapped process must provably fail to reach a real
+    external host; `"loopback"` must ALSO provably succeed reaching a real
+    127.0.0.1 listener (proving the mode isn't just a broken profile that
+    denies everything, which would silently break host-bound twins).
+
+    Non-vacuity: a BASELINE unwrapped connect to the external target must
+    succeed first, else the environment itself has no egress and any later
+    "denial" would be meaningless — fails closed rather than reporting a
+    false pass. See the module-level comment on `_NET_PROBE_EXTERNAL_HOST`
+    for why a real external host is used here rather than a locally-bound
+    "non-loopback" address (the latter is indistinguishable from loopback on
+    macOS, at the kernel routing level, before the sandbox ever sees it).
+
+    Any spawn failure, timeout, unknown mode, or ambiguous/short output —
+    (False, reason), never a guess.
+    """
+    if network == "unrestricted":
+        return True, "unrestricted: no network probe applies"
+    if network not in _NETWORK_MODES:
+        return False, f"unknown candidate_network mode {network!r}"
+    if backend is None or not backend.available():
+        return False, "no sandbox backend available"
+
+    try:
+        baseline = socket.create_connection(
+            (_NET_PROBE_EXTERNAL_HOST, _NET_PROBE_EXTERNAL_PORT), timeout=3
+        )
+        baseline.close()
+    except OSError as exc:
+        return False, (
+            f"baseline connect to {_NET_PROBE_EXTERNAL_HOST}:"
+            f"{_NET_PROBE_EXTERNAL_PORT} failed — probe environment "
+            f"unusable ({exc})"
+        )
+
+    # A real loopback listener to prove twins stay reachable in "loopback"
+    # mode. listen(1) with no accept() is sufficient — the wrapped child
+    # makes at most one connection attempt here, and a pending connection
+    # completes at the TCP level without the listener ever calling accept().
+    loop_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        loop_sock.bind(("127.0.0.1", 0))
+        loop_sock.listen(1)
+        loop_port = loop_sock.getsockname()[1]
+
+        try:
+            prefix = backend.wrap_prefix(deny_root, workspace, network=network)
+        except SandboxError as exc:
+            return False, f"wrap_prefix raised for network={network!r}: {exc}"
+
+        code = (
+            "import socket, sys\n"
+            f"host, port, loop_port = {_NET_PROBE_EXTERNAL_HOST!r}, "
+            f"{_NET_PROBE_EXTERNAL_PORT}, {loop_port}\n"
+            "try:\n"
+            "    socket.create_connection((host, port), timeout=3).close()\n"
+            "    sys.stdout.write('DF-NET-EXTERNAL-LEAKED')\n"
+            "except OSError:\n"
+            f"    sys.stdout.write({_NET_EXTERNAL_DENIAL_MARKER!r})\n"
+            "sys.stdout.write(chr(10))\n"
+            "try:\n"
+            "    socket.create_connection(('127.0.0.1', loop_port), timeout=3).close()\n"
+            "    sys.stdout.write('DF-NET-LOOPBACK-ALLOWED')\n"
+            "except OSError:\n"
+            f"    sys.stdout.write({_NET_LOOPBACK_DENIAL_MARKER!r})\n"
+        )
+        argv = prefix + [sys.executable, "-c", code]
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True, text=True, errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "wrapped network-probe process failed to launch or timed out"
+    finally:
+        loop_sock.close()
+
+    # Fail-closed: only trust a full, well-formed two-line transcript. Any
+    # missing/extra marker, nonzero exit, or unexpected value → ambiguous →
+    # False.
+    lines = proc.stdout.split("\n")
+    if len(lines) < 2:
+        return False, (
+            f"network probe produced too few output lines "
+            f"(rc={proc.returncode}): stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+    external_denied = lines[0].strip() == _NET_EXTERNAL_DENIAL_MARKER
+    loopback_line = lines[1].strip()
+    if network == "deny":
+        loopback_ok = loopback_line == _NET_LOOPBACK_DENIAL_MARKER
+    else:  # loopback
+        loopback_ok = loopback_line == "DF-NET-LOOPBACK-ALLOWED"
+
+    if proc.returncode != 0 or not external_denied or not loopback_ok:
+        return False, (
+            f"network probe did not prove {network!r}: "
+            f"external_denied={external_denied} loopback_line={loopback_line!r} "
+            f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+    detail = "external egress denied"
+    detail += ", loopback allowed" if network == "loopback" else ", loopback denied too"
+    return True, f"{network}: {detail} (proven via wrapped subprocess, baseline non-vacuous)"

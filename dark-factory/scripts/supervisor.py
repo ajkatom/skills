@@ -1112,6 +1112,61 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         "(or pass --allow-downgrade).")
 
 
+def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier, journal):
+    """M27 Task 2 (spec §7.4): builds the CANDIDATE/verifier-only exec wrapper
+    used by every run_all(...) call (and brownfield characterize()), kept
+    strictly separate from `exec_prefix` -- which stays exactly what
+    resolve_isolation returned and is what the BUILDER uses at every tier
+    (see _run_loop's builder_prefix handling, unchanged by this function). A
+    network restriction on the candidate must never reach the builder.
+
+    cfg["candidate_network"] == "unrestricted" (the default, and the ONLY
+    legal value df_config accepts at a configured cooperative tier) is a
+    total no-op: returns `exec_prefix` unchanged, byte-identical to pre-M27
+    behavior -- nothing new is ever built or probed.
+
+    Otherwise the EFFECTIVE tier must actually carry an OS sandbox backend
+    (standard/hardened/enterprise -- the same tiers resolve_isolation ever
+    calls `os_backend.wrap_prefix()` for; see _QUALIFYING_TIERS). A
+    --allow-downgrade run can still resolve to "cooperative" at RUNTIME even
+    though df_config only ever accepted candidate_network != "unrestricted"
+    for a CONFIGURED standard-or-above tier -- in that case there is no
+    sandbox left to enforce the restriction, so this fails closed exactly
+    like a failed isolation probe: journals PROBE_FAILED and raises
+    SandboxError, which every existing call site already catches and turns
+    into a clean exit 2 (never a traceback).
+
+    When a backend IS available, `wrap_prefix(..., network=mode)` builds the
+    candidate-only wrapper and `probe_network_denial` LIVE-proves it before
+    anything relies on it -- the same fail-closed discipline as the base
+    denial probe. A SandboxError raised by wrap_prefix itself (e.g. Linux +
+    "loopback", which bwrap cannot support) surfaces the same clean way.
+    """
+    mode = cfg["candidate_network"]
+    if mode == "unrestricted":
+        return exec_prefix
+    if eff_tier not in _QUALIFYING_TIERS:
+        reason = (f"effective isolation tier is {eff_tier!r} -- no OS sandbox "
+                  "backend is available to enforce it")
+        journal.write("PROBE_FAILED", requested=f"candidate_network:{mode}", reason=reason)
+        raise df_sandbox.SandboxError(
+            f"candidate_network {mode!r} requires a working OS sandbox backend, but "
+            f"{reason}. Fix the sandbox or set candidate_network=unrestricted.")
+    os_backend = df_sandbox.current_backend()
+    try:
+        candidate_prefix = os_backend.wrap_prefix(control_root, workspace, network=mode)
+    except df_sandbox.SandboxError as e:
+        journal.write("PROBE_FAILED", requested=f"candidate_network:{mode}", reason=str(e))
+        raise
+    ok, reason = df_sandbox.probe_network_denial(os_backend, control_root, workspace, mode)
+    if not ok:
+        journal.write("PROBE_FAILED", requested=f"candidate_network:{mode}", reason=reason)
+        raise df_sandbox.SandboxError(
+            f"candidate_network {mode!r} live network-denial probe failed -- refusing "
+            f"to run the candidate with an unproven network restriction: {reason}")
+    return candidate_prefix
+
+
 def _init_report_lines(report: dict) -> list:
     """Human-readable failure lines for a not-ok df_init.validate_scaffold
     report -- covers every branch that report shape can take (config,
@@ -1416,6 +1471,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     manifest_base = {
         "invocation": invocation,
         "tier": cfg["assurance"],
+        # Additive (M27 Task 2, spec §7.4): config-time-known, so it's on
+        # every terminal manifest including every pre-build abort branch —
+        # same "additive, present as soon as it's knowable" pattern as
+        # `credentials`/`mode`/`builder_confinement`.
+        "candidate_network": cfg["candidate_network"],
         "qualified": cfg["_qualified"],
         "config_sha256": cfg["_config_sha256"],
         "spec_sha256": sha256_str(spec_text),
@@ -1488,6 +1548,35 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: {e}\n")
         return anchor_exit or 2
+
+    # M27 Task 2 (spec §7.4): candidate_network=="deny" would make the
+    # candidate's OWN http server unreachable to the verifier -- an http
+    # scenario polls the candidate over 127.0.0.1, which "deny" blocks too
+    # (only "loopback" keeps 127.0.0.1 reachable). Refuse before any build
+    # ever runs, naming every offending scenario id. This is a pure
+    # scenario-content check, so it belongs here (where scenarios are
+    # already loaded) rather than at config-load time (df_config never
+    # reads scenarios).
+    if cfg["candidate_network"] == "deny":
+        http_scenario_ids = [sc["id"] for sc in scenarios if "http" in sc["when"]]
+        if http_scenario_ids:
+            journal.write("CANDIDATE_NETWORK_GATE_FAILED", scenarios=http_scenario_ids)
+            mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                      final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                      security={"checked": False}, container=None,
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                      usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(
+                f"dark-factory: pre-build gate FAILED — candidate_network 'deny' would make "
+                f"http scenario(s) unreachable, no build was run: "
+                f"{', '.join(http_scenario_ids)}\n"
+            )
+            return anchor_exit or 2
 
     # Mutation validation first (order matters: an inert oracle is a more
     # fundamental defect than a coverage gap, and coverage hasn't been
@@ -1623,6 +1712,18 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
 
+    # M27 Task 2 (spec §7.4): the CANDIDATE-only network wrapper. `exec_prefix`
+    # (above) is untouched and stays what the builder uses; `candidate_prefix`
+    # is what every run_all(...)/characterize() call below uses instead. A
+    # failed live network probe (or an unsupported mode/backend combo) fails
+    # closed here, before any build, exactly like a failed isolation probe.
+    try:
+        candidate_prefix = resolve_candidate_prefix(
+            cfg, control_root, workspace, exec_prefix, eff_tier, journal)
+    except df_sandbox.SandboxError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+
     # M15: brownfield detection + characterization. Runs HERE -- after
     # isolation is resolved (characterization probes execute under the same
     # exec_wrapper the verifier uses, per the barrier: a probe can read the
@@ -1654,7 +1755,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     if mode == "brownfield" and cfg["_brownfield"]["probes"]:
         try:
             generated = df_brownfield.characterize(
-                project_src, cfg["_brownfield"]["probes"], exec_wrapper=exec_prefix)
+                project_src, cfg["_brownfield"]["probes"], exec_wrapper=candidate_prefix)
         except df_brownfield.BrownfieldError as e:
             sys.stderr.write(f"dark-factory: brownfield characterization failed: {e}\n")
             return 2
@@ -1703,7 +1804,8 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     try:
         return _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                          adapter, timeout_s, workspace, start_iter=1, feedback=None,
-                         exec_prefix=exec_prefix, audit_key=audit_key,
+                         exec_prefix=exec_prefix, candidate_prefix=candidate_prefix,
+                         audit_key=audit_key,
                          creds=creds, redactor=redactor, extra_scenarios_dir=gen_dir)
     except df_sandbox.SandboxError as e:
         # In-loop fail-closed guards (e.g. the hardened adapter-mount re-check)
@@ -1714,11 +1816,18 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
 
 def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               adapter, timeout_s, workspace, start_iter, feedback, exec_prefix=None,
+              candidate_prefix=None,
               audit_key=None, prev_dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False,
               creds=None, redactor=None, extra_scenarios_dir=None,
               builder_input_tokens=0, builder_output_tokens=0, usage_known=False):
     exec_prefix = exec_prefix or []
+    # M27 Task 2: candidate_prefix is the CANDIDATE/verifier-only wrapper
+    # (run_all below); exec_prefix above stays the builder's. A caller that
+    # doesn't pass candidate_prefix (e.g. candidate_network=="unrestricted",
+    # or a pre-M27 test that predates this param) gets exec_prefix itself --
+    # byte-identical to before this task.
+    candidate_prefix = candidate_prefix if candidate_prefix is not None else exec_prefix
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
     # M14: a per-run-loop copy of cfg["_confine"] — NOT cfg["_confine"] itself
@@ -2144,7 +2253,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # would flag every BHV-REGRESS-* as an orphan_scenario (no
                 # matching behaviors.json entry) and spuriously fail any
                 # brownfield+coverage run. See references/brownfield.md.
-                report = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
+                report = run_all(scenarios_dir, workspace, exec_wrapper=candidate_prefix,
                                   env_extra=verify_env_extra, cohort="dev",
                                   observer_files=ts.observer_files if ts else None,
                                   extra_scenarios_dir=extra_scenarios_dir)
@@ -2210,7 +2319,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                         extra_env=seed_extra, phase="verify")
                         except df_twins.TwinError as e:
                             return _twin_error_abort(i, e)
-                final = run_all(scenarios_dir, workspace, exec_wrapper=exec_prefix,
+                final = run_all(scenarios_dir, workspace, exec_wrapper=candidate_prefix,
                                  env_extra=final_env_extra, cohort="final",
                                  observer_files=ts.observer_files if ts else None)
                 _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
@@ -2448,6 +2557,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         manifest_base = {
             "invocation": os.path.basename(run_dir),
             "tier": cfg["assurance"],
+            # Additive (M27 Task 2): same "fresh + resume" threading as
+            # `credentials`/`mode`/`builder_confinement`.
+            "candidate_network": cfg["candidate_network"],
             "qualified": cfg["_qualified"],
             "config_sha256": cfg["_config_sha256"],
             "spec_sha256": sha256_str(spec_text),
@@ -2627,12 +2739,22 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         if eff_tier not in _QUALIFYING_TIERS:
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                              "isolation; outcome can never be a qualified ship-candidate.\n")
+        # M27 Task 2: re-derive the candidate-only network wrapper on every
+        # resume too — isolation cannot be trusted across a pause, and
+        # neither can a network restriction built on top of it.
+        try:
+            candidate_prefix = resolve_candidate_prefix(
+                cfg, control_root, state["workspace"], exec_prefix, eff_tier, journal)
+        except df_sandbox.SandboxError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
         try:
             return _run_loop(
                 cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 adapter, timeout_s, state["workspace"],
                 start_iter=state["next_iter"], feedback=state["feedback"],
-                exec_prefix=exec_prefix, audit_key=audit_key,
+                exec_prefix=exec_prefix, candidate_prefix=candidate_prefix,
+                audit_key=audit_key,
                 prev_dev_status=state.get("dev_status", {}),
                 regressions=state.get("regressions", []),
                 builder_calls=state.get("builder_calls", 0),

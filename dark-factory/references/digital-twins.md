@@ -282,6 +282,21 @@ Twins are **trusted infrastructure**: they run **outside** the OS read-denial sa
 - **Persistent state (dev only).** Twins can maintain state across builder iterations (see "Honest Scope" below).
 - **No sandbox containment.** Twins are not subject to `sandbox-exec` (macOS) or `bwrap` (Linux) read-denial; they can access files, write logs, etc.
 
+**`candidate_network` interaction (M27, spec §7.4).** The "localhost access"
+bullet above holds unmodified only when `candidate_network` is at its
+default (`"unrestricted"`) or set to `"loopback"` — `loopback` is the
+twin-compatible network restriction: it narrows the candidate to
+`127.0.0.1` only, so a host-bound twin server stays reachable while real
+external egress is cut off. `"deny"` is NOT twin-compatible — it blocks
+loopback too, so `df_config` refuses the combination outright at config-load
+time (`candidate_network: "deny"` + `twins.enabled: true` → `ConfigError`,
+"would make configured twins unreachable; use 'loopback' (macOS) or remove
+twins") rather than letting a run silently starve every twin-backed
+scenario. See `references/isolation.md`'s "Candidate network authority
+(§7.4)" section for the full model, including the Linux limit (`loopback`
+is macOS-only — `bwrap`'s network namespace has its own private loopback,
+disconnected from the host's).
+
 ## Honest Scope: Dev-Shared Twins (M3a)
 
 ### What M3a Ships
