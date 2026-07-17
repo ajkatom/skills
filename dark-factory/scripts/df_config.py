@@ -15,6 +15,7 @@ TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash")
 # than importing df_sandbox) because config validation must never depend on
 # platform-specific sandbox backends being importable/available.
 _CANDIDATE_NETWORK_MODES = ("unrestricted", "deny", "loopback")
+_CANDIDATE_HOST_READ_MODES = ("default_deny", "allow_host_read")
 _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
@@ -304,6 +305,34 @@ def load_config(control_root: str) -> dict:
         raise ConfigError(
             "candidate_network 'deny' would make configured twins unreachable; "
             "use 'loopback' (macOS) or remove twins"
+        )
+
+    # M29b (DF-02 host-read half): candidate_host_read -- whether the
+    # CANDIDATE (the built artifact under test) runs under the default-deny
+    # host-read profile. The default at standard+ is the REMEDIATION itself
+    # ("default_deny"): existing configs get the stronger behavior
+    # automatically. "allow_host_read" is the explicit, honest opt-out for
+    # candidates that genuinely need host reads -- allowed, but the manifest
+    # marks host_isolation unqualified for it. At cooperative there is no
+    # candidate sandbox at all, so requesting "default_deny" there is a
+    # cooperative rejection (same tier rule as candidate_network); an
+    # explicit "allow_host_read" at cooperative merely states the tier's
+    # reality and is accepted.
+    candidate_host_read = raw.get("candidate_host_read")
+    if candidate_host_read is None:
+        candidate_host_read = ("default_deny"
+                               if tier in ("standard", "hardened", "enterprise")
+                               else "allow_host_read")
+    elif candidate_host_read not in _CANDIDATE_HOST_READ_MODES:
+        raise ConfigError(
+            f"candidate_host_read must be one of {_CANDIDATE_HOST_READ_MODES!r}, "
+            f"got {candidate_host_read!r}"
+        )
+    elif (candidate_host_read == "default_deny"
+          and tier not in ("standard", "hardened", "enterprise")):
+        raise ConfigError(
+            "candidate_host_read 'default_deny' requires assurance: standard or "
+            "above (cooperative has no sandbox to enforce it)"
         )
 
     audit_raw = raw.get("audit", {})
@@ -1237,6 +1266,7 @@ def load_config(control_root: str) -> dict:
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["candidate_network"] = candidate_network
+    cfg["candidate_host_read"] = candidate_host_read
     cfg["_audit"] = {
         "signing": audit_signing,
         "key_path": audit_key_path if audit_signing else "",

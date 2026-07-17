@@ -76,6 +76,42 @@ The attestation is anchored into the same hash chain as a custody attestation.
 See `references/security-gates.md` for the full waiver workflow and binding
 model.
 
+## `host_isolation` manifest field (M29b / DF-02 host-read half)
+
+Every terminal manifest (fresh run and resume, including pre-probe abort
+branches, which carry a `probed: false` preliminary) has a sealed
+`host_isolation` object describing what host-read isolation the CANDIDATE
+actually ran under:
+
+```json
+{"mode": "default_deny", "probed": true, "passed": true,
+ "residuals": ["file_metadata_outside_home"], "qualified": true}
+```
+
+- `mode` — `"default_deny"` (macOS standard+, the default: the candidate ran
+  under the `(deny default)` profile of `references/isolation.md`'s
+  "Default-deny candidate host isolation"); `"allow_host_read_optout"`
+  (explicit `candidate_host_read: "allow_host_read"` config);
+  `"allow_host_read_downgrade"` (`--allow-downgrade` after a failed
+  confinement probe); `"legacy_allow_host_read"` (Linux until M29c);
+  `"none"` (cooperative — no candidate sandbox exists).
+- `probed`/`passed` — whether `probe_candidate_confinement` ran and what it
+  proved, live, per run (and re-proved on every resume).
+- `residuals` — the MEASURED leftover channels, named honestly:
+  `host_read_open` (every non-default-deny mode), `keychain_mach_ipc_open` /
+  `dns_mach_ipc_open` / `system_data_file_open` (disqualifying; each only
+  appears if this machine measures the respective channel/file open — all
+  closed on the reference macOS backend), `file_metadata_outside_home`
+  (structural: stat/existence visibility outside `$HOME`, contents denied),
+  `network_unrestricted_open` (candidate_network was configured
+  unrestricted — that axis' own choice).
+- `qualified` — true ONLY for `default_deny` + probe-passed + no
+  disqualifying residual (the metadata and unrestricted-network ones are
+  the two structural non-disqualifying entries). This is the
+  `host_isolation_qualified` signal **M36's single qualification FSM will
+  fold into the overall `qualified` boolean** — M29b computes and seals it
+  but does not re-derive top-level `qualified` from it.
+
 ## Artifact binding (DF-01)
 
 Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes (`manifest.json`, `manifest.sha256`, `journal.jsonl`, and the optional signature) — it said nothing about whether the *built artifact* (the workspace a converged run produced) still matched what the manifest claimed to have shipped. A converged workspace could be silently mutated after the run finished and `verify-manifest` would still print `OK`. DF-01 (audit Critical) closes that gap: seal the artifact **before** the final exam runs, bind its identity into the signed manifest, and make every later verify/custody check re-derive that identity from the live object store rather than trust a mutable workspace path.

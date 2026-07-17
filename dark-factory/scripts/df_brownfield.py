@@ -139,7 +139,8 @@ def _observe(probe: dict, cwd: str, exec_wrapper: list | None) -> dict:
     }
 
 
-def characterize(src_root: str, probes: list[dict], exec_wrapper=None) -> list[dict]:
+def characterize(src_root: str, probes: list[dict], exec_wrapper=None,
+                 tmp_dir=None) -> list[dict]:
     """Snapshot `src_root` into a throwaway copy, run each probe there, and
     return one dev-cohort regression scenario per probe capturing the
     OBSERVED exit_code/stdout/stderr.
@@ -148,6 +149,13 @@ def characterize(src_root: str, probes: list[dict], exec_wrapper=None) -> list[d
     (human-supplied). `exec_wrapper` is an optional list prefix (the same
     isolation wrapper used for verification) -- the probe runs as
     `(exec_wrapper or []) + probe["run"]`.
+
+    `tmp_dir` (M29b): optional pre-created empty directory to host the
+    throwaway copy. The default-deny candidate wrapper (df_sandbox
+    .wrap_candidate_prefix) can only read paths it was BUILT knowing about,
+    so the supervisor pre-creates the copy dir, bakes it into the wrapper as
+    a scratch subpath, and passes it here. Ownership transfers either way:
+    the copy dir is always removed on exit, passed-in or not.
 
     Raises BrownfieldError on: invalid probe shapes; a probe that times out
     or can't be observed (naming the probe); a generated `then` that fails
@@ -158,7 +166,8 @@ def characterize(src_root: str, probes: list[dict], exec_wrapper=None) -> list[d
     """
     _validate_probes(probes)
 
-    tmp_dir = tempfile.mkdtemp(prefix="df-brownfield-")
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix="df-brownfield-")
     try:
         snapshot_source.snapshot(src_root, tmp_dir)
 

@@ -13,6 +13,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 
@@ -1979,7 +1980,7 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         "(or pass --allow-downgrade).")
 
 
-def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier, journal):
+def _resolve_candidate_network_prefix(cfg, control_root, workspace, exec_prefix, eff_tier, journal):
     """M27 Task 2 (spec §7.4): builds the CANDIDATE/verifier-only exec wrapper
     used by every run_all(...) call (and brownfield characterize()), kept
     strictly separate from `exec_prefix` -- which stays exactly what
@@ -2032,6 +2033,206 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
             f"candidate_network {mode!r} live network-denial probe failed -- refusing "
             f"to run the candidate with an unproven network restriction: {reason}")
     return candidate_prefix
+
+
+# host_isolation residuals that DISQUALIFY (manifest host_isolation.qualified
+# False when any is present). RESIDUAL_METADATA (stat/existence visibility
+# outside $HOME, structural to the profile's measured-required broad
+# file-read-metadata allow) and RESIDUAL_NET_UNRESTRICTED (egress open because
+# candidate_network was CONFIGURED unrestricted -- that axis' own choice, not
+# a host-read defect) are the two non-disqualifying ones; everything else --
+# host reads open, keychain reachable, resolver reachable at a denying network
+# mode -- defeats the point of host isolation. M36's qualification FSM folds
+# this field into the overall `qualified` boolean; M29b only computes and
+# seals it honestly.
+_HOST_ISOLATION_SOFT_RESIDUALS = frozenset({
+    df_sandbox.RESIDUAL_METADATA,
+    df_sandbox.RESIDUAL_NET_UNRESTRICTED,
+})
+
+
+def _host_isolation_qualified(mode, passed, residuals):
+    return bool(
+        mode == "default_deny"
+        and passed
+        and not [r for r in residuals if r not in _HOST_ISOLATION_SOFT_RESIDUALS]
+    )
+
+
+def _host_isolation_preliminary(cfg):
+    """Config-time-known seed for the manifest `host_isolation` field, so
+    EVERY terminal manifest carries it (including pre-probe abort branches,
+    same additive pattern as `candidate_network`). probed=False /
+    qualified=False until resolve_candidate_prefix replaces it with the
+    live-probed truth."""
+    if cfg.get("candidate_host_read") == "default_deny":
+        mode = "default_deny"
+    elif cfg.get("assurance") in ("standard", "hardened", "enterprise"):
+        mode = "allow_host_read_optout"
+    else:
+        mode = "none"
+    residuals = [] if mode == "default_deny" else [df_sandbox.RESIDUAL_HOST_READ_OPEN]
+    return {"mode": mode, "probed": False, "passed": None,
+            "residuals": residuals, "qualified": False}
+
+
+def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier,
+                             journal, allow_downgrade=False):
+    """M29b (DF-02 host-read half): resolves the CANDIDATE/verifier-only exec
+    wrapper AND the manifest `host_isolation` field -- returns
+    (candidate_prefix, host_isolation). The builder's `exec_prefix` is never
+    touched (CLI builders legitimately need HOME/keychain/DNS; their
+    isolation story is the hardened/enterprise container).
+
+    Paths, in order:
+    - cfg["candidate_host_read"] != "default_deny" (explicit opt-out at
+      standard+, or the cooperative-tier default): the prefix is EXACTLY the
+      M27 `_resolve_candidate_network_prefix` result -- byte-identical
+      behavior -- and host_isolation says so honestly
+      (mode="allow_host_read_optout"/"none", RESIDUAL_HOST_READ_OPEN,
+      qualified False).
+    - default_deny + effective tier downgraded to cooperative (only
+      reachable via --allow-downgrade, which already sanctioned running
+      unqualified): no backend is left to enforce anything; journal the
+      DOWNGRADE and return the (empty) exec_prefix with mode="none". A
+      restricted candidate_network still fails closed here exactly as M27
+      (delegated below).
+    - default_deny + backend WITHOUT `supports_default_deny` (Linux bwrap
+      until M29c, plus any test double): the legacy candidate wrapper +
+      legacy probes, reported as mode="legacy_allow_host_read" -- flagged,
+      never a fake default-deny claim.
+    - default_deny + macOS: `probe_candidate_confinement` live-proves the
+      profile fail-closed BEFORE any build. Probe failure refuses the run
+      (journal CANDIDATE_CONFINEMENT_PROBE_FAILED, SandboxError -> the
+      existing clean exit 2), unless --allow-downgrade, which falls back to
+      the legacy wrapper as mode="allow_host_read_downgrade" (journaled,
+      unqualified) -- mirroring the isolation-probe downgrade UX. On
+      success the returned prefix pins NO loopback ports yet (twins are not
+      started); _run_loop rebuilds the same proven profile shape per verify
+      pass with that pass's twin ports via _candidate_prefix_for_twins.
+    """
+    host_read = cfg.get("candidate_host_read", "allow_host_read")
+    net_mode = cfg["candidate_network"]
+
+    if host_read != "default_deny" or eff_tier not in _QUALIFYING_TIERS:
+        # Both the explicit opt-out and the sanctioned runtime downgrade land
+        # on the M27 resolver, which itself fails closed on a restricted
+        # candidate_network with no backend to enforce it.
+        prefix = _resolve_candidate_network_prefix(
+            cfg, control_root, workspace, exec_prefix, eff_tier, journal)
+        if eff_tier not in _QUALIFYING_TIERS:
+            if host_read == "default_deny":
+                # Configured default_deny but the run was explicitly
+                # downgraded to cooperative -- record that the host-read
+                # protection went with the sandbox it rides on.
+                journal.write("DOWNGRADE", requested="candidate_host_read:default_deny",
+                              effective="none",
+                              reason="effective tier is cooperative -- no OS sandbox backend")
+                sys.stderr.write(
+                    "dark-factory: candidate_host_read default_deny DOWNGRADED to none "
+                    "(cooperative tier has no sandbox) -- host_isolation unqualified.\n")
+            hi = {"mode": "none", "probed": False, "passed": None,
+                  "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+        else:
+            hi = {"mode": "allow_host_read_optout", "probed": False, "passed": None,
+                  "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+        return prefix, hi
+
+    os_backend = df_sandbox.current_backend()
+    if os_backend is None:
+        # eff_tier is qualifying, so resolve_isolation just used a live
+        # backend; it vanishing between the two calls is a broken
+        # environment, not a policy choice -- fail closed.
+        reason = "no OS sandbox backend available for the candidate wrapper"
+        journal.write("CANDIDATE_CONFINEMENT_PROBE_FAILED",
+                      requested="candidate_host_read:default_deny", reason=reason)
+        raise df_sandbox.SandboxError(
+            f"candidate_host_read 'default_deny': {reason}")
+
+    if not getattr(os_backend, "supports_default_deny", False):
+        # Backend without a default-deny profile (Linux bwrap until M29c,
+        # plus any test double): take the EXACT M27 path -- same wrapper,
+        # same probes, same journal events (a network-probe failure still
+        # surfaces as PROBE_FAILED, not as a confinement failure it isn't)
+        # -- and label the result honestly: host reads are OPEN here.
+        # probed/passed refer to the legacy guarantees that were actually
+        # proven for this run (resolve_isolation's control-root denial
+        # probe at every qualifying tier, plus the M27 network probe when
+        # candidate_network is restricted), never to a default-deny claim.
+        prefix = _resolve_candidate_network_prefix(
+            cfg, control_root, workspace, exec_prefix, eff_tier, journal)
+        hi = {"mode": "legacy_allow_host_read", "probed": True, "passed": True,
+              "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+        return prefix, hi
+
+    ok, report = df_sandbox.probe_candidate_confinement(
+        os_backend, control_root, workspace, net_mode)
+    if not ok:
+        reason = report.get("detail", "confinement probe failed")
+        journal.write("CANDIDATE_CONFINEMENT_PROBE_FAILED",
+                      requested="candidate_host_read:default_deny", reason=reason)
+        if allow_downgrade:
+            journal.write("DOWNGRADE", requested="candidate_host_read:default_deny",
+                          effective="allow_host_read", reason=reason)
+            sys.stderr.write(
+                "dark-factory: candidate default-deny confinement probe FAILED; "
+                "DOWNGRADED to allow_host_read (unqualified host_isolation) by "
+                "--allow-downgrade.\n")
+            prefix = _resolve_candidate_network_prefix(
+                cfg, control_root, workspace, exec_prefix, eff_tier, journal)
+            hi = {"mode": "allow_host_read_downgrade", "probed": True, "passed": False,
+                  "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+            return prefix, hi
+        raise df_sandbox.SandboxError(
+            "candidate_host_read 'default_deny' live confinement probe failed -- "
+            f"refusing to run the candidate with unproven host isolation: {reason} "
+            "(fix the sandbox, set candidate_host_read=allow_host_read, or pass "
+            "--allow-downgrade)")
+
+    try:
+        prefix = os_backend.wrap_candidate_prefix(
+            control_root, workspace, network=net_mode)
+    except df_sandbox.SandboxError as e:
+        journal.write("CANDIDATE_CONFINEMENT_PROBE_FAILED",
+                      requested="candidate_host_read:default_deny", reason=str(e))
+        raise
+    mode = report.get("mode", "default_deny")
+    residuals = list(report.get("residuals", []))
+    hi = {"mode": mode, "probed": True, "passed": True, "residuals": residuals,
+          "qualified": _host_isolation_qualified(mode, True, residuals)}
+    return prefix, hi
+
+
+def _candidate_prefix_for_twins(cfg, host_isolation, workspace, base_prefix, twin_env):
+    """Per-verify-pass candidate wrapper (M29b): when the run is in
+    default-deny mode, rebuild the SAME probe-proven profile shape with THIS
+    pass's twin ports pinned (twins bind fresh ephemeral ports on every
+    reset, so a run-start wrapper cannot know them). Ports are data flowing
+    into an already-live-proven profile shape -- no re-probe per pass. Any
+    other mode (opt-out, downgrade, legacy, cooperative) returns the
+    resolved base prefix untouched, so this can never silently re-tighten a
+    sanctioned downgrade or loosen anything.
+
+    A twin endpoint whose port cannot be parsed is SKIPPED, never widened:
+    the candidate then simply cannot reach that twin and the scenario fails
+    visibly -- fail closed, not open."""
+    if not host_isolation or host_isolation.get("mode") != "default_deny":
+        return base_prefix
+    backend = df_sandbox.current_backend()
+    if backend is None or not getattr(backend, "supports_default_deny", False):
+        # resolve_candidate_prefix proved a default-deny-capable backend at
+        # run start; it disappearing mid-run is a broken environment.
+        raise df_sandbox.SandboxError(
+            "candidate default-deny wrapper: sandbox backend disappeared mid-run")
+    ports = set()
+    for value in (twin_env or {}).values():
+        try:
+            ports.add(int(str(value).rsplit(":", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return backend.wrap_candidate_prefix(
+        cfg["_control_root"], workspace, network=cfg["candidate_network"],
+        allowed_loopback_ports=sorted(ports))
 
 
 def _init_report_lines(report: dict) -> list:
@@ -2355,6 +2556,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # same "additive, present as soon as it's knowable" pattern as
         # `credentials`/`mode`/`builder_confinement`.
         "candidate_network": cfg["candidate_network"],
+        # Additive (M29b, DF-02 host-read half): seeded with the config-known
+        # preliminary (probed=False) so every terminal manifest carries it;
+        # replaced with the live-probed truth right after
+        # resolve_candidate_prefix below.
+        "host_isolation": _host_isolation_preliminary(cfg),
         "qualified": cfg["_qualified"],
         "config_sha256": cfg["_config_sha256"],
         "spec_sha256": sha256_str(spec_text),
@@ -2605,17 +2811,20 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                          "isolation; outcome can never be a qualified ship-candidate.\n")
 
-    # M27 Task 2 (spec §7.4): the CANDIDATE-only network wrapper. `exec_prefix`
+    # M27 Task 2 (spec §7.4) + M29b: the CANDIDATE-only wrapper. `exec_prefix`
     # (above) is untouched and stays what the builder uses; `candidate_prefix`
     # is what every run_all(...)/characterize() call below uses instead. A
-    # failed live network probe (or an unsupported mode/backend combo) fails
-    # closed here, before any build, exactly like a failed isolation probe.
+    # failed live probe (network OR default-deny confinement) fails closed
+    # here, before any build, exactly like a failed isolation probe.
     try:
-        candidate_prefix = resolve_candidate_prefix(
-            cfg, control_root, workspace, exec_prefix, eff_tier, journal)
+        candidate_prefix, host_isolation = resolve_candidate_prefix(
+            cfg, control_root, workspace, exec_prefix, eff_tier, journal,
+            allow_downgrade=allow_downgrade)
     except df_sandbox.SandboxError as e:
         sys.stderr.write(f"dark-factory: {e}\n")
         return 2
+    manifest_base["host_isolation"] = host_isolation
+    journal.write("HOST_ISOLATION", **host_isolation)
 
     # M15: brownfield detection + characterization. Runs HERE -- after
     # isolation is resolved (characterization probes execute under the same
@@ -2646,9 +2855,23 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # probes at load time (nothing to characterize is a ConfigError there),
     # so this branch only ever sees probes==[] via auto-detection.
     if mode == "brownfield" and cfg["_brownfield"]["probes"]:
+        # M29b: characterize snapshots the source into a mkdtemp OUTSIDE the
+        # workspace and runs probes there; under the default-deny candidate
+        # profile that copy would be unreadable. Pre-create the copy dir and
+        # hand it to a characterize-specific wrapper as a scratch dir -- the
+        # SAME probe-proven profile shape, with exactly one extra
+        # read+write+exec subpath (the throwaway copy). Every other mode
+        # keeps the resolved candidate_prefix untouched.
+        char_tmp = tempfile.mkdtemp(prefix="df-brownfield-")
+        char_prefix = candidate_prefix
+        if host_isolation.get("mode") == "default_deny":
+            char_prefix = df_sandbox.current_backend().wrap_candidate_prefix(
+                control_root, workspace, network=cfg["candidate_network"],
+                scratch_dirs=(char_tmp,))
         try:
             generated = df_brownfield.characterize(
-                project_src, cfg["_brownfield"]["probes"], exec_wrapper=candidate_prefix)
+                project_src, cfg["_brownfield"]["probes"], exec_wrapper=char_prefix,
+                tmp_dir=char_tmp)
         except df_brownfield.BrownfieldError as e:
             sys.stderr.write(f"dark-factory: brownfield characterization failed: {e}\n")
             return 2
@@ -2723,6 +2946,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     candidate_prefix = candidate_prefix if candidate_prefix is not None else exec_prefix
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
+    # M29b: in default-deny mode the loopback allowlist must pin THIS pass's
+    # twin ports (fresh ephemeral ports on every twin reset), so the wrapper
+    # is re-derived per verify/final pass from the same probe-proven profile
+    # shape. host_isolation rides in manifest_base, so a caller that never
+    # went through resolve_candidate_prefix (pre-M29b tests, cooperative
+    # runs) has no "default_deny" mode and gets candidate_prefix untouched.
+    host_isolation = mb_clean.get("host_isolation") or {}
     # M14: a per-run-loop copy of cfg["_confine"] — NOT cfg["_confine"] itself
     # — so a required=False CONFINEMENT_WARN fallback (below) can flip
     # `enabled` to False for the REST of this loop without mutating cfg
@@ -3294,6 +3524,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                  phase="verify")
                 except df_twins.TwinError as e:
                     return _twin_error_abort(i, e)
+            # M29b: pin THIS pass's twin ports into the candidate wrapper
+            # (no-op outside default-deny mode).
+            pass_candidate_prefix = _candidate_prefix_for_twins(
+                cfg, host_isolation, workspace, candidate_prefix, verify_env_extra)
 
             try:
                 # M15: extra_scenarios_dir merges the brownfield-generated
@@ -3305,7 +3539,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # would flag every BHV-REGRESS-* as an orphan_scenario (no
                 # matching behaviors.json entry) and spuriously fail any
                 # brownfield+coverage run. See references/brownfield.md.
-                report = run_all(scenarios_dir, workspace, exec_wrapper=candidate_prefix,
+                report = run_all(scenarios_dir, workspace, exec_wrapper=pass_candidate_prefix,
                                   env_extra=verify_env_extra, cohort="dev",
                                   observer_files=ts.observer_files if ts else None,
                                   extra_scenarios_dir=extra_scenarios_dir)
@@ -3415,7 +3649,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                         extra_env=seed_extra, phase="verify")
                         except df_twins.TwinError as e:
                             return _twin_error_abort(i, e)
-                final = run_all(scenarios_dir, workspace, exec_wrapper=candidate_prefix,
+                # M29b: the final exam pins ITS pass's twin ports too. When no
+                # twin supports variants there was no reset above, so
+                # final_env_extra is dev-verify's endpoints and this re-derives
+                # a wrapper with the same (still-live) ports.
+                final_candidate_prefix = _candidate_prefix_for_twins(
+                    cfg, host_isolation, workspace, candidate_prefix, final_env_extra)
+                final = run_all(scenarios_dir, workspace, exec_wrapper=final_candidate_prefix,
                                  env_extra=final_env_extra, cohort="final",
                                  observer_files=ts.observer_files if ts else None)
                 _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
@@ -3747,6 +3987,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             # Additive (M27 Task 2): same "fresh + resume" threading as
             # `credentials`/`mode`/`builder_confinement`.
             "candidate_network": cfg["candidate_network"],
+            # Additive (M29b): preliminary seed; replaced with the re-probed
+            # truth after resolve_candidate_prefix below (isolation cannot be
+            # trusted across a pause, and neither can host isolation).
+            "host_isolation": _host_isolation_preliminary(cfg),
             "qualified": cfg["_qualified"],
             "config_sha256": cfg["_config_sha256"],
             "spec_sha256": sha256_str(spec_text),
@@ -3964,15 +4208,19 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
         if eff_tier not in _QUALIFYING_TIERS:
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "
                              "isolation; outcome can never be a qualified ship-candidate.\n")
-        # M27 Task 2: re-derive the candidate-only network wrapper on every
-        # resume too — isolation cannot be trusted across a pause, and
-        # neither can a network restriction built on top of it.
+        # M27 Task 2 + M29b: re-derive the candidate-only wrapper (and
+        # re-prove default-deny confinement) on every resume too — isolation
+        # cannot be trusted across a pause, and neither can a network
+        # restriction or a host-read denial built on top of it.
         try:
-            candidate_prefix = resolve_candidate_prefix(
-                cfg, control_root, state["workspace"], exec_prefix, eff_tier, journal)
+            candidate_prefix, host_isolation = resolve_candidate_prefix(
+                cfg, control_root, state["workspace"], exec_prefix, eff_tier, journal,
+                allow_downgrade=allow_downgrade)
         except df_sandbox.SandboxError as e:
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
+        manifest_base["host_isolation"] = host_isolation
+        journal.write("HOST_ISOLATION", **host_isolation)
         try:
             return _run_loop(
                 cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
