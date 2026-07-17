@@ -1365,16 +1365,26 @@ def _verify_enterprise_egress(cfg, pcfg, proxy_endpoint):
     automatically here.
 
     Returns (ok: bool, detail: dict [diagnostic only, never a secret/token],
-    policy_digest: str [sha256 over the allowlist/header/proxy_endpoint this
-    run is actually configured with]). Never raises: any failure to even set
+    policy_digest: str [a STABLE sha256 over the allowlist/header/image/seccomp
+    that define this run's egress policy — excludes the ephemeral proxy port
+    so it is comparable across runs to detect policy drift]). Never raises: any failure to even set
     up the probe (stub server, throwaway proxy, docker) resolves to
     ok=False with a diagnostic detail — fail-closed, like
     df_container.probe_enterprise_egress's own contract.
     """
+    # A STABLE, cross-run-comparable fingerprint of the egress-relevant
+    # policy: the allowlist + injection header + the container image + the
+    # seccomp profile that together define what egress is permitted. It
+    # deliberately EXCLUDES the ephemeral proxy_endpoint (its port is
+    # OS-assigned and random every run, which would make the digest differ
+    # run-to-run even under an identical policy and defeat drift detection).
+    # An operator can diff this digest across two runs to see whether the
+    # egress policy actually changed.
     policy_digest = sha256_str(canonical_json({
-        "allowlist": list(pcfg["allowlist"]),
+        "allowlist": sorted(pcfg["allowlist"]),
         "header": pcfg["header"],
-        "proxy_endpoint": proxy_endpoint,
+        "image": cfg["_container"]["image"],
+        "seccomp_profile": cfg["_enterprise"]["seccomp"],
     }))
     stub_httpd = None
     probe_proxy_httpd = None
