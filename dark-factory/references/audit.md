@@ -27,9 +27,11 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
 ```
 
 **Exit codes:**
-- `0`: manifest OK (unsigned, or signed and signature verified).
+- `0`: manifest OK — byte-integrity holds AND (DF-01/M28a) the manifest's bound artifact object independently re-verifies.
 - `2`: audit key error — `--key-path` given but the file is missing or malformed. Printed to **stderr** as `dark-factory: audit key error: <detail>`; verification is never attempted (the CLI loads the key with `load_key`, which never creates one — a typo'd path fails closed instead of silently minting a fresh key and reporting a false TAMPERED).
 - `4`: manifest TAMPERED (checks failed) or UNVERIFIED (signed manifest, no usable key supplied).
+- `5`: ARTIFACT MISMATCH or ARTIFACT UNAVAILABLE — the manifest's byte-integrity checks passed, but the bound artifact object drifted or is missing (DF-01/M28a). See "Artifact binding (DF-01)" below.
+- `6`: UNBOUND — the manifest never bound an artifact object at all (DF-01/M28a). See "Artifact binding (DF-01)" below.
 
 **Behavior (prints to stdout, unless noted):**
 
@@ -46,6 +48,40 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
    - `--key-path` given but the file is missing or the key is malformed → the CLI never reaches `verify_manifest`; it prints `dark-factory: audit key error: <detail>` to stderr and exits **2**. (Nothing is written; the key is never auto-created during verification.)
    - `--key-path` given and the key loads, but it is the **wrong** key → `TAMPERED (bad signature)` (exit 4).
    - `--key-path` given and the key is correct → `OK` (exit 0).
+
+## Artifact binding (DF-01)
+
+Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes (`manifest.json`, `manifest.sha256`, `journal.jsonl`, and the optional signature) — it said nothing about whether the *built artifact* (the workspace a converged run produced) still matched what the manifest claimed to have shipped. A converged workspace could be silently mutated after the run finished and `verify-manifest` would still print `OK`. DF-01 (audit Critical) closes that gap: seal the artifact **before** the final exam runs, bind its identity into the signed manifest, and make every later verify/custody check re-derive that identity from the live object store rather than trust a mutable workspace path.
+
+**Seal-first object store.** On a CONVERGED dev-loop iteration, the supervisor freezes the workspace into a content-addressed object under `<control_root>/objects/objects/<object_id>/` (with a `<object_id>.json` sidecar recording every file's path/mode/content-hash and every directory) using `scripts/df_seal.py`'s `freeze()` — atomic, no-overwrite publish, fd-relative traversal on the source side so a symlink swapped into the workspace mid-freeze cannot escape the tree. This happens **before** the final exam and mandatory security gates run, and a hostile/unhashable workspace (a symlink, special file, or setuid/setgid/world-writable entry) fails the run closed as `ARTIFACT_UNHASHABLE` — never a qualified/`CONVERGED` terminal — rather than silently shipping something that couldn't be sealed.
+
+**The manifest binds the object.** A successfully-frozen run's `manifest.json` carries:
+
+```json
+"artifact": {"object_id": "<sha256-style content hash>", "seal_version": <int>, "file_count": <int>, "dir_count": <int>}
+```
+
+`artifact` is `null` for any terminal reached before a workspace exists (e.g. `GATE_FAILED` from the pre-build coverage gate) — this mirrors the existing `snapshot_sha256: null` honesty on early aborts. After the final exam and security gates run, the supervisor re-verifies the already-frozen object against its own sidecar one more time (belt-and-suspenders: nothing should have written into the object store in between, but if it did, this catches it) and only THEN declares `CONVERGED` — a drift caught here also produces `ARTIFACT_UNHASHABLE`, `artifact: null`, never `CONVERGED`.
+
+**`verify-manifest` recomputes the object and fails closed.** After the existing byte-integrity checks pass, `verify-manifest` recomputes the bound object's sidecar from the live object store and requires it to match the manifest's `artifact.object_id` exactly (content, mode, and structure — an added empty directory or a renamed file both count as drift). The full exit-code table:
+
+| Exit | Status | Meaning |
+|---|---|---|
+| `0` | `OK` | Byte-integrity holds AND the bound artifact object independently re-verifies. |
+| `4` | `TAMPERED` / `UNVERIFIED` | Manifest byte-integrity or signature check failed (unchanged from pre-M28a). |
+| `5` | `ARTIFACT MISMATCH` | The bound object exists but no longer matches its own recorded identity (content/mode/name/structure drift). |
+| `5` | `ARTIFACT UNAVAILABLE` | The bound object is missing from the object store entirely (pruned, never published, or the control root couldn't be derived from `--run-dir` — pass `--object-store` explicitly in that case). |
+| `6` | `UNBOUND` | The manifest never bound an artifact object at all. |
+
+`--object-store <path>` overrides the object store location `verify-manifest` checks against; it defaults to `<control_root>/objects` derived from `--run-dir`'s `<control_root>/runs/<id>` layout, and is required when `run_dir` doesn't follow that layout (e.g. a run_dir copied elsewhere for offline verification).
+
+**`UNBOUND` is a distinct non-success — read this before automating on the exit code.** A manifest with no `artifact` field (a pre-M28a manifest, or any terminal that legitimately never reached a frozen workspace — `CAP_REACHED`, a config/gate abort, etc.) is `UNBOUND` (exit `6`), machine-distinguishable from both a clean `OK` (exit `0`) and a `MISMATCH`/`UNAVAILABLE` drift (exit `5`). **Behavior change from pre-M28a — read this if you automate on `verify-manifest`'s exit code:** before this milestone, `verify-manifest` on a legitimately artifact-less terminal (`CAP_REACHED`, a pre-build gate abort, or any manifest written before M28a) passed the (only) byte-integrity checks and printed `OK` (exit `0`). It now prints `UNBOUND` and exits `6` instead. This is an intentional fail-closed tightening — "no bound artifact is not a clean approval" — not a regression: those terminals were never shipping an artifact in the first place, and treating them as `OK` was itself the gap DF-01 closes. If any script or CI gate treated `verify-manifest`'s exit code as a boolean pass/fail, it needs to either special-case `6` as expected for those terminals, or (better) check `manifest.outcome`/`manifest.qualified` directly rather than inferring shippability from `verify-manifest` alone.
+
+**Custody binds to the object, not just the manifest.** `attach_custody` refuses to attach with a `null` artifact ("predates artifact binding") and independently re-verifies the bound object before writing `custody_attestation.json`; `verify-custody` re-verifies the object on every check, not just once at attach time. See `references/enterprise.md`'s custody section for the full contract.
+
+**Honest scope — detection-grade, not same-user prevention.** This is the SAME boundary `finalize_manifest`'s HMAC signing already documents for the manifest itself (see "Honest limits" below), now extended to the artifact object: `df_seal` defends against a symlink/special-file/hostile-permission entry escaping the tree during freeze, a partially-written object being reused, or the published object silently drifting from its sidecar without detection. It does **not** defend against a party with the SAME filesystem write access used to publish the object store deliberately overwriting bytes at that SAME privilege level — there is no cross-user MAC/DAC enforcement here. `verify_object`/`verify-manifest` are the detector for that residual risk (in-model detection: a confined candidate, an accident, or a mutating gate leaves evidence that gets caught, fail-closed), not a same-user-prevention guarantee. Two further scope notes:
+- The property "the final exam provably ran against exactly the sealed bytes" (copy-on-run per scenario, isolating the final exam's cwd from the live workspace) is **deferred to M29d** — today the final exam and security gates run against the live `workspace` directory, which is byte-identical to the frozen object at that point in the run (nothing mutates `workspace` between `freeze()` and the final exam) but is not itself read-only-enforced during that window.
+- The artifact today is **the whole workspace** — a dedicated output-directory split (sealing only a designated build-output subtree rather than everything the builder touched) is deferred.
 
 ## Honest limits
 
