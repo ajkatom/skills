@@ -30,7 +30,12 @@ def test_absent_security_gates_defaults_disabled(tmp_path):
     cr = tmp_path / "control"
     write_config(cr)
     cfg = df_config.load_config(str(cr))
-    assert cfg["_security"] == {"enabled": False}
+    # M33a: cooperative (write_config default tier) leaves gates disabled, but
+    # the tier-independent waiver policy is always present (fail-closed empty).
+    assert cfg["_security"] == {
+        "enabled": False,
+        "waivers": {"signers": [], "threshold": 0},
+    }
 
 
 def test_enabled_applies_defaults(tmp_path):
@@ -53,6 +58,7 @@ def test_enabled_applies_defaults(tmp_path):
             "ecosystems": [],
             "timeout_s": 20,
         },
+        "waivers": {"signers": [], "threshold": 0},
     }
 
 
@@ -87,6 +93,7 @@ def test_explicit_valid_config_round_trips(tmp_path):
             "ecosystems": [],
             "timeout_s": 20,
         },
+        "waivers": {"signers": [], "threshold": 0},
     }
 
 
@@ -373,3 +380,186 @@ def test_run_gates_gate_not_in_fail_on_does_not_fail_run(tmp_path):
     report = df_security.run_gates(str(ws), sec)
     assert report["gates"]["secret_scan"]["status"] == "fail"
     assert report["failed"] == []
+
+
+# --- M33a (DF-06): mandatory gates at standard+ + waiver policy ------------
+
+# A syntactically valid ed25519 public key (64 hex chars). df_config validates
+# waiver signers with the same stdlib _HEX64_RE shape check custody uses, so a
+# fixed hex literal is sufficient (no `cryptography` needed at config load).
+PUBKEY_A = "a" * 64
+PUBKEY_B = "b" * 64
+
+
+def _std(cr, **extra):
+    write_config(cr, assurance="standard", **extra)
+
+
+def test_standard_synthesizes_mandatory_gates_without_block(tmp_path):
+    cr = tmp_path / "control"
+    _std(cr)  # NO security_gates block at all
+    sec = df_config.load_config(str(cr))["_security"]
+    assert sec["enabled"] is True
+    assert sec["secret_scan"] is True and sec["dangerous_scan"] is True
+    assert sec["strict_unavailable"] is True
+    assert set(sec["fail_on"]) >= {"secret_scan", "dangerous_scan"}
+    assert sec["waivers"] == {"signers": [], "threshold": 0}
+
+
+def test_mandatory_tiers_membership():
+    # secret_scan/dangerous_scan are mandatory at exactly standard/hardened/
+    # enterprise (cooperative excluded). The forcing code keys off this tuple,
+    # so hardened/enterprise get the same treatment standard does (their full
+    # configs also require custody/proxy/adapter blocks that other tests cover;
+    # the security-gates logic itself is tier-generic).
+    assert df_config.MANDATORY_TIERS == ("standard", "hardened", "enterprise")
+    assert df_config.MANDATORY_GATES == ("secret_scan", "dangerous_scan")
+
+
+def test_standard_disabling_secret_scan_rejected(tmp_path):
+    cr = tmp_path / "control"
+    _std(cr, security_gates={"enabled": True, "secret_scan": False})
+    with pytest.raises(df_config.ConfigError, match="never disable secret_scan"):
+        df_config.load_config(str(cr))
+
+
+def test_standard_disabling_dangerous_scan_rejected(tmp_path):
+    cr = tmp_path / "control"
+    _std(cr, security_gates={"enabled": True, "dangerous_scan": False})
+    with pytest.raises(df_config.ConfigError, match="never disable dangerous_scan"):
+        df_config.load_config(str(cr))
+
+
+def test_standard_may_strengthen_fail_on(tmp_path):
+    cr = tmp_path / "control"
+    _std(cr, security_gates={"enabled": True, "sbom": True, "fail_on": ["sbom"]})
+    sec = df_config.load_config(str(cr))["_security"]
+    # operator added sbom; mandatory gates are UNIONED in, never dropped.
+    assert set(sec["fail_on"]) == {"sbom", "secret_scan", "dangerous_scan"}
+
+
+def test_cooperative_unchanged_gates_optional(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr)  # cooperative default, no gates
+    sec = df_config.load_config(str(cr))["_security"]
+    assert sec == {"enabled": False, "waivers": {"signers": [], "threshold": 0}}
+
+
+def test_cooperative_may_disable_secret_scan(tmp_path):
+    # The mandatory-gate rule is standard+ ONLY; cooperative can still turn a
+    # gate off (it was never mandatory there).
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={"enabled": True, "secret_scan": False})
+    sec = df_config.load_config(str(cr))["_security"]
+    assert sec["secret_scan"] is False
+
+
+def test_waivers_valid_policy(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True,
+        "waivers": {"signers": [PUBKEY_A, PUBKEY_B], "threshold": 2},
+    })
+    sec = df_config.load_config(str(cr))["_security"]
+    assert sec["waivers"] == {"signers": [PUBKEY_A, PUBKEY_B], "threshold": 2}
+
+
+def test_waivers_tier_independent_on_cooperative(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True,
+        "waivers": {"signers": [PUBKEY_A], "threshold": 1},
+    })
+    sec = df_config.load_config(str(cr))["_security"]
+    assert sec["waivers"] == {"signers": [PUBKEY_A], "threshold": 1}
+
+
+def test_waivers_bad_pubkey_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": ["nothex"], "threshold": 1}})
+    with pytest.raises(df_config.ConfigError, match="waivers.signers"):
+        df_config.load_config(str(cr))
+
+
+def test_waivers_threshold_over_len_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": [PUBKEY_A], "threshold": 2}})
+    with pytest.raises(df_config.ConfigError, match="waivers.threshold"):
+        df_config.load_config(str(cr))
+
+
+def test_waivers_threshold_zero_with_signers_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": [PUBKEY_A], "threshold": 0}})
+    with pytest.raises(df_config.ConfigError, match="waivers.threshold"):
+        df_config.load_config(str(cr))
+
+
+def test_waivers_threshold_without_signers_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": [], "threshold": 1}})
+    with pytest.raises(df_config.ConfigError, match="non-empty signers list"):
+        df_config.load_config(str(cr))
+
+
+def test_waivers_duplicate_signer_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": [PUBKEY_A, PUBKEY_A], "threshold": 1}})
+    with pytest.raises(df_config.ConfigError, match="duplicate"):
+        df_config.load_config(str(cr))
+
+
+# --- M33a Finding 1: a non-empty waiver policy requires signed manifests ----
+
+
+def test_waivers_require_audit_signing_explicit_false_rejected(tmp_path):
+    cr = tmp_path / "control"
+    _std(
+        cr,
+        security_gates={"enabled": True, "waivers": {"signers": [PUBKEY_A], "threshold": 1}},
+        audit={"signing": False},
+    )
+    with pytest.raises(df_config.ConfigError, match="requires audit.signing"):
+        df_config.load_config(str(cr))
+
+
+def test_waivers_with_audit_signing_true_ok(tmp_path):
+    cr = tmp_path / "control"
+    _std(
+        cr,
+        security_gates={"enabled": True, "waivers": {"signers": [PUBKEY_A], "threshold": 1}},
+        audit={"signing": True, "key_path": str(tmp_path / "keys" / "audit.key")},
+    )
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_audit"]["signing"] is True
+    assert cfg["_security"]["waivers"] == {"signers": [PUBKEY_A], "threshold": 1}
+
+
+def test_waivers_force_audit_signing_when_absent(tmp_path):
+    # Absent/defaulted-false signing + a waiver policy => forced ON (mirrors
+    # the hardened/enterprise audit.signing default), so the sealed allowlist
+    # is HMAC-protected by construction.
+    cr = tmp_path / "control"
+    write_config(cr, security_gates={
+        "enabled": True, "waivers": {"signers": [PUBKEY_A], "threshold": 1}})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_audit"]["signing"] is True
+    assert cfg["_audit"]["key_path"]  # a concrete key path was defaulted in
+
+
+def test_empty_waivers_policy_does_not_require_signing(tmp_path):
+    # No signers => no waiver acceptance => no signing requirement; an explicit
+    # audit.signing:false stays valid.
+    cr = tmp_path / "control"
+    _std(
+        cr,
+        security_gates={"enabled": True, "waivers": {"signers": [], "threshold": 0}},
+        audit={"signing": False},
+    )
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_audit"]["signing"] is False

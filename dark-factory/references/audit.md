@@ -49,6 +49,33 @@ python3 <skill_dir>/scripts/supervisor.py verify-manifest --run-dir <path> [--ke
    - `--key-path` given and the key loads, but it is the **wrong** key → `TAMPERED (bad signature)` (exit 4).
    - `--key-path` given and the key is correct → `OK` (exit 0).
 
+## `app_security_qualified` + waiver verification (M33a / DF-06)
+
+`qualified` on a manifest is now the conjunction of the isolation dimension
+and an **app-security** dimension. Every `CONVERGED`/`SECURITY_GATE_FAILED`/
+`SECURITY_GATES_MISSING` manifest carries `app_security_qualified`: `true` iff
+the tier does not mandate security gates (cooperative) **or** the mandatory
+gates ran and nothing in `fail_on` failed. At `standard`/`hardened`/
+`enterprise`, final `qualified = (tier qualifies) AND app_security_qualified`
+— so a security-gate failure, or (fail-closed) mandatory gates that somehow
+didn't run (`SECURITY_GATES_MISSING`, exit 3), is never a qualified ship.
+
+A `SECURITY_GATE_FAILED` run can be re-qualified **only** by a separate,
+signed `waiver_attestation.json` (never a manifest rewrite — the split-custody
+model). `df-waiver verify <control_root> --run-dir <run>` re-evaluates it
+against a **live clock**, so waiver expiry is checked at every verify:
+
+| Exit | Status | Meaning |
+|---|---|---|
+| `0` | `WAIVED_QUALIFIED` | every failing finding covered by ≥K distinct, in-scope, unexpired allowlisted signers, right now |
+| `1` | `NOT_WAIVED` | `SECURITY_GATE_FAILED` run with no attached (or not-applicable) waiver attestation — stays not-qualified |
+| `7` | `WAIVER_EXPIRED` | satisfiable when attached, but a waiver has since expired — flips back to not-qualified until re-issued |
+| `8` | `WAIVER_INVALID` | tamper / scope drift / short count / unreadable attestation, or the sealed manifest failed byte/artifact verification |
+
+The attestation is anchored into the same hash chain as a custody attestation.
+See `references/security-gates.md` for the full waiver workflow and binding
+model.
+
 ## Artifact binding (DF-01)
 
 Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes (`manifest.json`, `manifest.sha256`, `journal.jsonl`, and the optional signature) — it said nothing about whether the *built artifact* (the workspace a converged run produced) still matched what the manifest claimed to have shipped. A converged workspace could be silently mutated after the run finished and `verify-manifest` would still print `OK`. DF-01 (audit Critical) closes that gap: seal the artifact **before** the final exam runs, bind its identity into the signed manifest, and make every later verify/custody check re-derive that identity from the live object store rather than trust a mutable workspace path.

@@ -90,6 +90,30 @@ threat model justifies:
   interactive session, so "the same OS user" stops being true even when the
   operator and the run nominally share an account today.
 
+## M33a (DF-06) waiver/gate deferrals
+
+M33a landed mandatory security gates at standard+ plus signed, scoped,
+expiring **waivers** (`references/security-gates.md`). Three parts of the full
+M33 are explicit, documented residuals — each depends on unbuilt milestones or
+the off-host infrastructure above:
+
+- **Security-gate execution inside a default-deny sandbox / digest-pinned
+  container.** Gates run host-side today; running them under the M29b
+  default-deny host sandbox (standard) / pinned container (hardened+) is
+  deferred to **M29b**. A gate that runs host-side shares the runner's trust
+  domain — the same detection-grade boundary as the rest of this doc.
+- **A resumable in-loop `WAIVER_PENDING` pause phase.** M33a supplies waivers
+  **after** a `SECURITY_GATE_FAILED` run via a separate signed attestation
+  (the attach model, mirroring split-custody), decoupled from the phase-aware
+  FSM. Pausing the loop mid-run to collect waivers is deferred to **M36**.
+- **A trusted remote-timestamp for waiver expiry.** Waiver expiry is checked
+  against the **local clock** at every verify; a same-user-forgeable clock can
+  extend an existing waiver's window (but not, because of
+  `artifact_object_id`+`gate_report_digest` binding, replay it onto a
+  different artifact or a changed finding set). The unforgeable-"when" closure
+  is the **signed-timestamp service** already listed above under "An
+  authenticated remote WORM sink + signed-timestamp service."
+
 ## Framing this correctly
 
 None of the above is scheduled work inside this skill's milestones — it is

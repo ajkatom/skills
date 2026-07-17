@@ -472,3 +472,29 @@ as a `-e` var).
   separate from this container-side profile, and not built here.
 - The `cryptography` dependency is enterprise-only, imported solely by
   `df_custody.py` (`requirements-enterprise.txt`).
+- **Waiver allowlist tamper-proofing (M33a / DF-06) — true by construction.**
+  The signer allowlist + threshold governing a run are sealed into
+  `manifest.security.waiver_policy`, and a non-empty waiver policy **requires
+  `audit.signing: true`** (enforced at config load — see
+  `references/security-gates.md`), so that seal rides an HMAC-signed manifest.
+  No party with control-root write can widen who may waive a sealed run
+  without the audit key: appending a rogue pubkey to `waiver_policy` breaks
+  `manifest.hmac`, which `attach`/`verify` check. This preserves the
+  single-operator-proof property at `standard`+ the same way split-custody's
+  config-binding does at enterprise.
+- **Trusted remote-timestamp for waiver expiry is deferred (M33a / DF-06).**
+  Security-gate **waivers** (`references/security-gates.md`) are signed,
+  scoped, and **expiring**: `df-waiver verify` re-checks `issued_at <= now <
+  expires_at` against the local clock at every verify. M33a uses **local-time**
+  expiry uniformly at every tier, including enterprise — so the residual is a
+  **same-user-forgeable clock**: whoever runs the verifier can move the system
+  clock to keep an expired waiver "unexpired." This is bounded exactly like the
+  detection-grade audit boundary: a waiver stays bound to
+  `artifact_object_id` + `gate_report_digest`, so a forged clock **cannot**
+  make a waiver replayable across a different artifact or a changed set of
+  findings — only extend the acceptance window of the exact finding it already
+  named. A trusted remote-timestamp authority (an off-box signed time source
+  the verifier can't forge), the enterprise-grade closure, is deferred to the
+  same off-host trust-domain infrastructure the rest of prevention-grade needs
+  — see `references/prevention-grade-roadmap.md`. The split-custody two-phase
+  ship above is the exact pattern the `df-waiver` CLI mirrors.

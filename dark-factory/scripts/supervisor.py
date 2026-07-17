@@ -33,8 +33,16 @@ import df_sandbox
 import df_seal
 import df_security
 import df_twins
+import df_waiver
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
-from df_config import ConfigError, _adapter_provider, _disjoint, _PROXY_PROVIDER_RULES, load_config
+from df_config import (
+    ConfigError,
+    MANDATORY_TIERS,
+    _adapter_provider,
+    _disjoint,
+    _PROXY_PROVIDER_RULES,
+    load_config,
+)
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
@@ -609,6 +617,23 @@ def _run_security_gates(cfg, journal, run_dir, workspace, redactor=None):
     if not sec_cfg.get("enabled"):
         return {"checked": False}
     sec_report = df_security.run_gates(workspace, sec_cfg)
+    # M33a (DF-06): SEAL the waiver-binding metadata INTO the security report
+    # so both the SECURITY_GATE_FAILED terminal and the CONVERGED terminal
+    # carry it, and `df-waiver attach`/`verify` can recompute every binding
+    # digest from the sealed manifest ALONE (never re-loading a mutable
+    # config). `gate_policy_digest` fingerprints the effective gate policy;
+    # `waiver_policy` is the SEALED signer allowlist + threshold — the
+    # allowlist that governs a sealed run must itself be sealed, so it can't
+    # be widened by editing config.json after the fact. `gate_report_digest`
+    # is deliberately NOT stored here (it is always recomputed over this block
+    # minus the excluded keys — see df_waiver._REPORT_DIGEST_EXCLUDE — which
+    # avoids a digest-over-a-field-that-contains-itself recursion).
+    sec_report["gate_policy_digest"] = df_waiver.gate_policy_digest(sec_cfg)
+    waivers_cfg = sec_cfg.get("waivers", {"signers": [], "threshold": 0})
+    sec_report["waiver_policy"] = {
+        "signers": list(waivers_cfg.get("signers", [])),
+        "threshold": waivers_cfg.get("threshold", 0),
+    }
     _redacted_write(os.path.join(run_dir, "security_report.json"), sec_report, redactor)
     journal.write("SECURITY_GATES", checked=True, failed=sec_report["failed"])
     return sec_report
@@ -1107,6 +1132,414 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
         return True
     print(f"INVALID (attestation signatures no longer satisfy K-of-N: {reason})")
     return False
+
+
+# ---------------------------------------------------------------------------
+# M33a (DF-06): the `df-waiver` operator CLI + attach + verify-time re-check.
+#
+# Structurally a mirror of split-custody (df-custody keygen/sign/attach +
+# custody_attestation.json), but for security-gate findings: a
+# SECURITY_GATE_FAILED run is re-qualified by a SEPARATE, signed
+# `waiver_attestation.json` (never a manifest rewrite), and — crucially —
+# every verify RE-CHECKS expiry against a LIVE clock, so an expired waiver
+# flips the run back to not-qualified. All binding digests are recomputed
+# FROM the sealed manifest; the signer allowlist + threshold are read from the
+# manifest's SEALED waiver_policy (so no post-run config edit can widen who
+# may waive).
+# ---------------------------------------------------------------------------
+WAIVER_SIGNATURES_FILE = "waiver-signatures.json"
+WAIVER_ATTESTATION_FILE = "waiver_attestation.json"
+
+
+def _now_utc():
+    """The single live-clock source for waiver issue/expiry — an aware UTC
+    datetime. Verify re-evaluates expiry against THIS every time (never a
+    frozen boolean sealed at attach)."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _waiver_binding_from_manifest(manifest_obj):
+    """Recompute a run's waiver binding tuple FROM its sealed manifest object.
+
+    Returns `(binding, error)` where `binding` is a dict with `run_id`,
+    `artifact_object_id`, `policy_digest`, `report_digest`, `security`,
+    `signers`, `threshold` — every value derived from the (already
+    byte-verified) manifest, NEVER from a mutable config — or `(None, reason)`
+    fail-closed if the manifest lacks a usable, object-bound, gate-bearing
+    security block. `report_digest` is recomputed via
+    df_waiver.gate_report_digest over the sealed `security` object (excluding
+    the policy/attestation keys), so it matches exactly what `sign`/`attach`/
+    `verify` each compute.
+    """
+    if not isinstance(manifest_obj, dict):
+        return None, "manifest is not a JSON object"
+    run_id = manifest_obj.get("invocation")
+    if not isinstance(run_id, str) or not run_id:
+        return None, "manifest has no invocation (run_id)"
+    artifact = manifest_obj.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        return None, "manifest predates artifact binding (no manifest['artifact'])"
+    security = manifest_obj.get("security")
+    if not isinstance(security, dict):
+        return None, "manifest has no sealed security block"
+    policy_digest = security.get("gate_policy_digest")
+    if not isinstance(policy_digest, str) or not policy_digest:
+        return None, "sealed security block has no gate_policy_digest (pre-M33a run)"
+    waiver_policy = security.get("waiver_policy")
+    if not isinstance(waiver_policy, dict):
+        return None, "sealed security block has no waiver_policy"
+    try:
+        report_digest = df_waiver.gate_report_digest(security)
+    except df_waiver.WaiverError as e:
+        return None, f"cannot compute gate_report_digest: {e}"
+    binding = {
+        "run_id": run_id,
+        "artifact_object_id": artifact["object_id"],
+        "policy_digest": policy_digest,
+        "report_digest": report_digest,
+        "security": security,
+        "signers": list(waiver_policy.get("signers", [])),
+        "threshold": waiver_policy.get("threshold", 0),
+    }
+    return binding, None
+
+
+def _load_waiver_signatures(control_root):
+    """Load `<control_root>/waiver-signatures.json` — a JSON list of
+    `{claim, signer, sig}` entries an operator collected. Returns
+    `(list, None)` or `([], reason)` when absent/unreadable/wrong-shape.
+    Never raises (mirrors _load_custody_signatures)."""
+    sig_path = os.path.join(control_root, WAIVER_SIGNATURES_FILE)
+    if not os.path.exists(sig_path):
+        return [], f"{WAIVER_SIGNATURES_FILE} not found in the control root"
+    try:
+        with open(sig_path, encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return [], f"unreadable {WAIVER_SIGNATURES_FILE}: {e}"
+    if not isinstance(loaded, list):
+        return [], f"{WAIVER_SIGNATURES_FILE} must be a JSON list"
+    return loaded, None
+
+
+def _waiver_audit_key(cfg):
+    """Load the run's audit key IF the control root configures audit signing —
+    needed to byte-verify a SIGNED manifest (manifest.hmac) before trusting
+    any binding read from it. Returns `(key_or_None, error_or_None)`. A
+    control root with no audit signing returns (None, None) and its unsigned
+    manifest is byte-verified by sha256 sidecar alone."""
+    if not cfg.get("_audit", {}).get("signing"):
+        return None, None
+    try:
+        return df_audit.load_key(cfg["_audit"]["key_path"]), None
+    except df_audit.AuditKeyError as e:
+        return None, str(e)
+
+
+def _byte_verify_for_waiver(run_dir, cfg, control_root):
+    """Byte-integrity + artifact-identity verify of the sealed manifest,
+    reusing `_verify_manifest_status` (the same fail-closed path
+    verify-manifest uses). Returns (ok, status). A signed manifest needs the
+    audit key; we load it from config (the key PATH is config, but the
+    allowlist that governs waivers is sealed in the manifest, not config)."""
+    key, key_err = _waiver_audit_key(cfg)
+    if key_err is not None:
+        print(f"WAIVER_INVALID (audit key error: {key_err})")
+        return False, "AUDIT_KEY_ERROR"
+    status = _verify_manifest_status(
+        run_dir, key=key, object_store=_object_store_root(control_root))
+    return status == _ARTIFACT_OK, status
+
+
+def attach_waiver(control_root: str, run_dir: str) -> int:
+    """`df-waiver attach` — PHASE 2 of the two-phase waiver ship (mirrors
+    attach_custody). Byte-verifies the sealed manifest, reads the collected
+    `{claim,signer,sig}` entries from `<control_root>/waiver-signatures.json`,
+    recomputes every binding digest FROM the manifest, and calls
+    df_waiver.verify_waiver_set against the SEALED signer allowlist + threshold
+    at `now = utcnow`.
+
+    Satisfied → writes `<run_dir>/waiver_attestation.json` (never a manifest
+    rewrite) and anchors it into the M13 hash chain, returns 0. Otherwise
+    prints the fail-closed reason and returns 3. Precondition/usage errors
+    (no manifest, unreadable config, run that didn't fail a gate) return 2.
+    """
+    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        sys.stderr.write(f"dark-factory: no manifest.json in {run_dir}\n")
+        return 2
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"dark-factory: manifest.json is not valid JSON: {e}\n")
+        return 2
+    if manifest_obj.get("outcome") != "SECURITY_GATE_FAILED":
+        sys.stderr.write(
+            f"dark-factory: run outcome is {manifest_obj.get('outcome')!r}, not "
+            "SECURITY_GATE_FAILED — waivers apply only to a run rejected by a "
+            "security gate; nothing to attach.\n")
+        return 2
+
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+
+    ok, status = _byte_verify_for_waiver(run_dir, cfg, control_root)
+    if not ok:
+        sys.stderr.write(
+            f"dark-factory: sealed manifest failed verification ({status}) — refusing to "
+            "attach a waiver over an unverifiable run.\n")
+        return 3
+
+    binding, berr = _waiver_binding_from_manifest(manifest_obj)
+    if binding is None:
+        sys.stderr.write(f"dark-factory: cannot bind waivers to this run: {berr}\n")
+        return 2
+
+    waivers, load_reason = _load_waiver_signatures(control_root)
+    now = _now_utc()
+    satisfied, reason, covered, uncovered = df_waiver.verify_waiver_set(
+        failing_findings=binding["security"].get("failed", []),
+        gates=binding["security"].get("gates", {}),
+        waivers=waivers,
+        signers=binding["signers"],
+        threshold=binding["threshold"],
+        run_id=binding["run_id"],
+        artifact_object_id=binding["artifact_object_id"],
+        policy_digest=binding["policy_digest"],
+        report_digest=binding["report_digest"],
+        now=now,
+    )
+    if not satisfied:
+        print(f"dark-factory: WAIVER NOT ATTACHED ({load_reason or reason}).")
+        return 3
+
+    # Keep only the {claim,signer,sig} entries that actually contributed
+    # (in-scope, valid, unexpired, allowlisted) — never echo unrelated
+    # signature material into the attestation.
+    kept = _kept_waiver_entries(waivers, binding, covered, now)
+    attestation = {
+        "attestation_version": "0.1",
+        "manifest_sha256": manifest_sha,
+        "run_id": binding["run_id"],
+        "artifact_object_id": binding["artifact_object_id"],
+        "gate_policy_digest": binding["policy_digest"],
+        "gate_report_digest": binding["report_digest"],
+        "threshold": binding["threshold"],
+        "covered_fingerprints": covered,
+        "waivers": kept,
+        "satisfied": True,
+        "attached_ts": _now(),
+    }
+
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    try:
+        att_text = canonical_json(attestation)
+        att_path = os.path.join(run_dir, WAIVER_ATTESTATION_FILE)
+        atomic_write(att_path, att_text)
+
+        audit_key = None
+        if cfg.get("_audit", {}).get("signing"):
+            try:
+                audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
+            except df_audit.AuditKeyError as e:
+                sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+                return 2
+        chain_path = os.path.join(control_root, "audit-chain.jsonl")
+        waiver_chain_key = os.path.basename(run_dir) + ".waiver"
+        entry = df_audit_chain.append_entry(
+            chain_path, waiver_chain_key, sha256_str(att_text), _now(), audit_key)
+
+        sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+        if sink.get("kind", "none") != "none":
+            try:
+                receipt = df_audit_sink.push(sink, waiver_chain_key, att_text.encode("utf-8"))
+            except df_audit_sink.SinkError as e:
+                if sink.get("required"):
+                    sys.stderr.write(
+                        f"dark-factory: WAIVER ATTACHED locally, but the REQUIRED audit sink push "
+                        f"FAILED ({e}) — fix the sink and re-run df-waiver attach.\n")
+                    return 3
+                sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
+            else:
+                atomic_write(os.path.join(run_dir, "waiver_sink_receipt.json"),
+                            canonical_json(receipt))
+
+        print(f"dark-factory: WAIVER ATTACHED — {reason}. "
+              f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…  "
+              f"NOTE: expiry is re-checked at every verify.")
+        return 0
+    finally:
+        release_lock(lock)
+
+
+def _kept_waiver_entries(waivers, binding, covered, now):
+    """The subset of collected `{claim,signer,sig}` entries that are valid,
+    in-scope, unexpired, allowlisted-signer, and cover one of the `covered`
+    fingerprints — the exact entries that justified the attestation. Recorded
+    so a later verify re-checks THESE (and their expiry) rather than trusting
+    a bare boolean."""
+    signer_set = {s.lower() for s in binding["signers"] if isinstance(s, str)}
+    covered_set = set(covered)
+    kept = []
+    for w in waivers:
+        if not isinstance(w, dict):
+            continue
+        claim = w.get("claim")
+        signer = w.get("signer")
+        sig = w.get("sig")
+        if not (isinstance(claim, dict) and isinstance(signer, str) and isinstance(sig, str)):
+            continue
+        s = signer.lower()
+        if s not in signer_set:
+            continue
+        if claim.get("run_id") != binding["run_id"]:
+            continue
+        if claim.get("artifact_object_id") != binding["artifact_object_id"]:
+            continue
+        if claim.get("gate_policy_digest") != binding["policy_digest"]:
+            continue
+        if claim.get("gate_report_digest") != binding["report_digest"]:
+            continue
+        if claim.get("finding_fingerprint") not in covered_set:
+            continue
+        if not df_waiver._claim_within_validity(claim, now):
+            continue
+        try:
+            signed = df_waiver.waiver_signing_bytes(claim)
+        except df_waiver.WaiverError:
+            continue
+        if not df_custody.verify_one(s, signed, sig):
+            continue
+        kept.append({"claim": claim, "signer": s, "sig": sig})
+    return kept
+
+
+# Distinct df-waiver verify statuses -> distinct exit codes.
+_WAIVER_VERIFY_EXIT = {
+    "WAIVED_QUALIFIED": 0,
+    "NOT_WAIVED": 1,
+    "WAIVER_EXPIRED": 7,
+    "WAIVER_INVALID": 8,
+}
+
+
+def verify_waiver_cmd(control_root: str, run_dir: str) -> int:
+    """`df-waiver verify` — read-only re-evaluation of whether a
+    SECURITY_GATE_FAILED run is CURRENTLY waiver-qualified.
+
+    Byte-verifies the manifest, then (if a waiver_attestation.json exists)
+    re-runs df_waiver.verify_waiver_set at `now = utcnow`. Expiry is therefore
+    checked AT VERIFY TIME, never a frozen attach-time boolean: a waiver that
+    was valid at attach but has since expired flips the verdict to
+    WAIVER_EXPIRED. Prints a distinct status and returns its distinct exit
+    code (see _WAIVER_VERIFY_EXIT).
+
+    Expiry vs other invalidity is disambiguated by re-verifying the SAME
+    recomputed-from-manifest binding at the attestation's `attached_ts` (a
+    time it was, by construction, satisfied): satisfied-then-but-not-now ==
+    the clock is the only thing that changed == EXPIRED; not-satisfied-even-
+    then == tamper / drift / short count == INVALID.
+    """
+    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        print(f"WAIVER_INVALID (no manifest.json in {run_dir})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        print(f"WAIVER_INVALID (manifest.json is not valid JSON: {e})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    if manifest_obj.get("outcome") != "SECURITY_GATE_FAILED":
+        # A run that never failed a gate isn't waiver-governed; report clearly
+        # and don't pretend a waiver verdict applies.
+        print(f"NOT_WAIVED (outcome {manifest_obj.get('outcome')!r}; waivers apply only to "
+              "SECURITY_GATE_FAILED runs)")
+        return _WAIVER_VERIFY_EXIT["NOT_WAIVED"]
+
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        print(f"WAIVER_INVALID (config error: {e})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    ok, status = _byte_verify_for_waiver(run_dir, cfg, control_root)
+    if not ok:
+        # _byte_verify_for_waiver / _verify_manifest_status already printed a
+        # line; surface as INVALID (integrity is a precondition for any
+        # waiver verdict).
+        print(f"WAIVER_INVALID (sealed manifest failed verification: {status})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    binding, berr = _waiver_binding_from_manifest(manifest_obj)
+    if binding is None:
+        print(f"WAIVER_INVALID (cannot bind waivers to this run: {berr})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    att_path = os.path.join(run_dir, WAIVER_ATTESTATION_FILE)
+    if not os.path.exists(att_path):
+        print(f"NOT_WAIVED (no {WAIVER_ATTESTATION_FILE}; SECURITY_GATE_FAILED run stays "
+              "not-qualified until waivers are attached)")
+        return _WAIVER_VERIFY_EXIT["NOT_WAIVED"]
+    try:
+        with open(att_path, encoding="utf-8") as f:
+            attestation = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"WAIVER_INVALID (unreadable {WAIVER_ATTESTATION_FILE}: {e})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    # The attestation must bind THESE manifest bytes (a single-byte manifest
+    # edit that still passed byte-verify cannot happen — the sidecar/HMAC
+    # guard it — but a STALE attestation from a different sealing must not be
+    # honored).
+    if attestation.get("manifest_sha256") != manifest_sha:
+        print("WAIVER_INVALID (attestation does not bind the current manifest bytes)")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    waivers = attestation.get("waivers", [])
+    if not isinstance(waivers, list):
+        print(f"WAIVER_INVALID ({WAIVER_ATTESTATION_FILE} waivers must be a list)")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    def _eval(now):
+        return df_waiver.verify_waiver_set(
+            failing_findings=binding["security"].get("failed", []),
+            gates=binding["security"].get("gates", {}),
+            waivers=waivers,
+            signers=binding["signers"],
+            threshold=binding["threshold"],
+            run_id=binding["run_id"],
+            artifact_object_id=binding["artifact_object_id"],
+            policy_digest=binding["policy_digest"],
+            report_digest=binding["report_digest"],
+            now=now,
+        )
+
+    now = _now_utc()
+    satisfied_now, reason_now, covered, _unc = _eval(now)
+    if satisfied_now:
+        print(f"WAIVED_QUALIFIED ({reason_now}; expiry re-checked at {_now()})")
+        return _WAIVER_VERIFY_EXIT["WAIVED_QUALIFIED"]
+
+    # Not satisfied now. Was it satisfiable at attach time (with the SAME
+    # manifest-derived binding)? If so, only the clock changed -> EXPIRED.
+    attached_dt = df_waiver._parse_ts(attestation.get("attached_ts"))
+    satisfied_at_attach = False
+    if attached_dt is not None:
+        satisfied_at_attach = _eval(attached_dt)[0]
+    if satisfied_at_attach:
+        print(f"WAIVER_EXPIRED (satisfied when attached, expired by {_now()}; "
+              "re-issue with a later expiry and re-attach)")
+        return _WAIVER_VERIFY_EXIT["WAIVER_EXPIRED"]
+    print(f"WAIVER_INVALID ({reason_now})")
+    return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
 
 
 def _kb_writeback(cfg, journal, manifest_dict, failing):
@@ -3020,8 +3453,18 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 sec_report = _run_security_gates(cfg, journal, run_dir, workspace, redactor=redactor)
                 if sec_report.get("failed"):
                     journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
+                    # M33a (DF-06): app_security_qualified is False here by
+                    # construction (a fail_on gate failed). The run stays
+                    # not-qualified in the sealed manifest; a
+                    # SECURITY_GATE_FAILED run becomes shippable ONLY via a
+                    # SEPARATE, signed df-waiver attestation (never a manifest
+                    # rewrite) — exactly the split-custody attach model. The
+                    # sealed security block already carries gate_policy_digest
+                    # + waiver_policy (see _run_security_gates), so attach can
+                    # recompute every binding digest from these bytes alone.
                     mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
-                              qualified=False, final_exam=fe, regressions=sorted(regressed),
+                              qualified=False, app_security_qualified=False,
+                              final_exam=fe, regressions=sorted(regressed),
                               security=sec_report, artifact=artifact_field,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                               usage=_usage_manifest_field(cfg["_budget"], usage_known,
@@ -3033,6 +3476,22 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     _kb_writeback(cfg, journal, mf, [])
                     print(f"dark-factory: security gate failed (artifact rejected): "
                           f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
+                    # Surface the signed-waiver path when a waiver policy is in
+                    # force (>=1 allowlisted signer) — an accepted-risk finding
+                    # can be signed off without ever weakening the gate.
+                    _wpol = sec_report.get("waiver_policy", {"threshold": 0})
+                    if _wpol.get("threshold", 0) >= 1:
+                        manifest_path = os.path.join(run_dir, "manifest.json")
+                        print(
+                            f"dark-factory: a waiver policy is configured "
+                            f"({_wpol['threshold']} of {len(_wpol.get('signers', []))} signers). "
+                            f"To accept a specific finding: list them with\n"
+                            f"  supervisor.py df-waiver findings --manifest {manifest_path}\n"
+                            f"have signers sign each with `df-waiver sign`, collect the entries "
+                            f"into {os.path.join(cfg['_control_root'], 'waiver-signatures.json')}, "
+                            f"then:\n"
+                            f"  supervisor.py df-waiver attach {cfg['_control_root']} --run-dir {run_dir}"
+                        )
                     return anchor_exit or 3
 
                 # DF-01/M28a belt-and-suspenders: re-verify the object frozen
@@ -3049,6 +3508,45 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                            "(object store integrity drift)", fe=fe, sec_report=sec_report)
 
                 eff = manifest_base.get("_effective_tier", "cooperative")
+
+                # M33a (DF-06) fail-closed: at a mandatory tier the security
+                # gates MUST have actually run (Task 2 forces secret_scan +
+                # dangerous_scan on at standard+). Reaching CONVERGED with
+                # `checked` False there would mean the mandatory gates silently
+                # didn't execute — refuse to qualify with a DISTINCT terminal
+                # rather than emit a COMPLETE_QUALIFIED whose gates never ran.
+                # This should be unreachable in normal operation; it exists so
+                # a future refactor that breaks the forcing fails loud, not
+                # silent.
+                if eff in MANDATORY_TIERS and not sec_report.get("checked"):
+                    journal.write("SECURITY_GATES_MISSING", tier=eff)
+                    mf = dict(mb_clean, outcome="SECURITY_GATES_MISSING", iterations=i,
+                              qualified=False, app_security_qualified=False,
+                              final_exam=fe, regressions=sorted(regressed),
+                              security=sec_report, artifact=artifact_field,
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                          builder_input_tokens, builder_output_tokens))
+                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                digest, audit_key, journal)
+                    _clear_state()
+                    _kb_writeback(cfg, journal, mf, [])
+                    print(f"dark-factory: mandatory security gates did not run at tier {eff} "
+                          f"(fail-closed, not qualified). Run: {run_dir}")
+                    return anchor_exit or 3
+
+                # M33a (DF-06): the app-security dimension of qualification.
+                # True iff the tier does not mandate gates (cooperative), OR
+                # the gates ran AND nothing in fail_on failed. Past the
+                # SECURITY_GATE_FAILED early-return above, `failed` is empty
+                # here, so at a mandatory tier this is True exactly when
+                # `checked` is True (guaranteed by the guard just above) — but
+                # we compute it from first principles so the manifest field is
+                # honest regardless of how we arrived.
+                app_security_qualified = (eff not in MANDATORY_TIERS) or (
+                    bool(sec_report.get("checked")) and not sec_report.get("failed"))
+
                 custody_field = None
                 proxy_field = None
                 egress_field = None
@@ -3104,11 +3602,19 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                   approvers=len(cfg["_custody"]["approvers"]))
                 else:
                     journal.write("CONVERGED", iteration=i)
-                    qualified = eff in _QUALIFYING_TIERS
+                    # M33a (DF-06): fold the app-security dimension into
+                    # qualification. At standard+ a run is qualified ONLY if
+                    # its mandatory gates ran and passed (or every failing
+                    # finding was waived — that path terminates
+                    # SECURITY_GATE_FAILED and re-qualifies via a df-waiver
+                    # attestation at verify, not here). cooperative is
+                    # unchanged (never in _QUALIFYING_TIERS).
+                    qualified = (eff in _QUALIFYING_TIERS) and app_security_qualified
                     outcome = "COMPLETE_QUALIFIED" if qualified else "COMPLETE_UNQUALIFIED"
 
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report, qualified=qualified,
+                          app_security_qualified=app_security_qualified,
                           artifact=artifact_field,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
@@ -3559,6 +4065,45 @@ def main():
     dc_attach.add_argument("control_root")
     dc_attach.add_argument("--run-dir", required=True)
 
+    # `df-waiver` — the M33a (DF-06) waiver operator CLI, structurally a mirror
+    # of df-custody but for security-gate findings on a SECURITY_GATE_FAILED
+    # run: findings -> sign -> collect -> attach -> verify (expiry re-checked
+    # at every verify). See references/security-gates.md.
+    p_dw = sub.add_parser("df-waiver",
+                          help="signed/scoped/expiring security-gate waivers "
+                               "(keygen / findings / sign / attach / verify)")
+    dw_sub = p_dw.add_subparsers(dest="waiver_cmd", required=True)
+    dw_keygen = dw_sub.add_parser("keygen", help="generate a fresh waiver-signer ed25519 keypair")
+    dw_keygen.add_argument("--out-prefix", default=None,
+                           help="if given, write <prefix>.key (private) + <prefix>.pub (public); "
+                                "otherwise print both to stdout")
+    dw_findings = dw_sub.add_parser(
+        "findings", help="list a failed run's WAIVABLE finding fingerprints (+ un-waivable gates) "
+                         "so an operator knows what to sign")
+    dw_findings.add_argument("--manifest", required=True, help="path to the run's manifest.json")
+    dw_sign = dw_sub.add_parser(
+        "sign", help="sign ONE finding fingerprint for a run; prints a {claim,signer,sig} entry "
+                     "(all binding digests recomputed FROM the sealed manifest)")
+    dw_sign.add_argument("--manifest", required=True, help="path to the run's manifest.json")
+    dw_sign.add_argument("--fingerprint", required=True,
+                         help="the finding fingerprint to waive (from `df-waiver findings`)")
+    dw_sign.add_argument("--expires", required=True,
+                         help="ISO-8601 UTC expiry, e.g. 2026-09-01T00:00:00Z (waiver is void "
+                              "at/after this instant; re-checked at every verify)")
+    dw_sign.add_argument("--reason", required=True, help="human-readable acceptance rationale")
+    dw_sign.add_argument("--key-file", required=True,
+                         help="path to the signer's private key (raw-32-byte hex)")
+    dw_attach = dw_sub.add_parser(
+        "attach", help="PHASE 2: verify collected waiver signatures against the SEALED policy and, "
+                       "if satisfied, write waiver_attestation.json + anchor it")
+    dw_attach.add_argument("control_root")
+    dw_attach.add_argument("--run-dir", required=True)
+    dw_verify = dw_sub.add_parser(
+        "verify", help="re-evaluate a failed run's waiver qualification NOW (expiry re-checked "
+                       "against a live clock): WAIVED_QUALIFIED / WAIVER_EXPIRED / WAIVER_INVALID")
+    dw_verify.add_argument("control_root")
+    dw_verify.add_argument("--run-dir", required=True)
+
     args = ap.parse_args()
     if args.cmd == "init":
         sys.exit(init_cmd(args.control_root, args.answers, force=args.force,
@@ -3605,6 +4150,126 @@ def main():
         sys.exit(0 if verify_custody_cmd(args.control_root, args.run_dir) else 1)
     elif args.cmd == "df-custody":
         sys.exit(_df_custody_cli(args))
+    elif args.cmd == "df-waiver":
+        sys.exit(_df_waiver_cli(args))
+
+
+def _df_waiver_cli(args) -> int:
+    """Dispatch for the `df-waiver` operator CLI (keygen/findings/sign/attach/
+    verify). keygen delegates to df_custody (a waiver-signer key IS an ed25519
+    keypair); findings/sign recompute every binding digest FROM the sealed
+    manifest so an operator can never sign against operator-supplied copies of
+    run_id/artifact/policy/report."""
+    if args.waiver_cmd == "keygen":
+        try:
+            priv, pub = df_custody.generate_keypair()
+        except df_custody.CustodyError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        if args.out_prefix:
+            atomic_write(args.out_prefix + ".key", priv + "\n")
+            os.chmod(args.out_prefix + ".key", 0o600)
+            atomic_write(args.out_prefix + ".pub", pub + "\n")
+            print(f"dark-factory: wrote {args.out_prefix}.key (private, 0600) + "
+                  f"{args.out_prefix}.pub (public: {pub})")
+        else:
+            print(json.dumps({"private": priv, "public": pub}))
+        return 0
+
+    if args.waiver_cmd == "attach":
+        return attach_waiver(args.control_root, args.run_dir)
+    if args.waiver_cmd == "verify":
+        return verify_waiver_cmd(args.control_root, args.run_dir)
+
+    # findings / sign both read + bind FROM the sealed manifest.
+    if args.waiver_cmd in ("findings", "sign"):
+        if not os.path.exists(args.manifest):
+            sys.stderr.write(f"dark-factory: manifest not found: {args.manifest}\n")
+            return 2
+        try:
+            with open(args.manifest, "rb") as f:
+                manifest_obj = json.loads(f.read())
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write(f"dark-factory: cannot read manifest: {e}\n")
+            return 2
+        binding, berr = _waiver_binding_from_manifest(manifest_obj)
+        if binding is None:
+            sys.stderr.write(f"dark-factory: {berr}\n")
+            return 2
+
+        if args.waiver_cmd == "findings":
+            security = binding["security"]
+            waivable, unwaivable = df_waiver.required_fingerprints(
+                security.get("failed", []), security.get("gates", {}))
+            # Re-attach each fingerprint to its gate+finding so the operator
+            # can SEE what they'd be signing (never just an opaque hash).
+            detail = []
+            gates = security.get("gates", {})
+            for name in security.get("failed", []):
+                gate = gates.get(name) if isinstance(gates, dict) else None
+                findings = gate.get("findings") if isinstance(gate, dict) else None
+                if not isinstance(findings, list):
+                    continue
+                for finding in findings:
+                    detail.append({
+                        "gate": name,
+                        "fingerprint": df_waiver.finding_fingerprint(name, finding),
+                        "finding": finding,
+                    })
+            out = {
+                "run_id": binding["run_id"],
+                "artifact_object_id": binding["artifact_object_id"],
+                "gate_policy_digest": binding["policy_digest"],
+                "gate_report_digest": binding["report_digest"],
+                "waivable_fingerprints": waivable,
+                "findings": detail,
+                "unwaivable_gates": unwaivable,
+                "waiver_policy": {"signers": binding["signers"], "threshold": binding["threshold"]},
+            }
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return 0
+
+        # sign: build + sign ONE scoped, expiring claim.
+        expires_dt = df_waiver._parse_ts(args.expires)
+        if expires_dt is None:
+            sys.stderr.write(
+                f"dark-factory: --expires is not a valid ISO-8601 UTC timestamp: {args.expires!r}\n")
+            return 2
+        issued_at = _now()
+        issued_dt = df_waiver._parse_ts(issued_at)
+        if not (issued_dt < expires_dt):
+            sys.stderr.write(
+                f"dark-factory: --expires {args.expires!r} is not after the issue time "
+                f"{issued_at!r}; the waiver would be dead on arrival.\n")
+            return 2
+        try:
+            with open(args.key_file, encoding="utf-8") as f:
+                private_hex = f.read().strip()
+        except OSError as e:
+            sys.stderr.write(f"dark-factory: cannot read key file: {e}\n")
+            return 2
+        claim = {
+            "waiver_version": df_waiver.WAIVER_VERSION,
+            "run_id": binding["run_id"],
+            "artifact_object_id": binding["artifact_object_id"],
+            "gate_policy_digest": binding["policy_digest"],
+            "gate_report_digest": binding["report_digest"],
+            "finding_fingerprint": args.fingerprint,
+            "reason": args.reason,
+            "issued_at": issued_at,
+            "expires_at": args.expires,
+        }
+        try:
+            signed = df_waiver.waiver_signing_bytes(claim)
+            sig = df_custody.sign_manifest(private_hex, signed)
+            signer = df_custody.public_from_private(private_hex)
+        except (df_custody.CustodyError, df_waiver.WaiverError) as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        print(json.dumps({"claim": claim, "signer": signer, "sig": sig}))
+        return 0
+
+    return 2
 
 
 def _df_custody_cli(args) -> int:

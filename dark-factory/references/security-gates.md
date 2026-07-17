@@ -4,10 +4,18 @@ Because **no human reviews the built code** in a dark-factory run, the
 supervisor runs a mandatory security check on the **converged artifact**
 before it will ever declare `CONVERGED` — **independent of scenario
 pass-rate**. A clean, fully-passing build with a planted secret in it still
-gets rejected. This is opt-in (`security_gates.enabled`, default `false`,
-back-compatible) but, once enabled, fail-closed: a finding on a gate listed
+gets rejected. Once enabled, fail-closed: a finding on a gate listed
 in `fail_on` makes the run terminal `SECURITY_GATE_FAILED` (exit 3, never
 qualified), the same way `FINAL_EXAM_FAILED` does.
+
+**At `cooperative` the gates are opt-in** (`security_gates.enabled`, default
+`false`, back-compatible). **At `standard`/`hardened`/`enterprise` they are
+MANDATORY** — M33a (DF-06) forces `secret_scan` + `dangerous_scan` on, in
+`fail_on`, with `strict_unavailable: true`, whether or not you write a
+`security_gates` block. A standard+ run cannot reach `COMPLETE_QUALIFIED`
+unless every mandatory gate ran and passed — **or** each failing finding is
+covered by a valid, in-scope, unexpired, allowlisted-signer **waiver**
+(see "Signed waivers" below). See "Mandatory at standard+" below.
 
 ## When it runs
 
@@ -24,6 +32,34 @@ tree the builder wrote, no holdout scenario content is ever involved. A
 they didn't (gates disabled, or the run died before reaching the converged
 gate — pre-build gate failure, build error, final-exam failure, a paused
 run that was aborted/accepted, etc.).
+
+## Mandatory at standard+ (M33a / DF-06)
+
+At `standard`, `hardened`, and `enterprise`, security gates are **not
+optional**. `df_config` forces, keyed off the configured tier:
+
+- `secret_scan` **and** `dangerous_scan` enabled (the immutable minimum set),
+- both **in `fail_on`** (unioned in — an operator's extra `fail_on` entries
+  are kept, the mandatory ones are added, never dropped),
+- `strict_unavailable: true` (a mandatory gate that can't run **fails** the
+  run — "the scanner could not run" is never a pass).
+
+You may **strengthen** the policy (add more gates, add more `fail_on`
+entries, enable `license`/`dependency_audit`) but you may **not disable** the
+minimum: an explicit `security_gates: {enabled: true, secret_scan: false}` at
+standard+ is a **`ConfigError`** at config load (*"`<tier>` may strengthen
+security gates, never disable secret_scan"*). Omitting the `security_gates`
+block entirely is fine — the mandatory minimum is **synthesized**. At
+`cooperative`, none of this applies (gates stay fully opt-in, byte-identical
+to before).
+
+**Qualification wiring.** The manifest carries `app_security_qualified`:
+`true` iff the tier doesn't mandate gates (cooperative) **or** the gates ran
+and nothing in `fail_on` failed. At standard+ the final `qualified` is
+`(eff_tier in {standard,hardened,enterprise}) AND app_security_qualified` —
+so a run that reaches `CONVERGED` but whose mandatory gates somehow didn't
+run (`checked` false) fails closed with a distinct `SECURITY_GATES_MISSING`
+terminal (exit 3), never a silent `COMPLETE_QUALIFIED`.
 
 ## The built-ins
 
@@ -344,6 +380,112 @@ whole point: nobody reviewed the code, and passing behavioral tests says
 nothing about whether the code also planted a secret or called
 `eval()` on untrusted input.
 
+## Signed waivers (M33a / DF-06) — accept a finding without weakening the gate
+
+Because gates are mandatory at standard+, a run with an **accepted-risk**
+finding would otherwise be permanently un-shippable. A **waiver** is the
+auditable escape hatch: it never disables a gate; it records that **specific
+named findings, on this exact sealed artifact + report, are accepted by ≥K
+distinct allowlisted signers until a stated expiry**. Every adjective is
+enforced. This mirrors split-custody exactly — a `SECURITY_GATE_FAILED` run
+is re-qualified by a **separate signed attestation**
+(`waiver_attestation.json`), never a rewrite of the immutable manifest.
+
+**Policy (sealed into the manifest).** `security_gates.waivers` is optional,
+tier-independent:
+
+```json
+"security_gates": {
+  "enabled": true,
+  "waivers": {"signers": ["<ed25519-pubkey-hex>", "..."], "threshold": 2}
+}
+```
+
+`signers` are ed25519 public keys (64-hex, deduped, validated shape-only —
+`df_config` stays stdlib-only, exactly like `custody.approvers`); `threshold`
+is `1..len(signers)`. Absent → `{"signers": [], "threshold": 0}`, the
+fail-closed default (**threshold 0 is never satisfiable**, so a run with no
+policy can never be waived). The signer allowlist + threshold that govern a
+run are **sealed into that run's manifest** (`security.waiver_policy`), so no
+post-run edit of `config.json` can widen who may waive it.
+
+**A non-empty waiver policy REQUIRES `audit.signing: true`** — enforced at
+config load (`ConfigError` on an explicit `audit.signing: false`; forced on
+when absent/defaulted-false, mirroring the hardened/enterprise signing
+default). This is what makes the sealing claim **true by construction rather
+than aspirational**: the sealed `waiver_policy` is only tamper-*proof* when
+the manifest carries a `manifest.hmac` (HMAC-SHA256 over the exact bytes).
+Without a signature, anyone with control-root write could append their own
+pubkey to the sealed allowlist, recompute `manifest.sha256`, self-sign a
+waiver, and self-qualify — so waivers are simply not allowed on an unsigned
+run. (Split-custody never faced this because it is enterprise-only, where
+signing is always on; waivers are offered at `standard`, where it is not by
+default.) `attach`/`verify` byte-verify the signed manifest — loading the
+audit key from config — before trusting anything read from it.
+
+**Binding — why a waiver can never be replayed.** A valid waiver claim must
+match, exactly, the run's `run_id`, `artifact_object_id`, `gate_policy_digest`
+(the effective gate policy), `gate_report_digest` (the exact findings), and a
+**finding fingerprint**. The fingerprint is `sha256(canonical_json(...))` over
+a finding's stable identity: for `secret_scan`/`dangerous_scan` findings it is
+`{gate, file, rule}` — **deliberately excluding `line`** (a secret that moves
+a line is the same finding); for `license` findings it is `{gate, file,
+package, rule}` (excluding the license string). An unknown gate / unexpected
+shape fingerprints the **whole finding** (fail toward more specificity).
+Residual (documented, bounded): a waiver keyed file+rule also covers a
+*different* secret of the same rule in the same file — but it is re-bound to
+`artifact_object_id` + `gate_report_digest`, so the instant the file's
+contents change the report digest changes and the waiver stops applying; it is
+never replayable across artifacts or across edits to the waived file.
+
+**Un-waivable failures.** A failing gate with **no enumerable structured
+findings** — an `unavailable` mandatory gate, or an external gate that failed
+with only a `detail` string — **cannot be waived** (you cannot sign off on
+"the scanner could not run", only on specific findings). Its presence forces
+`satisfied = False` regardless of any signatures.
+
+**Workflow (the `df-waiver` operator CLI, mirroring `df-custody`):**
+
+```
+# 1. each signer makes a keypair (a waiver-signer key IS an ed25519 keypair)
+supervisor.py df-waiver keygen --out-prefix alice
+
+# 2. see what a failed run's WAIVABLE fingerprints are (+ un-waivable gates)
+supervisor.py df-waiver findings --manifest <run>/manifest.json
+
+# 3. each signer signs ONE fingerprint (all binding digests are recomputed
+#    FROM the sealed manifest — operator-supplied copies are never trusted)
+supervisor.py df-waiver sign --manifest <run>/manifest.json \
+    --fingerprint <fp> --expires 2026-09-01T00:00:00Z \
+    --reason "accepted: test fixture key" --key-file alice.key
+
+# 4. collect the {claim,signer,sig} entries into
+#    <control_root>/waiver-signatures.json, then attach (verifies against the
+#    SEALED policy at now; writes + anchors waiver_attestation.json)
+supervisor.py df-waiver attach <control_root> --run-dir <run>
+
+# 5. re-check qualification at any later time
+supervisor.py df-waiver verify <control_root> --run-dir <run>
+```
+
+**Expiry is re-checked at every verify — never a frozen boolean.**
+`df-waiver verify` re-runs the full waiver check at `now = utcnow` and prints a
+distinct status with a distinct exit code:
+
+| Status | Exit | Meaning |
+|---|---|---|
+| `WAIVED_QUALIFIED` | 0 | every failing finding is covered by ≥K distinct, in-scope, **unexpired** allowlisted signers, right now |
+| `WAIVER_EXPIRED` | 7 | it was satisfiable when attached, but a waiver has since expired — verdict flips back to not-qualified until re-issued + re-attached |
+| `WAIVER_INVALID` | 8 | tamper / scope drift / short count / unreadable attestation |
+| `NOT_WAIVED` | 1 | a `SECURITY_GATE_FAILED` run with no (or not-yet-attached) attestation — stays not-qualified |
+
+Expiry vs. other invalidity is disambiguated by re-verifying the same
+manifest-derived binding at the attestation's `attached_ts` (a time it was, by
+construction, satisfied): satisfied-then-but-not-now means only the clock
+changed (`EXPIRED`); not-satisfied-even-then means something else drifted
+(`INVALID`). The attestation is anchored into the same M13 hash chain as a
+custody attestation.
+
 ## Manifest `security` field
 
 Every terminal manifest from every code path — pre-build gate failures,
@@ -371,11 +513,20 @@ report:
     "license": {"status": "pass", "findings": []},
     "dependency_audit": {"status": "pass", "findings": []}
   },
-  "failed": []
+  "failed": [],
+  "gate_policy_digest": "<sha256 of the effective gate policy>",
+  "waiver_policy": {"signers": ["<pubkey-hex>", "..."], "threshold": 2}
 }
 ```
 
-on `CONVERGED`/`SECURITY_GATE_FAILED` when gates ran. `security_report.json`
+on `CONVERGED`/`SECURITY_GATE_FAILED` when gates ran. **M33a** adds
+`gate_policy_digest` (fingerprints the effective policy) and `waiver_policy`
+(the sealed signer allowlist + threshold) into this block, and
+`app_security_qualified` as a top-level manifest field. `gate_report_digest`
+is **not** stored — it is always recomputed over this block *minus*
+`gate_policy_digest`/`waiver_policy` (so a digest is never taken over a field
+that contains itself), and `df-waiver` `sign`/`attach`/`verify` each recompute
+it identically from the sealed bytes. `security_report.json`
 in the run directory is the same object, written whenever gates ran
 (regardless of pass/fail) — a copy on disk independent of `manifest.json`,
 for tooling that wants to inspect the raw report.
@@ -411,6 +562,26 @@ never gate-checked.
   a sandbox-tier concern (see `references/isolation.md`), not a
   build-time security gate.
 
+## Deferred residuals (M33a — documented, not shipped)
+
+The M33a slice lands the buildable, security-meaningful core (mandatory gates
++ attach-time signed waivers). Two parts of the full M33 depend on unbuilt
+milestones and are explicit residuals (see
+`references/prevention-grade-roadmap.md`):
+
+- **Gate execution inside a default-deny sandbox / digest-pinned container.**
+  Gates today run host-side. Running them under the M29b default-deny host
+  sandbox (standard) / pinned container (hardened+) is deferred to M29b.
+- **A resumable in-loop `WAIVER_PENDING` pause phase.** M33a supplies waivers
+  **after** a `SECURITY_GATE_FAILED` run via a separate signed attestation
+  (the attach model, decoupled from the M36 phase-aware FSM), rather than
+  pausing the loop to collect them mid-run.
+- **Enterprise trusted remote-timestamp for expiry.** M33a uses local-time
+  expiry uniformly at every tier; a same-user-forgeable clock is the
+  documented residual (waivers stay artifact + report-digest bound, so a
+  forged clock cannot make a waiver replayable across artifacts) — see
+  `references/enterprise.md`.
+
 ## See also
 
 - `references/config-reference.md` — `security_gates.*` schema +
@@ -420,3 +591,9 @@ never gate-checked.
   **post**-final-exam mandatory gate on the converged artifact
 - `references/budget.md` — another mandatory-by-config control that
   threads a field through every terminal manifest the same way
+- `references/audit.md` — `app_security_qualified` in the qualification
+  semantics + the `df-waiver verify` statuses/exit codes
+- `references/enterprise.md` — the split-custody pattern `df-waiver` mirrors,
+  and the deferred enterprise trusted-timestamp for waiver expiry
+- `references/prevention-grade-roadmap.md` — the M33 deferrals (gate sandbox,
+  resumable `WAIVER_PENDING`, trusted time)

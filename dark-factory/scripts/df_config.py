@@ -20,6 +20,15 @@ _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
+# M33a (DF-06): at these tiers the security gates are MANDATORY — a run cannot
+# reach COMPLETE_QUALIFIED with them off (supervisor folds app_security into
+# `qualified`). secret_scan + dangerous_scan are the immutable minimum set: an
+# operator may STRENGTHEN the policy (add gates, add fail_on entries, keep
+# strict_unavailable) but never disable the minimum at standard+. cooperative
+# is unaffected — gates stay fully optional there, byte-identical to pre-M33a.
+MANDATORY_TIERS = ("standard", "hardened", "enterprise")
+MANDATORY_GATES = ("secret_scan", "dangerous_scan")
+
 
 class ConfigError(ValueError):
     pass
@@ -655,19 +664,158 @@ def load_config(control_root: str) -> dict:
                     f"(known: {sorted(known_gates)})"
                 )
 
+        # M33a (DF-06): mandatory-gate forcing at standard+. The operator may
+        # STRENGTHEN the policy (more gates, more fail_on entries, stricter
+        # unavailable handling) but never weaken the immutable minimum. An
+        # EXPLICIT attempt to disable a mandatory gate is a loud ConfigError
+        # (not a silent override) so the operator learns the policy rather
+        # than believing a disabled gate took effect.
+        sg_fail_on = list(sg_fail_on_raw)
+        if tier in MANDATORY_TIERS:
+            for gate in MANDATORY_GATES:
+                if sg_raw.get(gate) is False:
+                    raise ConfigError(
+                        f"{tier} may strengthen security gates, never disable "
+                        f"{gate} (mandatory at {'/'.join(MANDATORY_TIERS)})"
+                    )
+            sg_secret_scan = True
+            sg_dangerous_scan = True
+            # Force each mandatory gate INTO fail_on (union, dedup, sorted for
+            # a deterministic sealed policy) and force strict_unavailable: a
+            # mandatory gate that cannot run must FAIL the run, never pass by
+            # omission.
+            sg_fail_on = sorted(set(sg_fail_on) | set(MANDATORY_GATES))
+            sg_strict_unavailable = True
+
         cfg_security = {
             "enabled": True,
             "secret_scan": sg_secret_scan,
             "dangerous_scan": sg_dangerous_scan,
             "sbom": sg_sbom,
             "external": sg_external,
-            "fail_on": list(sg_fail_on_raw),
+            "fail_on": sg_fail_on,
             "strict_unavailable": sg_strict_unavailable,
             "license": cfg_license,
             "dependency_audit": cfg_depaudit,
         }
+    elif tier in MANDATORY_TIERS:
+        # No security_gates block (or enabled:false) at a mandatory tier:
+        # SYNTHESIZE the mandatory minimum rather than leave gates off. This is
+        # the intended M33a behavior change — a standard/hardened/enterprise
+        # run with no gate config still gets secret_scan + dangerous_scan,
+        # enabled, in fail_on, strict_unavailable. Omission is NOT an error;
+        # only an EXPLICIT enabled:true + mandatory-gate:false is (handled
+        # above). The sub-blocks mirror the enabled-branch disabled defaults
+        # byte-for-byte so run_gates reads them uniformly.
+        cfg_security = {
+            "enabled": True,
+            "secret_scan": True,
+            "dangerous_scan": True,
+            "sbom": False,
+            "external": [],
+            "fail_on": list(MANDATORY_GATES),
+            "strict_unavailable": True,
+            "license": {"enabled": False, "allowlist": [], "require_license": False},
+            "dependency_audit": {
+                "enabled": False,
+                "source": None,
+                "snapshot_path": None,
+                "ecosystems": [],
+                "timeout_s": 20,
+            },
+        }
     else:
         cfg_security = {"enabled": False}
+
+    # M33a (DF-06): the OPTIONAL waiver policy — TIER-INDEPENDENT (a standard
+    # run may carry one), validated even when the gate flags above were
+    # synthesized, and ALWAYS present on cfg["_security"] so downstream code
+    # reads it unconditionally. Absent -> {"signers": [], "threshold": 0}: the
+    # fail-closed default, since threshold 0 is NEVER satisfiable in
+    # df_waiver.verify_waiver_set (a run with no waiver policy can never be
+    # waived). `signers` are ed25519 PUBLIC keys as raw-32-byte hex (64 chars),
+    # lowercased + deduped, validated with the SAME stdlib _HEX64_RE shape
+    # check `custody.approvers` uses — this module stays stdlib-only and never
+    # imports `cryptography`; df_custody.verify_one rejects a malformed/
+    # off-curve key at verify time, exactly as for custody approvers.
+    sg_waivers_raw = sg_raw.get("waivers", {})
+    if not isinstance(sg_waivers_raw, dict):
+        raise ConfigError("security_gates.waivers must be a JSON object")
+    w_signers_raw = sg_waivers_raw.get("signers", [])
+    if not isinstance(w_signers_raw, list):
+        raise ConfigError(
+            "security_gates.waivers.signers must be a list of 64-hex-char "
+            "ed25519 public keys"
+        )
+    w_signers = []
+    w_seen = set()
+    for entry in w_signers_raw:
+        if not isinstance(entry, str) or not _HEX64_RE.match(entry):
+            raise ConfigError(
+                "security_gates.waivers.signers entries must be 64-hex-char "
+                f"ed25519 public keys: {entry!r}"
+            )
+        canonical = entry.lower()
+        if canonical in w_seen:
+            raise ConfigError(
+                "security_gates.waivers.signers has a duplicate entry "
+                f"(signers must be unique): {entry!r}"
+            )
+        w_seen.add(canonical)
+        w_signers.append(canonical)
+    w_threshold = sg_waivers_raw.get("threshold", 0)
+    if w_signers:
+        if (
+            not isinstance(w_threshold, int)
+            or isinstance(w_threshold, bool)
+            or not (1 <= w_threshold <= len(w_signers))
+        ):
+            raise ConfigError(
+                "security_gates.waivers.threshold must be an int in 1.."
+                f"{len(w_signers)} (the number of signers)"
+            )
+    else:
+        # No signers => no waivers acceptable. A truthy threshold with no
+        # signers is a broken policy — reject it loudly rather than silently
+        # pin to 0; the absent/0 default is fine.
+        if w_threshold:
+            raise ConfigError(
+                "security_gates.waivers.threshold requires a non-empty signers list"
+            )
+        w_threshold = 0
+    cfg_security["waivers"] = {"signers": w_signers, "threshold": w_threshold}
+
+    # M33a (DF-06) SECURITY: a NON-EMPTY waiver policy REQUIRES a SIGNED audit
+    # manifest. The signer allowlist + threshold that govern a run are sealed
+    # into `security.waiver_policy`, but that seal is only tamper-PROOF when the
+    # manifest is HMAC-signed. With `audit.signing` off (its default at
+    # cooperative/standard), an attacker with control-root write could append
+    # their OWN pubkey to the sealed allowlist, recompute `manifest.sha256`,
+    # self-sign a waiver, and get WAIVED_QUALIFIED — defeating "sealed so no
+    # post-run edit can widen who may waive." (Split-custody sidesteps this by
+    # being enterprise-only, where signing is always on; waivers are offered at
+    # standard, where it is not.) So: require signing whenever signers are
+    # configured, MIRRORING the hardened/enterprise audit.signing rule above —
+    # an EXPLICIT `false` is a hard rejection, an absent/defaulted-false is
+    # forced ON (with the same key_path defaulting + disjointness guard the
+    # audit block applies), so the strong sealing claim holds by construction.
+    if w_signers:
+        if audit_raw.get("signing") is False:
+            raise ConfigError(
+                "security_gates.waivers requires audit.signing: true so the sealed "
+                "waiver allowlist is HMAC-protected — an unsigned manifest's "
+                "waiver_policy can be widened by anyone with control-root write"
+            )
+        if not audit_signing:
+            audit_signing = True
+            if not audit_key_path:
+                audit_key_path = os.path.expanduser("~/.dark-factory/audit.key")
+            key_dir = os.path.dirname(os.path.abspath(audit_key_path))
+            if not _disjoint(key_dir, control_root) or not _disjoint(key_dir, ws):
+                raise ConfigError(
+                    "audit.key_path must live outside both the control root and "
+                    "workspace_root (the signing key must never be reachable by a run)"
+                )
 
     # Optional `credentials` block -> cfg["_credentials"] (M11): a brokered
     # allowlist of provider credentials the builder is permitted to receive.
