@@ -15,6 +15,7 @@ import pytest
 
 import df_config
 import df_container
+import df_creds
 import df_sandbox
 import supervisor
 from test_config import write_config
@@ -57,7 +58,7 @@ def test_hardened_tier_accepted_with_defaults(tmp_path):
     assert cfg["_qualified"] is True
     assert cfg["_container"] == {
         "image": df_container.DEFAULT_IMAGE, "network": "none",
-        "memory": "2g", "pids": 256,
+        "memory": "2g", "pids": 256, "dep_cache_dir": None,
     }
 
 
@@ -69,6 +70,7 @@ def test_hardened_block_overrides_defaults(tmp_path):
     cfg = df_config.load_config(str(cr))
     assert cfg["_container"] == {
         "image": "myorg/img:1", "network": "bridge", "memory": "512m", "pids": 64,
+        "dep_cache_dir": None,
     }
 
 
@@ -112,6 +114,47 @@ def test_hardened_bool_pids_rejected(tmp_path):
     cr = tmp_path / "control"
     write_hardened(cr, hardened={"pids": True})
     with pytest.raises(df_config.ConfigError, match="pids"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_valid_directory_accepted(tmp_path):
+    # §7.3 Task 2: hardened.dep_cache_dir accepts an existing directory and
+    # normalizes it to a realpath in cfg["_container"].
+    cr = tmp_path / "control"
+    cache_dir = tmp_path / "depcache"
+    cache_dir.mkdir()
+    write_hardened(cr, hardened={"dep_cache_dir": str(cache_dir)})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_container"]["dep_cache_dir"] == os.path.realpath(str(cache_dir))
+
+
+def test_dep_cache_dir_absent_defaults_to_none(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_container"]["dep_cache_dir"] is None
+
+
+def test_dep_cache_dir_missing_directory_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr, hardened={"dep_cache_dir": str(tmp_path / "does-not-exist")})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_not_a_directory_rejected(tmp_path):
+    cr = tmp_path / "control"
+    f = tmp_path / "notadir"
+    f.write_text("x")
+    write_hardened(cr, hardened={"dep_cache_dir": str(f)})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_non_string_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr, hardened={"dep_cache_dir": 123})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
         df_config.load_config(str(cr))
 
 
@@ -372,7 +415,7 @@ def test_builder_wiring_docker_prefix_no_control_root_mount(tmp_path, monkeypatc
     assert m["sandbox_backend"] == df_container.BACKEND_NAME
     assert m["denial_probe_passed"] is True
     assert m["container"] == {"image": df_container.DEFAULT_IMAGE, "network": "none",
-                              "memory": "2g", "pids": 256}
+                              "memory": "2g", "pids": 256, "dep_cache_dir": None}
 
 
 def test_builder_wiring_twin_env_skipped_at_hardened(tmp_path, monkeypatch):
@@ -408,6 +451,159 @@ def test_builder_wiring_twin_env_skipped_at_hardened(tmp_path, monkeypatch):
     states = [json.loads(l)["state"] for l in
               (cr / "runs" / run_id / "journal.jsonl").read_text().splitlines()]
     assert "TWIN_ENV_SKIPPED" in states
+
+
+# ---------------------------------------------------------------------------
+# §7.3 Task 3: hardened.dep_cache_dir (Task 2's cfg["_container"]["dep_cache_dir"])
+# is wired into the real hardened build_argv call — an extra ro_mount PLUS
+# four non-secret pip/npm env vars that point pip/npm entirely at the local
+# cache. build_argv is genuinely exercised (it's pure — no docker needed);
+# only invoke_adapter is faked (same pattern as
+# test_builder_wiring_docker_prefix_no_control_root_mount above), so the
+# assertions below are against the REAL docker argv's -v/-e flags.
+# ---------------------------------------------------------------------------
+
+def test_dep_cache_dir_hardened_mounted_and_env_injected(tmp_path, monkeypatch):
+    cr = _hardened_control(tmp_path)
+    dep_cache = tmp_path / "depcache"
+    (dep_cache / "pypi").mkdir(parents=True)
+    (dep_cache / "npm-cache").mkdir(parents=True)
+    cfg_dict = json.loads((cr / "config.json").read_text())
+    cfg_dict["hardened"] = {"dep_cache_dir": str(dep_cache)}
+    (cr / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
+
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    captured = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                    exec_prefix=None, env_extra=None):
+        captured.append(list(exec_prefix) if exec_prefix else [])
+        with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+            f.write(GREET_PY)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    assert captured, "builder invoke_adapter was never called"
+
+    argv = captured[0]
+    dep_cache_real = os.path.realpath(str(dep_cache))
+    v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+    assert any(spec == f"{dep_cache_real}:{dep_cache_real}:ro" for spec in v_specs), v_specs
+
+    e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
+    assert "PIP_NO_INDEX=1" in e_pairs
+    assert f"PIP_FIND_LINKS={os.path.join(dep_cache_real, 'pypi')}" in e_pairs
+    assert f"npm_config_cache={os.path.join(dep_cache_real, 'npm-cache')}" in e_pairs
+    assert "npm_config_offline=true" in e_pairs
+
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["container"]["dep_cache_dir"] == dep_cache_real
+
+
+def test_dep_cache_dir_unset_hardened_ro_mounts_and_env_unchanged(tmp_path, monkeypatch):
+    # Back-compat: a hardened run that never configures dep_cache_dir must
+    # see byte-identical ro_mounts/env to pre-M26 behavior — only the
+    # adapter directory mounted, no pip/npm env vars injected.
+    cr = _hardened_control(tmp_path)
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    captured = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                    exec_prefix=None, env_extra=None):
+        captured.append(list(exec_prefix) if exec_prefix else [])
+        with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+            f.write(GREET_PY)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    assert captured, "builder invoke_adapter was never called"
+
+    argv = captured[0]
+    adapter_ro_dir = os.path.realpath(os.path.dirname(FAKE))
+    v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+    ro_specs = [s for s in v_specs if s.endswith(":ro")]
+    assert ro_specs == [f"{adapter_ro_dir}:{adapter_ro_dir}:ro"]
+
+    e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
+    for forbidden in ("PIP_NO_INDEX=1", "npm_config_offline=true"):
+        assert forbidden not in e_pairs
+    assert not any(p.startswith("PIP_FIND_LINKS=") for p in e_pairs)
+    assert not any(p.startswith("npm_config_cache=") for p in e_pairs)
+
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["container"]["dep_cache_dir"] is None
+
+
+def test_dep_cache_env_merges_with_creds_env_hardened(tmp_path, monkeypatch):
+    # Coverage gap closed: M11 credentials and M26 dep_cache_dir are each
+    # tested alone, but supervisor.py's hardened branch does
+    # `merged_env = dict(creds) if creds else {}` then
+    # `merged_env.update(dep_cache_env)` — nothing proves BOTH sets of `-e`
+    # flags survive together when both features are configured at once.
+    cr = _hardened_control(tmp_path)
+
+    secret = "supersecretvalue-9f8e7d6c5b4a"
+    cfg_dict = json.loads((cr / "config.json").read_text())
+    cfg_dict["credentials"] = {"source": "env", "allowlist": ["FOO_API_KEY"]}
+    dep_cache = tmp_path / "depcache"
+    (dep_cache / "pypi").mkdir(parents=True)
+    (dep_cache / "npm-cache").mkdir(parents=True)
+    cfg_dict["hardened"] = {"dep_cache_dir": str(dep_cache)}
+    (cr / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
+
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    def _fake_load_credentials(spec):
+        return {name: secret for name in spec["allowlist"]}
+    monkeypatch.setattr(supervisor.df_creds, "load_credentials", _fake_load_credentials)
+
+    captured = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                    exec_prefix=None, env_extra=None, env_full=None):
+        captured.append(list(exec_prefix) if exec_prefix else [])
+        with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+            f.write(GREET_PY)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 0
+    assert captured, "builder invoke_adapter was never called"
+
+    argv = captured[0]
+    dep_cache_real = os.path.realpath(str(dep_cache))
+    v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+    assert any(spec == f"{dep_cache_real}:{dep_cache_real}:ro" for spec in v_specs), v_specs
+
+    e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
+    # credential env survives the merge (would fail if dep_cache_env.update()
+    # replaced merged_env instead of updating it, or if creds were dropped)
+    assert f"FOO_API_KEY={secret}" in e_pairs
+    # all four dep-cache env vars survive alongside the credential (would
+    # fail if `dict(creds) if creds else {}` were seeded fresh and never
+    # updated with dep_cache_env, dropping the cache vars silently)
+    assert "PIP_NO_INDEX=1" in e_pairs
+    assert f"PIP_FIND_LINKS={os.path.join(dep_cache_real, 'pypi')}" in e_pairs
+    assert f"npm_config_cache={os.path.join(dep_cache_real, 'npm-cache')}" in e_pairs
+    assert "npm_config_offline=true" in e_pairs
+
+    run_id = os.listdir(cr / "runs")[0]
+    m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert m["container"]["dep_cache_dir"] == dep_cache_real
+    manifest_text = (cr / "runs" / run_id / "manifest.json").read_text()
+    assert secret not in manifest_text
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +733,46 @@ def test_supervisor_guard_refuses_control_root_adapter_mount(tmp_path, monkeypat
         cfg = real_load(control_root)  # loads as valid cooperative config
         cfg["assurance"] = "hardened"  # mutate AFTER validation (simulates drift)
         cfg["roles"]["builder"]["adapter"] = str(bad_adapter)
+        return cfg
+
+    monkeypatch.setattr(supervisor, "load_config", sneaky_load)
+    _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
+
+    called = []
+    monkeypatch.setattr(supervisor.df_container, "build_argv",
+                        lambda *a, **k: called.append("build_argv") or ["docker"])
+    monkeypatch.setattr(
+        supervisor, "invoke_adapter",
+        lambda *a, **k: called.append("invoke_adapter")
+        or ({"adapter_protocol": "0.1", "status": "ok"}, None))
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 2  # in-loop guard refuses with the standard refusal exit code
+    assert called == []  # refused BEFORE any docker argv was built or spawned
+
+
+def test_supervisor_guard_refuses_dep_cache_dir_overlapping_control_root(tmp_path, monkeypatch):
+    # §7.3 Task 3: same TOCTOU discipline as the adapter-mount guard above,
+    # for the dep_cache_dir mount — the holdout barrier must never be
+    # breachable via THIS mount either. df_config validates dep_cache_dir
+    # against the control root at load time (Task 2); this is the layer-2
+    # re-check right before the bind mount is built.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    good_cache = tmp_path / "depcache"
+    (good_cache / "pypi").mkdir(parents=True)
+    (good_cache / "npm-cache").mkdir(parents=True)
+    cfg_dict = json.loads((cr / "config.json").read_text())
+    cfg_dict["assurance"] = "hardened"
+    cfg_dict["hardened"] = {"dep_cache_dir": str(good_cache)}
+    (cr / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
+
+    real_load = supervisor.load_config
+
+    def sneaky_load(control_root):
+        cfg = real_load(control_root)  # loads/validates a legit dep_cache_dir
+        # mutate AFTER validation (simulates drift): now points inside the
+        # control root.
+        cfg["_container"]["dep_cache_dir"] = os.path.realpath(str(cr))
         return cfg
 
     monkeypatch.setattr(supervisor, "load_config", sneaky_load)

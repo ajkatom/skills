@@ -249,6 +249,68 @@ reaches a hardened builder call, the supervisor journals `TWIN_ENV_SKIPPED`
 nowhere — an authenticated builder↔twin topology across the container
 boundary is **not built yet** — that is M12.
 
+## Pinned dependency cache (§7.3)
+
+**The problem.** A hardened (or enterprise) builder has `hardened.network:
+"none"` by default and, even at `"bridge"`, has no credential/allowlist path
+to a package registry. Before M26, that meant a hardened builder could not
+`pip install` or `npm install` **anything** — every dependency a spec's
+builder needed had to be pre-vendored by hand into the workspace, which does
+not scale past a handful of packages.
+
+**What M26 adds.** An optional `hardened.dep_cache_dir` points at an
+operator-provisioned, **read-only** local directory of pinned package
+artifacts. When set, the supervisor bind-mounts that directory read-only
+into the builder container (a second `ro_mount`, alongside the adapter
+directory) and sets four non-secret environment variables so pip/npm resolve
+entirely from it:
+
+| Env var | Effect |
+|---|---|
+| `PIP_NO_INDEX=1` | pip never contacts PyPI or any index, even if reachable |
+| `PIP_FIND_LINKS=<dir>/pypi` | pip resolves wheels/sdists only from this local directory |
+| `npm_config_cache=<dir>/npm-cache` | npm reads from its own offline-cache format at this path |
+| `npm_config_offline=true` | npm never contacts the registry, even if reachable |
+
+**Provisioning (operator, out-of-band).** The cache is built before a run,
+on the operator's own host, with:
+
+```
+python3 dark-factory/scripts/df_depcache.py --source <spec-or-scaffold-dir> --dest <cache-dir>
+```
+
+`df_depcache.py` reuses `df_depaudit.parse_installed` to discover the
+project's PINNED manifests (`requirements.txt`/`pyproject.toml`,
+`package.json`+lockfile), fetches exactly those pinned packages into
+`<cache-dir>/pypi` and `<cache-dir>/npm-cache`, and rolls back the whole
+fetch on any single-package failure (no partial cache silently shipped).
+Fetching npm packages needs the `npm` CLI on the **operator's** host at
+provisioning time only — the builder container never needs `npm` installed
+to publish, only to install from the pre-populated offline cache.
+
+**Config.** `hardened.dep_cache_dir` — absolute path to a pre-provisioned,
+existing directory; see `references/config-reference.md`. Unset (`null`,
+the default) is byte-identical to pre-M26 behavior: no extra mount, no env
+vars injected.
+
+**Honest scope.** This is a **read-only filesystem mount, not a live
+proxy.** "No direct registry/DNS" holds *by construction* — there is no
+listener running inside or reachable from the container for pip/npm to talk
+to, so there is nothing to misconfigure into an open egress path (a
+*stronger* guarantee than a network proxy, which is only as safe as its own
+allowlist). Anything not present in the cache fails to install — that is
+pip/npm's own ordinary fail-closed behavior when told `--no-index`/offline
+with a missing package, not a mechanism dark-factory reimplements or
+enforces itself. `df_depcache.py` does **not** resolve transitive
+dependencies beyond what `parse_installed` finds pinned in the artifact
+tree's own manifests — if a builder's install ends up needing an
+un-pinned transitive dependency that pip/npm would normally resolve live,
+that install fails closed (never silently reaches out to the network); the
+operator re-runs `df_depcache.py` with a fuller pinned manifest and
+re-provisions. The cache covers PyPI and npm only — no other ecosystems
+(cargo, gem, etc.), matching the same ecosystem scope `df_depaudit.
+parse_installed` already has for the M23 CVE gate.
+
 ## Deferred (honest scope)
 
 Explicitly not built in M10, in increasing order of the milestone that ships

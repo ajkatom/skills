@@ -413,6 +413,56 @@ def test_enterprise_run_always_custody_pending_exit_3(tmp_path, monkeypatch):
         assert supervisor.verify_custody_cmd(str(cr), str(cr / "runs" / run_id)) is False
 
 
+def test_dep_cache_dir_enterprise_mounted_and_env_injected(tmp_path, monkeypatch):
+    # §7.3 Task 3: identical dep-cache wiring on the enterprise branch
+    # (build_enterprise_argv instead of build_argv) — the mount + four
+    # non-secret env vars carry through even though enterprise otherwise
+    # passes env=None for credentials (the credential_proxy is the sole
+    # credential path; dep-cache env is NOT a credential, so it's exempt).
+    approvers = [_approver()[1] for _ in range(3)]
+    dep_cache = tmp_path / "depcache"
+    (dep_cache / "pypi").mkdir(parents=True)
+    (dep_cache / "npm-cache").mkdir(parents=True)
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        cfg_dict = json.loads((cr / "config.json").read_text())
+        cfg_dict["hardened"] = {"dep_cache_dir": str(dep_cache)}
+        (cr / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
+
+        _patch_enterprise_probes(monkeypatch)
+
+        captured = []
+
+        def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                        exec_prefix=None, env_extra=None, env_full=None, confine=False):
+            assert env_extra is None  # unchanged: creds still never cross via env_extra
+            captured.append(list(exec_prefix) if exec_prefix else [])
+            with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+                f.write(GREET_PY)
+            return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+        monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+        rc = supervisor.run(str(cr), None)
+        assert rc == 3  # enterprise always seals CUSTODY_PENDING; unrelated to dep-cache
+        assert captured, "builder invoke_adapter was never called"
+
+        argv = captured[0]
+        dep_cache_real = os.path.realpath(str(dep_cache))
+        v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+        assert any(spec == f"{dep_cache_real}:{dep_cache_real}:ro" for spec in v_specs), v_specs
+
+        e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
+        assert "PIP_NO_INDEX=1" in e_pairs
+        assert f"PIP_FIND_LINKS={os.path.join(dep_cache_real, 'pypi')}" in e_pairs
+        assert f"npm_config_cache={os.path.join(dep_cache_real, 'npm-cache')}" in e_pairs
+        assert "npm_config_offline=true" in e_pairs
+
+        run_id = os.listdir(cr / "runs")[0]
+        m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+        assert m["container"]["dep_cache_dir"] == dep_cache_real
+
+
 def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
     """THE end-to-end contract: real supervisor.run + real ed25519 sigs.
     run -> CUSTODY_PENDING; 1-of-3 attach -> not satisfied (exit 3, no

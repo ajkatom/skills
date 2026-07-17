@@ -277,7 +277,7 @@ holdout scenarios in a session that will also drive the builder.
 - `references/config-reference.md` — config schema
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
-- `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, deferred scope (M10)
+- `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)

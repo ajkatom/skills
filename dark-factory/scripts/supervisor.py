@@ -1913,11 +1913,37 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # docker CLIENT process's own env. This is the sole channel any
                 # env reaches the hardened builder; `-e K=V` is visible to local
                 # `ps` (documented residual, see references/credentials.md).
+                # (§7.3 Task 3) hardened.dep_cache_dir, when configured, is a
+                # SECOND ro_mount — a pre-provisioned read-only pip/npm cache
+                # so a hardened builder can pip/npm install pinned deps
+                # without live network access. Same TOCTOU re-check
+                # discipline as the adapter mount above: config-load already
+                # validated the dir exists, but this is the moment it's about
+                # to be bind-mounted into the container.
+                ro_mounts = [adapter_ro_dir]
+                dep_cache_env = None
+                dep_cache_dir = c.get("dep_cache_dir")
+                if dep_cache_dir:
+                    if not _disjoint(dep_cache_dir, cfg["_control_root"]):
+                        raise df_sandbox.SandboxError(
+                            "hardened: refusing to mount dep_cache_dir — it "
+                            f"overlaps the control root ({dep_cache_dir}); the "
+                            "holdout barrier would be breached by construction")
+                    ro_mounts.append(dep_cache_dir)
+                    dep_cache_env = {
+                        "PIP_NO_INDEX": "1",
+                        "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
+                        "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
+                        "npm_config_offline": "true",
+                    }
+                merged_env = dict(creds) if creds else {}
+                if dep_cache_env:
+                    merged_env.update(dep_cache_env)
                 builder_prefix = df_container.build_argv(
                     c["image"], workspace,
-                    ro_mounts=[adapter_ro_dir],
+                    ro_mounts=ro_mounts,
                     network=c["network"], memory=c["memory"], pids=c["pids"],
-                    env=creds if creds else None)
+                    env=merged_env if merged_env else None)
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="hardened",
                                   reason="builder-side twin env not forwarded into "
@@ -1942,14 +1968,33 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # container as a `-e` var. (df_config additionally refuses a
                 # config where credential_proxy.token_env also appears in
                 # credentials.allowlist, so the two channels can't collide.)
+                # (§7.3 Task 3) dep_cache_dir carries the SAME ro_mount + env
+                # wiring as hardened above — it is not a credential, so it's
+                # the only thing allowed to ride in `env` here.
+                ro_mounts_ent = [adapter_ro_dir]
+                dep_cache_env_ent = None
+                dep_cache_dir = c.get("dep_cache_dir")
+                if dep_cache_dir:
+                    if not _disjoint(dep_cache_dir, cfg["_control_root"]):
+                        raise df_sandbox.SandboxError(
+                            "enterprise: refusing to mount dep_cache_dir — it "
+                            f"overlaps the control root ({dep_cache_dir}); the "
+                            "holdout barrier would be breached by construction")
+                    ro_mounts_ent.append(dep_cache_dir)
+                    dep_cache_env_ent = {
+                        "PIP_NO_INDEX": "1",
+                        "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
+                        "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
+                        "npm_config_offline": "true",
+                    }
                 builder_prefix = df_container.build_enterprise_argv(
                     c["image"], workspace,
-                    ro_mounts=[adapter_ro_dir],
+                    ro_mounts=ro_mounts_ent,
                     proxy_endpoint=proxy_endpoint,
                     seccomp_profile_path=cfg["_enterprise"]["seccomp"],
                     entrypoint_path=entrypoint_path,
                     memory=c["memory"], pids=c["pids"],
-                    env=None)
+                    env=dep_cache_env_ent)
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
                                   reason="builder-side twin env not forwarded into "
