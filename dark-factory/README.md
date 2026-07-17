@@ -14,6 +14,13 @@ this skill): [`SKILL.md`](SKILL.md). A plain-language overview of what this
 does and what each reference doc covers, if `SKILL.md` and this README are
 too technical: [`OVERVIEW.md`](OVERVIEW.md).
 
+("Level-5" above is the industry-generic term for fully-autonomous coding,
+not dark-factory's own config. Inside dark-factory, "level" means two
+separate things: four **assurance tiers** — cooperative/standard/hardened/
+enterprise, isolation strength — and two **autonomy modes** — L4
+checkpoint-per-iteration vs. L5 unattended lights-off, gated to
+`hardened`/`enterprise` only. See "Assurance tiers" below.)
+
 ## Why "dark factory"
 
 An AI builder that can see the tests will, given enough iterations, learn to
@@ -135,4 +142,8 @@ documents one thing this skill deliberately does **not** self-provide: a
 skill cannot sandbox the session that is running it (the *orchestrator*,
 as opposed to the *builder*, which dark-factory does confine) — that is a
 harness-layer configuration step, with the operator recipe spelled out
-there.
+there. **Non-goals:** merge, deployment, and production operation are out
+of scope — the workflow ends at a qualified, artifact-bound workspace plus
+the reported manifest/checkpoint handoff; what happens to that artifact
+afterward (code review, merge, deploy, running it for real users) is on the
+operator, outside this skill.

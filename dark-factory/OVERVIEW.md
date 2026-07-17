@@ -34,9 +34,12 @@ container) where it is *physically incapable* of reading the hidden test
 files, the same way a student can't see a sealed answer key even if they
 wanted to.
 
-## The four "how much do you trust this" levels
+## The four "how much do you trust this" tiers
 
-You pick one of these per project, depending on how much is at stake:
+You pick one of these per project, depending on how much is at stake. (Note:
+these are **assurance tiers**, a different axis from the separate
+**checkpointed-vs-unattended** choice described in the third one below — see
+the callout after the list.)
 
 1. **cooperative** — the builder is just asked nicely not to peek. Fastest
    and simplest, but nothing stops a determined or buggy attempt from
@@ -47,15 +50,24 @@ You pick one of these per project, depending on how much is at stake:
    refuses to start rather than pretending it's safe).
 3. **hardened** — the builder runs inside its own disposable mini-computer
    (a Docker container) that the hidden tests are never even placed into —
-   there's nothing to sneak a read of, because it was never there. This
-   level can also run fully unattended, no human needed to click "continue"
-   between attempts.
+   there's nothing to sneak a read of, because it was never there. This tier
+   also *unlocks the option* to run fully unattended, no human needed to
+   click "continue" between attempts — that unattended mode is a separate
+   setting you opt into, not something hardened does automatically.
 4. **enterprise** — everything in hardened, plus: the container can't quietly
    phone home to the internet (only one pre-approved, credential-injecting
    gateway), and before anything ships, a *separate group of people* (not
    just the one operator who ran it) have to independently sign off,
    cryptographically, that the result is real. Nobody can ship something
    alone even if they wanted to fake success.
+
+**Tiers vs. attended/unattended — two different questions.** The four items
+above answer "how hard is it for the builder to cheat." A separate setting
+answers "does a human check in between attempts": the default is
+checkpointed (you review progress and say continue/adjust/stop after each
+attempt), and only `hardened`/`enterprise` additionally allow the fully
+unattended, lights-off mode. Picking `hardened` doesn't turn on unattended
+mode by itself — it just makes that mode available if you also ask for it.
 
 ## What it can build with
 

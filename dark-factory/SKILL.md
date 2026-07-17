@@ -1,6 +1,6 @@
 ---
 name: dark-factory
-description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified), `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified), and `hardened` (builder runs in a Docker container with the control root never mounted — denial by construction, probe-verified — and unlocks fully unattended L5/autonomy-5 runs). Per-iteration human checkpoints (pause/resume) at autonomy 4.
+description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified), `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified), `hardened` (builder runs in a Docker container with the control root never mounted — denial by construction, probe-verified — and unlocks fully unattended L5/autonomy-5 runs), and `enterprise` (hardened + kernel-locked egress + seccomp + K-of-N split-custody sign-off — the strongest tier). Per-iteration human checkpoints (pause/resume) at autonomy 4.
 ---
 
 # dark-factory
@@ -9,6 +9,14 @@ Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 → isolated builder (spec-only) → verifier → deterministic ID feedback → loop →
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
 (Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2).
+
+**Two independent axes, not one.** Assurance tier (isolation strength:
+cooperative/standard/hardened/enterprise) and autonomy/intervention mode
+(**L4** — per-iteration human checkpoint, pause/resume; **L5** — fully
+unattended lights-off) are separate config choices. A tier does not imply
+an autonomy mode: every tier defaults to L4, and only `hardened`/`enterprise`
+may additionally opt into L5 (see below). There are four tiers and two
+autonomy modes — not "four levels" of anything single-dimensional.
 
 ## Authoring a run (`init`) — the on-ramp for "provide context and specs"
 
@@ -322,6 +330,8 @@ holdout scenarios in a session that will also drive the builder.
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier, honest scope vs. remaining host-read/copy-on-run/netns work (DF-02, M29a)
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
+- `references/reproducibility.md` — what's reproducible/verifiable today (stdlib-only tiers, pinned `cryptography` range, content-addressed artifact binding, config/spec/scenario hashes, digest-pinnable images) vs. the honest owner/infra TODO (LICENSE, CI, hash-locked installs, default digest pinning, release SBOM/provenance)
+- `references/prevention-grade-roadmap.md` — why dark-factory's assurance is DETECTION-grade (catches tampering/misbehavior/accidents after the fact) rather than PREVENTION-grade against a hostile same-OS-user process, and the concrete off-host infrastructure a future project would need to close that gap
 - `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
