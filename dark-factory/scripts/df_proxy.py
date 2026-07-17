@@ -264,7 +264,15 @@ def _make_handler(allowlist, token_env, header, capability_token, method_path):
             # token a byte at a time.
             presented = self.headers.get("Proxy-Authorization")
             expected = f"Bearer {capability_token}"
-            if presented is None or not hmac.compare_digest(presented, expected):
+            # hmac.compare_digest raises TypeError on a non-ASCII value (headers
+            # are latin-1); a hostile/garbled Proxy-Authorization must produce a
+            # clean fail-closed 407, not an unhandled exception that resets the
+            # connection with no HTTP response.
+            try:
+                ok = presented is not None and hmac.compare_digest(presented, expected)
+            except TypeError:
+                ok = False
+            if not ok:
                 self._send_json(407, {"error": "proxy authentication required"})
                 return
 
@@ -469,6 +477,10 @@ def serve(allowlist, token_env, *, header="authorization", port=0,
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="interface to bind (default 127.0.0.1 loopback; the "
+                         "credential-injecting proxy should not be exposed on "
+                         "all interfaces without a deliberate reason)")
     ap.add_argument(
         "--allowlist", required=True,
         help="comma-separated list of allowlisted origins (see "
@@ -504,8 +516,8 @@ def main():
     handler_cls = _make_handler(
         allowlist, args.token_env, args.header, resolved_token, method_path
     )
-    httpd = _Server(("0.0.0.0", args.port), handler_cls)
-    print(f"df_proxy: listening on :{args.port}, allowlist={allowlist}")
+    httpd = _Server((args.bind, args.port), handler_cls)
+    print(f"df_proxy: listening on {args.bind}:{args.port}, allowlist={allowlist}")
     if args.capability_token is None and args.capability_token_env is None:
         # Only the auto-generated case is ever surfaced -- an explicitly
         # given token (CLI arg or env var) is the caller's own secret and is
