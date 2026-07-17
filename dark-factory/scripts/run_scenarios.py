@@ -734,24 +734,42 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env
     # it -- a scenario that makes zero twin calls gets an empty delta, never
     # a previous scenario's leftover lines.
     offsets = _observer_offsets(observer_files)
+    # DF-02/M29a Task 2: give CLI scenarios the SAME start_new_session +
+    # process-group-reap discipline as _run_http_scenario, so a candidate
+    # that setsid's/double-forks a background child (or just leaves a
+    # detached subprocess running) never survives past this call -- no
+    # orphan, ever, whether the command finishes normally, times out, or
+    # fails to launch at all.
+    proc = None
+    pgid = None
     try:
-        proc = subprocess.run(
-            command,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        observed = {
-            "exit_code": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        }
-    except subprocess.TimeoutExpired:
-        taxonomy = "timeout"
-    except (FileNotFoundError, PermissionError, OSError):
-        taxonomy = "crash"
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            # Capture pgid NOW while the child is definitely alive -- mirrors
+            # _run_http_scenario (see _reap_process_group for why this must
+            # not be re-resolved later via os.getpgid(proc.pid)).
+            pgid = proc.pid
+            stdout, stderr = proc.communicate(timeout=timeout)
+            observed = {
+                "exit_code": proc.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+        except subprocess.TimeoutExpired:
+            taxonomy = "timeout"
+        except (FileNotFoundError, PermissionError, OSError):
+            taxonomy = "crash"
+    finally:
+        if proc is not None:
+            _reap_process_group(proc, pgid)
 
     twin_observations, twin_tokens = _read_twin_deltas(observer_files, offsets)
     observed["twin_observations"] = twin_observations
