@@ -285,7 +285,7 @@ to, so there is nothing to misconfigure into an open egress path (a
 allowlist). Anything not present in the cache fails to install — that is
 pip/npm's own ordinary fail-closed behavior when told `--no-index`/offline
 with a missing package, not a mechanism dark-factory reimplements or
-enforces itself. `df_depcache.py fetch` does **not** resolve transitive
+enforces itself. `df_depcache.py` does **not** resolve transitive
 dependencies beyond what `parse_installed` finds pinned in the artifact
 tree's own manifests — if a builder's install ends up needing an
 un-pinned transitive dependency that pip/npm would normally resolve live,
