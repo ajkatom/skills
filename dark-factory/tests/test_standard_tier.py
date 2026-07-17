@@ -79,7 +79,10 @@ def test_standard_resume_stays_qualified_and_reprobes(tmp_path):
     p = cr / "config.json"
     cfg = json.loads(p.read_text()); cfg["checkpoint"] = "pause"; p.write_text(json.dumps(cfg))
     assert supervisor.run(str(cr), None) == 10          # paused at iteration 1
-    assert supervisor.resume(str(cr), "continue") == 0  # resume re-probes, converges
+    # M36b: H2 converges into a before-ship pause; the seal-reentry re-probes
+    # isolation + re-runs gates over the frozen object, then seals qualified.
+    assert supervisor.resume(str(cr), "continue") == 10  # converged -> AWAIT_SHIP
+    assert supervisor.resume(str(cr), "continue") == 0   # seal-reentry
     run_id = os.listdir(cr / "runs")[0]
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "COMPLETE_QUALIFIED" and m["qualified"] is True

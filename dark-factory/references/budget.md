@@ -296,3 +296,47 @@ byte-identical to M18: no spool directory is ever created, no `NOTIFY_FLUSH`/
 - `dark-factory/tests/test_usage_metering.py` — Task 1 (adapter usage reporting +
   supervisor accumulation) and Task 2 (`token_pricing` → `actual_usd` + the manifest
   `usage` field, fresh/resume/abort/e2e) tests.
+
+## Signed budget-ceiling override at resume (M36b)
+
+A `BUDGET_PAUSE` normally clears by editing `budget.max_usd` (or `max_calls`) in
+`config.json` and `resume`-ing — an unauthenticated local edit. When a run needs
+a *governed* ceiling raise (a policy change that should be authorized, not
+silent), configure a `resume_overrides` policy and raise the ceiling with a
+**signed** override instead:
+
+```json
+"resume_overrides": { "approvers": ["<pubkey_hex>", "..."], "threshold": 1 }
+```
+
+A non-empty policy REQUIRES `audit.signing: true` (mirroring M33a waivers), so
+the sealed `config_sha256` that pins the approver allowlist is HMAC-protected.
+Absent the block, `threshold` defaults to 0 and NO override is ever accepted
+(fail-closed).
+
+Workflow:
+
+```
+# once, per approver:
+supervisor.py df-override keygen --out-prefix approver1        # -> approver1.key / approver1.pub
+#   put each .pub in config.json resume_overrides.approvers
+
+# when a run BUDGET_PAUSEs (its run_dir is <cr>/runs/<run_id>):
+supervisor.py df-override sign --run-dir <cr>/runs/<run_id> \
+    --new-usd-ceiling 250 --expires 2026-09-01T00:00:00Z --key-file approver1.key > override.json
+#   for threshold>1, other approvers: df-override sign --claim override.json ... (merge signatures)
+
+supervisor.py resume --control-root <cr> --decision continue --override override.json
+```
+
+The override is bound to that exact `run_id`, expires at the stated instant, and
+carries a one-time `nonce` recorded in `<control_root>/override-nonces.json` — it
+authorizes **exactly one** resume (a replay is refused). On success the run
+journals `OVERRIDE_APPLIED` and continues under the raised `budget.max_usd` for
+that resume only (the on-disk config is untouched; a fresh run re-reads the
+original cap). `max_calls`-only pauses are out of scope (the override raises the
+`$` ceiling; `budget_ceiling` is the only override type in M36b).
+
+**Credential refresh is NOT an override.** `resume` re-resolves credentials on
+every resume under the sealed credential policy (source/allowlist unchanged), so
+a rotated secret VALUE is picked up automatically — no signed override needed.

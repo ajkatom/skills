@@ -887,6 +887,80 @@ def load_config(control_root: str) -> dict:
                     "workspace_root (the signing key must never be reachable by a run)"
                 )
 
+    # M36b (Part A): optional `resume_overrides` block -> cfg["_resume_overrides"].
+    # The allowlist + threshold that govern a SIGNED resume budget-ceiling
+    # override (df_override). Shape mirrors `security_gates.waivers` exactly:
+    # `approvers` are ed25519 PUBLIC keys as 64-hex (lowercased + deduped, same
+    # stdlib _HEX64_RE shape check — this module never imports `cryptography`),
+    # `threshold` an int in 1..len(approvers). ABSENT -> {"approvers": [],
+    # "threshold": 0}, the fail-closed default: threshold 0 is NEVER satisfiable
+    # in df_override.verify_override, so no override is accepted unless a policy
+    # is explicitly configured. Tier-independent (overrides are a governance
+    # feature, not a tier gate).
+    ro_raw = raw.get("resume_overrides", {})
+    if not isinstance(ro_raw, dict):
+        raise ConfigError("resume_overrides must be a JSON object")
+    ro_approvers_raw = ro_raw.get("approvers", [])
+    if not isinstance(ro_approvers_raw, list):
+        raise ConfigError(
+            "resume_overrides.approvers must be a list of 64-hex-char ed25519 public keys")
+    ro_approvers = []
+    ro_seen = set()
+    for entry in ro_approvers_raw:
+        if not isinstance(entry, str) or not _HEX64_RE.match(entry):
+            raise ConfigError(
+                "resume_overrides.approvers entries must be 64-hex-char ed25519 "
+                f"public keys: {entry!r}")
+        canonical = entry.lower()
+        if canonical in ro_seen:
+            raise ConfigError(
+                "resume_overrides.approvers has a duplicate entry "
+                f"(approvers must be unique): {entry!r}")
+        ro_seen.add(canonical)
+        ro_approvers.append(canonical)
+    ro_threshold = ro_raw.get("threshold", 0)
+    if ro_approvers:
+        if (not isinstance(ro_threshold, int) or isinstance(ro_threshold, bool)
+                or not (1 <= ro_threshold <= len(ro_approvers))):
+            raise ConfigError(
+                "resume_overrides.threshold must be an int in 1.."
+                f"{len(ro_approvers)} (the number of approvers)")
+    else:
+        # No approvers => no override acceptable. A truthy threshold with no
+        # approvers is a broken policy — reject it loudly rather than pin to 0.
+        if ro_threshold:
+            raise ConfigError(
+                "resume_overrides.threshold requires a non-empty approvers list")
+        ro_threshold = 0
+    cfg_resume_overrides = {"approvers": ro_approvers, "threshold": ro_threshold}
+
+    # M36b SECURITY (mirrors the M33a waiver rule above): a NON-EMPTY resume-
+    # override policy REQUIRES a SIGNED audit manifest. The approver allowlist
+    # governing who may raise a spend cap lives in config.json, and every
+    # terminal manifest seals `config_sha256`; that seal is only tamper-PROOF
+    # when the manifest is HMAC-signed. With `audit.signing` off (its default at
+    # cooperative/standard), an actor with control-root write could append their
+    # OWN pubkey to `resume_overrides.approvers`, self-sign, and lift the cap
+    # undetectably. So: require signing whenever approvers are configured — an
+    # EXPLICIT `false` is a hard rejection; an absent/defaulted-false is forced
+    # ON (with the same key_path defaulting + disjointness guard the audit block
+    # applies) so the sealing claim holds by construction.
+    if ro_approvers:
+        if audit_raw.get("signing") is False:
+            raise ConfigError(
+                "resume_overrides requires audit.signing: true so the sealed config "
+                "(hence the approver allowlist) is HMAC-protected — an unsigned "
+                "manifest's config_sha256 can be forged by anyone with control-root write")
+        if not audit_signing:
+            audit_signing = True
+            if not audit_key_path:
+                audit_key_path = os.path.expanduser("~/.dark-factory/audit.key")
+            key_dir = os.path.dirname(os.path.abspath(audit_key_path))
+            if not _disjoint(key_dir, control_root) or not _disjoint(key_dir, ws):
+                raise ConfigError(
+                    "audit.key_path must live outside both the control root and "
+                    "workspace_root (the signing key must never be reachable by a run)")
+
     # Optional `credentials` block -> cfg["_credentials"] (M11): a brokered
     # allowlist of provider credentials the builder is permitted to receive.
     # Absent -> None (exactly today's behavior at every tier). Validated here
@@ -1339,6 +1413,7 @@ def load_config(control_root: str) -> dict:
         "token_pricing": token_pricing,
     }
     cfg["_credentials"] = cfg_credentials
+    cfg["_resume_overrides"] = cfg_resume_overrides
     cfg["_brownfield"] = cfg_brownfield
     cfg["_confine"] = cfg_confine
     cfg["_custody"] = cfg_custody

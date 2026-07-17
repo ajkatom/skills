@@ -35,27 +35,45 @@ with no covering waiver, a hard budget/CAP terminal, and a
 `QUALIFICATION_LIMITED` sub-state (e.g. host-isolation limited) are TERMINALS in
 **every** mode — never a pause you could skip.
 
-## DEFERRED: the before-ship gate
+## The before-ship gate (H1/H2) — M36b
 
-The original plan sketched a *before-ship* PAUSE (approve the artifact before
-sealing) for H1 and H2. M36a **defers** it — no mode pauses before ship — for
-two reasons:
+On convergence, **H1 and H2 pause for a human ship approval** before the
+artifact is sealed. The pause fires only **after** the final exam PASSES, the
+security gates PASS, and the frozen artifact re-verifies by identity — the run
+is one approval away from `COMPLETE_QUALIFIED`. H3 (guarded) and H4 (lights-out)
+never pause here.
 
-1. **Back-compat.** A before-ship pause on H2 (the default) would fire a second
-   pause on every converging run, changing the observable behavior of the whole
-   converge-after-resume test corpus. The plan's own mapping note ("legacy
-   `pause` paused only after verify — not before build, not before ship") and
-   the hard back-compat mandate both forbid this.
-2. **The pause mechanism.** The existing mechanism resumes by advancing the
-   iteration and rebuilding. A ship-approval pause happens *after* the converged
-   artifact exists, so resuming it must seal *without* rebuilding — otherwise it
-   re-dispatches a paid builder call, violating the crash-dispatch invariant
-   ("resume never silently re-dispatches"). Supporting that cleanly needs
-   seal-reentry machinery beyond a pause-point set.
+M36a deferred this because the existing pause mechanism resumes by *rebuilding*,
+and a ship pause happens *after* the artifact is already frozen — resuming it
+must seal *without* re-dispatching a paid builder call (the M35 crash-dispatch
+invariant). M36b adds the **seal-reentry** resume path to do exactly that:
 
-The `AWAIT_SHIP` phase and the `pauses_before_ship()` predicate exist (they
-return False everywhere) so a future milestone can enable the gate in one place
-once seal-reentry is designed.
+- **Pausing.** In the converged branch, before sealing, the supervisor persists
+  an `AWAIT_SHIP` FSM checkpoint carrying the converged iteration, the sealed
+  final-exam result, and the frozen `artifact.object_id`; it appends an
+  `AWAIT_SHIP` transition to the hash chain (binding that object_id) and writes
+  `checkpoint_ship.md`. `state.json` records `phase: "AWAIT_SHIP"` +
+  `ship_meta`.
+- **`resume --decision continue`.** Re-validates the FSM chain, **re-verifies
+  the frozen object matches its sidecar** (fail-closed on drift), **re-runs the
+  security gates over the frozen object**, and seals via the SAME
+  `df_qualify.derive` path — **never entering the build loop**, so the builder
+  call count is unchanged (`SHIP_RESUME` is journaled). The artifact is
+  immutable, so re-running the gates is cheap; re-running (rather than trusting
+  the persisted verdict) is the honest fail-closed choice.
+- **`resume --decision abort`.** Seals a distinct **`SHIP_DECLINED`** terminal
+  (qualified `False`) that still binds the frozen artifact object (the declined
+  candidate stays auditable) — not `ABORTED_BY_HUMAN`.
+
+Under **H1** a converging run therefore pauses up to three times per final
+cycle: `AWAIT_VERIFY_i`, `AWAIT_BUILD_{i+1}`, then `AWAIT_SHIP`. Under **H2**
+(the default) it pauses at `AWAIT_VERIFY_i` and then `AWAIT_SHIP`. This is a
+deliberate, documented behavior change from M36a: a supervised mode now signs
+off the ship.
+
+**Credential-value refresh needs no override or special handling here:** resume
+re-resolves credentials on *every* resume under the sealed credential policy, so
+the ship-resume already picks up a changed secret value automatically.
 
 ## Resume workflow
 
@@ -64,19 +82,23 @@ Identical to before. At a pause:
 - `checkpoint_iter_N.md` — an after-verify checkpoint (H1/H2).
 - `checkpoint_build_N.md` — an H1 before-build checkpoint (review the prior
   feedback before approving the next build).
+- `checkpoint_ship.md` — an H1/H2 before-ship checkpoint (approve the converged,
+  frozen artifact before it seals). `continue` seals without rebuilding; `abort`
+  seals `SHIP_DECLINED`.
 
 Then one of:
 
 ```
-supervisor.py resume --control-root <cr> --decision continue   # approve / build again
+supervisor.py resume --control-root <cr> --decision continue   # approve / build again / seal
 supervisor.py resume --control-root <cr> --decision accept     # stop, waived/unverified
-supervisor.py resume --control-root <cr> --decision abort
+supervisor.py resume --control-root <cr> --decision abort      # (from AWAIT_SHIP: SHIP_DECLINED)
 ```
 
-Under **H1**, a converging run pauses twice per cycle: once after the verify
-(`AWAIT_VERIFY_i`) and once before the approved rebuild (`AWAIT_BUILD_{i+1}`).
-The before-build approval is one-shot (a `build_approved_through` cursor in the
-saved state), so resuming an approved build does not re-pause it.
+Under **H1**, a converging run pauses up to three times per final cycle: after
+the verify (`AWAIT_VERIFY_i`), before the approved rebuild (`AWAIT_BUILD_{i+1}`),
+and before the ship (`AWAIT_SHIP`). The before-build approval is one-shot (a
+`build_approved_through` cursor in the saved state), so resuming an approved
+build does not re-pause it.
 
 ## Migrating a legacy config
 

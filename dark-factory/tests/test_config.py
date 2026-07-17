@@ -154,3 +154,73 @@ def test_hardened_tier_now_accepted(tmp_path):
     cfg = df_config.load_config(str(cr))
     assert cfg["assurance"] == "hardened"
     assert cfg["_qualified"] is True
+
+
+# --- M36b (Part A) resume_overrides validation ------------------------------
+
+_PK = "ab" * 32  # a 64-hex placeholder public key (shape-valid)
+_PK2 = "cd" * 32
+
+
+def test_resume_overrides_absent_defaults_to_fail_closed(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_resume_overrides"] == {"approvers": [], "threshold": 0}
+
+
+def test_resume_overrides_valid_policy_forces_signing(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [_PK, _PK2], "threshold": 2},
+                 audit={"signing": True, "key_path": str(tmp_path / "keys" / "a.key")})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_resume_overrides"] == {"approvers": [_PK, _PK2], "threshold": 2}
+    assert cfg["_audit"]["signing"] is True
+
+
+def test_resume_overrides_nonempty_forces_signing_when_absent(tmp_path):
+    # A non-empty policy with NO explicit audit.signing forces it ON.
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [_PK], "threshold": 1},
+                 audit={"key_path": str(tmp_path / "keys" / "a.key")})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_audit"]["signing"] is True
+
+
+def test_resume_overrides_explicit_signing_false_is_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [_PK], "threshold": 1},
+                 audit={"signing": False})
+    with pytest.raises(df_config.ConfigError, match="resume_overrides requires audit.signing"):
+        df_config.load_config(str(cr))
+
+
+def test_resume_overrides_threshold_out_of_range_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [_PK], "threshold": 2},
+                 audit={"signing": True, "key_path": str(tmp_path / "keys" / "a.key")})
+    with pytest.raises(df_config.ConfigError, match="resume_overrides.threshold"):
+        df_config.load_config(str(cr))
+
+
+def test_resume_overrides_threshold_without_approvers_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [], "threshold": 1})
+    with pytest.raises(df_config.ConfigError, match="requires a non-empty approvers list"):
+        df_config.load_config(str(cr))
+
+
+def test_resume_overrides_duplicate_approver_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": [_PK, _PK], "threshold": 1},
+                 audit={"signing": True, "key_path": str(tmp_path / "keys" / "a.key")})
+    with pytest.raises(df_config.ConfigError, match="duplicate"):
+        df_config.load_config(str(cr))
+
+
+def test_resume_overrides_malformed_key_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, resume_overrides={"approvers": ["nothex"], "threshold": 1},
+                 audit={"signing": True, "key_path": str(tmp_path / "keys" / "a.key")})
+    with pytest.raises(df_config.ConfigError, match="64-hex"):
+        df_config.load_config(str(cr))

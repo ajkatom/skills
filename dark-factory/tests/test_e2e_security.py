@@ -166,8 +166,13 @@ def test_resumed_converge_also_runs_security_gates(tmp_path):
     assert not (run_dir / "manifest.json").exists()
     assert not (run_dir / "security_report.json").exists()
 
+    # M36b: converge pauses before ship; gates already ran (report exists), and
+    # a second resume re-runs them over the frozen object + seals.
     p2 = _run(cr, "resume", "--decision", "continue")
-    assert p2.returncode == 0, p2.stderr  # converged after resume
+    assert p2.returncode == 10, p2.stderr  # converged -> AWAIT_SHIP pause
+    assert (run_dir / "security_report.json").exists()
+    p3 = _run(cr, "resume", "--decision", "continue")
+    assert p3.returncode == 0, p3.stderr  # seal-reentry
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["outcome"] == "COMPLETE_UNQUALIFIED"

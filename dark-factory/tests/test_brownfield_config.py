@@ -404,8 +404,11 @@ def test_resume_reuses_generated_scenarios_dir_without_recharacterizing(tmp_path
         "import sys\nprint('completely different legacy app now')\n", encoding="utf-8",
     )
 
+    # M36b: FAKE converges on iteration 2 but H2 pauses before ship; seal it.
     rc2 = supervisor.resume(str(cr), "continue")
-    assert rc2 == 0  # FAKE converges on iteration 2
+    assert rc2 == supervisor.PAUSED  # converged -> AWAIT_SHIP
+    rc3 = supervisor.resume(str(cr), "continue")
+    assert rc3 == 0  # seal-reentry
 
     after = {
         name: (gen_dir / name).read_text(encoding="utf-8")

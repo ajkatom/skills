@@ -29,48 +29,47 @@ The four modes (human name aliases in parentheses):
                   indefinite block. Requires a hardened/enterprise backend
                   (the same tier gate legacy autonomy 5 used).
 
-DEVIATION FROM THE PLAN'S TABLE (documented, deliberate) -- the BEFORE_SHIP
-gate: the plan's table + Task-6 e2e sketch list a "before ship" PAUSE for H1
-AND H2. Two hard constraints defeat it:
+BEFORE_SHIP (M36b — the pause the plan's table always specified for H1 AND H2,
+DEFERRED in M36a, LANDED here): on convergence, after the final exam PASSES and
+the security gates PASS and the frozen artifact re-verifies — but BEFORE sealing
+COMPLETE_QUALIFIED — H1 and H2 PAUSE for a ship approval. M36a deferred this for
+two reasons M36b resolves:
 
   1. Back-compat. A before-ship pause on H2 (the DEFAULT) fires a SECOND pause
-     on every converging run, changing the observable behavior of ~10 existing
-     converge-after-resume tests. The plan's OWN mapping note ("legacy `pause`
-     paused only AFTER verify -- not before build, not before ship") and the
-     thrice-stated compat mandate ("default mode H2 reproduces today's pause
-     behavior; legacy observable pause UNCHANGED") both forbid this.
+     on every converging run. M36b ACCEPTS this as the intended semantics of a
+     supervised mode (a human signs off the ship), and updates the
+     converge-after-resume tests to expect the AWAIT_SHIP pause + one more
+     `resume` to seal. This is a deliberate behavior change, not a regression.
 
-  2. The pause MECHANISM. Every M36a mode is defined as a pause-point SET over
-     the EXISTING pause mechanism, which resumes by advancing the iteration and
-     REBUILDING. A ship-approval pause happens AFTER the builder already
+  2. The pause MECHANISM. A ship-approval pause happens AFTER the builder
      produced the converged artifact, so resuming it must seal WITHOUT
-     rebuilding -- otherwise it re-dispatches a paid builder call, violating the
-     M35 crash-dispatch invariant ("resume never silently re-dispatches"). That
-     needs new seal-reentry machinery, which the plan explicitly forbids ("do
-     NOT build new interactive-prompt machinery; keep blast radius bounded").
+     rebuilding — otherwise it re-dispatches a paid builder call, violating the
+     M35 crash-dispatch invariant. M36b adds the SEAL-REENTRY resume path
+     (supervisor `_run_loop(resume_ship=True)`): from AWAIT_SHIP, resume
+     re-verifies the frozen object, re-runs the security gates over it, and
+     seals via the SAME `df_qualify.derive` path — the build for-loop is never
+     entered, so `builder_calls` is provably unchanged across the ship-resume.
 
-By contrast BEFORE_BUILD DOES fit the existing mechanism (it pauses BEFORE the
-dispatch; resume rebuilds exactly once, no duplicate spend). So the honest,
-constraint-respecting resolution is: BEFORE_SHIP is DEFERRED (no mode pauses on
-it in M36a); H1 (directed) is distinguished from H2 by the BEFORE_BUILD gate it
-adds. The token + AWAIT_SHIP phase are kept defined for forward-compat but map
-to no pause. See references/modes.md for the full rationale.
+H3/H4 stay False for BEFORE_SHIP: guarded/lights-out never pause for a human
+here. `resume --decision abort` from AWAIT_SHIP seals a SHIP_DECLINED terminal
+(qualified False). See references/modes.md for the full rationale.
 """
 
 # --- Pause-point tokens (the columns of the state-transition table) ---------
 BEFORE_BUILD = "before_build"      # before each BUILD_i, i>=2 (post-first-feedback)
 AFTER_VERIFY = "after_verify"      # after a non-converged VERIFY_i (i<cap)
-BEFORE_SHIP = "before_ship"        # on convergence -- DEFERRED (see module docstring)
+BEFORE_SHIP = "before_ship"        # on convergence, before seal (H1/H2; M36b)
 ON_BUDGET_GUARD = "on_budget_guard"  # the budget admission guard (recoverable pause)
 
 INTERVENTION_MODES = ("H1", "H2", "H3", "H4")
 
 # The authoritative pause-point SET per mode. Everything else in this module is
 # a thin predicate over this dict; the supervisor consults the predicates.
-# BEFORE_SHIP appears in NO set (deferred -- see the module docstring).
+# BEFORE_SHIP is in H1 and H2 (M36b): both supervised/directed modes pause for a
+# human ship approval on convergence. H3/H4 never do.
 _PAUSE_POINTS = {
-    "H1": frozenset({BEFORE_BUILD, AFTER_VERIFY, ON_BUDGET_GUARD}),
-    "H2": frozenset({AFTER_VERIFY, ON_BUDGET_GUARD}),
+    "H1": frozenset({BEFORE_BUILD, AFTER_VERIFY, BEFORE_SHIP, ON_BUDGET_GUARD}),
+    "H2": frozenset({AFTER_VERIFY, BEFORE_SHIP, ON_BUDGET_GUARD}),
     "H3": frozenset({ON_BUDGET_GUARD}),
     "H4": frozenset(),
 }
@@ -128,9 +127,11 @@ def pauses_after_verify(mode: str) -> bool:
 
 
 def pauses_before_ship(mode: str) -> bool:
-    """True iff convergence pauses for a ship-approval before FINAL_EXAM/seal.
-    DEFERRED in M36a -- always False (see the module-level DEVIATION note).
-    Kept as a predicate so a future milestone can enable it in ONE place."""
+    """True iff convergence pauses for a human ship-approval before the artifact
+    is sealed COMPLETE_QUALIFIED. H1/H2 -> True (M36b); H3/H4 -> False. The
+    supervisor takes this pause only AFTER the final exam + gates pass and the
+    frozen object re-verifies, and resumes it via the seal-reentry path (no
+    builder re-dispatch)."""
     return BEFORE_SHIP in pause_points(mode)
 
 

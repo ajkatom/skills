@@ -496,9 +496,13 @@ def test_resume_reresolves_credentials_and_state_json_is_value_free(tmp_path, mo
     state_text = state_path.read_text(encoding="utf-8")
     assert SECRET not in state_text  # state.json must NEVER carry a credential value
 
+    # M36b: H2 converges into an AWAIT_SHIP pause; each resume re-resolves creds.
     rc2 = supervisor.resume(str(cr), "continue")
-    assert rc2 == 0
-    assert len(calls) == 2  # re-resolved on resume, before the loop re-enters
+    assert rc2 == supervisor.PAUSED  # converged -> before-ship pause
+    assert len(calls) == 2  # re-resolved on this resume, before the loop re-enters
+    rc3 = supervisor.resume(str(cr), "continue")
+    assert rc3 == 0  # seal-reentry
+    assert len(calls) == 3  # re-resolved again on the ship-resume
 
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["credentials"] == {"source": "env", "allowlist": ["FOO_API_KEY"]}

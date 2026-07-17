@@ -313,12 +313,16 @@ def test_resume_reloads_accumulated_tokens_no_double_count(tmp_path, monkeypatch
 
     monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke_fixed)
 
+    # M36b: the rebuild+converge resume pauses before ship; the ship-resume
+    # seals WITHOUT a builder call, so token totals do not change again.
     rc2 = supervisor.resume(str(cr), "continue")
-    assert rc2 == 0
+    assert rc2 == supervisor.PAUSED  # converge -> AWAIT_SHIP
+    rc3 = supervisor.resume(str(cr), "continue")
+    assert rc3 == 0
 
     entries2, _ = read_journal(cr)
     builds = [e for e in entries2 if e["state"] == "BUILD"]
-    assert len(builds) == 2  # 1 before pause + 1 after resume, no double count
+    assert len(builds) == 2  # 1 before pause + 1 after resume, no double count (ship-resume adds none)
     assert builds[0]["data"]["builder_input_tokens"] == 100
     assert builds[0]["data"]["builder_output_tokens"] == 200
     # additive, not re-summed from scratch: 100+50 / 200+70, never 100+100.
@@ -560,8 +564,11 @@ def test_manifest_usage_after_resume_converged_accumulates_across_pause(tmp_path
                 "usage": {"known": True, "input_tokens": 50, "output_tokens": 70}}, None
 
     monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke_fixed)
+    # M36b: converge -> before-ship pause -> seal-reentry (no builder call).
     rc2 = supervisor.resume(str(cr), "continue")
-    assert rc2 == 0
+    assert rc2 == supervisor.PAUSED
+    rc3 = supervisor.resume(str(cr), "continue")
+    assert rc3 == 0
 
     _, run_id = read_journal(cr)
     manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text(encoding="utf-8"))
