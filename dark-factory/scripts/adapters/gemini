@@ -43,10 +43,17 @@ def main():
         argv = df_confine.confinement_flags("gemini", prompt)
     else:
         argv = ["gemini", "--yolo", "--prompt", prompt]
+    # gemini refuses autonomous (--yolo) file writes in an "untrusted" folder,
+    # silently downgrading approval to "default" so nothing gets written. The
+    # workspace IS the intended build target (and the tier sandbox, not gemini's
+    # own folder-trust prompt, provides the real isolation), so tell gemini to
+    # trust it. Without this a gemini build produces an empty workspace.
+    child_env = dict(os.environ, GEMINI_CLI_TRUST_WORKSPACE="true")
     try:
         proc = subprocess.run(
             argv,
             cwd=req["workdir"],
+            env=child_env,
             timeout=req.get("timeout_s", 600),
             capture_output=True,
             text=True,
