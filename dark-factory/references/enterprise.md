@@ -118,6 +118,21 @@ Keys are generated with `supervisor.py df-custody keygen [--out-prefix <p>]`
 supervisor.py df-custody attach <control_root> --run-dir <run_dir>
 ```
 
+**Custody binds the artifact `object_id` (DF-01/M28a), not just the manifest bytes.**
+`attach` first requires the manifest to carry a bound `artifact` (see
+`references/audit.md`'s "Artifact binding (DF-01)" section) — a `null` artifact
+(a pre-M28a manifest, or a terminal that never froze a workspace) is refused
+outright, before any signature check ("predates artifact binding"). It then
+independently re-verifies the bound object against the live object store
+(`df_seal.verify_object`) and refuses if that object has drifted or gone
+missing, even when every signature is otherwise valid. So approvers attesting
+K-of-N over the manifest bytes are, transitively, attesting to the **exact
+built object** those bytes reference — a signed manifest whose artifact was
+mutated or pruned out from under it cannot be attached. `verify-custody`
+re-runs this same object re-verification on every check, not just once at
+attach time, so a custody attestation that was valid at attach time stops
+reading `QUALIFIED` the moment the underlying object drifts.
+
 `attach` reads the immutable manifest and the collected signatures, runs
 `verify_custody(manifest_bytes, sigs, config-approvers, config-threshold)`, and:
 

@@ -36,6 +36,7 @@ import pytest
 
 import df_common
 import df_custody
+import df_sandbox
 import df_seal
 import supervisor
 from test_enterprise_config import (
@@ -357,7 +358,10 @@ def test_verify_manifest_cli_prints_artifact_unavailable_on_pruned_object(tmp_pa
 
     proc = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir", run_dir],
                           capture_output=True, text=True)
-    assert proc.returncode != 0
+    # Carry-over Minor #1: pin the EXACT code, not just "nonzero" -- a
+    # regression that swapped ARTIFACT_UNAVAILABLE's exit code with
+    # UNBOUND's (5 <-> 6) must fail this test.
+    assert proc.returncode == 5, proc.stdout + proc.stderr
     assert "ARTIFACT UNAVAILABLE" in proc.stdout
 
 
@@ -376,7 +380,10 @@ def test_verify_manifest_cli_distinguishes_unbound_from_mismatch(tmp_path):
     _make_unbound_manifest(run_dir)
     unbound = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir", run_dir],
                              capture_output=True, text=True)
-    assert unbound.returncode != 0
+    # Carry-over Minor #1: pin the EXACT codes (not just distinctness) --
+    # UNBOUND=6, ARTIFACT_MISMATCH=5, so a regression swapping 5<->6 is
+    # caught by this test, not just "some difference exists."
+    assert unbound.returncode == 6, unbound.stdout + unbound.stderr
     assert "UNBOUND" in unbound.stdout
 
     cr2, run_dir2, manifest2 = _run_and_get(tmp_path / "second")
@@ -386,7 +393,7 @@ def test_verify_manifest_cli_distinguishes_unbound_from_mismatch(tmp_path):
     _mutate_one_byte(target2)
     mismatch = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir", run_dir2],
                               capture_output=True, text=True)
-    assert mismatch.returncode != 0
+    assert mismatch.returncode == 5, mismatch.stdout + mismatch.stderr
     assert "ARTIFACT MISMATCH" in mismatch.stdout
     # The two failure modes must be machine-distinguishable, not just two
     # different flavors of the same nonzero exit code.
@@ -556,3 +563,151 @@ def test_attach_custody_takes_control_root_lock_around_writes(tmp_path, monkeypa
         assert supervisor.attach_custody(str(cr), str(run_dir)) == 0
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# DF-01/M28a Task 4: end-to-end acceptance.
+#
+# Everything above this point exercises the plumbing (supervisor.run() /
+# supervisor.verify_manifest() called in-process, plus a couple of direct
+# CLI subprocess calls for exit-code shape). This section drives a REAL
+# converged run through the supervisor CLI end to end (mirroring
+# test_e2e_standard.py's pattern), and pins the FULL verify-manifest exit-
+# code contract exactly (Carry-over Minor #1): OK=0, TAMPERED/UNVERIFIED=4
+# (byte-tamper, unchanged -- already pinned in
+# test_manifest.py::test_verify_manifest_cli_exit_codes, unaffected by this
+# milestone), ARTIFACT_MISMATCH=5, ARTIFACT_UNAVAILABLE=5, UNBOUND=6.
+#
+# Honest scope -- read before relying on this section for more than it
+# claims: every test below proves IN-MODEL DETECTION. A confined candidate
+# process, an accident, or a gate/scenario that mutates bytes under
+# <control_root>/objects/ after freeze() is caught fail-closed --
+# verify-manifest reports ARTIFACT_MISMATCH/UNAVAILABLE (never a clean
+# pass), and the supervisor's OWN post-final-exam re-verify (the
+# df_seal.verify_object call right after _run_security_gates returns, see
+# supervisor.py) refuses to let a mutated object reach CONVERGED in the
+# first place, regardless of what mutated it or why.
+#
+# This does NOT prove same-user prevention. A party with the SAME
+# filesystem write access used to publish the object store can forge new,
+# internally-consistent "pristine" bytes at the same privilege level --
+# nothing in df_seal or this test suite can tell that apart from a
+# legitimate object. This is the identical, already-documented residual
+# finalize_manifest's HMAC signing carries for the manifest itself (see
+# references/audit.md's "Honest limits"), now simply extended to the
+# artifact object it references. See references/audit.md's "Artifact
+# binding (DF-01)" section for the full writeup and the documented residual.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
+def test_e2e_standard_tier_cli_run_binds_object_and_verify_manifest_pins_exit_codes(tmp_path):
+    """Acceptance items (a) + (b): a REAL converged standard-tier run,
+    driven via the supervisor CLI as a subprocess (not an in-process
+    supervisor.run() call) -- mirrors test_e2e_standard.py's
+    control-root/fake-builder scaffold. Proves the run binds
+    manifest["artifact"]["object_id"] to a genuinely-published,
+    independently-verifying object and that `verify-manifest` exits 0 on
+    it via the real CLI; then, after mutating one byte under
+    <control_root>/objects/, that the SAME CLI invocation exits with the
+    EXACT pinned ARTIFACT_MISMATCH code (5), not just some nonzero code."""
+    b = df_sandbox.current_backend()
+    if not (b and b.available()):
+        pytest.skip("no OS sandbox primitive")
+
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text())
+    cfg["assurance"] = "standard"
+    p.write_text(json.dumps(cfg))
+
+    proc = subprocess.run([sys.executable, SUP, "run", "--control-root", str(cr)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "COOPERATIVE MODE" not in proc.stderr  # not silently downgraded
+
+    run_id = os.listdir(cr / "runs")[0]
+    run_dir = str(cr / "runs" / run_id)
+    manifest = _manifest(cr, run_id)
+    assert manifest["outcome"] == "COMPLETE_QUALIFIED" and manifest["qualified"] is True
+
+    # (a) the run binds a real, independently-verifying object, and the CLI
+    # (not just the in-process helper) reports OK on it -- exit code
+    # PINNED, not just "== 0 happened to be truthy."
+    artifact = manifest["artifact"]
+    assert artifact is not None
+    object_store = supervisor._object_store_root(str(cr))
+    assert df_seal.verify_object(object_store, artifact["object_id"]) is True
+
+    ok = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir", run_dir],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "OK" in ok.stdout
+
+    # (b) mutate one byte under the published object -- the same drift a
+    # hostile write, an accident, or a mutating gate would leave. The CLI
+    # must fail closed with the EXACT pinned code, never a silent pass.
+    content_dir = _object_content_dir(cr, artifact["object_id"])
+    target = _first_file_in(content_dir)
+    assert target, "fixture object has no files to mutate"
+    _mutate_one_byte(target)
+
+    mismatch = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir", run_dir],
+                              capture_output=True, text=True)
+    assert mismatch.returncode == 5, mismatch.stdout + mismatch.stderr
+    assert "ARTIFACT MISMATCH" in mismatch.stdout
+
+
+def test_gate_that_mutates_the_frozen_object_never_reaches_converged(tmp_path, monkeypatch):
+    """Acceptance item (c): a gate that writes INTO the object dir is
+    rejected -- demonstrated directly, not via the standalone
+    object-mutation helper tests above. `_run_security_gates` runs AFTER
+    freeze() and BEFORE the supervisor's own post-final-exam
+    `df_seal.verify_object` re-check (see supervisor.py, the "DF-01/M28a
+    belt-and-suspenders" comment right after the `_run_security_gates`
+    call site). We wrap the REAL `_run_security_gates` with a spy that
+    flips one byte of the just-frozen object as a side effect -- standing
+    in for a hostile or simply buggy gate implementation that writes where
+    it has no business writing -- then returns the real, unmodified
+    security report so gate LOGIC itself is untouched; only the fail-
+    closed net under test is exercised. The run must never reach
+    CONVERGED, regardless of what mutated the bytes or why."""
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    real_gates = supervisor._run_security_gates
+
+    def mutating_gates(cfg, journal, run_dir, workspace, redactor=None):
+        result = real_gates(cfg, journal, run_dir, workspace, redactor=redactor)
+        object_store = supervisor._object_store_root(cfg["_control_root"])
+        object_id = df_seal.object_id_of(df_seal.object_manifest(workspace))
+        content_dir = os.path.join(object_store, "objects", object_id)
+        target = _first_file_in(content_dir)
+        assert target, "fixture workspace produced an object with no files to mutate"
+        _mutate_one_byte(target)
+        return result
+
+    monkeypatch.setattr(supervisor, "_run_security_gates", mutating_gates)
+
+    rc = supervisor.run(str(cr), None)
+    assert rc == 3
+
+    entries, run_id = read_journal(cr)
+    states = [e["state"] for e in entries]
+    assert "ARTIFACT_UNHASHABLE" in states
+    assert "CONVERGED" not in states
+    assert "CUSTODY_PENDING" not in states
+
+    manifest = _manifest(cr, run_id)
+    assert manifest["outcome"] == "ARTIFACT_UNHASHABLE"
+    assert manifest["qualified"] is False
+    # No object_id trustworthy enough to bind -- the mutated object is
+    # never presented as this run's artifact.
+    assert manifest["artifact"] is None
+
+    # The drift is independently confirmed the same way an operator would
+    # discover it: verify-manifest on this run_dir is UNBOUND (no artifact
+    # was ever bound for this ARTIFACT_UNHASHABLE terminal) -- exit 6,
+    # never a clean pass.
+    proc = subprocess.run([sys.executable, SUP, "verify-manifest", "--run-dir",
+                          str(cr / "runs" / run_id)], capture_output=True, text=True)
+    assert proc.returncode == 6, proc.stdout + proc.stderr
+    assert "UNBOUND" in proc.stdout

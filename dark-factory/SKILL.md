@@ -250,7 +250,15 @@ unchanged below.
      the raised cap and continues from where it paused (builder-call/estimate counts
      persist, no reset, no double-count). See `references/budget.md`.
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
-   path, and `verify-manifest --run-dir <run_dir>`. State that cooperative tier is unqualified.
+   path, and `verify-manifest --run-dir <run_dir>`. `verify-manifest` (DF-01/M28a) now also
+   re-verifies the manifest's bound artifact object against the content-addressed store at
+   `<control_root>/objects/` — pass `--object-store <path>` when checking a `run_dir` copied
+   away from its original control root. Exit codes: `0` OK · `4` TAMPERED/UNVERIFIED (manifest
+   byte-integrity/signature) · `5` ARTIFACT MISMATCH/UNAVAILABLE (bound object drifted or
+   missing) · `6` UNBOUND (manifest never bound an artifact — expected for `CAP_REACHED`/gate
+   aborts/pre-M28a manifests, not itself a failure of the run). See `references/audit.md`'s
+   "Artifact binding (DF-01)" section for the full table and the honest detection-grade scope.
+   State that cooperative tier is unqualified.
    Every run — regardless of config — also appends one linked entry to
    `<control_root>/audit-chain.jsonl`; check the WHOLE control root's chain with
    `verify-chain <control_root> [--key-path <keyfile>]` (`OK: N entries` / exit 0, or the
