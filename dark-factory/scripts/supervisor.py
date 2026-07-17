@@ -27,6 +27,7 @@ import df_kb
 import df_notify
 import df_proxy
 import df_sandbox
+import df_seal
 import df_security
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
@@ -396,6 +397,50 @@ def _confine_manifest_field(confine_cfg, cli):
         "tool_allowlist": list(profile.get("tool_allowlist", [])),
         "probe": "unverified",
     }
+
+
+def _object_store_root(control_root: str) -> str:
+    """Where DF-01/M28a's content-addressed object store lives for this
+    control root: `<control_root>/objects`. This is the `object_store`
+    argument passed to every `df_seal.freeze`/`df_seal.verify_object` call
+    in this module — the actual per-object directories/sidecars therefore
+    live at `<control_root>/objects/objects/<object_id>[.json]` (df_seal's
+    own `object_store/objects/...` convention layered under this module's
+    `objects` dir). A later `verify` (Task 3) derives the SAME path from
+    just the control root, so nothing about the object store's location
+    needs to be recorded anywhere else.
+    """
+    return os.path.join(control_root, "objects")
+
+
+def _seal_workspace_artifact(control_root: str, workspace: str):
+    """Freeze `workspace` into the content-addressed object store (DF-01/
+    M28a seal-first fix) and return `(object_id, artifact_field)`, where
+    `artifact_field` is exactly what belongs at `manifest["artifact"]`.
+
+    Raises `df_seal.SealError` on any hostile/unhashable workspace content
+    (symlink, special file, setuid/setgid/world-writable entry, ...) — the
+    caller MUST treat that as a fail-closed, non-qualified terminal
+    (`ARTIFACT_UNHASHABLE`), never let a qualified/CONVERGED manifest out
+    the door whose artifact couldn't actually be frozen.
+
+    Reads the sidecar `df_seal.freeze()` already wrote back off disk
+    (rather than re-scanning `workspace` a second time) so `file_count`/
+    `dir_count` are exactly what was published — no second read of a
+    workspace that could, in principle, differ from what was just hashed.
+    """
+    object_store = _object_store_root(control_root)
+    object_id = df_seal.freeze(workspace, object_store)
+    sidecar_path = os.path.join(object_store, "objects", object_id + ".json")
+    with open(sidecar_path, "r", encoding="utf-8") as f:
+        sidecar = json.load(f)
+    artifact_field = {
+        "object_id": object_id,
+        "seal_version": sidecar["seal_version"],
+        "file_count": len(sidecar["files"]),
+        "dir_count": len(sidecar["dirs"]),
+    }
+    return object_id, artifact_field
 
 
 def _run_security_gates(cfg, journal, run_dir, workspace, redactor=None):
@@ -1524,6 +1569,17 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # enterprise resolve's LIVE seccomp probe has actually verified True
         # (resolve_isolation never returns "enterprise" otherwise).
         "enterprise_seccomp": None,
+        # Additive (DF-01/M28a Task 2): same "None unless overridden"
+        # threading as custody/proxy/enterprise_egress — seeded here so
+        # EVERY terminal manifest carries `artifact`, including every
+        # pre-workspace abort branch below (mirrors how `snapshot_sha256`
+        # is seeded None until a workspace actually exists). Only
+        # overridden, in `_run_loop`, on the terminals reached AFTER the
+        # converged workspace has been successfully frozen into the
+        # content-addressed object store (CONVERGED, FINAL_EXAM_FAILED,
+        # SECURITY_GATE_FAILED) — never on ARTIFACT_UNHASHABLE or any
+        # earlier terminal, where no trustworthy object_id exists yet.
+        "artifact": None,
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -1868,6 +1924,33 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
         return anchor_exit or 2
+
+    def _artifact_unhashable_abort(iteration, detail, fe=None, sec_report=None):
+        # DF-01/M28a: fail-closed terminal for a converged workspace that
+        # could not be trusted as a content-addressed artifact — either
+        # `df_seal.freeze()` itself refused it (hostile/unhashable content:
+        # symlink, special file, setuid/setgid/world-writable entry, ...),
+        # or a post-final-exam `verify_object` re-check found the already-
+        # frozen object no longer matches its own sidecar (integrity drift
+        # in the object store between freeze and manifest write). Either
+        # way: NEVER a qualified/CONVERGED manifest, and `artifact` stays
+        # None — there is no object_id trustworthy enough to bind.
+        journal.write("ARTIFACT_UNHASHABLE", iteration=iteration, detail=detail)
+        mf = dict(mb_clean, outcome="ARTIFACT_UNHASHABLE", iterations=iteration, qualified=False,
+                  final_exam=fe or {"ran": False, "passed": None, "count": 0},
+                  regressions=sorted(regressed), artifact=None,
+                  security=sec_report if sec_report is not None else {"checked": False},
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                              builder_input_tokens, builder_output_tokens))
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, [])
+        print(f"dark-factory: ARTIFACT UNHASHABLE (artifact rejected, not qualified): "
+              f"{detail}. Run: {run_dir}")
+        return anchor_exit or 3
 
     twins_enabled = cfg["_twins"]["enabled"]
     ts = df_twins.TwinSet() if twins_enabled else None
@@ -2298,6 +2381,46 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             prev_dev_status = cur_dev_status
 
             if report["all_pass"]:
+                # DF-01/M28a (seal-first): freeze the converged workspace into
+                # a content-addressed object BEFORE the final exam runs, so
+                # the identity bound into the manifest is provably what dev
+                # converged on -- not a workspace that could still be swapped
+                # after the fact and before the final exam/gates/manifest
+                # write. Fail-closed on hostile/unhashable content: this run
+                # NEVER reaches CONVERGED/qualified without a trustworthy
+                # object_id. See _seal_workspace_artifact + the module-level
+                # ARTIFACT_UNHASHABLE terminal (_artifact_unhashable_abort).
+                #
+                # ENGINEERING NOTE on where the final exam + gates then run
+                # (task-2-report.md has the full writeup): they still run
+                # against `workspace` below, byte-identical to before this
+                # change, rather than being redirected to read from the
+                # frozen copy at objects/<object_id>/. Redirecting is the
+                # long-run goal (a gate/scenario command really should only
+                # ever see the immutable object), but the object store's
+                # copies are NOT filesystem-read-only against the owning
+                # process (df_seal's own documented residual: same-privilege
+                # writes are detection-grade, not prevented) -- so pointing
+                # an arbitrary candidate-produced final-exam command's cwd at
+                # the object dir risks a scenario incidentally writing into
+                # it and silently corrupting the very object whose identity
+                # we just bound into the manifest, which would be worse than
+                # not redirecting at all. Nothing runs between freeze() (this
+                # call) and the final exam below that can mutate `workspace`
+                # (no builder call happens in between), so testing
+                # `workspace` here is equivalent to testing the frozen
+                # object's content for THIS run. The `verify_object` re-check
+                # right before the CONVERGED manifest is written below is the
+                # belt-and-suspenders half of this: it confirms the object
+                # published above still matches its own sidecar after the
+                # final exam + gates have run, and fails closed
+                # (ARTIFACT_UNHASHABLE) if it doesn't.
+                try:
+                    object_id, artifact_field = _seal_workspace_artifact(
+                        cfg["_control_root"], workspace)
+                except df_seal.SealError as e:
+                    return _artifact_unhashable_abort(i, str(e))
+
                 # DEV converged. The sealed FINAL exam runs exactly ONCE, here, and its
                 # results are NEVER fed back: project_feedback is never called on it,
                 # nothing from it is written to `workspace`, and only final
@@ -2336,6 +2459,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                   if not r["pass"]}))
                     mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
+                              artifact=artifact_field,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                               usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                           builder_input_tokens, builder_output_tokens))
@@ -2358,7 +2482,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     journal.write("SECURITY_GATE_FAILED", failed=sec_report["failed"])
                     mf = dict(mb_clean, outcome="SECURITY_GATE_FAILED", iterations=i,
                               qualified=False, final_exam=fe, regressions=sorted(regressed),
-                              security=sec_report,
+                              security=sec_report, artifact=artifact_field,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                               usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                           builder_input_tokens, builder_output_tokens))
@@ -2370,6 +2494,19 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     print(f"dark-factory: security gate failed (artifact rejected): "
                           f"{', '.join(sec_report['failed'])}. Run: {run_dir}")
                     return anchor_exit or 3
+
+                # DF-01/M28a belt-and-suspenders: re-verify the object frozen
+                # above still matches its own sidecar now that the final exam
+                # + security gates have run (see the ENGINEERING NOTE where
+                # freeze() was called). In normal operation this is a cheap,
+                # always-true confirmation (nothing between freeze() and here
+                # writes into the object store); it exists to fail closed,
+                # rather than silently bind a stale/wrong object_id, if the
+                # object store was ever touched out from under this run.
+                if not df_seal.verify_object(_object_store_root(cfg["_control_root"]), object_id):
+                    return _artifact_unhashable_abort(
+                        i, f"frozen object {object_id} failed post-final-exam re-verification "
+                           "(object store integrity drift)", fe=fe, sec_report=sec_report)
 
                 eff = manifest_base.get("_effective_tier", "cooperative")
                 custody_field = None
@@ -2429,6 +2566,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report, qualified=qualified,
+                          artifact=artifact_field,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                       builder_input_tokens, builder_output_tokens),
@@ -2589,6 +2727,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             # Additive (M22 Task 1): see the matching seed in the fresh-run
             # manifest_base above.
             "enterprise_seccomp": None,
+            # Additive (DF-01/M28a Task 2): see the matching seed + comment
+            # in the fresh-run manifest_base above.
+            "artifact": None,
         }
 
         # M7: coverage/oracle are deterministic from the control root +
