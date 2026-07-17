@@ -2405,16 +2405,20 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # the object dir risks a scenario incidentally writing into
                 # it and silently corrupting the very object whose identity
                 # we just bound into the manifest, which would be worse than
-                # not redirecting at all. Nothing runs between freeze() (this
-                # call) and the final exam below that can mutate `workspace`
-                # (no builder call happens in between), so testing
-                # `workspace` here is equivalent to testing the frozen
-                # object's content for THIS run. The `verify_object` re-check
-                # right before the CONVERGED manifest is written below is the
-                # belt-and-suspenders half of this: it confirms the object
-                # published above still matches its own sidecar after the
-                # final exam + gates have run, and fails closed
-                # (ARTIFACT_UNHASHABLE) if it doesn't.
+                # not redirecting at all. The object bound here is the
+                # dev-converged (pre-exam) workspace state, which IS the
+                # correct artifact. HONEST SCOPE (M29d): if a final-cohort
+                # scenario command writes into `workspace` as a side effect,
+                # the exam validates a state that has drifted from the frozen
+                # object, and the `verify_object` re-check below does NOT
+                # detect that (it compares the object to its OWN sidecar, not
+                # to the live workspace). Closing "the exam provably ran
+                # against the sealed bytes" needs copy-on-run per scenario
+                # (M29d) — deferred, documented. What M28a DOES guarantee: the
+                # manifest binds the real object_id, so any POST-qualification
+                # tampering is caught by verify (Task 3). The `verify_object`
+                # re-check below is the fail-closed net for the object itself
+                # (published bytes still match their sidecar).
                 try:
                     object_id, artifact_field = _seal_workspace_artifact(
                         cfg["_control_root"], workspace)
