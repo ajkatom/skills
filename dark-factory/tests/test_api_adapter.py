@@ -109,6 +109,42 @@ def test_thinking_block_before_text_is_handled(tmp_path):
         _stop_stub(stub_proc)
 
 
+def test_symlink_escape_rejected(tmp_path):
+    # A symlink planted in the workspace pointing OUTSIDE must not let a reply
+    # path through it write outside (realpath check in _safe_join).
+    stub_proc, base = _start_stub(tmp_path, "symlinkesc")
+    try:
+        req = make_req(tmp_path)
+        outside = tmp_path / "OUTSIDE_TARGET"
+        outside.mkdir()
+        os.symlink(str(outside), os.path.join(req["workdir"], "evil_link"))
+        proc = invoke(req, {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": TEST_KEY})
+        resp = json.loads(proc.stdout)
+        assert resp["status"] == "error"
+        assert not (outside / "pwned.txt").exists()  # nothing written through the link
+    finally:
+        _stop_stub(stub_proc)
+
+
+def test_write_phase_oserror_rolls_back_no_partial_tree(tmp_path):
+    # An OSError mid-write (a returned relpath collides with a pre-existing
+    # plain file where a dir is needed) must roll back the files already
+    # written this call — the documented "never a partial tree" invariant.
+    stub_proc, base = _start_stub(tmp_path, "collide")
+    try:
+        req = make_req(tmp_path)
+        # pre-create a plain file "b" so makedirs for "b/c.txt" OSErrors,
+        # AFTER "a.txt" is already written.
+        open(os.path.join(req["workdir"], "b"), "w").close()
+        proc = invoke(req, {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": TEST_KEY})
+        resp = json.loads(proc.stdout)
+        assert resp["status"] == "error"
+        # a.txt was written first then rolled back -> gone
+        assert not os.path.exists(os.path.join(req["workdir"], "a.txt"))
+    finally:
+        _stop_stub(stub_proc)
+
+
 def test_unsafe_paths_rejected_all_or_nothing(tmp_path):
     stub_proc, base = _start_stub(tmp_path, "unsafe")
     try:

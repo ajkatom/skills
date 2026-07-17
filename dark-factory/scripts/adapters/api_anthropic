@@ -188,10 +188,26 @@ def _write_files(workdir, files):
         if target is None:
             raise ValueError(f"unsafe file path in model reply: {relpath!r}")
         resolved.append((target, content))
-    for target, content in resolved:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+    # All-or-nothing at the file level too: if any write hits an OSError
+    # (a path collides with an existing entry of the wrong type, permission
+    # denied, disk full), roll back the files this call already created so the
+    # supervisor never finds a partial tree to build on. (Path-safety is
+    # already guaranteed above; this closes the write-phase half of the
+    # documented "never a partial tree" invariant.)
+    written = []
+    try:
+        for target, content in resolved:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+            written.append(target)
+    except OSError as e:
+        for p in written:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        raise ValueError(f"file write failed: {type(e).__name__}") from None
 
 
 def _run():

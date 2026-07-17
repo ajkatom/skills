@@ -80,6 +80,13 @@ class H(BaseHTTPRequestHandler):
                 "../../escaped": "pwned",
                 "/etc/escaped": "pwned",
             }})
+        elif mode == "symlinkesc":
+            # a path THROUGH a symlink the test plants in workdir pointing outside
+            text = json.dumps({"files": {"evil_link/pwned.txt": "pwned"}})
+        elif mode == "collide":
+            # two files; the test pre-creates a plain file named "b" so
+            # makedirs("b") OSErrors mid-write — exercises the rollback.
+            text = json.dumps({"files": {"a.txt": "A", "b/c.txt": "C"}})
         elif mode == "badshape":
             text = "Sure, here is my answer: I decline to produce JSON."
         else:  # "greet" and any unrecognized mode
