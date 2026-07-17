@@ -24,6 +24,74 @@ cooperative, each journaled). The seccomp probe (M22 Task 1) is one of these
 gates: a profile that parses fine but doesn't actually deny what it claims to
 fails the resolve just like a down Docker daemon does.
 
+## `init --answers` scaffolding (DF-04)
+
+`dark-factory init` can now scaffold a complete, load-valid `enterprise`
+config directly — see `references/authoring.md`, "Enterprise answers", for
+the full `answers` schema (`approver_pubkeys`, `custody_threshold`,
+`credential_proxy`, `audit_sink`, optional `seccomp_profile`). Two rules
+worth restating here because they're security-relevant, not just
+mechanical:
+
+- **`init` never generates, sees, or stores an approver PRIVATE key.**
+  Only public keys travel through `answers`/`config.json` (they're public —
+  inlining them is fine). Generate each approver's keypair off-host with
+  `supervisor.py df-custody keygen` and distribute the private half
+  directly to that approver; `init`'s preflight
+  (`df_custody.validate_public_key`) only proves the PUBLIC key you handed
+  it parses as a well-formed ed25519 key, nothing about a private key that
+  never existed on this host in the first place.
+- **`init`'s preflight is offline and shape-only.** It proves the
+  `custody.approvers` entries parse as ed25519 public keys and that
+  `audit_sink`'s URL/bucket fields are well-formed with `*_env` NAMES
+  (never inline secret values) — it never makes a network call. A missing
+  operator input is a fail-closed `InitError` (or, with
+  `answers.allow_dev_downgrade: true`, a `hardened`-tier scaffold with a
+  recorded downgrade note) — `init` never emits an enterprise-shaped config
+  that `df_config.load_config` would then reject.
+
+### Manual WORM-readback preflight (operator step)
+
+`init`'s offline preflight cannot, and does not claim to, prove the
+configured audit sink is actually **WORM** (write-once-read-many): that a
+pushed object reads back byte-identical, and that the bucket/object
+carries an **active** retention / Object Lock configuration that would
+refuse deletion before the retention period elapses. `df_audit_sink.py`
+is explicit about this same boundary at the push layer — `push()` ships
+bytes to the configured sink; WORM enforcement is the operator's bucket/
+retention policy, not something this codebase can verify without reaching
+real infrastructure.
+
+Before relying on a scaffolded (or hand-written) `audit.sink` for real
+custody attestations, run this checklist by hand (or wire it into a
+CI job that has the real sink provisioned — never in this repo's regular
+unit test suite, which never stands up live WORM infra):
+
+1. **Reachability** — push a test object through the configured sink
+   (`df_audit_sink.push`) and confirm a 2xx response.
+2. **Readback** — fetch the object back (`http-append`: `GET` the same
+   key; `s3-objectlock`: a normal S3 `GetObject`) and confirm the bytes
+   match exactly what was pushed.
+3. **Retention is ACTIVE, not just configured** — for `s3-objectlock`,
+   confirm the bucket has Object Lock enabled AND the object itself carries
+   a retention mode/date (`GetObjectRetention` — a bucket with Object Lock
+   *available* but no default retention policy, or a caller with
+   permissions to strip retention, does not actually guarantee WORM). For
+   `http-append`, confirm the receiver's own append-only/immutability
+   guarantee independently — this repo's reference receiver
+   (`df_audit_receiver.py`) demonstrates the wire protocol only and says so
+   explicitly in its own docstring: no auth, unencrypted HTTP, not by
+   itself a hardened production trust boundary.
+4. **Deletion is refused** — attempt to delete or overwrite the test
+   object before its retention period elapses and confirm it is refused.
+
+`scripts/df_init.py` carries a deliberately unimplemented stub,
+`verify_worm_readback_MANUAL`, marking exactly where this checklist would
+plug in as code once real infra is available to test against — it raises
+`NotImplementedError` and is never called by `init`, `build_config`, or any
+test, so a passing test suite can never be mistaken for a WORM guarantee
+that was never actually checked.
+
 ## Configurable + live-probed seccomp (M22 Task 1)
 
 M17 shipped exactly one fixed seccomp profile

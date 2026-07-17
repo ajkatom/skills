@@ -46,12 +46,61 @@ guesses wrong on an unstated edge case is a spec bug, not a scenario bug).
 | `cooperative` | Honor-system isolation. Every run is explicitly **unqualified** — nothing stops a curious builder process from reading the control root; it just doesn't. Works everywhere. | None. |
 | `standard` | OS read-denial sandbox (macOS `sandbox-exec` / Linux `bwrap`), probe-verified at run start — a converged run is **qualified**. | A supported OS sandbox backend + a passing startup denial probe. |
 | `hardened` | Builder runs inside a Docker container that never has the control root mounted — denial **by construction**, not a deny-rule — still probe-verified. Unlocks `autonomy: 5` (fully unattended). | A running Docker daemon + a passing container probe + a working OS sandbox for the verifier. Mandatory signed audit. |
-| `enterprise` | Everything `hardened` gives, plus kernel-locked egress to a host-side credential proxy, a restrictive seccomp profile, and **split-custody sign-off** (K-of-N ed25519 approvers must sign the sealed manifest before it's qualified — no single operator can ship). | Everything `hardened` needs, plus a running credential proxy, a required off-box audit sink, and approver keypairs. `init` does **not** scaffold the `custody`/`credential_proxy`/`hardened.*` config blocks for you — add them to `config.json` by hand after `init` (see `references/enterprise.md`). |
+| `enterprise` | Everything `hardened` gives, plus kernel-locked egress to a host-side credential proxy, a restrictive seccomp profile, and **split-custody sign-off** (K-of-N ed25519 approvers must sign the sealed manifest before it's qualified — no single operator can ship). | Everything `hardened` needs, plus a running credential proxy, a required off-box audit sink, and approver keypairs. `init` **does** scaffold the `custody`/`credential_proxy`/`audit.sink` blocks for you — see "Enterprise answers" below — but only from operator-supplied inputs it can never invent (approver *public* keys, the proxy's allowlist, the sink's endpoint); missing any of them is a fail-closed `InitError`, never a broken scaffold. |
 
 Set `answers.assurance` to one of the four. Default `answers.autonomy` is 4;
 `autonomy: 5` requires `hardened`/`enterprise`. If in doubt, start at
 `cooperative` to prove the spec and scenarios out, then raise the tier once
 the app converges.
+
+### Enterprise answers (DF-04)
+
+`assurance: "enterprise"` requires `df_config.load_config` to see a
+`custody` block, an enabled `credential_proxy`, a required off-box
+`audit.sink`, required `builder_confinement`, and signed audit — none of
+which `init` can invent, since the values are operator-only (a real
+approver public key, a real proxy allowlist, a real sink endpoint). So
+`answers.assurance: "enterprise"` also requires these top-level keys:
+
+- `answers.approver_pubkeys` — a non-empty list of **64-hex-char ed25519
+  PUBLIC keys**. Generate each keypair **off-host**, one per approver,
+  with `supervisor.py df-custody keygen` — `init` never generates, sees,
+  or stores a private key; only the public half goes into `answers`.
+- `answers.custody_threshold` — the K in K-of-N (an int, `1..len(approver_pubkeys)`).
+- `answers.credential_proxy` — `{"token_env": "<ENV_VAR_NAME>", "allowlist": ["host", ...]}`.
+  `token_env` is the NAME of an environment variable the proxy reads
+  host-side at request time — never the token value itself (`init`
+  rejects a literal `"token"` key outright, same as `df_config`).
+- `answers.audit_sink` — either `{"kind": "http-append", "url": "https://..."}`
+  or `{"kind": "s3-objectlock", "endpoint": "...", "bucket": "...",
+  "region": "...", "prefix": "..."?, "access_key_env": "..."?,
+  "secret_key_env": "..."?}`. Like `credential_proxy`, the `*_env` fields
+  are NAMES, never inline secret values (`init` rejects a literal
+  `"secret_key"`/`"access_key"` key).
+- `answers.seccomp_profile` (optional) — a path to a Docker seccomp JSON
+  profile; absent uses the shipped default (see `references/enterprise.md`).
+
+`init` preflight-validates all of this **before writing a single file**:
+each pubkey is parsed as an ed25519 public key (`df_custody.validate_public_key`),
+the sink URL/bucket-triple is checked for well-formedness, and any inline
+secret is rejected — a malformed input is an `InitError` naming exactly
+what's wrong, not a half-written control root. A successful `init
+--answers <enterprise-answers>` therefore passes `df_config.load_config`
+immediately.
+
+**If you don't have the operator inputs yet:** `init` fails closed with an
+`InitError` listing exactly which of the keys above are missing — it never
+emits an enterprise-shaped-but-invalid config. To scaffold something
+runnable anyway (e.g. to iterate on behaviors/scenarios before custody is
+set up), set `answers.allow_dev_downgrade: true`: `init` scaffolds at
+`assurance: "hardened"` instead, and prints/records a note that the
+control root is **not** enterprise-qualified.
+
+**What `init` still can't prove:** that the audit sink is actually
+reachable and its WORM/retention (Object Lock) configuration is active —
+that requires live infra `init` never provisions or touches. See
+`references/enterprise.md`, "Manual WORM-readback preflight (operator
+step)", before relying on a scaffolded sink for real custody attestations.
 
 **Checkpoint default differs from a hand-written config.json.** `init`
 always writes `checkpoint: "auto"` regardless of autonomy (matching this
@@ -154,11 +203,14 @@ the provider HTTP API with no CLI installed (the only builders that work
 a real-model build in-container, or authoritative cost metering. See
 `references/role-adapters.md`.
 
-`init` does **not** currently scaffold `hardened.*` (including
-`hardened.dep_cache_dir` — the offline pinned-dependency cache for a
-network-restricted builder, spec §7.3, see `references/hardened.md`),
-`custody`, `credential_proxy`, `audit.sink`, `credentials`, or `brownfield`
-blocks — add those to the scaffolded `config.json` by hand per
+`init` scaffolds `custody`/`credential_proxy`/`audit.sink` automatically at
+`assurance: "enterprise"` when `answers` supplies the operator inputs
+listed in "Enterprise answers" above (otherwise it fails closed, or
+downgrades under `allow_dev_downgrade` — never a broken scaffold). It does
+**not** currently scaffold `hardened.*` (including `hardened.dep_cache_dir`
+— the offline pinned-dependency cache for a network-restricted builder,
+spec §7.3, see `references/hardened.md`), `credentials`, or `brownfield`
+blocks at any tier — add those to the scaffolded `config.json` by hand per
 `references/config-reference.md` if your tier or workflow needs them.
 
 ## Then: init → review → run

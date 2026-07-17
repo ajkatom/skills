@@ -85,6 +85,33 @@ def public_from_private(private_hex: str) -> str:
     return pub_bytes.hex()
 
 
+def validate_public_key(public_hex: str) -> None:
+    """Parse `public_hex` as a raw-32-byte-hex ed25519 PUBLIC key. Raises
+    CustodyError naming the offending value on any failure (non-hex chars,
+    wrong length after decoding). Returns None on success -- a pure
+    assertion, not a boolean predicate (unlike verify_one, which must never
+    raise because it runs in a signature-counting loop over
+    attacker/typo-controlled input; this one is a loud, operator-facing
+    preflight check called from a context -- `df_init.build_config`'s
+    enterprise scaffold -- that wants to fail closed with a clear reason
+    BEFORE writing anything).
+
+    Honest scope: the underlying `cryptography` backend accepts any 32-byte
+    string as a syntactically valid Ed25519 public key (curve-membership is
+    not checked at parse time, only implicitly by `verify()` on a signature
+    later) -- this catches malformed hex / wrong key length, not "off-curve"
+    points, which is the same shape-only guarantee df_config's 64-hex regex
+    already gives. It exists as the guarded single import site for this
+    parse (df_config.py never imports `cryptography`; see module docstring).
+    """
+    _require_cryptography()
+    try:
+        pub_bytes = bytes.fromhex(public_hex)
+        Ed25519PublicKey.from_public_bytes(pub_bytes)
+    except (ValueError, TypeError) as e:
+        raise CustodyError(f"malformed ed25519 public key {public_hex!r}: {e}") from e
+
+
 def sign_manifest(private_hex: str, manifest_bytes: bytes) -> str:
     """Sign manifest_bytes with the ed25519 private key given as raw-32-byte
     hex. Returns the 64-byte signature as hex (128 hex chars). Raises
