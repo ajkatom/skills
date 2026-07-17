@@ -64,13 +64,32 @@ _MAX_TOKENS = 8192
 _SNIPPET_LEN = 200  # bounded snippet for error details; never the full reply
 
 
-def respond(status, detail=""):
+def respond(status, detail="", usage=None):
     print(json.dumps({
         "adapter_protocol": "0.1",
         "status": status,
         "detail": detail,
-        "usage": {"known": False},
+        "usage": usage if isinstance(usage, dict) else {"known": False},
     }))
+
+
+def _extract_usage(parsed):
+    """Return {"known": True, "input_tokens": int, "output_tokens": int} when
+    the Messages API response's top-level "usage" block has int-able
+    input_tokens/output_tokens; else {"known": False}. NEVER raises -- an
+    absent or malformed usage block is not a build failure, only an unknown-
+    usage report (M25 Task 1: metering is fail-soft by construction)."""
+    try:
+        usage = parsed.get("usage")
+        if not isinstance(usage, dict):
+            return {"known": False}
+        return {
+            "known": True,
+            "input_tokens": int(usage["input_tokens"]),
+            "output_tokens": int(usage["output_tokens"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return {"known": False}
 
 
 def _snippet(text):
@@ -141,8 +160,11 @@ def _call_messages_api(base_url, api_key, model, prompt, timeout_s):
 
 
 def _extract_files(resp_body):
-    """Parse a Messages API response body into a {relpath: content} dict, or
-    raise ValueError with a short, key-free detail message."""
+    """Parse a Messages API response body into a ({relpath: content}, usage)
+    pair, or raise ValueError with a short, key-free detail message. `usage`
+    is always a well-formed {"known": bool, ...} dict (see _extract_usage) --
+    never raises on its own, so a malformed usage block never turns a
+    successful build into an error."""
     try:
         parsed = json.loads(resp_body)
         blocks = parsed["content"]
@@ -175,7 +197,7 @@ def _extract_files(resp_body):
     for relpath, content in files.items():
         if not isinstance(relpath, str) or not isinstance(content, str):
             raise ValueError("model reply files entry is not path->string content")
-    return files
+    return files, _extract_usage(parsed)
 
 
 def _write_files(workdir, files):
@@ -238,13 +260,13 @@ def _run():
         return
 
     try:
-        files = _extract_files(resp_body)
+        files, usage = _extract_files(resp_body)
         _write_files(workdir, files)
     except ValueError as e:
         respond("error", str(e))
         return
 
-    respond("ok")
+    respond("ok", usage=usage)
 
 
 def main():
