@@ -61,58 +61,71 @@ def fetch_pypi(pkgs, dest_dir, *, fetcher=_urlopen_fetch, timeout_s: int = 60) -
     package in pkgs (`[{ecosystem,name,version}]`, ecosystem=="PyPI" entries
     only -- others are ignored) into dest_dir/pypi/. Raises DepCacheError on
     any failure for any package -- fail closed, no partial cache silently
-    accepted. Returns the count written."""
+    accepted. On failure, every file this call wrote is removed (best-effort)
+    before the error is re-raised, so a raised call never leaves partial
+    on-disk state behind. Returns the count written."""
     out_dir = os.path.join(dest_dir, "pypi")
     os.makedirs(out_dir, exist_ok=True)
     count = 0
-    for pkg in pkgs:
-        if pkg.get("ecosystem") != "PyPI":
-            continue
-        name, version = pkg["name"], pkg["version"]
-        meta_url = f"https://pypi.org/pypi/{name}/{version}/json"
-        try:
-            status, body = fetcher(meta_url, None, timeout_s)
-            if status != 200:
-                raise DepCacheError(f"pypi metadata fetch failed for {name}=={version}: HTTP {status}")
-            data = json.loads(body)
-        except DepCacheError:
-            raise
-        except Exception as e:
-            raise DepCacheError(f"pypi metadata fetch failed for {name}=={version}: {e}") from None
+    written = []
+    try:
+        for pkg in pkgs:
+            if pkg.get("ecosystem") != "PyPI":
+                continue
+            name, version = pkg["name"], pkg["version"]
+            meta_url = f"https://pypi.org/pypi/{name}/{version}/json"
+            try:
+                status, body = fetcher(meta_url, None, timeout_s)
+                if status != 200:
+                    raise DepCacheError(f"pypi metadata fetch failed for {name}=={version}: HTTP {status}")
+                data = json.loads(body)
+            except DepCacheError:
+                raise
+            except Exception as e:
+                raise DepCacheError(f"pypi metadata fetch failed for {name}=={version}: {e}") from None
 
-        urls = data.get("urls") if isinstance(data, dict) else None
-        chosen = None
-        if isinstance(urls, list):
-            for u in urls:
-                if isinstance(u, dict) and u.get("packagetype") == "bdist_wheel":
-                    chosen = u
-                    break
-            if chosen is None:
+            urls = data.get("urls") if isinstance(data, dict) else None
+            chosen = None
+            if isinstance(urls, list):
                 for u in urls:
-                    if isinstance(u, dict) and u.get("packagetype") == "sdist":
+                    if isinstance(u, dict) and u.get("packagetype") == "bdist_wheel":
                         chosen = u
                         break
-        if chosen is None:
-            raise DepCacheError(f"no wheel or sdist found for {name}=={version}")
+                if chosen is None:
+                    for u in urls:
+                        if isinstance(u, dict) and u.get("packagetype") == "sdist":
+                            chosen = u
+                            break
+            if chosen is None:
+                raise DepCacheError(f"no wheel or sdist found for {name}=={version}")
 
-        filename = chosen.get("filename")
-        dl_url = chosen.get("url")
-        if not filename or not dl_url:
-            raise DepCacheError(f"malformed pypi release metadata for {name}=={version}")
-        try:
-            status, body = fetcher(dl_url, None, timeout_s)
-            if status != 200:
-                raise DepCacheError(f"pypi download failed for {name}=={version}: HTTP {status}")
-        except DepCacheError:
-            raise
-        except Exception as e:
-            raise DepCacheError(f"pypi download failed for {name}=={version}: {e}") from None
+            filename = chosen.get("filename")
+            dl_url = chosen.get("url")
+            if not filename or not dl_url:
+                raise DepCacheError(f"malformed pypi release metadata for {name}=={version}")
+            try:
+                status, body = fetcher(dl_url, None, timeout_s)
+                if status != 200:
+                    raise DepCacheError(f"pypi download failed for {name}=={version}: HTTP {status}")
+            except DepCacheError:
+                raise
+            except Exception as e:
+                raise DepCacheError(f"pypi download failed for {name}=={version}: {e}") from None
 
-        # basename only -- never trust a path component from remote metadata
-        safe_name = os.path.basename(filename)
-        with open(os.path.join(out_dir, safe_name), "wb") as f:
-            f.write(body)
-        count += 1
+            # basename only -- never trust a path component from remote metadata
+            safe_name = os.path.basename(filename)
+            out_path = os.path.join(out_dir, safe_name)
+            with open(out_path, "wb") as f:
+                f.write(body)
+            written.append(out_path)
+            count += 1
+    except DepCacheError:
+        for p in written:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        raise
     return count
 
 
@@ -122,64 +135,82 @@ def fetch_npm(pkgs, dest_dir, *, fetcher=_urlopen_fetch, npm_cmd=("npm",),
     (ecosystem=="npm" entries only) and seed dest_dir/npm-cache/ via
     `npm cache add <tarball> --cache <dest_dir>/npm-cache` (operator-host
     subprocess; requires npm CLI on the operator's host, never inside the
-    container). Raises DepCacheError on any failure. Returns the count
+    container). Raises DepCacheError on any failure. The scratch tarball dir
+    (dest_dir/_npm-tarballs) is always cleaned up, success or failure. On
+    failure: if dest_dir/npm-cache did not exist before this call, it was
+    created fresh by this call and is torn down whole (no partial cache
+    survives). If it already existed (an operator re-running fetch against an
+    existing cache), it is left alone -- npm's cache format has no clean
+    single-package removal -- and the raised DepCacheError says plainly that
+    the cache may hold a partial addition from this call. Returns the count
     seeded."""
     tmp_dir = os.path.join(dest_dir, "_npm-tarballs")
     cache_dir = os.path.join(dest_dir, "npm-cache")
+    cache_preexisted = os.path.isdir(cache_dir)
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
     count = 0
-    for pkg in pkgs:
-        if pkg.get("ecosystem") != "npm":
-            continue
-        name, version = pkg["name"], pkg["version"]
-        meta_url = f"https://registry.npmjs.org/{name}"
-        try:
-            status, body = fetcher(meta_url, None, timeout_s)
-            if status != 200:
-                raise DepCacheError(f"npm metadata fetch failed for {name}@{version}: HTTP {status}")
-            data = json.loads(body)
-        except DepCacheError:
-            raise
-        except Exception as e:
-            raise DepCacheError(f"npm metadata fetch failed for {name}@{version}: {e}") from None
+    npm_pkgs = [pkg for pkg in pkgs if pkg.get("ecosystem") == "npm"]
+    try:
+        for pkg in npm_pkgs:
+            name, version = pkg["name"], pkg["version"]
+            meta_url = f"https://registry.npmjs.org/{name}"
+            try:
+                status, body = fetcher(meta_url, None, timeout_s)
+                if status != 200:
+                    raise DepCacheError(f"npm metadata fetch failed for {name}@{version}: HTTP {status}")
+                data = json.loads(body)
+            except DepCacheError:
+                raise
+            except Exception as e:
+                raise DepCacheError(f"npm metadata fetch failed for {name}@{version}: {e}") from None
 
-        versions = data.get("versions") if isinstance(data, dict) else None
-        entry = versions.get(version) if isinstance(versions, dict) else None
-        tarball = None
-        if isinstance(entry, dict):
-            dist = entry.get("dist")
-            if isinstance(dist, dict):
-                tarball = dist.get("tarball")
-        if not tarball:
-            raise DepCacheError(f"npm registry has no tarball for {name}@{version}")
+            versions = data.get("versions") if isinstance(data, dict) else None
+            entry = versions.get(version) if isinstance(versions, dict) else None
+            tarball = None
+            if isinstance(entry, dict):
+                dist = entry.get("dist")
+                if isinstance(dist, dict):
+                    tarball = dist.get("tarball")
+            if not tarball:
+                raise DepCacheError(f"npm registry has no tarball for {name}@{version}")
 
-        try:
-            status, body = fetcher(tarball, None, timeout_s)
-            if status != 200:
-                raise DepCacheError(f"npm tarball download failed for {name}@{version}: HTTP {status}")
-        except DepCacheError:
-            raise
-        except Exception as e:
-            raise DepCacheError(f"npm tarball download failed for {name}@{version}: {e}") from None
+            try:
+                status, body = fetcher(tarball, None, timeout_s)
+                if status != 200:
+                    raise DepCacheError(f"npm tarball download failed for {name}@{version}: HTTP {status}")
+            except DepCacheError:
+                raise
+            except Exception as e:
+                raise DepCacheError(f"npm tarball download failed for {name}@{version}: {e}") from None
 
-        safe_name = os.path.basename(f"{name.replace('/', '-')}-{version}.tgz")
-        tarball_path = os.path.join(tmp_dir, safe_name)
-        with open(tarball_path, "wb") as f:
-            f.write(body)
+            safe_name = os.path.basename(f"{name.replace('/', '-')}-{version}.tgz")
+            tarball_path = os.path.join(tmp_dir, safe_name)
+            with open(tarball_path, "wb") as f:
+                f.write(body)
 
-        argv = list(npm_cmd) + ["cache", "add", tarball_path, "--cache", cache_dir]
-        try:
-            proc = runner(argv, capture_output=True, text=True, timeout=timeout_s)
-        except Exception as e:
-            raise DepCacheError(f"npm cache add failed for {name}@{version}: {e}") from None
-        if proc.returncode != 0:
+            argv = list(npm_cmd) + ["cache", "add", tarball_path, "--cache", cache_dir]
+            try:
+                proc = runner(argv, capture_output=True, text=True, timeout=timeout_s)
+            except Exception as e:
+                raise DepCacheError(f"npm cache add failed for {name}@{version}: {e}") from None
+            if proc.returncode != 0:
+                raise DepCacheError(
+                    f"npm cache add failed for {name}@{version}: "
+                    f"{(proc.stderr or proc.stdout or '')[:500]}"
+                )
+            count += 1
+    except DepCacheError as e:
+        if cache_preexisted:
             raise DepCacheError(
-                f"npm cache add failed for {name}@{version}: "
-                f"{(proc.stderr or proc.stdout or '')[:500]}"
-            )
-        count += 1
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+                f"{e}; npm-cache already existed before this call; "
+                f"{count} of {len(npm_pkgs)} target npm package(s) may have been added to it "
+                f"before this failure -- inspect {cache_dir} manually"
+            ) from e
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return count
 
 
