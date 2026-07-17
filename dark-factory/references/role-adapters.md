@@ -91,9 +91,28 @@ error, unparseable reply, unsafe path all produce a short, key-free
 `{"status":"error","detail":"..."}`; the adapter never raises uncaught and
 never dumps a raw response body beyond a bounded snippet).
 
-**Overrides.** `ANTHROPIC_BASE_URL` — point at a test stub, or (enterprise)
-the credential-proxy endpoint instead of `api.anthropic.com` directly.
-`DF_API_MODEL` — pin a specific model id.
+**Overrides.** `ANTHROPIC_BASE_URL` — point at a test stub. `DF_API_MODEL` —
+pin a specific model id.
+
+**Enterprise proxy mode (M30/DF-03).** `ANTHROPIC_BASE_URL` is NOT how this
+adapter reaches the credential proxy — see `references/enterprise.md`'s
+"API-adapter proxy mode" for the full picture, including why. In short: an
+env var override still means "send the same direct request, just to a
+different base URL," and a direct HTTPS request through a proxy CONNECT-
+tunnels, which `df_proxy` refuses (opaque tunnels can't be credential-
+injected). Instead, when `DF_PROXY_DESCRIPTOR` (a JSON object naming the
+local proxy's endpoint, the real provider's `target_base_url`, `provider:
+"anthropic"`, and a `capability_token`) is set, this adapter switches
+transport entirely: no `ANTHROPIC_API_KEY` is required or read, no
+`x-api-key` header is set by the adapter itself, and the request is sent as
+plaintext HTTP directly to the local proxy's `(host, port)` with the REAL
+provider's absolute `https://` URL as the request line's target (built with
+`http.client.HTTPConnection`, not `urllib`) plus a
+`Proxy-Authorization: Bearer <capability_token>` header authenticating this
+workload to the proxy. `df_proxy` parses that absolute-URI target, matches
+it against its allowlist, and injects the real key on its own TLS leg to
+the provider — this adapter's process never sees it. `DF_PROXY_DESCRIPTOR`
+unset -> byte-identical to the direct-request behavior above.
 
 **Confinement.** `df_confine.PROFILES["api_anthropic"]` is `supported: True`
 on structural grounds, not a live tool-denial probe — see
@@ -139,7 +158,11 @@ provider flag to hold against every model.
 `api_anthropic` (see above) — same `_safe_join`, same all-or-nothing write
 with rollback on a mid-write `OSError`, same never-leaks-the-key discipline
 (`OPENAI_API_KEY` only ever appears in the `Authorization` header),
-`OPENAI_BASE_URL`/`DF_API_MODEL` overrides.
+`OPENAI_BASE_URL`/`DF_API_MODEL` overrides, and the identical M30/DF-03
+`DF_PROXY_DESCRIPTOR` enterprise proxy mode (`provider: "openai"`, target
+path `/v1/chat/completions`, no `OPENAI_API_KEY` required/read, no
+`Authorization` header set by the adapter — see `api_anthropic`'s entry
+above and `references/enterprise.md` for the full transport rationale).
 
 **Usage field-name mapping.** OpenAI's Chat Completions response reports
 usage as `{"prompt_tokens": N, "completion_tokens": M}` — the adapter maps
