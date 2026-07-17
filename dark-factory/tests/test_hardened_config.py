@@ -57,7 +57,7 @@ def test_hardened_tier_accepted_with_defaults(tmp_path):
     assert cfg["_qualified"] is True
     assert cfg["_container"] == {
         "image": df_container.DEFAULT_IMAGE, "network": "none",
-        "memory": "2g", "pids": 256,
+        "memory": "2g", "pids": 256, "dep_cache_dir": None,
     }
 
 
@@ -69,6 +69,7 @@ def test_hardened_block_overrides_defaults(tmp_path):
     cfg = df_config.load_config(str(cr))
     assert cfg["_container"] == {
         "image": "myorg/img:1", "network": "bridge", "memory": "512m", "pids": 64,
+        "dep_cache_dir": None,
     }
 
 
@@ -112,6 +113,47 @@ def test_hardened_bool_pids_rejected(tmp_path):
     cr = tmp_path / "control"
     write_hardened(cr, hardened={"pids": True})
     with pytest.raises(df_config.ConfigError, match="pids"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_valid_directory_accepted(tmp_path):
+    # §7.3 Task 2: hardened.dep_cache_dir accepts an existing directory and
+    # normalizes it to a realpath in cfg["_container"].
+    cr = tmp_path / "control"
+    cache_dir = tmp_path / "depcache"
+    cache_dir.mkdir()
+    write_hardened(cr, hardened={"dep_cache_dir": str(cache_dir)})
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_container"]["dep_cache_dir"] == os.path.realpath(str(cache_dir))
+
+
+def test_dep_cache_dir_absent_defaults_to_none(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_container"]["dep_cache_dir"] is None
+
+
+def test_dep_cache_dir_missing_directory_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr, hardened={"dep_cache_dir": str(tmp_path / "does-not-exist")})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_not_a_directory_rejected(tmp_path):
+    cr = tmp_path / "control"
+    f = tmp_path / "notadir"
+    f.write_text("x")
+    write_hardened(cr, hardened={"dep_cache_dir": str(f)})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
+        df_config.load_config(str(cr))
+
+
+def test_dep_cache_dir_non_string_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_hardened(cr, hardened={"dep_cache_dir": 123})
+    with pytest.raises(df_config.ConfigError, match="dep_cache_dir"):
         df_config.load_config(str(cr))
 
 
@@ -372,7 +414,7 @@ def test_builder_wiring_docker_prefix_no_control_root_mount(tmp_path, monkeypatc
     assert m["sandbox_backend"] == df_container.BACKEND_NAME
     assert m["denial_probe_passed"] is True
     assert m["container"] == {"image": df_container.DEFAULT_IMAGE, "network": "none",
-                              "memory": "2g", "pids": 256}
+                              "memory": "2g", "pids": 256, "dep_cache_dir": None}
 
 
 def test_builder_wiring_twin_env_skipped_at_hardened(tmp_path, monkeypatch):

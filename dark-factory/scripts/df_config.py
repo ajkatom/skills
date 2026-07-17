@@ -175,6 +175,16 @@ def load_config(control_root: str) -> dict:
     c_pids = hardened_raw.get("pids", 256)
     if not isinstance(c_pids, int) or isinstance(c_pids, bool) or c_pids < 16:
         raise ConfigError("hardened.pids must be an int >= 16")
+    c_dep_cache_dir = hardened_raw.get("dep_cache_dir")
+    if c_dep_cache_dir is not None:
+        if not isinstance(c_dep_cache_dir, str) or not c_dep_cache_dir:
+            raise ConfigError("hardened.dep_cache_dir must be a non-empty string")
+        if not os.path.isdir(c_dep_cache_dir):
+            raise ConfigError(
+                f"hardened.dep_cache_dir does not exist or is not a directory: "
+                f"{c_dep_cache_dir!r}"
+            )
+        c_dep_cache_dir = os.path.realpath(c_dep_cache_dir)
 
     kb_raw = raw.get("knowledge_base", {})
     if not isinstance(kb_raw, dict):
@@ -978,6 +988,7 @@ def load_config(control_root: str) -> dict:
     cfg["_security"] = cfg_security
     cfg["_container"] = {
         "image": c_image, "network": c_network, "memory": c_memory, "pids": c_pids,
+        "dep_cache_dir": c_dep_cache_dir,
     }
     cfg["_budget"] = {
         "billing": billing,
