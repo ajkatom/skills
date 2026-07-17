@@ -72,6 +72,15 @@ class LockError(RuntimeError):
 
 
 PAUSED = 10
+# DF-08/M35: a prior process crashed mid-dispatch — after a DISPATCH_INTENT
+# was journaled (and its reserved spend committed to state.json) but before
+# the matching DISPATCH_RESULT resolved. Distinct from PAUSED: the run is
+# NOT simply waiting on a human checkpoint/budget decision, it needs
+# reconciliation (`resume --decision reconcile` or `--decision abort`)
+# because the outcome of an already-sent builder call is unknown. Fail-closed
+# default: plain `resume --decision continue` refuses to re-enter the loop
+# while this is set, so a crash never causes a silent duplicate dispatch.
+UNKNOWN_OUTCOME = 11
 
 
 def _now() -> str:
@@ -217,6 +226,51 @@ def _mode_from_journal(run_dir):
                 data = e.get("data", {})
                 return data.get("mode", "greenfield"), bool(data.get("legacy_ignored", False))
     return "greenfield", False
+
+
+def _dispatch_idempotency_key(invocation: str, iteration: int) -> str:
+    """Deterministic per-(run, iteration) key (DF-08/M35). Stable across a
+    crash + resume/reconcile: the SAME iteration always derives the SAME
+    key, so re-entering iteration i after a crash re-uses it rather than
+    minting a new one -- resolution-matching (see
+    `_unresolved_dispatch_intent`) works by exact key equality."""
+    return sha256_str(f"{invocation}:{iteration}")
+
+
+def _unresolved_dispatch_intent(run_dir):
+    """Scan run_dir/journal.jsonl for the LATEST DISPATCH_INTENT event and
+    report whether it has a matching DISPATCH_RESULT (same idempotency_key)
+    anywhere later in the journal.
+
+    Returns the intent's data dict (iteration/idempotency_key/reserved_calls/
+    reserved_usd) if unresolved -- meaning a prior process crashed after
+    committing a builder call's reserved spend but before the call resolved
+    -- else None.
+
+    A journal with no DISPATCH_INTENT at all (every pre-M35 run) returns
+    None: absence is "no unresolved intent", never a false positive, so an
+    old state.json resumes exactly as before this task.
+    """
+    path = os.path.join(run_dir, "journal.jsonl")
+    if not os.path.exists(path):
+        return None
+    latest_intent = None
+    resolved_keys = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            e = json.loads(line)
+            data = e.get("data", {})
+            state = e.get("state")
+            if state == "DISPATCH_INTENT":
+                latest_intent = data
+            elif state == "DISPATCH_RESULT":
+                resolved_keys.add(data.get("idempotency_key"))
+    if latest_intent is not None and latest_intent.get("idempotency_key") not in resolved_keys:
+        return latest_intent
+    return None
 
 
 def latest_paused_run(control_root):
@@ -2421,6 +2475,34 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             _confined_kwargs = dict(_invoke_kwargs)
             if confine_state["enabled"]:
                 _confined_kwargs["confine"] = True
+
+            # --- DF-08/M35: crash-safe dispatch. Journal INTENT to dispatch
+            # a paid builder call, and COMMIT the reservation computed above
+            # (calls_after/est_after) to durable state, BOTH before the call
+            # is made -- so if this process is killed anywhere between here
+            # and the matching DISPATCH_RESULT below (including mid-
+            # subprocess, after a real provider request has already gone
+            # out), the spend is never understated and a resume never
+            # silently re-dispatches: `_unresolved_dispatch_intent` (used by
+            # resume()) finds this INTENT with no matching RESULT and stops,
+            # fail-closed, at UNKNOWN_OUTCOME instead of guessing. This
+            # replaces the old post-call `builder_calls = calls_after;
+            # estimated_usd = est_after` commit (moved here, before the
+            # call) -- a normal, non-crashing run ends with the identical
+            # final numbers, just committed earlier.
+            dispatch_key = _dispatch_idempotency_key(mb_clean["invocation"], i)
+            journal.write("DISPATCH_INTENT", iteration=i, idempotency_key=dispatch_key,
+                          reserved_calls=calls_after, reserved_usd=est_after)
+            builder_calls = calls_after
+            estimated_usd = est_after
+            save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                      dev_status=prev_dev_status, regressions=regressed,
+                      builder_calls=builder_calls, estimated_usd=estimated_usd,
+                      budget_alerted=budget_alerted, reason="dispatch", redactor=redactor,
+                      builder_input_tokens=builder_input_tokens,
+                      builder_output_tokens=builder_output_tokens,
+                      usage_known=usage_known)
+
             resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
                                        **_confined_kwargs)
 
@@ -2433,6 +2515,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # unconfined — refuse here, before any unconfined build
                     # happens (this iteration's builder call already did
                     # nothing but report the refusal; no artifact written).
+                    journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
+                                 status="error")
                     journal.write("CONFINEMENT_UNSUPPORTED", iteration=i,
                                  detail=resp.get("detail", ""))
                     mf = dict(mb_clean, outcome="CONFINEMENT_REFUSED", iterations=i,
@@ -2463,6 +2547,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
                                            **_invoke_kwargs)
 
+            # DF-08/M35: durable marker that iteration i's dispatch RESOLVED
+            # (the adapter call returned -- no crash) -- whichever of the
+            # one or two invoke_adapter attempts above actually produced the
+            # resp/err this iteration lands on. Written unconditionally,
+            # before the ok/error branch, so both outcomes are bracketed.
+            journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
+                          status="error" if err else ("ok" if resp.get("status") == "ok" else "error"))
+
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -2478,8 +2570,11 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 _kb_writeback(cfg, journal, mf, [])
                 sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
                 return anchor_exit or 2
-            builder_calls = calls_after
-            estimated_usd = est_after
+            # DF-08/M35: builder_calls/estimated_usd were already committed
+            # BEFORE the call, right after DISPATCH_INTENT above -- nothing
+            # to do here. (Historically this is where the M8 post-call
+            # commit lived; moving it earlier is what makes a crash mid-call
+            # never understate spend.)
             # M25 Task 1: authoritative token accounting, additive alongside
             # the M8 estimate above -- reads resp["usage"] (an adapter that
             # can report real Messages-API token counts, e.g. api_anthropic)
@@ -3063,8 +3158,43 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             _kb_writeback(cfg, journal, mf, [])
             print("dark-factory: ACCEPTED (waived/unverified — not a qualified ship-candidate).")
             return anchor_exit or 0
-        # decision == "continue" — isolation cannot be trusted across a pause;
-        # re-probe (and re-wrap) before re-entering the loop.
+
+        # DF-08/M35: decision in {"continue", "reconcile"} both re-enter the
+        # loop below, but "continue" must NEVER silently re-dispatch a
+        # builder call whose outcome is unknown (a prior process crashed
+        # after committing the reserved spend but before the call
+        # resolved) -- fail-closed by default. Only "reconcile" (explicit
+        # operator consent to possible duplicate spend) clears the way.
+        unresolved = _unresolved_dispatch_intent(run_dir) if decision in ("continue", "reconcile") else None
+        if unresolved is not None:
+            if decision == "continue":
+                journal.write("UNKNOWN_OUTCOME", iteration=unresolved.get("iteration"),
+                              idempotency_key=unresolved.get("idempotency_key"),
+                              reserved_calls=unresolved.get("reserved_calls"),
+                              reserved_usd=unresolved.get("reserved_usd"))
+                sys.stderr.write(
+                    f"dark-factory: a model dispatch at iteration {unresolved.get('iteration')} "
+                    "did not resolve before a crash; its outcome is unknown — reconcile before "
+                    "continuing. The reserved spend has been counted. To proceed, "
+                    "`resume --decision reconcile` (re-dispatches, accepting possible duplicate "
+                    "spend) or `--decision abort`.\n")
+                return UNKNOWN_OUTCOME
+            # decision == "reconcile": operator consents to possibly
+            # re-sending a builder call whose earlier outcome is unknown.
+            # The reserved spend from the crashed attempt is NOT reversed
+            # (never understate — see DISPATCH_INTENT above); _run_loop
+            # re-entering at the same iteration will reserve+commit AGAIN
+            # for the retry, so a reconciled iteration's budget numbers
+            # honestly reflect up to two attempted calls.
+            journal.write("DISPATCH_RECONCILED", iteration=unresolved.get("iteration"),
+                          idempotency_key=unresolved.get("idempotency_key"),
+                          note="operator accepted possible duplicate spend; re-dispatching")
+            print(f"dark-factory: reconciling unresolved dispatch at iteration "
+                  f"{unresolved.get('iteration')} — re-dispatching (possible duplicate spend).")
+
+        # decision == "continue" (or "reconcile", now cleared) — isolation
+        # cannot be trusted across a pause; re-probe (and re-wrap) before
+        # re-entering the loop.
         try:
             eff_tier, exec_prefix, backend_name, probe_passed = resolve_isolation(
                 cfg, control_root, state["workspace"], journal, allow_downgrade)
@@ -3147,7 +3277,8 @@ def main():
                            "signed (any entry carrying 'sig') chain")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
-    p_res.add_argument("--decision", choices=["continue", "accept", "abort"], default="continue")
+    p_res.add_argument("--decision", choices=["continue", "accept", "abort", "reconcile"],
+                       default="continue")
     p_res.add_argument("--allow-downgrade", action="store_true",
                        help="if standard tier is unavailable/probe fails on re-probe, "
                             "downgrade to cooperative (unqualified) instead of failing closed")
