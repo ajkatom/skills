@@ -192,17 +192,25 @@ unchanged below.
      enforced under any billing. See `references/budget.md` for the full model
      (85% alert, 100% phase-boundary pause, raise-and-resume) and its honest caveat:
      dollars are an **estimate**, not metered usage.
-   - **Security gates (optional, recommended).** Set `security_gates.enabled: true` to
+   - **Security gates (opt-in at cooperative; MANDATORY at standard+).** Set
+     `security_gates.enabled: true` to
      run a mandatory secret scan + dangerous-pattern scan + SBOM (plus any configured
      external tool, e.g. `bandit`/`semgrep`) on the **converged artifact**, once, after
      the final exam passes and before `CONVERGED` — **independent of scenario
      pass-rate**: because no human reviews the built code, a fully-passing build with a
      planted secret still gets rejected. A finding on a `fail_on` gate (default
      `["secret_scan", "dangerous_scan"]`) makes the run terminal `SECURITY_GATE_FAILED`
-     (exit 3, never qualified) — the artifact is rejected, not iterated on. See
+     (exit 3, never qualified) — the artifact is rejected, not iterated on. **At
+     `standard`/`hardened`/`enterprise` (M33a) `secret_scan` + `dangerous_scan` are
+     forced on and `qualified` folds in `app_security_qualified`** — a standard+ run
+     can't qualify unless the mandatory gates ran and passed. If a standard+ run hits
+     a finding you've **accepted**, don't disable the gate: issue a signed, scoped,
+     **expiring** waiver (`security_gates.waivers` + the `df-waiver`
+     findings→sign→attach→verify CLI; expiry is re-checked at every verify). See
      `references/security-gates.md` for the built-ins, the external-gate interface,
-     and the honest heuristic/floor caveat (false positives are the safe direction;
-     false negatives mean it's a floor, not a proof).
+     the mandatory-at-standard+ policy, the full waiver workflow, and the honest
+     heuristic/floor caveat (false positives are the safe direction; false negatives
+     mean it's a floor, not a proof).
    - **Credentials (optional).** If the builder needs a real provider credential (e.g.
      an API key for the CLI it wraps), set `credentials.source` (`"env-file"` —
      recommended, an absolute path to a `KEY=VALUE` file OUTSIDE the control root and
@@ -301,7 +309,7 @@ unchanged below.
 - Signed audit is opt-in at `cooperative`/`standard` (`audit.signing: true` in config) but **mandatory** at `hardened` (an explicit `audit.signing: false` is a `ConfigError`). Verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
 - Every run also chains its manifest into `<control_root>/audit-chain.jsonl` (always-on, M13); check it with `verify-chain <control_root> [--key-path <path>]`, which fails closed the same way — a chain carrying a signed entry, checked without `--key-path`, is UNVERIFIED, not OK. An optional `audit.sink` ships each entry off-box; see `references/audit.md` for what it does and does not prove.
 - `hardened` is fail-closed on **both** halves: a working Docker daemon + passing container probe, AND a working OS sandbox for the verifier. Either missing refuses (exit 2) unless `--allow-downgrade` is passed. See `references/hardened.md`.
-- Security gates are opt-in (`security_gates.enabled: true`) but, once enabled, mandatory and fail-closed: a `fail_on` finding on the converged artifact rejects it (`SECURITY_GATE_FAILED`, exit 3) even when every scenario passed. Report the manifest's `security` field honestly — `checked: false` means gates never ran, not that the artifact is clean.
+- Security gates are opt-in at `cooperative` and **MANDATORY at `standard`/`hardened`/`enterprise`** (M33a forces `secret_scan`+`dangerous_scan` on, in `fail_on`, `strict_unavailable`; `qualified` folds in `app_security_qualified`). Once running, fail-closed: a `fail_on` finding on the converged artifact rejects it (`SECURITY_GATE_FAILED`, exit 3) even when every scenario passed. An accepted finding at standard+ is cleared with a signed, scoped, expiring waiver (`df-waiver`), never by disabling the gate. Report the manifest's `security` field honestly — `checked: false` means gates never ran, not that the artifact is clean.
 
 ## Composing with other skills (control-plane only)
 
@@ -342,7 +350,7 @@ holdout scenarios in a session that will also drive the builder.
 - `references/prevention-grade-roadmap.md` — why dark-factory's assurance is DETECTION-grade (catches tampering/misbehavior/accidents after the fact) rather than PREVENTION-grade against a hostile same-OS-user process, and the concrete off-host infrastructure a future project would need to close that gap
 - `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
-- `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
+- `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, the mandatory-at-standard+ policy and signed/scoped/expiring waivers (`df-waiver`), honest heuristic/floor caveat (M9, M33a)
 - `references/credentials.md` — the credential broker: allowlist-only injection, scrubbed artifacts, gitignore/permission gates, launcher-scoped standard-tier env, and honest limits (no rotation, `ps`-visibility, egress) (M11)
 - `references/digital-twins.md` — twin definition, lifecycle, and honest scope (M3a); observation log, evidence assertions, and verifier-only variant seeds (M12)
 - `references/brownfield.md` — greenfield/brownfield detection, characterization into holdout regression guards, and the probe-coverage-bounded honest scope (M15)

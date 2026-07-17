@@ -51,7 +51,8 @@ def test_absent_security_gates_no_dependency_audit_key(tmp_path):
     cr = tmp_path / "control"
     write_config(cr)
     cfg = df_config.load_config(str(cr))
-    assert cfg["_security"] == {"enabled": False}
+    # M33a: the tier-independent waiver policy is always present (empty here).
+    assert cfg["_security"] == {"enabled": False, "waivers": {"signers": [], "threshold": 0}}
 
 
 def test_osv_api_at_standard_ok(tmp_path):
@@ -216,7 +217,11 @@ def test_fail_on_dependency_audit_accepted(tmp_path):
         },
     )
     cfg = df_config.load_config(str(cr))
-    assert cfg["_security"]["fail_on"] == ["dependency_audit"]
+    # M33a: standard forces the mandatory gates INTO fail_on (union), so the
+    # operator-added dependency_audit is joined by secret_scan/dangerous_scan
+    # rather than standing alone.
+    assert set(cfg["_security"]["fail_on"]) == {
+        "dependency_audit", "secret_scan", "dangerous_scan"}
 
 
 def test_dependency_audit_block_non_dict_rejected(tmp_path):

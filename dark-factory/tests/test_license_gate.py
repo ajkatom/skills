@@ -504,4 +504,5 @@ def test_absent_security_gates_no_license_key(tmp_path):
     cr = tmp_path / "control"
     write_config(cr)
     cfg = df_config.load_config(str(cr))
-    assert cfg["_security"] == {"enabled": False}
+    # M33a: the tier-independent waiver policy is always present (empty here).
+    assert cfg["_security"] == {"enabled": False, "waivers": {"signers": [], "threshold": 0}}
