@@ -31,14 +31,260 @@ The `answers` contract (single source of truth for `init`):
 """
 import json
 import os
+import re
 
 import df_config
+import df_custody
 import df_gates
 import run_scenarios
 
 
 class InitError(RuntimeError):
     pass
+
+
+# --- assurance: "enterprise" scaffolding (DF-04) ----------------------------
+#
+# df_config.load_config REQUIRES, for assurance: "enterprise": a `custody`
+# block (approvers + threshold), `credential_proxy.enabled: true` (+ a valid
+# token_env), `audit.sink.required: true` (a real http-append or
+# s3-objectlock sink), `builder_confinement.required: true`, and
+# `audit.signing: true`. None of these can be invented by `init` -- the
+# approver PUBLIC keys, the credential proxy's allowlist/token_env name, and
+# the audit sink's endpoint are all operator-only inputs (and the matching
+# approver PRIVATE keys must be generated OFF-HOST -- init never generates,
+# sees, or stores one). So `build_config` has exactly two outcomes at
+# assurance: "enterprise", never a silent middle:
+#
+#   1. `answers` supplies every operator input (`approver_pubkeys`,
+#      `custody_threshold`, `credential_proxy`, `audit_sink`) -> the full
+#      mandatory enterprise config is generated AND preflight-validated
+#      (malformed pubkeys, malformed sink URL/bucket, inline secrets) before
+#      a single byte is returned, so `scaffold` (which calls `build_config`
+#      before writing anything) never writes an enterprise-shaped-but-invalid
+#      tree. A resulting `init --answers <enterprise-answers>` control root
+#      passes `df_config.load_config` on the first try.
+#   2. Any of those inputs is missing -> InitError naming exactly which keys
+#      are missing (fail closed), UNLESS `answers.allow_dev_downgrade` is
+#      truthy, in which case `assurance` is silently downgraded to
+#      "hardened" (an explicitly NON-enterprise config -- `cooperative`/
+#      `standard`/`hardened` init is unaffected by any of this) with a
+#      `enterprise_downgrade_note` recorded in the returned config for the
+#      caller (`supervisor.py init`) to print/journal. There is no
+#      "enterprise but missing a guarantee" output -- ever.
+_ENTERPRISE_ANSWER_HELP = (
+    "generate approver keypairs OFF-HOST (see references/enterprise.md, "
+    "'supervisor.py df-custody keygen') and supply ONLY their PUBLIC keys as "
+    "answers.approver_pubkeys -- the private keys must never touch this "
+    "host. Also provide answers.custody_threshold (int), "
+    "answers.credential_proxy (object: token_env + a non-empty allowlist), "
+    "and answers.audit_sink (object: kind 'http-append' + url, or "
+    "'s3-objectlock' + endpoint/bucket/region). To scaffold a non-enterprise "
+    "fallback instead, set answers.allow_dev_downgrade: true (assurance is "
+    "downgraded to 'hardened' and the control root is marked NOT "
+    "enterprise-qualified)."
+)
+
+
+def _missing_enterprise_inputs(answers: dict) -> list:
+    """Which operator-only enterprise inputs are absent/wrong-shaped in
+    `answers` -- a shape-only gate that decides whether build_config may
+    proceed to generate+preflight the enterprise config at all, or must fail
+    closed (or downgrade). Deep validation (malformed pubkey, malformed sink
+    URL) happens only once this returns []."""
+    missing = []
+
+    pubkeys = answers.get("approver_pubkeys")
+    if not isinstance(pubkeys, list) or not pubkeys:
+        missing.append("approver_pubkeys (non-empty list of 64-hex ed25519 PUBLIC keys)")
+
+    threshold = answers.get("custody_threshold")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        missing.append("custody_threshold (int)")
+
+    proxy = answers.get("credential_proxy")
+    if (
+        not isinstance(proxy, dict)
+        or not proxy.get("token_env")
+        or not isinstance(proxy.get("allowlist"), list)
+        or not proxy.get("allowlist")
+    ):
+        missing.append("credential_proxy (object with token_env + a non-empty allowlist)")
+
+    sink = answers.get("audit_sink")
+    if not isinstance(sink, dict) or sink.get("kind") not in ("http-append", "s3-objectlock"):
+        missing.append(
+            "audit_sink (object with kind: 'http-append' (+ url) or "
+            "'s3-objectlock' (+ endpoint/bucket/region))"
+        )
+    elif sink["kind"] == "http-append" and not sink.get("url"):
+        missing.append("audit_sink.url (required for kind 'http-append')")
+    elif sink["kind"] == "s3-objectlock":
+        for field in ("endpoint", "bucket", "region"):
+            if not sink.get(field):
+                missing.append(f"audit_sink.{field} (required for kind 's3-objectlock')")
+
+    return missing
+
+
+def _build_enterprise_addendum(answers: dict) -> dict:
+    """Preflight-validate + generate the mandatory enterprise config blocks
+    (custody, credential_proxy, audit.sink+signing, builder_confinement)
+    from operator-supplied `answers`. Only called once
+    `_missing_enterprise_inputs` has already returned [] -- every input here
+    is present and shape-checked at that gate; this function does the DEEP
+    validation (an actual ed25519 public key, a well-formed sink URL/bucket,
+    no inline secrets) and raises InitError on the first violation, before
+    returning anything -- this IS the "operational preflight": it runs
+    before `scaffold` ever touches disk, not after, so a preflight failure
+    never leaves a half-written control root behind.
+
+    The DEEP preflight this does NOT do -- actually reaching the configured
+    sink and reading back an anchored object with active retention/Object
+    Lock -- requires real provisioned infra and is intentionally never run
+    here; see `verify_worm_readback_MANUAL` below and
+    references/enterprise.md.
+    """
+    pubkeys = answers["approver_pubkeys"]
+    canonical_pubkeys = []
+    seen = set()
+    for i, pk in enumerate(pubkeys):
+        if not isinstance(pk, str) or not df_config._HEX64_RE.match(pk):
+            raise InitError(
+                f"answers.approver_pubkeys[{i}] must be a 64-hex-char ed25519 "
+                f"public key, got {pk!r}"
+            )
+        try:
+            df_custody.validate_public_key(pk)
+        except df_custody.CustodyError as e:
+            raise InitError(f"answers.approver_pubkeys[{i}]: {e}") from e
+        canonical = pk.lower()
+        if canonical in seen:
+            raise InitError(f"answers.approver_pubkeys has a duplicate entry: {pk!r}")
+        seen.add(canonical)
+        canonical_pubkeys.append(canonical)
+
+    threshold = answers["custody_threshold"]
+    if not (1 <= threshold <= len(canonical_pubkeys)):
+        raise InitError(
+            f"answers.custody_threshold must be an int in 1..{len(canonical_pubkeys)} "
+            "(the number of approver_pubkeys)"
+        )
+
+    proxy = answers["credential_proxy"]
+    if "token" in proxy:
+        raise InitError(
+            "answers.credential_proxy.token is a raw secret value and is not "
+            "allowed -- use credential_proxy.token_env to name an "
+            "environment variable instead (init never accepts inline secrets)"
+        )
+    token_env = proxy.get("token_env")
+    if not isinstance(token_env, str) or not df_config._CRED_NAME_RE.match(token_env):
+        raise InitError(
+            "answers.credential_proxy.token_env must be an environment "
+            f"variable NAME matching {df_config._CRED_NAME_RE.pattern!r}, "
+            f"got {token_env!r}"
+        )
+    allowlist = proxy["allowlist"]
+    for entry in allowlist:
+        if not isinstance(entry, str) or not entry:
+            raise InitError(
+                f"answers.credential_proxy.allowlist entries must be "
+                f"non-empty hostname strings, got {entry!r}"
+            )
+    header = proxy.get("header", "authorization")
+    if header not in ("authorization", "x-api-key"):
+        raise InitError(
+            "answers.credential_proxy.header must be 'authorization' or 'x-api-key'"
+        )
+
+    sink = answers["audit_sink"]
+    for forbidden in ("secret_key", "access_key"):
+        if forbidden in sink:
+            raise InitError(
+                f"answers.audit_sink.{forbidden} is a raw secret value and is "
+                f"not allowed -- use audit_sink.{forbidden}_env to name an "
+                "environment variable instead (init never accepts inline secrets)"
+            )
+
+    sink_kind = sink["kind"]
+    sink_cfg = {"kind": sink_kind, "required": True}
+    if sink_kind == "http-append":
+        url = sink.get("url")
+        if not isinstance(url, str) or not re.match(r"^https?://\S+$", url):
+            raise InitError("answers.audit_sink.url must be a http(s):// URL")
+        sink_cfg["url"] = url
+    else:  # s3-objectlock
+        for field in ("endpoint", "bucket", "region"):
+            val = sink.get(field)
+            if not isinstance(val, str) or not val:
+                raise InitError(
+                    f"answers.audit_sink.{field} is required for kind 's3-objectlock'"
+                )
+            sink_cfg[field] = val
+        prefix = sink.get("prefix", "")
+        if not isinstance(prefix, str):
+            raise InitError("answers.audit_sink.prefix must be a str")
+        sink_cfg["prefix"] = prefix
+        for env_field, default in (
+            ("access_key_env", "DF_AUDIT_S3_ACCESS_KEY"),
+            ("secret_key_env", "DF_AUDIT_S3_SECRET_KEY"),
+        ):
+            env_name = sink.get(env_field, default)
+            if not isinstance(env_name, str) or not df_config._CRED_NAME_RE.match(env_name):
+                raise InitError(
+                    f"answers.audit_sink.{env_field} must be an environment "
+                    f"variable NAME matching {df_config._CRED_NAME_RE.pattern!r} "
+                    "(never a raw secret)"
+                )
+            sink_cfg[env_field] = env_name
+
+    addendum = {
+        "custody": {"approvers": canonical_pubkeys, "threshold": threshold},
+        "credential_proxy": {
+            "enabled": True,
+            "token_env": token_env,
+            "allowlist": list(allowlist),
+            "header": header,
+        },
+        "audit": {"signing": True, "sink": sink_cfg},
+        "builder_confinement": {"enabled": True, "required": True},
+    }
+
+    seccomp_profile = answers.get("seccomp_profile")
+    if seccomp_profile:
+        addendum["enterprise"] = {"seccomp_profile": seccomp_profile}
+
+    return addendum
+
+
+def verify_worm_readback_MANUAL(sink_cfg: dict) -> None:
+    """STUB -- deliberately never called by build_config/scaffold/init or any
+    unit test. The offline preflight in `_build_enterprise_addendum` proves
+    only that the sink config is well-formed (a real http(s) URL, or a
+    bucket/endpoint/region triple, with *_env NAMES rather than inline
+    secrets) -- it never touches the network. It CANNOT prove the sink is
+    actually WORM: that an object pushed through it reads back byte-
+    identical, and that the bucket/object carries an ACTIVE retention /
+    Object Lock configuration that would refuse deletion before the
+    retention period elapses. Proving that requires REAL provisioned infra
+    (a live http-append receiver or an S3-compatible bucket with Object Lock
+    actually enabled) -- exactly the kind of external dependency this test
+    suite never stands up for a WORM guarantee (df_audit_sink.py's own
+    module docstring: "WORM here is NOT enforced ... that is the operator's
+    object-lock retention configuration").
+
+    Treat this as a checklist, not working code: run it (or an equivalent
+    manual check) by hand, or in a CI job with real infra, after
+    provisioning the sink and before relying on it for enterprise custody
+    attestations. See references/enterprise.md, "Manual WORM-readback
+    preflight (operator step)".
+    """
+    raise NotImplementedError(
+        "verify_worm_readback_MANUAL is a documented manual/CI-with-infra "
+        "step, not an automated check -- see its docstring and "
+        "references/enterprise.md"
+    )
 
 
 def build_config(answers: dict) -> dict:
@@ -108,6 +354,26 @@ def build_config(answers: dict) -> dict:
     for key in ("security_gates", "twins", "knowledge_base"):
         if key in options:
             cfg[key] = options[key]
+
+    if assurance == "enterprise":
+        missing = _missing_enterprise_inputs(answers)
+        if missing:
+            if answers.get("allow_dev_downgrade"):
+                cfg["assurance"] = "hardened"
+                cfg["enterprise_downgrade_note"] = (
+                    "assurance downgraded from 'enterprise' to 'hardened' at "
+                    "init time (answers.allow_dev_downgrade was set) -- the "
+                    "following required enterprise operator inputs were not "
+                    f"supplied in answers: {'; '.join(missing)}. This control "
+                    "root is NOT enterprise-qualified."
+                )
+            else:
+                raise InitError(
+                    "assurance: enterprise requires operator-supplied inputs "
+                    f"missing from answers: {'; '.join(missing)}. {_ENTERPRISE_ANSWER_HELP}"
+                )
+        else:
+            cfg.update(_build_enterprise_addendum(answers))
 
     return cfg
 

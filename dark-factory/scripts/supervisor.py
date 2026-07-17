@@ -1453,10 +1453,20 @@ def _init_prerequisite_lines(cfg: dict) -> list:
         lines.append("  - a working OS sandbox backend (macOS sandbox-exec / Linux bwrap) + a passing denial probe")
     if assurance == "enterprise":
         lines.append(
-            "  - >=1 distinct approver keypair(s) for split-custody sign-off "
-            "(supervisor.py df-custody keygen/sign/attach) -- add a `custody` block to "
-            "config.json yourself; init does not scaffold one (see references/enterprise.md)"
+            "  - approver PRIVATE keys distributed to the operators named by "
+            "custody.approvers (generated off-host, e.g. `supervisor.py "
+            "df-custody keygen`; init never generates or sees a private key) "
+            "-- a run stays CUSTODY_PENDING until >=threshold approvers sign "
+            "via `df-custody sign` + `attach` (see references/enterprise.md)"
         )
+        lines.append(
+            "  - the configured audit sink must be REACHABLE and its WORM/"
+            "retention (Object Lock) config ACTIVE -- init only checked the "
+            "sink config's SHAPE, never reached it; verify this by hand "
+            "(see references/enterprise.md, 'Manual WORM-readback preflight')"
+        )
+    if cfg.get("enterprise_downgrade_note"):
+        lines.append(f"  - NOTE: {cfg['enterprise_downgrade_note']}")
     return lines
 
 
@@ -1531,6 +1541,8 @@ def init_cmd(control_root: str, answers_path: str, force: bool = False, force_ke
 
     print(f"dark-factory: init OK -- control root {control_root}")
     print(f"  config.json     assurance={cfg['assurance']}  autonomy={cfg['autonomy']}")
+    if cfg.get("enterprise_downgrade_note"):
+        print(f"  ** NOT enterprise-qualified ** {cfg['enterprise_downgrade_note']}")
     print("  spec.md         (builder-visible; no scenario content)")
     print(f"  behaviors.json  {len(behaviors)} behavior(s): {', '.join(b['id'] for b in behaviors)}")
     print(f"  scenarios/      {len(scenarios)} scenario(s) ({dev_n} dev, {final_n} final/sealed)")
