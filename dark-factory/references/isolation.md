@@ -144,6 +144,76 @@ until a real need for Linux-loopback-plus-twins shows up. Use `deny` on
 Linux when you don't need twins/http scenarios reachable, or run on macOS
 when you do.
 
+## Candidate process + env containment (DF-02)
+
+The read-denial sandbox and `candidate_network` above answer "can the process
+read/write the control root?" and "can it reach the network?" — two further,
+orthogonal questions are "what host environment does the candidate's own
+process inherit?" and "does anything the candidate spawns outlive the
+scenario that started it?" M29a Task 1/2 (`run_scenarios.py`) answer those,
+at **every tier**, independent of which sandbox backend (if any) is active.
+
+**Minimal allowlisted environment (`candidate_env`).** Every candidate/verifier
+scenario — CLI (`run_scenario`) and HTTP (`_run_http_scenario`) alike — used to
+launch its subprocess with `dict(os.environ, **env_extra)`, i.e. the operator's
+full ambient shell environment plus whatever the supervisor injected.
+`candidate_env(env_extra)` replaces that with:
+- an explicit **allowlist** of host vars a normal program needs to run at all —
+  `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TMPDIR`, `TMP`, `TEMP`, `TERM`, `TZ`,
+  `PWD`, `SHELL`, `USER`, `LOGNAME` (`_CANDIDATE_ENV_ALLOWLIST_NAMES`), plus
+  every `LC_*` locale variable by prefix — UNION
+- `env_extra`, the supervisor-injected, trusted portion (twin endpoints, the
+  M11 credential allowlist), passed through unfiltered since the supervisor
+  already decided what belongs there.
+
+A **denylist** is applied as a belt-and-suspenders scrub to the allowlisted
+host portion (never to `env_extra`, which is supervisor-controlled), covering
+known-dangerous names (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `SSH_CONNECTION`,
+`GH_TOKEN`, `GITHUB_TOKEN`, `DOCKER_HOST`, `KUBECONFIG`), whole cloud/provider
+credential prefix families (`AWS_`, `GOOGLE_`, `GCP_`, `AZURE_`, `ANTHROPIC_`,
+`OPENAI_`, `GEMINI_`), and a case-insensitive substring check
+(`PROXY`, `SECRET`, `TOKEN`, `PASSWORD`, `APIKEY`, `API_KEY`, `CREDENTIAL`) —
+so `*_PROXY` and any vendor's `*TOKEN*`/`*SECRET*`/`*API_KEY*` are caught
+regardless of prefix. If a denylisted name somehow shows up in `env_extra`
+(the supervisor itself injecting something it shouldn't), `candidate_env`
+fails closed with a real `raise ValueError` rather than an `assert` — the
+latter compiles out under `python -O`/`PYTHONOPTIMIZE`, which would silently
+let the leak through. Net effect: generated candidate code no longer inherits
+the operator's SSH agent socket, proxy config, cloud credentials, or CLI API
+keys just by being spawned — only the minimal runtime env plus whatever the
+supervisor explicitly threaded through.
+
+**Full process-group teardown.** Both scenario launchers now start their
+subprocess with `start_new_session=True` (a fresh session/process group, PGID
+== PID at launch) and capture that PGID immediately, before anything else can
+happen to the child. `_reap_process_group` is always invoked from a `finally`
+— on normal completion, on an oracle timeout, and on a launch failure — and
+mirrors `df_twins.TwinSet.stop()`'s discipline: `SIGTERM` the whole captured
+process group, wait up to 3s for the direct child to exit, then `SIGKILL` the
+group if anything is still alive (checked via `os.killpg(pgid, 0)`), polling
+up to 2s more for the group to actually clear. Because the PGID is captured
+once at launch and never re-resolved later via `os.getpgid(proc.pid)`, an
+already-exited direct child (e.g. a shell wrapper) can't cause a
+still-running grandchild in the same group to leak. This closes the
+`setsid`/double-fork escape: a candidate that backgrounds or detaches a child
+process to survive past its own exit is still in the same process group, and
+still gets killed. Applies identically to CLI scenarios (`run_scenario`) and
+HTTP scenarios (`_run_http_scenario`, which additionally reaps the started
+service regardless of whether it ever became ready or answered the request).
+
+**Honest scope.** This is the env/IPC + process half of DF-02, not the whole
+of it. What it does NOT do: a `standard`-tier candidate can still **read**
+host files today — the current sandbox profile (top of this doc) is
+allow-default with the control root denied, not a default-deny profile that
+would also block reads of the operator's home directory, dotfiles, etc.
+Copy-on-run scratch per scenario (so a candidate's writes never touch a
+shared workspace across scenarios) and a network-namespace egress topology
+finer than `candidate_network`'s three modes (§7.4 above) are likewise not
+delivered by this work. All three are tracked for M29b/M29c. What IS closed
+by Tasks 1-2: a candidate can no longer read the operator's ambient secrets
+via environment variables, and a candidate can no longer leave a surviving
+background/daemon process behind after its scenario ends.
+
 ## Linux live-coverage harness
 
 The maintainer's daily machine is macOS, so the Linux `bwrap` backend was
