@@ -133,7 +133,8 @@ or anything else. UDP and other socket types are denied by the same
 `network*` primitive by construction on macOS but are not separately probed
 (only TCP connects are). **M29b update:** this limit now applies only to the
 `(allow default)` wrapper (the builder's, and the candidate's under the
-`allow_host_read` opt-out / Linux legacy path) — the M29b default-deny
+`allow_host_read` opt-out or the legacy fallback wrapper) — the M29b/M29c
+default-deny
 CANDIDATE profile default-denies Mach IPC, which was measured to CLOSE the
 resolver channel for the candidate at `deny`/`loopback` (see "Default-deny
 candidate host isolation" below).
@@ -208,8 +209,8 @@ service regardless of whether it ever became ready or answered the request).
 
 **Honest scope.** This is the env/IPC + process half of DF-02. The host-READ
 half — a candidate reading the operator's home directory, dotfiles, other
-repos — is closed by M29b's default-deny candidate profile on macOS (next
-section); Linux keeps the legacy allow-read candidate wrapper until M29c.
+repos — is closed by M29b's default-deny candidate profile on macOS and
+M29c's on Linux (next two sections).
 Copy-on-run scratch per scenario (so a candidate's writes never touch a
 shared workspace across scenarios) remains tracked for M29d. What IS closed
 by M29a Tasks 1-2: a candidate can no longer read the operator's ambient
@@ -319,10 +320,17 @@ probe-passed + no disqualifying residuals (`file_metadata_outside_home` and
 `network_unrestricted_open` are the two structural, non-disqualifying ones).
 M36's qualification FSM will fold this into the overall `qualified` boolean.
 
-**Honest limits.** (a) Linux keeps the LEGACY candidate wrapper (bwrap
-ro-binds `/`, so the whole host stays readable) and reports
-`mode: "legacy_allow_host_read"` — flagged, fixed in M29c, never a fake
-default-deny claim. (b) Candidates using an interpreter/runtime outside the
+**Honest limits.** (a) The Linux default-deny profile is a SEPARATE backend
+with its own probe (next section, M29c). The real Linux backend now
+advertises `supports_default_deny` UNCONDITIONALLY, so a host where bwrap
+cannot create the namespace (too old, or unprivileged with user namespaces
+disabled) does NOT silently fall back to a host-readable legacy wrapper — the
+live confinement probe FAILS and the run is REFUSED
+(`CANDIDATE_CONFINEMENT_PROBE_FAILED`, exit 2), or, with `--allow-downgrade`,
+drops to `mode: "allow_host_read_downgrade"` (journaled, unqualified). The
+`legacy_allow_host_read` path now only applies to a backend WITHOUT
+`supports_default_deny` (e.g. a test double). (b) Candidates using an
+interpreter/runtime outside the
 system paths + the verifier interpreter's prefixes need the
 `allow_host_read` opt-out — the honest tradeoff, not a silent widening.
 (c) `network-bind`/`network-inbound` on localhost are port-wildcarded (the
@@ -330,6 +338,113 @@ HTTP oracle assigns the candidate's own port per scenario); LISTENING on a
 loopback port is not a host-read/exfil channel, and outbound pinning is
 what protects host loopback services. (d) stat/existence metadata outside
 `$HOME` stays visible (see the residual above).
+
+## Default-deny candidate host isolation on Linux (M29c, DF-02 Linux half)
+
+The Linux parallel of M29b: `_LinuxBackend.wrap_candidate_prefix` no longer
+falls back to the legacy `--ro-bind / /` passthrough. It now builds a REAL
+default-deny **mount + PID + IPC + UTS namespace** (plus `--unshare-net` at
+`network: "deny"`) from EXPLICIT minimal binds, and the backend advertises
+`supports_default_deny = True`, so the supervisor flows it through the exact
+same backend-agnostic path M29b built (probe → seal `host_isolation`). A
+passing Linux `standard` run now reports `host_isolation.mode:
+"default_deny"`, `qualified: true` — where it previously reported
+`legacy_allow_host_read` and could not qualify.
+
+**The final argv** (developed and proven live under `docker run --privileged
+ubuntu:24.04`, bwrap 0.9.0), each bind justified:
+- `--unshare-pid --unshare-ipc --unshare-uts` — private PID/IPC/UTS namespaces
+  (the candidate cannot see or signal host processes, or read host SysV IPC).
+- `--proc /proc` — a PRIVATE proc for the new PID ns, **not** a host
+  `--ro-bind` (which would leak every host process's `cmdline`/`environ`/root
+  via `/proc/<pid>`).
+- `--dev /dev` — minimal private devtmpfs (`null`/`zero`/`urandom`/`tty`…);
+  host disks and other ttys stay absent.
+- `--tmpfs /tmp` — private empty `/tmp`; the host `/tmp` (other processes'
+  scratch files and unix sockets) is unreadable.
+- `--ro-bind` of `/usr /bin /sbin /lib` (+ the `/lib64,/lib32,/libx32`
+  variants that exist) and `/etc` — the minimum a runtime needs to START,
+  proven by removal live (drop `/lib` and every dynamic binary dies `execvp:
+  No such file` because its ELF loader is gone). `/etc` is system config
+  (resolv.conf, nsswitch, ld.so.cache, localtime) — a candidate reading it is
+  standard and mirrors the macOS `/private/etc` allow; it is NOT `$HOME`
+  secrets. The verifier interpreter's own realpath'd prefixes (a venv may live
+  outside `/usr`) are ro-bound too, so the wrapped child can launch.
+- **Secret-leaf masks** (last-apply-wins, AFTER the `/usr` + `/etc` ro-binds;
+  each emitted only when the host path exists) — the Linux parallel of the
+  macOS `system_read_carveouts`, closing sensitive DATA that falls inside the
+  broad ro-binds but is not runtime code: `--tmpfs` over `/usr/local/etc`
+  `/usr/local/var` (service confs like `redis.conf requirepass` + live DB
+  data — exactly the macOS `/usr/local` carve-out), `/etc/ssl/private` (TLS
+  private keys), `/etc/kubernetes` `/etc/rancher` (cluster admin creds); and
+  `--ro-bind /dev/null` over `/etc/shadow` `/etc/gshadow` (+ `-` backups). The
+  shadow mask is **load-bearing and proven so**: strip it and a candidate
+  running as euid 0 (privileged CI runs as root, so DAC does not save it) reads
+  the real password hashes back; with it the read is denied. Without these
+  masks a Linux run would qualify on strictly WEAKER isolation than macOS for
+  the identical layout.
+- `--bind <workspace> <workspace> --chdir <workspace>` (+ `--bind` each
+  scratch dir) — the workspace and scratch are the only read-WRITE mounts.
+- `--cap-drop ALL` — drop every capability, so the candidate cannot
+  `mount`/`remount`/`pivot_root` to re-expose the host (measured live:
+  `mount(MS_REMOUNT)` on a ro system bind → `EPERM`; strip this pair and the
+  same remount SUCCEEDS, which is exactly the non-vacuity the probe asserts).
+- `--die-with-parent` — the candidate is reaped if the supervisor dies.
+- **NO `--ro-bind / /`.** The control root, `$HOME`, `/root`, other users'
+  homes, `/var`, `/run`, `/opt`, `/mnt` are simply not in the namespace →
+  a candidate `open()` of any of them returns `ENOENT`. Denial is by
+  **ABSENCE**, not a policy line.
+
+Before mounting, a **realpath disjointness gate** refuses (fail-closed
+`SandboxError`) if any bind would expose the control root — i.e. the control
+root sits under a bind, or a bind sits under it. In the normal layout the
+control root and workspace are siblings, disjoint from the system dirs, so no
+mask is needed (the control root is absent, not masked).
+
+**ENOENT-is-denial (and how the probe tells it from a bug).**
+`probe_candidate_confinement` runs a Linux-specific body (there are no Mach
+services on Linux, so the macOS keychain/DNS IPC checks do not apply). Because
+absence yields `ENOENT`, a naive "open failed" could equally mean "the sandbox
+removed it" OR "the probe never planted the canary". To disambiguate, the
+parent plants each canary (control-root, an outside-workspace temp file, and a
+temp-named file directly in `$HOME`) and **confirms it is readable UNWRAPPED
+first** — only a canary that provably exists on the host yet is unreadable
+inside the wrapper counts as denial. The `$HOME` check reads a planted file
+(not a `listdir`) so it stays correct even when a bound venv leaves a skeleton
+dir under `$HOME`. The child also proves: workspace write SUCCEEDS (physically
+verified back on the host — non-vacuity), outside write DENIED, subprocess
+spawn SUCCEEDS, the `CAP_SYS_ADMIN` remount-escape is DENIED, the
+**system-data carve-outs** are DENIED (non-vacuously: the parent plants a
+token inside each maskable dir it can write and includes the real
+`/etc/shadow`/`/etc/gshadow` when readable-unwrapped, then asserts each reads
+back absent/empty inside — so a regressed mask surfaces as
+`system_data_file_open` and fails the run), and at
+`network: "deny"` external egress is DENIED (`ENETUNREACH`). At `deny`,
+`--unshare-net` also closes DNS (the net ns has no route to any resolver), so
+there is no DNS residual — and no `file_metadata_outside_home` residual either
+(absence leaves nothing stat-visible), so a passing Linux `deny` run has **no
+hard residuals** and qualifies. `network: "unrestricted"` records the soft
+`network_unrestricted_open` residual (egress open by design of the mode).
+
+**Deferred (own follow-ons, refused fail-closed today).**
+`network: "loopback"` on bwrap raises `SandboxError` — `--unshare-net` gives
+the namespace its own empty loopback, so host-bound twins are unreachable and
+there is no port-pinned host-loopback passthrough like macOS's; loopback +
+netns-local twins is **M29c-2**. The hardened/enterprise candidate container
+is **M29c-3**. `allowed_loopback_ports` is accepted and validated for
+signature parity but unused until M29c-2.
+
+**Live proof (privileged CI).** bwrap cannot run on the macOS dev host and
+default Docker blocks unprivileged user namespaces, so the Linux confinement
+tests (`tests/test_candidate_confinement_linux.py`) are gated on a
+`_privileged_linux_bwrap()` helper: True only when `sys.platform` is Linux AND
+a trivial `bwrap --unshare-pid --unshare-net /bin/true` (with the loader
+bound) actually succeeds. They self-skip on macOS and on unprivileged Linux CI
+and RUN on a privileged-Linux runner (native or `docker run --privileged`),
+driving the production `df_sandbox` code path. The argv-SHAPE unit tests (no
+`--ro-bind / /`, workspace rw, control-root/`$HOME` not bound, disjointness
+raises, loopback raises, `supports_default_deny is True`) run everywhere,
+including macOS.
 
 ## Linux live-coverage harness
 

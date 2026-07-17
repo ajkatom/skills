@@ -116,12 +116,12 @@ the off-host infrastructure above:
   is the **signed-timestamp service** already listed above under "An
   authenticated remote WORM sink + signed-timestamp service."
 
-## DF-02 candidate containment status (M29a env half + M29b host-read half)
+## DF-02 candidate containment status (M29a env half + M29b/M29c host-read half)
 
 DF-02 ("the candidate inherits the operator's host") is being closed in
-honest, probe-verified slices — and unlike most of this doc, the M29b slice
-IS prevention-grade against its stated adversary (the CONFINED candidate
-process), because the OS kernel, not an application check, does the
+honest, probe-verified slices — and unlike most of this doc, the M29b/M29c
+slices ARE prevention-grade against their stated adversary (the CONFINED
+candidate process), because the OS kernel, not an application check, does the
 denying:
 
 - **Env + process half — merged (M29a):** minimal allowlisted candidate
@@ -138,9 +138,17 @@ denying:
   hardened/enterprise container's job, and a candidate needing host reads
   can opt out visibly (`candidate_host_read: "allow_host_read"`,
   `qualified: false`).
-- **Linux default-deny + per-scenario PID-namespace reaping + netns-local
-  verifier/twins → M29c**; Linux today honestly reports
-  `host_isolation.mode: "legacy_allow_host_read"`.
+- **Host-read half — merged (M29c), standard-Linux:** the candidate runs in
+  a REAL default-deny bwrap **mount + PID/IPC/UTS (+ net at `deny`) namespace**
+  built from explicit minimal binds — NO `--ro-bind / /`, so the control root,
+  `$HOME` and the rest of the host are ABSENT from the namespace (denial by
+  construction), `--cap-drop ALL` blocks the mount-manipulation escape, and a
+  Linux-specific per-run probe live-proves it (ENOENT-is-denial, with
+  host-confirmed canaries to tell real denial from a setup bug). A passing
+  Linux `standard` run now reports `host_isolation.mode: "default_deny"`,
+  `qualified: true` — DF-02 Linux host-read is now **detection + prevention at
+  standard**, not just detection. Deferred: `loopback` + netns-local twins on
+  bwrap (M29c-2), the hardened/enterprise candidate container (M29c-3).
 - **Copy-on-run scratch per scenario → M29d.**
 
 ## Framing this correctly

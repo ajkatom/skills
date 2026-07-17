@@ -2,7 +2,7 @@
 
 Three layers, mirroring the M27 candidate_network test split:
 - unit: profile construction (exact port pinning, clause ordering, tier/config
-  validation, Linux legacy passthrough) -- no sandbox needed;
+  validation, Linux default-deny argv shape) -- no sandbox needed;
 - live (macOS sandbox-exec): the confinement probe against a real workspace,
   port-pinning non-vacuity through a wrapped child, and the HONESTY property
   (whatever the machine measures for keychain/DNS, the report's residuals and
@@ -131,13 +131,124 @@ def test_profile_rejects_bad_modes_and_ports():
             _profile(network="loopback", allowed_loopback_ports=[bad])
 
 
-def test_linux_wrap_candidate_prefix_is_legacy_passthrough():
-    # Honest legacy: identical argv to the M27 wrapper, ports/scratch ignored.
-    a = _linux.wrap_candidate_prefix("/tmp/d", "/tmp/w", network="deny",
-                                     allowed_loopback_ports=[1234],
-                                     scratch_dirs=("/tmp/s",))
-    b = _linux.wrap_prefix("/tmp/d", "/tmp/w", network="deny")
-    assert a == b
+# ------------------------------------------- unit: Linux default-deny argv (M29c)
+# These construct the bwrap argv only (no kernel needed), so they run
+# everywhere, including on this macOS host. The LIVE proof that the argv
+# actually isolates on a real kernel is test_candidate_confinement_linux.py.
+
+def _linux_argv(deny="/tmp/df-deny", ws="/tmp/df-ws", **kw):
+    return _linux.wrap_candidate_prefix(deny, ws, **kw)
+
+
+def test_linux_backend_advertises_default_deny():
+    assert _linux.supports_default_deny is True
+
+
+def test_linux_argv_has_no_ro_bind_root():
+    # The whole point of M29c: NO `--ro-bind / /` passthrough. The host root
+    # must never appear as a ro-bind source/dest pair.
+    argv = _linux_argv(network="deny")
+    pairs = [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv)
+             if a == "--ro-bind" and i + 2 < len(argv)]
+    assert ("/", "/") not in pairs
+    assert "--ro-bind" in argv and argv.count("bwrap") == 1
+
+
+def test_linux_argv_binds_workspace_rw_and_chdir():
+    real_ws = os.path.realpath("/tmp/df-ws")
+    argv = _linux_argv(network="deny")
+    # workspace is a read-WRITE --bind (not --ro-bind) and the cwd.
+    assert ["--bind", real_ws, real_ws] == _find_pair(argv, "--bind", real_ws)
+    assert argv[argv.index("--chdir") + 1] == real_ws
+
+
+def test_linux_argv_does_not_bind_control_root_or_home():
+    real_deny = os.path.realpath("/tmp/df-deny")
+    home = os.path.realpath(os.path.expanduser("~"))
+    argv = _linux_argv(network="deny")
+    # Denial by ABSENCE: neither the control root nor $HOME is a bind target.
+    assert real_deny not in argv
+    assert home not in argv
+
+
+def test_linux_argv_unshare_flags_and_cap_drop():
+    argv = _linux_argv(network="deny")
+    for flag in ("--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                 "--unshare-net", "--die-with-parent"):
+        assert flag in argv, flag
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    # private /proc /dev /tmp, not host ro-binds of them.
+    assert argv[argv.index("--proc") + 1] == "/proc"
+    assert argv[argv.index("--dev") + 1] == "/dev"
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp"
+
+
+def test_linux_argv_unrestricted_has_no_unshare_net():
+    argv = _linux_argv(network="unrestricted")
+    assert "--unshare-net" not in argv
+
+
+def test_linux_loopback_raises_deferred():
+    with pytest.raises(df_sandbox.SandboxError):
+        _linux_argv(network="loopback")
+
+
+def test_linux_unknown_network_raises():
+    with pytest.raises(df_sandbox.SandboxError):
+        _linux_argv(network="bogus")
+
+
+def test_linux_bad_loopback_port_raises():
+    for bad in (0, 70000, True, "x", 1.5):
+        with pytest.raises(df_sandbox.SandboxError):
+            _linux_argv(network="deny", allowed_loopback_ports=[bad])
+
+
+def test_linux_argv_masks_sensitive_system_data_leaves(monkeypatch):
+    # Parity with the macOS system_read_carveouts: the sensitive leaves inside
+    # the broad /usr and /etc ro-binds must be MASKED (last-apply-wins) so a
+    # Linux run never qualifies on weaker isolation. Force every candidate mask
+    # path to "exist" so the (existence-guarded) clauses are emitted regardless
+    # of this host's layout.
+    monkeypatch.setattr(df_sandbox.os.path, "exists", lambda p: True)
+    argv = _linux_argv(network="deny")
+
+    def idx_pair(flag, a, b):
+        for i in range(len(argv) - 2):
+            if argv[i] == flag and argv[i + 1] == a and argv[i + 2] == b:
+                return i
+        return -1
+
+    etc_bind = idx_pair("--ro-bind", "/etc", "/etc")
+    usr_bind = idx_pair("--ro-bind", "/usr", "/usr")
+    ws_bind = idx_pair("--bind", os.path.realpath("/tmp/df-ws"), os.path.realpath("/tmp/df-ws"))
+    # dir masks (tmpfs) for the /usr/local + /etc secret dirs.
+    for d in ("/usr/local/etc", "/usr/local/var", "/etc/ssl/private",
+              "/etc/kubernetes", "/etc/rancher"):
+        j = [i for i in range(len(argv) - 1) if argv[i] == "--tmpfs" and argv[i + 1] == d]
+        assert j, f"missing --tmpfs {d}"
+        assert j[0] > usr_bind and j[0] > etc_bind, f"{d} mask must come after the ro-binds"
+        assert j[0] < ws_bind, f"{d} mask must precede the workspace bind"
+    # file masks (/dev/null) for the shadow password hashes.
+    for f in ("/etc/shadow", "/etc/gshadow", "/etc/shadow-", "/etc/gshadow-"):
+        assert idx_pair("--ro-bind", "/dev/null", f) > etc_bind, f"missing/misordered mask {f}"
+
+
+def test_linux_disjointness_raises_when_bind_would_expose_control_root():
+    # deny_root nested under the workspace → binding the workspace would expose
+    # it → fail closed.
+    with pytest.raises(df_sandbox.SandboxError):
+        _linux.wrap_candidate_prefix("/tmp/proj/control", "/tmp/proj", network="deny")
+    # workspace nested under deny_root → also refused.
+    with pytest.raises(df_sandbox.SandboxError):
+        _linux.wrap_candidate_prefix("/tmp/proj", "/tmp/proj/ws", network="deny")
+
+
+def _find_pair(argv, flag, target):
+    for i, a in enumerate(argv):
+        if a == flag and i + 2 < len(argv) and argv[i + 1] == target:
+            return [argv[i], argv[i + 1], argv[i + 2]]
+    return None
 
 
 # ---------------------------------------------------------------- unit: config

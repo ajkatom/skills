@@ -166,15 +166,20 @@ unchanged below.
      ever runs under it (fail-closed, same discipline as the base denial probe);
      `"deny"` is refused with `twins.enabled: true` or any http scenario, and
      `"loopback"` is macOS-only. See `references/isolation.md`.
-   - **`candidate_host_read` (optional, M29b, DF-02; `standard`+).** At standard+
-     the CANDIDATE runs under a **default-deny** host-read sandbox by default
-     (macOS: `~/.ssh`/dotfiles/other-repos OS-denied, workspace-only writes,
-     loopback pinned to the run's own twin ports, keychain/DNS Mach channels
-     closed — live-probed per run and sealed as the manifest `host_isolation`
-     field). Opt out with `"allow_host_read"` ONLY if the app under test truly
-     needs to read the host — the run still works but `host_isolation.qualified`
-     is honestly `false`. Linux keeps the legacy (host-readable) candidate
-     wrapper until M29c and says so on the manifest. See `references/isolation.md`.
+   - **`candidate_host_read` (optional, M29b/M29c, DF-02; `standard`+).** At
+     standard+ the CANDIDATE runs under a **default-deny** host-read sandbox by
+     default on BOTH macOS and Linux: `~/.ssh`/dotfiles/other-repos OS-denied,
+     workspace-only writes — macOS via a `(deny default)` `sandbox-exec` profile
+     (loopback pinned to the run's own twin ports, keychain/DNS Mach channels
+     closed), Linux (M29c) via a real bwrap mount+PID namespace built from
+     explicit minimal binds (NO `--ro-bind / /`; the host is ABSENT from the
+     namespace, `--cap-drop ALL`). Live-probed per run and sealed as the
+     manifest `host_isolation` field. Opt out with `"allow_host_read"` ONLY if
+     the app under test truly needs to read the host — the run still works but
+     `host_isolation.qualified` is honestly `false`. On Linux, `loopback`/twins
+     at standard remain macOS-only until M29c-2; use `candidate_network: "deny"`
+     (no twins/http) for a qualifying host-isolated Linux run. See
+     `references/isolation.md`.
    - **`hardened` (optional block, only under `assurance: hardened`).** Set
      `hardened.image` (default `python:3.12-alpine` — a real cross-model builder needs a
      user-supplied image with that CLI + credentials baked in), `hardened.network`
@@ -366,7 +371,7 @@ holdout scenarios in a session that will also drive the builder.
 - `references/config-reference.md` — config schema
 - `references/modes.md` — the four intervention modes (H1 directed / H2 supervised / H3 guarded / H4 lights-out), the full state-transition (pause-point) table, the legacy `(autonomy,checkpoint)→mode` mapping + `df-migrate-config`, the H4 fail-closed contract, and the deferred before-ship gate (M36a)
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), the honest trust-domain limits of each, the single-SM `qualification` field + codes, and the phase-aware hash-chained FSM checkpoint (M5a, M13, M36a)
-- `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier (DF-02, M29a); default-deny candidate host isolation — `candidate_host_read`, port-pinned loopback, closed keychain/DNS Mach channels, the per-run confinement probe, and the manifest `host_isolation` field (DF-02, M29b; Linux legacy until M29c)
+- `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier (DF-02, M29a); default-deny candidate host isolation — `candidate_host_read`, port-pinned loopback, closed keychain/DNS Mach channels, the per-run confinement probe, and the manifest `host_isolation` field (DF-02, M29b macOS + M29c Linux bwrap mount+PID namespace; Linux `loopback`/twins deferred to M29c-2)
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/reproducibility.md` — what's reproducible/verifiable today (stdlib-only tiers, pinned `cryptography` range, content-addressed artifact binding, config/spec/scenario hashes, digest-pinnable images) vs. the honest owner/infra TODO (LICENSE, CI, hash-locked installs, default digest pinning, release SBOM/provenance)
 - `references/prevention-grade-roadmap.md` — why dark-factory's assurance is DETECTION-grade (catches tampering/misbehavior/accidents after the fact) rather than PREVENTION-grade against a hostile same-OS-user process, and the concrete off-host infrastructure a future project would need to close that gap
