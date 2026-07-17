@@ -271,6 +271,8 @@ holdout scenarios in a session that will also drive the builder.
 
 ## References
 
+- `README.md` — human-facing quickstart, tier table, repo layout, testing
+- `OVERVIEW.md` — plain-language overview of what this does + what every reference doc below covers
 - `references/authoring.md` — the `init` interview script: spec, tier choice, writing discriminating holdout scenarios (dev vs. sealed final), and the optional config blocks; see also `examples/kv-service/answers.json` (M19)
 - `references/config-reference.md` — config schema
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
