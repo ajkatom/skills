@@ -225,3 +225,70 @@ Walks `<control_root>/audit-chain.jsonl`, recomputing every `chain_hash` from it
 **`journal.jsonl` is sealed WHOLE — the audit feature does not touch it.** `verify-manifest` hashes the entire `journal.jsonl` and compares to `manifest.journal_sha256`, exactly as in M5a — no prefix, no `journal_bytes`, no trailing-line allowlist. This holds because `_anchor_audit` writes its events to a separate `audit_events.jsonl` (see the chain section above), never appending to the sealed journal. Any post-finalize edit to `journal.jsonl` — appending a forged line, even one wearing an `AUDIT_*` state, or truncating it — changes the whole-file hash and reads `TAMPERED`.
 
 **Concurrent-append serialization (carried over from the Task 1 review).** `df_audit_chain.append_entry` is crash-safe (read-modify-atomic-replace via a temp file + `os.replace`) but is NOT file-locked against a second, truly concurrent writer appending to the SAME control root's `audit-chain.jsonl` at the same moment — two processes could both read the same "last entry," compute the same `prev_chain_hash`, and one append could silently clobber the other's (last writer wins, `os.replace` is atomic but the read-then-write is not a single atomic transaction across processes). This is not a new gap introduced by M13's supervisor wiring: `acquire_lock`/`release_lock` already serialize the supervisor's OWN runs per control root one at a time (see the top of this file's `run()`/`resume()`), so a single supervisor never appends concurrently with itself. It only matters if something OTHER than the supervisor's own lock-protected run/resume calls `df_audit_chain.append_entry` directly against a shared control root (e.g. a future multi-writer or distributed setup) — that scenario is out of scope for M13 and would need its own file lock around the chain file specifically, not just the existing per-run lock.
+
+## M36a: the `qualification` field + the phase-aware FSM chain
+
+### `manifest["qualification"]` — the single qualification state machine
+Every terminal manifest now carries a `qualification` object computed by ONE
+pure function (`df_qualify.derive`):
+
+```json
+"qualification": {
+  "qualified": false,
+  "substates": {"barrier": true, "host_isolation": false, "control_plane": true,
+                "app_security": true, "waiver_validity": true},
+  "code": "HOST_ISOLATION_LIMITED"
+}
+```
+
+`qualified` is the AND of five sub-states, evaluated in a fixed precedence
+(first-failing wins the `code`):
+
+1. `barrier` — the effective tier is probe-proven isolated (`_QUALIFYING_TIERS`).
+   Fail → `BARRIER_UNQUALIFIED` (cooperative seals the legacy
+   `COMPLETE_UNQUALIFIED` outcome).
+2. `host_isolation` — `host_isolation.qualified` (M29b). **This is the M36a
+   security fix:** pre-M36a the top-level `qualified` was
+   `barrier ∧ app_security` and simply ignored host isolation, so a standard run
+   downgraded to `allow_host_read` still sealed `COMPLETE_QUALIFIED`. It now
+   gates `qualified`; fail → distinct outcome `HOST_ISOLATION_LIMITED`.
+3. `control_plane` — a real content-addressed artifact object_id is bound.
+   Fail → `CONTROL_PLANE_UNVERIFIED`.
+4. `app_security` — `app_security_qualified` (M33a). Fail → `SECURITY_GATE_FAILED`.
+5. `waiver_validity` — no waiver in play, or a valid attestation covers every
+   finding. Fail → `WAIVER_INVALID`.
+
+**Superset (fail-closed) invariant:** because the old expression's two booleans
+were exactly `barrier` and `app_security` and `derive` only ADDs conjuncts, it
+can newly FAIL a run the old code passed but can never newly PASS one the old
+code failed. On the CONVERGED terminal the supervisor passes the exact decided
+booleans; every other terminal gets an auditability record derived from manifest
+fields (conservative — `app_security` defaults False when unknown, so a failed
+terminal never over-claims `qualification.qualified: true`). For an **enterprise**
+run the five sub-states are orthogonal to split custody: `qualification.qualified`
+may be true while the top-level `qualified` is false (shipping still needs the
+K-of-N attestation).
+
+### The versioned, phase-aware, hash-chained FSM checkpoint (`state_version: "0.2"`)
+A resumable pause now records its FSM `phase` (e.g. `AWAIT_VERIFY_3`,
+`AWAIT_BUILD_2`, `AWAIT_BUDGET_2`) and appends a transition to a per-run
+`fsm_chain.jsonl`. Each entry is
+`{seq, phase, ts, prev_chain, bound_ids, entry_hash}` where
+`entry_hash = sha256(canonical_json({seq, phase, ts, prev_chain, bound_ids}))`
+and `bound_ids` binds the run's `artifact.object_id` (once sealed) + the
+scenario-set hash. The latest `entry_hash` is recorded in `state.json`
+(`fsm_chain_head`).
+
+On **every** resume the whole chain is recomputed and verified — seq ordering,
+each `prev_chain` linkage, each `entry_hash`, and that the head matches the saved
+state's recorded head. Any mismatch → `FSM_CHAIN_CORRUPT` on stderr + exit 2
+(fail-closed), journaled `FSM_CHAIN_CORRUPT`. A pre-M36a `state_version:"0.1"`
+state (no chain) resumes through a back-compat path journaled
+`FSM_CHAIN_ABSENT_LEGACY`.
+
+**Honest scope:** the FSM chain is **corruption-detection (in-model)** — it
+catches an accidental truncation/edit of the transition log or the recorded head
+across a pause. It is explicitly NOT forgery-resistance against a same-user
+process that can rewrite both `fsm_chain.jsonl` and `state.json`'s head together
+(exactly the detection-grade scope of the manifest sha256 sidecar; a
+signed/off-box anchor is the hardened+ story — see "Honest limits" above).

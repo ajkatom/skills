@@ -28,8 +28,10 @@ import df_custody
 import df_gates
 import df_init
 import df_kb
+import df_modes
 import df_notify
 import df_proxy
+import df_qualify
 import df_sandbox
 import df_seal
 import df_security
@@ -93,6 +95,103 @@ PAUSED = 10
 # default: plain `resume --decision continue` refuses to re-enter the loop
 # while this is set, so a crash never causes a silent duplicate dispatch.
 UNKNOWN_OUTCOME = 11
+
+# M36a Task 3: the versioned, phase-aware, hash-chained FSM checkpoint. A 0.2
+# state records `phase` + the head of a per-run transition chain
+# (fsm_chain.jsonl). Pre-M36a states are 0.1 (no phase, no chain) and resume
+# through a back-compat path. This chain is CORRUPTION-DETECTION (an in-model
+# integrity check that catches an accidental truncation/edit of the transition
+# log across a pause/resume); it is explicitly NOT forgery-resistance against a
+# same-user process that can rewrite both the chain and the recorded head
+# together -- that is the same detection-grade scope as finalize_manifest's
+# sha256 sidecar (a signed/off-box anchor is the hardened+ story). Documented
+# in references/audit.md.
+STATE_VERSION = "0.2"
+FSM_CHAIN_FILE = "fsm_chain.jsonl"
+
+
+def _fsm_chain_lines(run_dir):
+    path = os.path.join(run_dir, FSM_CHAIN_FILE)
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _fsm_entry_hash(seq, phase, ts, prev_chain, bound_ids):
+    # The hash binds the transition's ordinal, its phase, its timestamp, its
+    # predecessor's hash (the chain linkage), AND the run-identifying bound_ids
+    # (artifact object_id once sealed + the scenario-set hash) so a chain
+    # can't be spliced from a different run's transitions without detection.
+    return sha256_str(canonical_json({
+        "seq": seq, "phase": phase, "ts": ts,
+        "prev_chain": prev_chain, "bound_ids": bound_ids,
+    }))
+
+
+def _fsm_chain_head(run_dir):
+    lines = _fsm_chain_lines(run_dir)
+    return lines[-1]["entry_hash"] if lines else None
+
+
+def _fsm_chain_append(run_dir, phase, scenario_set_sha256, artifact_object_id, redactor=None):
+    """Append one transition to fsm_chain.jsonl (atomic whole-file rewrite via
+    the same redaction choke point as every other artifact) and return the new
+    head entry_hash. bound_ids are value-free control-plane identifiers."""
+    lines = _fsm_chain_lines(run_dir)
+    seq = len(lines)
+    prev_chain = lines[-1]["entry_hash"] if lines else None
+    ts = _now()
+    bound_ids = {"artifact_object_id": artifact_object_id,
+                 "scenario_set_sha256": scenario_set_sha256}
+    entry_hash = _fsm_entry_hash(seq, phase, ts, prev_chain, bound_ids)
+    entry = {"seq": seq, "phase": phase, "ts": ts, "prev_chain": prev_chain,
+             "bound_ids": bound_ids, "entry_hash": entry_hash}
+    text = "".join(canonical_json(e) + "\n" for e in (lines + [entry]))
+    _redacted_write(os.path.join(run_dir, FSM_CHAIN_FILE), text, redactor)
+    return entry_hash
+
+
+def _validate_fsm_chain(run_dir, expected_head):
+    """Recompute + verify the whole FSM chain and that its head matches the
+    resumed state's recorded head. Returns (ok, detail). ANY mismatch -> not ok
+    (the caller refuses, fail-closed). An EMPTY/absent chain with a None
+    expected_head is a legacy (0.1) resume, handled by the caller BEFORE this
+    is even reached -- here an absent chain with a non-None expected_head is
+    corruption (the recorded head claims a chain that is gone)."""
+    try:
+        # A truncated/malformed line (the most likely accidental corruption --
+        # a crash or disk-full mid-append) must route to FSM_CHAIN_CORRUPT/
+        # exit 2 like any other integrity failure, NOT escape as an uncaught
+        # JSONDecodeError (the resume try only catches SandboxError, so it
+        # would otherwise traceback + exit 1, violating the fail-closed
+        # contract).
+        lines = _fsm_chain_lines(run_dir)
+    except json.JSONDecodeError:
+        return False, "unparseable chain line (truncated/corrupt JSON)"
+    if not lines:
+        if expected_head is None:
+            return True, "empty"
+        return False, "recorded FSM head references a chain that is absent/empty"
+    prev = None
+    for idx, e in enumerate(lines):
+        if e.get("seq") != idx:
+            return False, f"seq out of order at line {idx} (got {e.get('seq')})"
+        if e.get("prev_chain") != prev:
+            return False, f"broken prev_chain linkage at seq {idx}"
+        recomputed = _fsm_entry_hash(e.get("seq"), e.get("phase"), e.get("ts"),
+                                     e.get("prev_chain"), e.get("bound_ids"))
+        if recomputed != e.get("entry_hash"):
+            return False, f"entry_hash mismatch at seq {idx} (tampered/corrupt)"
+        prev = e["entry_hash"]
+    if prev != expected_head:
+        return False, "chain head does not match the recorded state head"
+    return True, "ok"
 
 
 def _now() -> str:
@@ -163,7 +262,23 @@ def _redacted_write(path: str, payload, redactor) -> str:
 def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint",
               redactor=None, builder_input_tokens=0, builder_output_tokens=0,
-              usage_known=False):
+              usage_known=False, phase=None, chain_append=False,
+              scenario_set_sha256=None, artifact_object_id=None,
+              build_approved_through=0):
+    # M36a Task 3: state_version 0.2 additionally records the FSM `phase` and
+    # the head of the per-run hash chain. Genuine resumable pause transitions
+    # (chain_append=True: the checkpoint / budget / before-build pauses) append
+    # a new chain entry; the crash-safe per-dispatch save (chain_append=False)
+    # records the CURRENT head without growing the chain, so state.json's
+    # recorded head always equals the last fsm_chain.jsonl entry and resume can
+    # verify head-of-chain either way. phase defaults to the reason when a
+    # caller doesn't pass a richer AWAIT_* label.
+    phase = phase or reason
+    if chain_append:
+        chain_head = _fsm_chain_append(run_dir, phase, scenario_set_sha256,
+                                       artifact_object_id, redactor=redactor)
+    else:
+        chain_head = _fsm_chain_head(run_dir)
     # state.json must NEVER carry a credential value: it holds only control-
     # plane bookkeeping (iteration counters, ID/taxonomy feedback, paths), but
     # it goes through the same redaction choke point as every other artifact
@@ -171,7 +286,7 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
     _redacted_write(
         os.path.join(run_dir, "state.json"),
         {
-            "state_version": "0.1",
+            "state_version": STATE_VERSION,
             "next_iter": next_iter,
             "feedback": feedback,
             "workspace": workspace,
@@ -182,6 +297,12 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             "estimated_usd": estimated_usd,
             "budget_alerted": budget_alerted,
             "reason": reason,
+            # M36a: FSM phase + hash-chain head + the before-build approval
+            # cursor (so a directed/H1 resume doesn't re-pause a build it
+            # already approved). Additive; a 0.1 state defaults them on load.
+            "phase": phase,
+            "fsm_chain_head": chain_head,
+            "build_approved_through": build_approved_through,
             # M25 Task 1: authoritative token totals, additive alongside the
             # M8 estimated_usd/builder_calls fields above -- never read by the
             # estimated_usd admission/alert/pause path, only accumulated and
@@ -209,6 +330,15 @@ def load_state(run_dir):
     state.setdefault("builder_input_tokens", 0)
     state.setdefault("builder_output_tokens", 0)
     state.setdefault("usage_known", False)
+    # M36a Task 3: additive FSM fields. A pre-M36a (0.1) state has none of
+    # these -- default them so a legacy paused run resumes cleanly through the
+    # no-chain back-compat path (state_version stays "0.1", so resume can tell
+    # it apart and journal FSM_CHAIN_ABSENT_LEGACY instead of validating a
+    # chain that never existed).
+    state.setdefault("state_version", "0.1")
+    state.setdefault("phase", None)
+    state.setdefault("fsm_chain_head", None)
+    state.setdefault("build_approved_through", 0)
     return state
 
 
@@ -323,6 +453,64 @@ def write_checkpoint_report(run_dir, iteration, report, redactor=None):
     path = os.path.join(run_dir, f"checkpoint_iter_{iteration}.md")
     _redacted_write(path, "\n".join(lines), redactor)
     return path
+
+
+def write_build_checkpoint_report(run_dir, iteration, feedback, redactor=None):
+    """M36a: the human-review surface for a DIRECTED (H1) before-build pause.
+    At this point iteration `iteration` has NOT been built yet -- the human is
+    reviewing the PRIOR iteration's ID/taxonomy feedback (barrier-safe: behavior
+    IDs + coarse taxonomy only, never scenario content) before approving the
+    next builder call. Distinct filename from the after-verify checkpoint so an
+    H1 run's two pauses per cycle don't overwrite each other."""
+    failures = (feedback or {}).get("failures", [])
+    lines = [
+        f"# Before-build checkpoint — iteration {iteration} (directed mode)",
+        "",
+        f"About to spend another builder call to (re)build iteration {iteration}.",
+        f"Still-failing behaviors from the last verify: **{len(failures)}**",
+        "",
+        "| behavior | taxonomy |",
+        "|---|---|",
+    ]
+    for f in failures:
+        tax = ", ".join(f.get("taxonomy", [])) if isinstance(f.get("taxonomy"), list) else ""
+        lines.append(f"| {f.get('behavior_id', '')} | {tax} |")
+    lines += [
+        "",
+        "Decide: `resume --decision continue` (approve this build) · edit `spec.md` "
+        "then `resume --decision continue` (adjust) · `resume --decision accept` "
+        "(stop, waived/unverified) · `resume --decision abort`.",
+        "",
+    ]
+    path = os.path.join(run_dir, f"checkpoint_build_{iteration}.md")
+    _redacted_write(path, "\n".join(lines), redactor)
+    return path
+
+
+def _qualification_field(mb_clean, effective, app_security=None, waiver_validity=True,
+                         artifact_field=None):
+    """M36a Task 2: the sealed `qualification` object for a terminal manifest,
+    computed by the SINGLE qualification SM (df_qualify.derive). At the
+    CONVERGED terminal the caller passes the exact booleans it decided; every
+    OTHER terminal (which keeps qualified=False for its own reason) calls this
+    with best-effort values so the manifest still carries an auditable
+    substate breakdown. Conservative on the two dimensions a failed/early
+    terminal can't have fully established: `app_security` defaults to
+    False at a mandatory tier (gates may not have run) so this auxiliary field
+    never OVER-claims qualification, and `control_plane` is True only when a
+    real artifact object_id is bound. Because barrier ∧ ... precedence puts
+    tier first, a cooperative terminal reads BARRIER_UNQUALIFIED regardless."""
+    hi = (mb_clean.get("host_isolation") or {})
+    if app_security is None:
+        app_security = effective not in MANDATORY_TIERS
+    art = artifact_field if artifact_field is not None else mb_clean.get("artifact")
+    control_plane = bool(isinstance(art, dict) and art.get("object_id"))
+    return df_qualify.derive(
+        barrier=effective in _QUALIFYING_TIERS,
+        host_isolation=bool(hi.get("qualified")),
+        control_plane=control_plane,
+        app_security=bool(app_security),
+        waiver_validity=bool(waiver_validity))
 
 
 def _budget_enforced(b):
@@ -691,6 +879,23 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
     journal_path = os.path.join(run_dir, "journal.jsonl")
     manifest = dict(extra)
     manifest["manifest_version"] = "0.1"
+    # M36a Task 2: EVERY terminal manifest carries the single qualification SM's
+    # verdict. The three terminals that make a real ship decision (CONVERGED,
+    # enterprise CUSTODY_PENDING, and H4 BUDGET_HALTED) set `qualification`
+    # explicitly with their known effective tier; for every OTHER terminal we
+    # derive an auditability record HERE from manifest fields alone. Barrier is
+    # keyed off `denial_probe_passed` (probe-proven isolation THIS run) and
+    # app_security defaults False when unknown, so this can never OVER-claim:
+    # a non-converged terminal (which never set app_security_qualified=True)
+    # always reads qualified=False, consistent with its top-level `qualified`.
+    if "qualification" not in manifest:
+        _art = manifest.get("artifact")
+        manifest["qualification"] = df_qualify.derive(
+            barrier=bool(manifest.get("denial_probe_passed")),
+            host_isolation=bool((manifest.get("host_isolation") or {}).get("qualified")),
+            control_plane=bool(isinstance(_art, dict) and _art.get("object_id")),
+            app_security=bool(manifest.get("app_security_qualified", False)),
+            waiver_validity=True)
     manifest["journal_sha256"] = sha256_file(journal_path)
     manifest["finished_ts"] = _now()
     if audit_key is not None:
@@ -2936,7 +3141,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               audit_key=None, prev_dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False,
               creds=None, redactor=None, extra_scenarios_dir=None,
-              builder_input_tokens=0, builder_output_tokens=0, usage_known=False):
+              builder_input_tokens=0, builder_output_tokens=0, usage_known=False,
+              build_approved_through=0):
     exec_prefix = exec_prefix or []
     # M27 Task 2: candidate_prefix is the CANDIDATE/verifier-only wrapper
     # (run_all below); exec_prefix above stays the builder's. A caller that
@@ -2946,6 +3152,20 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     candidate_prefix = candidate_prefix if candidate_prefix is not None else exec_prefix
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
+    # M36a: the resolved intervention mode drives WHICH transitions pause. It's
+    # recorded on every terminal manifest (auditability) and journaled at loop
+    # entry (fresh run AND every resume, so a paused-then-resumed run's mode is
+    # visible in the journal on both segments).
+    mode = cfg.get("_intervention_mode", "H2")
+    mb_clean["intervention_mode"] = mode
+    scenario_set_sha256 = mb_clean.get("scenario_set_sha256")
+    journal.write("MODE", mode=mode, source=cfg.get("_intervention_source", "default"),
+                  start_iter=start_iter)
+    # H4 (lights-out) MUST never take a pause transition. This is asserted at
+    # each would-be pause point below; if the invariant is ever violated the
+    # run fails closed (a real raise, not a bare assert -- the suite runs under
+    # python -O) rather than silently PAUSING a lights-out run.
+    _lights_out = df_modes.is_lights_out(mode)
     # M29b: in default-deny mode the loopback allowlist must pin THIS pass's
     # twin ports (fresh ephemeral ports on every twin reset), so the wrapper
     # is re-derived per verify/final pass from the same probe-proven profile
@@ -3118,6 +3338,35 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
         last_report = None
         for i in range(start_iter, cfg["max_iterations"] + 1):
+            # M36a before-build gate (H1/directed only): pause BEFORE rebuilding
+            # iteration i (i>=2) so a human can approve/edit-spec/abort before
+            # another builder call is spent. This fits the EXISTING pause
+            # mechanism cleanly: no dispatch has happened yet this iteration, so
+            # resume simply rebuilds i exactly once (no duplicate spend). The
+            # `build_approved_through` cursor is the one-shot: a resume from a
+            # "build" pause carries build_approved_through=i, so the very next
+            # entry here does NOT re-pause the build it just approved.
+            if df_modes.pauses_before_build(mode, i) and i > build_approved_through:
+                if _lights_out:
+                    raise df_sandbox.SandboxError(
+                        "H4 lights-out invariant violated: before-build pause reached")
+                write_build_checkpoint_report(run_dir, i, feedback, redactor=redactor)
+                save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                          dev_status=prev_dev_status, regressions=regressed,
+                          builder_calls=builder_calls, estimated_usd=estimated_usd,
+                          budget_alerted=budget_alerted, reason="build",
+                          phase=f"AWAIT_BUILD_{i}", chain_append=True,
+                          scenario_set_sha256=scenario_set_sha256,
+                          build_approved_through=build_approved_through, redactor=redactor,
+                          builder_input_tokens=builder_input_tokens,
+                          builder_output_tokens=builder_output_tokens, usage_known=usage_known)
+                journal.write("CHECKPOINT", iteration=i, phase=f"AWAIT_BUILD_{i}",
+                              failing=[f["behavior_id"] for f in feedback["failures"]]
+                              if feedback else [])
+                print(f"dark-factory: PAUSED before build (iteration {i}, directed mode). "
+                      f"Review {run_dir}/checkpoint_build_{i}.md, then "
+                      f"`supervisor.py resume --control-root {cfg.get('_control_root', '<CR>')}`.")
+                return PAUSED
             build_env_extra = None
             if twins_enabled:
                 if not twins_started:
@@ -3187,6 +3436,34 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
             budget_pause = ((calls_enforced and calls_after > b["max_calls"]) or
                             (dollar_enforced and est_after > b["max_usd"]))
+            if budget_pause and _lights_out:
+                # M36a H4 (lights-out) fail-closed contract: a budget guard that
+                # PAUSES in H1/H2/H3 becomes a deterministic TERMINAL under
+                # lights-out. Never a silent proceed past a human-needed
+                # decision (raise-the-cap), never an indefinite block. This is
+                # the ONLY safe meaning of "unattended": the run halts, sealed,
+                # rather than waiting forever for a human who isn't watching.
+                journal.write("BUDGET_HALTED", estimated_usd=estimated_usd,
+                              builder_calls=builder_calls, cap_usd=b["max_usd"],
+                              max_calls=b["max_calls"], mode=mode)
+                _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
+                               "BUDGET_HALTED", estimated_usd, builder_calls)
+                mf = dict(mb_clean, outcome="BUDGET_HALTED", iterations=i, qualified=False,
+                          final_exam={"ran": False, "passed": None, "count": 0},
+                          regressions=sorted(regressed),
+                          qualification=_qualification_field(mb_clean, effective),
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens, builder_output_tokens))
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                print(f"dark-factory: BUDGET HALTED (lights-out) — budget cap reached "
+                      f"(estimated_usd={estimated_usd}, builder_calls={builder_calls}); "
+                      f"a lights-out run fails closed instead of pausing. Run: {run_dir}")
+                return anchor_exit or 3
             if budget_pause:
                 journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
                               builder_calls=builder_calls, cap_usd=b["max_usd"],
@@ -3196,7 +3473,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="budget", redactor=redactor,
+                          budget_alerted=budget_alerted, reason="budget",
+                          phase=f"AWAIT_BUDGET_{i}", chain_append=True,
+                          scenario_set_sha256=scenario_set_sha256,
+                          build_approved_through=build_approved_through, redactor=redactor,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
                           usage_known=usage_known)
@@ -3407,7 +3687,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
                       dev_status=prev_dev_status, regressions=regressed,
                       builder_calls=builder_calls, estimated_usd=estimated_usd,
-                      budget_alerted=budget_alerted, reason="dispatch", redactor=redactor,
+                      budget_alerted=budget_alerted, reason="dispatch",
+                      phase=f"DISPATCH_{i}", chain_append=False,
+                      build_approved_through=build_approved_through, redactor=redactor,
                       builder_input_tokens=builder_input_tokens,
                       builder_output_tokens=builder_output_tokens,
                       usage_known=usage_known)
@@ -3806,6 +4088,17 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # in-loop custody "gate" that could pretend to qualify;
                     # there is only this honest pending terminal.
                     outcome, qualified = "CUSTODY_PENDING", False
+                    # M36a: the qualification SM's 5-substate posture is still
+                    # sealed for auditability, but it is ORTHOGONAL to split
+                    # custody -- an enterprise run can have all five substates
+                    # green yet still (correctly) seal qualified=False here,
+                    # because shipping needs the SEPARATE K-of-N custody
+                    # attestation. `qualification.qualified` therefore describes
+                    # the security substates only; the authoritative ship gate
+                    # is `qualified` (False) + the custody field.
+                    qualification = _qualification_field(
+                        mb_clean, eff, app_security=app_security_qualified,
+                        waiver_validity=True, artifact_field=artifact_field)
                     proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
                     # DF-05/M32: `enterprise_egress_result` was computed once,
                     # above, by `_verify_enterprise_egress` BEFORE the first
@@ -3842,19 +4135,44 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                   approvers=len(cfg["_custody"]["approvers"]))
                 else:
                     journal.write("CONVERGED", iteration=i)
-                    # M33a (DF-06): fold the app-security dimension into
-                    # qualification. At standard+ a run is qualified ONLY if
-                    # its mandatory gates ran and passed (or every failing
-                    # finding was waived — that path terminates
-                    # SECURITY_GATE_FAILED and re-qualifies via a df-waiver
-                    # attestation at verify, not here). cooperative is
-                    # unchanged (never in _QUALIFYING_TIERS).
-                    qualified = (eff in _QUALIFYING_TIERS) and app_security_qualified
-                    outcome = "COMPLETE_QUALIFIED" if qualified else "COMPLETE_UNQUALIFIED"
+                    # M36a Task 2 (THE SECURITY FIX): the SINGLE qualification
+                    # SM. Pre-M36a this was
+                    #   qualified = (eff in _QUALIFYING_TIERS) and app_security_qualified
+                    # which left host_isolation (sealed by M29b) OUT of the
+                    # top-level `qualified` -- so a standard run downgraded to
+                    # allow_host_read still sealed COMPLETE_QUALIFIED. Now every
+                    # dimension AND-s in ONE place (df_qualify.derive): barrier
+                    # (the tier gate, unchanged) ∧ host_isolation (NEWLY folded
+                    # in) ∧ control_plane (a real artifact object_id is bound,
+                    # always true here post-seal) ∧ app_security (M33a) ∧
+                    # waiver_validity (True in-loop; a waiver only ever comes
+                    # into play on the SEPARATE SECURITY_GATE_FAILED->df-waiver
+                    # path). Because the two booleans the old expression used are
+                    # exactly barrier+app_security and we only ADD conjuncts, a
+                    # run the old code passed can only NEWLY FAIL, never newly
+                    # pass -- fail-closed superset. cooperative keeps its
+                    # COMPLETE_UNQUALIFIED naming; a standard+ run that fails
+                    # ONLY on host_isolation seals the distinct
+                    # HOST_ISOLATION_LIMITED outcome.
+                    qualification = df_qualify.derive(
+                        barrier=eff in _QUALIFYING_TIERS,
+                        host_isolation=bool((mb_clean.get("host_isolation") or {}).get("qualified")),
+                        control_plane=bool(isinstance(artifact_field, dict)
+                                           and artifact_field.get("object_id")),
+                        app_security=app_security_qualified,
+                        waiver_validity=True)
+                    qualified = qualification["qualified"]
+                    if qualified:
+                        outcome = "COMPLETE_QUALIFIED"
+                    elif eff not in _QUALIFYING_TIERS:
+                        outcome = "COMPLETE_UNQUALIFIED"
+                    else:
+                        outcome = qualification["code"]
 
                 mf = dict(mb_clean, outcome=outcome, iterations=i, final_exam=fe,
                           regressions=sorted(regressed), security=sec_report, qualified=qualified,
                           app_security_qualified=app_security_qualified,
+                          qualification=qualification,
                           artifact=artifact_field,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
@@ -3899,16 +4217,27 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             atomic_write(os.path.join(workspace, "feedback.json"), canonical_json(feedback))
             journal.write("FEEDBACK", iteration=i, failing=[f["behavior_id"] for f in feedback["failures"]])
 
-            if cfg["_checkpoint"] == "pause" and i < cfg["max_iterations"]:
+            # M36a after-verify gate: pauses under H1/H2 (== legacy
+            # `checkpoint:"pause"`), runs straight through under H3/H4 (== legacy
+            # `auto`). This is the byte-for-byte replacement of the old
+            # `cfg["_checkpoint"] == "pause"` gate: H1/H2 both map back to a
+            # `pause` checkpoint, so the default (H2) reproduces today exactly.
+            if df_modes.pauses_after_verify(mode) and i < cfg["max_iterations"]:
+                if _lights_out:
+                    raise df_sandbox.SandboxError(
+                        "H4 lights-out invariant violated: after-verify pause reached")
                 write_checkpoint_report(run_dir, i, report, redactor=redactor)
                 save_state(run_dir, next_iter=i + 1, feedback=feedback, workspace=workspace,
                           dev_status=prev_dev_status, regressions=regressed,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="checkpoint", redactor=redactor,
+                          budget_alerted=budget_alerted, reason="checkpoint",
+                          phase=f"AWAIT_VERIFY_{i}", chain_append=True,
+                          scenario_set_sha256=scenario_set_sha256,
+                          build_approved_through=build_approved_through, redactor=redactor,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
                           usage_known=usage_known)
-                journal.write("CHECKPOINT", iteration=i,
+                journal.write("CHECKPOINT", iteration=i, phase=f"AWAIT_VERIFY_{i}",
                               failing=[f["behavior_id"] for f in feedback["failures"]])
                 print(f"dark-factory: PAUSED at checkpoint (iteration {i}). "
                       f"Review {run_dir}/checkpoint_iter_{i}.md, then "
@@ -3971,6 +4300,28 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
     try:
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
+
+        # M36a Task 3: validate the phase-aware FSM hash chain BEFORE doing any
+        # work. A 0.2 state records a head into a per-run fsm_chain.jsonl; recompute
+        # the whole chain + verify head-of-chain. ANY mismatch -> refuse,
+        # fail-closed (FSM_CHAIN_CORRUPT, exit 2). A pre-M36a 0.1 state has no
+        # chain (the field defaults to None on load) -- resume it through the
+        # documented back-compat path, journaling FSM_CHAIN_ABSENT_LEGACY so the
+        # skip is auditable rather than silent.
+        if state.get("state_version") == STATE_VERSION:
+            ok, detail = _validate_fsm_chain(run_dir, state.get("fsm_chain_head"))
+            if not ok:
+                journal.write("FSM_CHAIN_CORRUPT", detail=detail)
+                sys.stderr.write(
+                    f"dark-factory: FSM_CHAIN_CORRUPT — the resumable checkpoint's "
+                    f"transition chain failed integrity validation ({detail}); refusing "
+                    f"to resume (fail-closed). This detects accidental corruption of "
+                    f"{FSM_CHAIN_FILE}/state.json across the pause.\n")
+                return 2
+            journal.write("FSM_CHAIN_VERIFIED", head=state.get("fsm_chain_head"),
+                          phase=state.get("phase"))
+        else:
+            journal.write("FSM_CHAIN_ABSENT_LEGACY", state_version=state.get("state_version"))
 
         audit_key, audit_err = _load_audit_key(cfg, journal)
         if audit_err is not None:
@@ -4237,6 +4588,14 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
                 builder_input_tokens=state.get("builder_input_tokens", 0),
                 builder_output_tokens=state.get("builder_output_tokens", 0),
                 usage_known=state.get("usage_known", False),
+                # M36a: the before-build (H1/directed) one-shot cursor. Resuming
+                # FROM a "build" pause means the human APPROVED building this
+                # iteration -- carry the cursor up to it so the loop does NOT
+                # re-pause the build it just approved. Every other resume simply
+                # threads the persisted cursor forward.
+                build_approved_through=(
+                    state["next_iter"] if state.get("reason") == "build"
+                    else state.get("build_approved_through", 0)),
             )
         except df_sandbox.SandboxError as e:
             # In-loop fail-closed guards exit 2, not an unhandled traceback.
@@ -4244,6 +4603,76 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False):
             return 2
     finally:
         release_lock(lock)
+
+
+def migrate_config_cmd(control_root) -> int:
+    """M36a Task 5: rewrite a legacy (autonomy, checkpoint) config to the
+    equivalent `intervention_mode`. Validate-before-commit (the rewritten config
+    must load cleanly), atomic, idempotent (already-migrated -> no-op), refuses
+    a dual-field config (hand-edit to resolve), and leaves a config.json.bak."""
+    control_root = os.path.abspath(control_root)
+    cfg_path = os.path.join(control_root, "config.json")
+    if not os.path.exists(cfg_path):
+        sys.stderr.write(f"dark-factory: no config.json under {control_root}\n")
+        return 2
+    try:
+        original_text = open(cfg_path, encoding="utf-8").read()
+        raw = json.loads(original_text)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"dark-factory: cannot read config.json: {e}\n")
+        return 2
+    if not isinstance(raw, dict):
+        sys.stderr.write("dark-factory: config.json is not a JSON object\n")
+        return 2
+
+    has_mode = "intervention_mode" in raw
+    has_legacy = ("autonomy" in raw) or ("checkpoint" in raw)
+    if has_mode and has_legacy:
+        sys.stderr.write(
+            "dark-factory: config has BOTH intervention_mode and legacy "
+            "autonomy/checkpoint — resolve by hand (remove one); refusing to guess.\n")
+        return 2
+    if has_mode:
+        print(f"dark-factory: already migrated (intervention_mode="
+              f"{raw['intervention_mode']!r}); no change.")
+        return 0
+
+    # Map legacy (or the all-defaults case) to a mode. Mirrors df_config's
+    # legacy defaulting exactly so the mapped mode matches what the config
+    # loads as today.
+    autonomy = raw.get("autonomy", 4)
+    checkpoint = raw.get("checkpoint")
+    if checkpoint is None:
+        checkpoint = "pause" if autonomy == 4 else "auto"
+    try:
+        mode = df_modes.legacy_mode(autonomy, checkpoint)
+    except df_modes.ModeError as e:
+        sys.stderr.write(f"dark-factory: cannot migrate this config: {e}\n")
+        return 2
+
+    new_raw = {k: v for k, v in raw.items() if k not in ("autonomy", "checkpoint")}
+    new_raw["intervention_mode"] = mode
+    new_text = canonical_json(new_raw)
+
+    # Validate-before-commit: write the candidate, confirm load_config accepts
+    # it, and roll back to the original bytes on any ConfigError so a failed
+    # migration never leaves a broken config on disk.
+    atomic_write(cfg_path, new_text)
+    try:
+        load_config(control_root)
+    except ConfigError as e:
+        atomic_write(cfg_path, original_text)
+        sys.stderr.write(
+            f"dark-factory: migrated config failed validation ({e}); "
+            f"rolled back, no change.\n")
+        return 2
+
+    atomic_write(cfg_path + ".bak", original_text)
+    src = "defaults" if not has_legacy else f"autonomy={autonomy}, checkpoint={checkpoint!r}"
+    print(f"dark-factory: migrated {cfg_path}\n"
+          f"  {src}  ->  intervention_mode={mode!r}\n"
+          f"  (removed legacy autonomy/checkpoint; original saved as config.json.bak)")
+    return 0
 
 
 def main():
@@ -4285,6 +4714,11 @@ def main():
     p_res.add_argument("--allow-downgrade", action="store_true",
                        help="if standard tier is unavailable/probe fails on re-probe, "
                             "downgrade to cooperative (unqualified) instead of failing closed")
+    p_mig = sub.add_parser(
+        "df-migrate-config",
+        help="rewrite a legacy autonomy/checkpoint config.json to the equivalent "
+             "intervention_mode (idempotent; leaves a .bak)")
+    p_mig.add_argument("control_root")
     p_vcu = sub.add_parser(
         "verify-custody",
         help="confirm an enterprise run is QUALIFIED under split custody "
@@ -4393,6 +4827,8 @@ def main():
         sys.exit(0 if verify_chain_cmd(args.control_root, key=vkey) else 1)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade))
+    elif args.cmd == "df-migrate-config":
+        sys.exit(migrate_config_cmd(args.control_root))
     elif args.cmd == "verify-custody":
         # exit 0 = QUALIFIED, 1 = PENDING/INVALID (mirrors verify-chain).
         sys.exit(0 if verify_custody_cmd(args.control_root, args.run_dir) else 1)

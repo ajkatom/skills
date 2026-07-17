@@ -5,6 +5,7 @@ import re
 import urllib.parse
 
 import df_container
+import df_modes
 import df_proxy
 from df_common import canonical_json, sha256_str
 
@@ -192,19 +193,59 @@ def load_config(control_root: str) -> dict:
     # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
     # (lights-off) is available only with a conforming hardened (or, being
     # strictly stronger, enterprise) backend.
-    autonomy = raw.get("autonomy", 4)
-    if not isinstance(autonomy, int) or isinstance(autonomy, bool) or autonomy not in (4, 5):
-        raise ConfigError("autonomy must be an int, 4 or 5")
-    if autonomy == 5 and tier not in ("hardened", "enterprise"):
-        raise ConfigError(
-            "autonomy 5 (lights-off) requires assurance: hardened or enterprise (spec 2.2)"
+    # M36a: intervention_mode (H1..H4) is the NEW, single knob. It is mutually
+    # exclusive with the legacy (autonomy, checkpoint) pair -- specifying both
+    # is a hard error (name the migration command; a machine can't know which
+    # the operator meant). When only the legacy fields are present they map to
+    # a mode via df_modes.legacy_mode, and cfg["_checkpoint"]/cfg["autonomy"]
+    # keep being derived so every existing reader (the pause gate, the status
+    # print) is byte-unchanged. Default when NOTHING is set: H2 (faithful to
+    # today's autonomy 4 -> checkpoint pause).
+    intervention_raw = raw.get("intervention_mode")
+    autonomy_raw = raw.get("autonomy")
+    checkpoint_raw = raw.get("checkpoint")
+    if intervention_raw is not None:
+        if autonomy_raw is not None or checkpoint_raw is not None:
+            raise ConfigError(
+                "intervention_mode cannot be combined with legacy autonomy/checkpoint "
+                "(specify one scheme); migrate an old config with "
+                "`supervisor.py df-migrate-config <control_root>`")
+        try:
+            intervention_mode = df_modes.canonical_mode(intervention_raw)
+        except df_modes.ModeError as e:
+            raise ConfigError(str(e))
+        # Back-compat derivations so the rest of the codebase (which still reads
+        # cfg["_checkpoint"] and cfg["autonomy"]) is unaffected by the new knob.
+        autonomy, checkpoint = df_modes.legacy_fields_for(intervention_mode)
+        intervention_source = "explicit"
+    else:
+        autonomy = 4 if autonomy_raw is None else autonomy_raw
+        if not isinstance(autonomy, int) or isinstance(autonomy, bool) or autonomy not in (4, 5):
+            raise ConfigError("autonomy must be an int, 4 or 5")
+        if autonomy == 5 and tier not in ("hardened", "enterprise"):
+            raise ConfigError(
+                "autonomy 5 (lights-off) requires assurance: hardened or enterprise (spec 2.2)"
+            )
+        checkpoint = checkpoint_raw
+        if checkpoint is None:
+            checkpoint = "pause" if autonomy == 4 else "auto"
+        elif checkpoint not in ("pause", "auto"):
+            raise ConfigError("checkpoint must be 'pause' or 'auto'")
+        try:
+            intervention_mode = df_modes.legacy_mode(autonomy, checkpoint)
+        except df_modes.ModeError as e:
+            raise ConfigError(str(e))
+        intervention_source = (
+            "default" if (autonomy_raw is None and checkpoint_raw is None) else "legacy"
         )
 
-    checkpoint = raw.get("checkpoint")
-    if checkpoint is None:
-        checkpoint = "pause" if autonomy == 4 else "auto"
-    elif checkpoint not in ("pause", "auto"):
-        raise ConfigError("checkpoint must be 'pause' or 'auto'")
+    # H4 (lights-out) reuses legacy autonomy-5's tier gate: a run that never
+    # pauses and fail-closes any human-needed condition is only safe on a
+    # denial-by-construction backend. (The legacy path already enforced this
+    # via the autonomy-5 check above; this catches an explicit H4 too.)
+    if df_modes.requires_hardened(intervention_mode) and tier not in ("hardened", "enterprise"):
+        raise ConfigError(
+            "intervention_mode H4 (lights-out) requires assurance: hardened or enterprise")
 
     # hardened tier: optional `hardened` block -> cfg["_container"]. The block
     # is meaningless (and rejected) outside assurance: hardened|enterprise
@@ -1263,6 +1304,15 @@ def load_config(control_root: str) -> dict:
     cfg["_qualified"] = bool(tiers[tier]["qualified"])
     cfg["_config_sha256"] = sha256_str(canonical_json(raw))
     cfg["_checkpoint"] = checkpoint
+    # M36a: resolved intervention mode + how we got it (explicit /
+    # legacy-mapped / default) for the run-start MODE journal event.
+    cfg["_intervention_mode"] = intervention_mode
+    cfg["_intervention_source"] = intervention_source
+    # Keep the legacy fields present on cfg so readers (status print, any
+    # `cfg['autonomy']`) work even for an intervention_mode-only config that
+    # never wrote autonomy/checkpoint to disk.
+    cfg["autonomy"] = autonomy
+    cfg["checkpoint"] = checkpoint
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["candidate_network"] = candidate_network

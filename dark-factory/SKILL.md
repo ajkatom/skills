@@ -18,6 +18,18 @@ an autonomy mode: every tier defaults to L4, and only `hardened`/`enterprise`
 may additionally opt into L5 (see below). There are four tiers and two
 autonomy modes — not "four levels" of anything single-dimensional.
 
+**Intervention mode (M36a).** The autonomy axis is now expressed as a single
+`intervention_mode` naming *which transitions pause* — pick ONE (default **H2**):
+- **H1 `directed`** — pause before every rebuild AND after every verify (most hands-on).
+- **H2 `supervised`** — pause after every non-converged verify (== legacy `checkpoint:"pause"`; the default).
+- **H3 `guarded`** — run straight through, pause only on a budget cap (== legacy `checkpoint:"auto"`).
+- **H4 `lights_out`** — never pause; any human-needed condition (e.g. a budget cap) is a fail-closed TERMINAL (`BUDGET_HALTED`). Hardened/enterprise only (== legacy `autonomy:5`).
+
+`intervention_mode` and the legacy `autonomy`/`checkpoint` pair are mutually
+exclusive (specifying both is a config error). Convert an old config with
+`supervisor.py df-migrate-config <control_root>` (idempotent; leaves a `.bak`).
+Full state-transition table + resume workflow: `references/modes.md`.
+
 ## Authoring a run (`init`) — the on-ramp for "provide context and specs"
 
 When the user's ask is "here's my spec/context, build me a dark-factory
@@ -352,7 +364,8 @@ holdout scenarios in a session that will also drive the builder.
 - `OVERVIEW.md` — plain-language overview of what this does + what every reference doc below covers
 - `references/authoring.md` — the `init` interview script: spec, tier choice, writing discriminating holdout scenarios (dev vs. sealed final), and the optional config blocks; see also `examples/kv-service/answers.json` (M19)
 - `references/config-reference.md` — config schema
-- `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
+- `references/modes.md` — the four intervention modes (H1 directed / H2 supervised / H3 guarded / H4 lights-out), the full state-transition (pause-point) table, the legacy `(autonomy,checkpoint)→mode` mapping + `df-migrate-config`, the H4 fail-closed contract, and the deferred before-ship gate (M36a)
+- `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), the honest trust-domain limits of each, the single-SM `qualification` field + codes, and the phase-aware hash-chained FSM checkpoint (M5a, M13, M36a)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier (DF-02, M29a); default-deny candidate host isolation — `candidate_host_read`, port-pinned loopback, closed keychain/DNS Mach channels, the per-run confinement probe, and the manifest `host_isolation` field (DF-02, M29b; Linux legacy until M29c)
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/reproducibility.md` — what's reproducible/verifiable today (stdlib-only tiers, pinned `cryptography` range, content-addressed artifact binding, config/spec/scenario hashes, digest-pinnable images) vs. the honest owner/infra TODO (LICENSE, CI, hash-locked installs, default digest pinning, release SBOM/provenance)
