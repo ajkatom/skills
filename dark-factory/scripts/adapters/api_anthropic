@@ -145,11 +145,23 @@ def _extract_files(resp_body):
     raise ValueError with a short, key-free detail message."""
     try:
         parsed = json.loads(resp_body)
-        text = parsed["content"][0]["text"]
+        blocks = parsed["content"]
+        # Extended-thinking models (e.g. claude-sonnet-5) emit a "thinking"
+        # block BEFORE the "text" block, so content[0] is not necessarily the
+        # answer — take the FIRST block that is type "text" (or that carries a
+        # string "text" field). content[0]["text"] alone KeyErrors on a thinking
+        # block. (Found live: a real KV build returned content=[thinking,text].)
+        text = None
+        for b in blocks:
+            if isinstance(b, dict) and isinstance(b.get("text"), str) and (
+                b.get("type", "text") == "text"
+            ):
+                text = b["text"]
+                break
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, UnicodeDecodeError) as e:
         raise ValueError(f"unparseable api response: {type(e).__name__}") from None
     if not isinstance(text, str):
-        raise ValueError("api response content[0].text is not a string")
+        raise ValueError("api response has no text content block")
 
     inner = _strip_fence(text)
     try:

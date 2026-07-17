@@ -84,6 +84,16 @@ class H(BaseHTTPRequestHandler):
             text = "Sure, here is my answer: I decline to produce JSON."
         else:  # "greet" and any unrecognized mode
             text = json.dumps({"files": {"greet.py": _GREET_PY}})
+        if mode == "thinking":
+            # Extended-thinking models (e.g. claude-sonnet-5) emit a thinking
+            # block BEFORE the text block, so content[0] is NOT the answer.
+            # The adapter must skip it and take the first text block. (This is
+            # the exact shape a live claude-sonnet-5 KV build returned.)
+            self._write_json(200, {"content": [
+                {"type": "thinking", "thinking": "Let me plan the greet script..."},
+                {"type": "text", "text": text},
+            ]})
+            return
         self._write_json(200, {"content": [{"type": "text", "text": text}]})
 
     def log_message(self, *a):  # quiet

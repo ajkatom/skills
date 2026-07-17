@@ -93,6 +93,22 @@ def test_greet_mode_writes_file_ok(tmp_path):
         _stop_stub(stub_proc)
 
 
+def test_thinking_block_before_text_is_handled(tmp_path):
+    # Regression (found live): claude-sonnet-5 emits content=[thinking, text],
+    # so the adapter must skip the thinking block and take the first TEXT block
+    # rather than blindly reading content[0]["text"] (which KeyErrors).
+    stub_proc, base = _start_stub(tmp_path, "thinking")
+    try:
+        req = make_req(tmp_path)
+        proc = invoke(req, {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": TEST_KEY})
+        assert proc.returncode == 0, proc.stderr
+        resp = json.loads(proc.stdout)
+        assert resp["status"] == "ok", resp.get("detail")
+        assert os.path.isfile(os.path.join(req["workdir"], "greet.py"))
+    finally:
+        _stop_stub(stub_proc)
+
+
 def test_unsafe_paths_rejected_all_or_nothing(tmp_path):
     stub_proc, base = _start_stub(tmp_path, "unsafe")
     try:
