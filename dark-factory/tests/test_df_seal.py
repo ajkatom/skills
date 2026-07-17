@@ -166,6 +166,25 @@ def test_setgid_dir_rejected(tmp_path):
         df_seal.object_manifest(str(t1))
 
 
+def test_toctou_setuid_added_after_lstat_still_caught(tmp_path, monkeypatch):
+    """Simulates a race where a file's permissions change between the
+    directory-entry lstat and the subsequent open: the post-open fstat
+    re-check in _open_file_fd_safe must still catch it (not just the
+    pre-open lstat check)."""
+    t1 = make_tree(tmp_path / "t1")
+    real_open = df_seal._open_file_fd_safe
+
+    def flip_to_setuid_then_open(dir_fd, name, rel):
+        if rel == "a.txt":
+            p = t1 / "a.txt"
+            os.chmod(str(p), stat.S_IMODE(os.stat(str(p)).st_mode) | stat.S_ISUID)
+        return real_open(dir_fd, name, rel)
+
+    monkeypatch.setattr(df_seal, "_open_file_fd_safe", flip_to_setuid_then_open)
+    with pytest.raises(df_seal.SealError, match="setuid"):
+        df_seal.object_manifest(str(t1))
+
+
 # ---------------------------------------------------------------------------
 # freeze / verify_object round trip
 # ---------------------------------------------------------------------------
@@ -223,6 +242,28 @@ def test_verify_object_missing_object_is_false(tmp_path):
     store = tmp_path / "store"
     (store / "objects").mkdir(parents=True)
     assert df_seal.verify_object(str(store), "0" * 64) is False
+
+
+def test_verify_object_rejects_path_traversal_object_id(tmp_path):
+    """object_id may come from an attacker-tampered manifest field in later
+    callers (verify/custody); it must never be usable to escape objects_dir
+    via os.path.join, and must fail closed (False, not an exception)."""
+    store = tmp_path / "store"
+    (store / "objects").mkdir(parents=True)
+    # A file that exists just outside the object store, to make sure a
+    # traversal payload can't be used to "verify" something else as if it
+    # were a sealed object.
+    (tmp_path / "not_an_object_store_secret.txt").write_text("secret", encoding="utf-8")
+    for hostile_id in (
+        "../not_an_object_store_secret.txt",
+        "../../etc/passwd",
+        "",
+        "not-hex-at-all",
+        "0" * 63,  # too short
+        "0" * 65,  # too long
+        "F" * 64,  # uppercase not allowed (must match exactly what hexdigest() produces)
+    ):
+        assert df_seal.verify_object(str(store), hostile_id) is False
 
 
 def test_freeze_rejects_hostile_source(tmp_path):

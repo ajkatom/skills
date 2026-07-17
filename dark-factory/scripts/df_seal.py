@@ -56,6 +56,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import uuid
@@ -64,11 +65,10 @@ from df_common import atomic_write, canonical_json, sha256_str
 
 SEAL_VERSION = "1"
 
-# Regular-file bits we refuse to seal.
-_FILE_HOSTILE_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_IWOTH
-# Directory bits we refuse to seal (world-writable or setgid; brief does not
-# call out setuid on directories so it is intentionally not checked here).
-_DIR_HOSTILE_BITS = stat.S_ISGID | stat.S_IWOTH
+# object_id is always a sha256 hexdigest: 64 lowercase hex chars. Any caller
+# passing something else (e.g. a manifest field an attacker tampered with)
+# must be refused before it is used to build a filesystem path.
+_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SealError(RuntimeError):
@@ -140,7 +140,6 @@ def _iter_dir(dir_fd, rel):
             raise SealError(f"symlink not allowed: {entry_rel}")
         if stat.S_ISDIR(st.st_mode):
             _check_dir_stat(st, entry_rel)
-            yield ("dir", entry_rel, None, None)
             try:
                 sub_fd = os.open(
                     name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
@@ -148,6 +147,15 @@ def _iter_dir(dir_fd, rel):
             except OSError as e:
                 raise SealError(f"cannot open directory {entry_rel}: {e}") from e
             try:
+                # Re-check against the fd we actually opened (fstat), not just
+                # the earlier lstat: closes the TOCTOU window between the
+                # lstat above and this open where the entry could have been
+                # replaced with a hostile-permission directory.
+                sub_st = os.fstat(sub_fd)
+                if not stat.S_ISDIR(sub_st.st_mode):
+                    raise SealError(f"entry changed type during scan (TOCTOU): {entry_rel}")
+                _check_dir_stat(sub_st, entry_rel)
+                yield ("dir", entry_rel, None, None)
                 yield from _iter_dir(sub_fd, entry_rel)
             finally:
                 os.close(sub_fd)
@@ -184,6 +192,15 @@ def _open_file_fd_safe(dir_fd, name, rel):
     if fst.st_nlink > 1:
         os.close(fd)
         raise SealError(f"multi-link file not allowed: {rel}")
+    # Re-check hostile permission bits against the fd we actually opened, not
+    # just the earlier lstat: closes the TOCTOU window between the lstat in
+    # _iter_dir and this open where the entry's permissions could have been
+    # changed (e.g. setuid added) without changing its type.
+    try:
+        _check_file_stat(fst, rel)
+    except SealError:
+        os.close(fd)
+        raise
     return fd, fst
 
 
@@ -394,7 +411,17 @@ def verify_object(object_store: str, object_id: str) -> bool:
     invalid sidecar, hostile content planted inside the object dir, or
     mismatch of any kind is a plain False. This is the fail-closed detector;
     it must never be "true by exception being swallowed elsewhere".
+
+    object_id is treated as untrusted (it is expected to be read back from a
+    manifest by later callers, e.g. verify/custody, which may have been
+    tampered with): it must match a bare 64-char lowercase hex sha256
+    digest, or this returns False immediately. This also rules out path
+    traversal via a crafted object_id (e.g. "../../etc") reaching outside
+    objects_dir through the os.path.join calls below.
     """
+    if not isinstance(object_id, str) or not _OBJECT_ID_RE.match(object_id):
+        return False
+
     objects_dir = os.path.join(object_store, "objects")
     obj_path = os.path.join(objects_dir, object_id)
     sidecar_path = os.path.join(objects_dir, object_id + ".json")
