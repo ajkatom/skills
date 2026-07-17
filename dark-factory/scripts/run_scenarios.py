@@ -99,6 +99,92 @@ class OracleError(ValueError):
     pass
 
 
+# --- DF-02 / M29a Task 1: candidate scenario env sanitization --------------
+# Candidate code (the built app under test) must NOT inherit the full host
+# environment. Before this, both scenario launchers built the child env as
+# `dict(os.environ, **env_extra)` -- so generated code could see
+# SSH_AUTH_SOCK, HTTP_PROXY, AWS_*, OPENAI_API_KEY, and anything else in the
+# operator's shell. `candidate_env` replaces that: a small, explicit
+# allowlist of "a normal program needs this to run" host vars, UNION
+# `env_extra` (trusted, supervisor-injected -- twin endpoints, the M11
+# credential allowlist -- and passed through unfiltered, since the
+# supervisor already decided what belongs there; it is not raw host env).
+# A denylist is applied to the inherited/allowlisted portion as a
+# belt-and-suspenders scrub, in case the allowlist is ever loosened by
+# mistake to overlap something dangerous.
+
+# Exact-name allowlist: what a normal program needs to run at all (locale,
+# temp dirs, shell/user identity, PATH/HOME). Deliberately NOT extended for
+# convenience -- anything a candidate legitimately needs beyond this must be
+# threaded through env_extra by the supervisor, not silently inherited here.
+_CANDIDATE_ENV_ALLOWLIST_NAMES = {
+    "PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP", "TERM",
+    "TZ", "PWD", "SHELL", "USER", "LOGNAME",
+}
+# Prefix form: every LC_* locale var (LC_ALL, LC_CTYPE, LC_COLLATE, ...) --
+# a prefix rather than an enumeration so a locale var this list doesn't name
+# yet still gets through.
+_CANDIDATE_ENV_ALLOWLIST_PREFIXES = ("LC_",)
+
+# Exact-name denylist: known-dangerous single vars that don't fit a prefix
+# or substring rule below.
+_CANDIDATE_ENV_DENYLIST_NAMES = {
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_CONNECTION",
+    "GH_TOKEN", "GITHUB_TOKEN", "DOCKER_HOST", "KUBECONFIG",
+}
+# Prefix form: whole cloud/provider credential families.
+_CANDIDATE_ENV_DENYLIST_PREFIXES = (
+    "AWS_", "GOOGLE_", "GCP_", "AZURE_", "ANTHROPIC_", "OPENAI_", "GEMINI_",
+)
+# Substring form (case-insensitive, matched against the uppercased name):
+# catches *_PROXY/*_proxy plus anything that reads as a credential by name,
+# regardless of vendor prefix.
+_CANDIDATE_ENV_DENYLIST_SUBSTRINGS = (
+    "PROXY", "SECRET", "TOKEN", "PASSWORD", "APIKEY", "API_KEY", "CREDENTIAL",
+)
+
+
+def _is_denylisted_env_name(name: str) -> bool:
+    if name in _CANDIDATE_ENV_DENYLIST_NAMES:
+        return True
+    if name.startswith(_CANDIDATE_ENV_DENYLIST_PREFIXES):
+        return True
+    upper = name.upper()
+    return any(substr in upper for substr in _CANDIDATE_ENV_DENYLIST_SUBSTRINGS)
+
+
+def candidate_env(env_extra: dict | None) -> dict:
+    """The env a candidate scenario subprocess actually runs under.
+
+    = {allowlisted subset of os.environ, denylist-scrubbed} UNION (env_extra
+    or {}). env_extra is trusted/supervisor-injected (DF_TWIN_* endpoints,
+    the M11 credential allowlist) and is passed through WITHOUT denylist
+    filtering -- it must still reach the candidate, and scrubbing it would
+    break the twin/credential wiring this runner depends on. A denylisted
+    name showing up in env_extra would mean the supervisor itself injected
+    something it shouldn't have, so that's asserted against defensively
+    rather than silently dropped (silently dropping could mask a real bug in
+    the caller).
+    """
+    env = {}
+    for name, value in os.environ.items():
+        allowlisted = (
+            name in _CANDIDATE_ENV_ALLOWLIST_NAMES
+            or name.startswith(_CANDIDATE_ENV_ALLOWLIST_PREFIXES)
+        )
+        if allowlisted and not _is_denylisted_env_name(name):
+            env[name] = value
+
+    env_extra = env_extra or {}
+    bad = [name for name in env_extra if _is_denylisted_env_name(name)]
+    assert not bad, (
+        f"candidate_env: env_extra contained denylisted name(s) {bad!r} -- "
+        f"the supervisor should never inject these; check the caller"
+    )
+    env.update(env_extra)
+    return env
+
+
 def _validate_twin_then(then: dict, fname: str) -> None:
     """Load-time shape validation for the twin-evidence assertion keys.
 
@@ -499,7 +585,7 @@ def _run_http_scenario(
     observed = {"http_status": None, "body": "", "json": None}
 
     port = _pick_ephemeral_port()
-    env = dict(os.environ, **(env_extra or {}))
+    env = candidate_env(env_extra)
     if port_env:
         env[port_env] = str(port)
 
@@ -642,9 +728,7 @@ def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env
     observed = {"exit_code": None, "stdout": "", "stderr": ""}
     taxonomy = None
     command = (list(exec_wrapper) if exec_wrapper else []) + sc["when"]["run"]
-    env = None
-    if env_extra:
-        env = dict(os.environ, **env_extra)
+    env = candidate_env(env_extra)
     # M12: snapshot each observer file's size BEFORE the candidate runs, so
     # only lines appended DURING this scenario's command are attributed to
     # it -- a scenario that makes zero twin calls gets an empty delta, never
