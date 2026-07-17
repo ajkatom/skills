@@ -275,6 +275,32 @@ def test_sigv4_headers_matches_published_put_object_vector():
 
 _MINIO_ACCESS_KEY = "minioadmin"
 _MINIO_SECRET_KEY = "minioadmin123"
+_MINIO_NAME_PREFIX = "df-audit-minio-"
+
+
+def _reap_stale_minio_containers():
+    """Remove any leftover df-audit-minio-* containers from a PRIOR run that
+    was hard-killed (timeout / SIGKILL) before its session-teardown `docker
+    stop` could run. Each such orphan keeps a MinIO server (and its published
+    host port + `/data` volume) alive indefinitely, and they accumulate one
+    per interrupted run -- eventually starving Docker of resources and
+    slowing or stalling a fresh session's own container startup. Best-effort:
+    never raises, so a docker hiccup here can't fail the run it's trying to
+    protect."""
+    try:
+        listed = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"name={_MINIO_NAME_PREFIX}"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return
+    ids = [cid for cid in listed.stdout.split() if cid]
+    if not ids:
+        return
+    try:
+        subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=60)
+    except Exception:
+        pass
 
 
 def _wait_for_minio(endpoint, timeout_s=30):
@@ -334,12 +360,16 @@ def minio_endpoint():
         yield None
         return
 
+    # Sweep away any orphan from a prior hard-killed run before starting ours,
+    # so leftovers can't accumulate and stall Docker across interrupted runs.
+    _reap_stale_minio_containers()
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     host_port = s.getsockname()[1]
     s.close()
 
-    name = f"df-audit-minio-{uuid.uuid4().hex[:8]}"
+    name = f"{_MINIO_NAME_PREFIX}{uuid.uuid4().hex[:8]}"
     subprocess.run(
         ["docker", "pull", "-q", "minio/minio"], capture_output=True, timeout=300
     )
@@ -619,3 +649,51 @@ def test_audit_sink_not_object_rejected(tmp_path):
     write_config(cr, audit={"sink": "http://example.com"})
     with pytest.raises(df_config.ConfigError, match="sink"):
         df_config.load_config(str(cr))
+
+
+# ---------------------------------------------------------------------------
+# _reap_stale_minio_containers -- orphan cleanup (no docker needed; the docker
+# CLI calls are captured via a fake subprocess.run).
+# ---------------------------------------------------------------------------
+
+
+def test_reap_stale_minio_filters_by_prefix_and_force_removes(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "ps", "-aq"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="abc123\ndef456\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _reap_stale_minio_containers()
+
+    # Listed with the df-audit-minio- name filter, then force-removed exactly
+    # the two ids that filter returned.
+    assert calls[0] == ["docker", "ps", "-aq", "--filter", "name=df-audit-minio-"]
+    assert calls[1] == ["docker", "rm", "-f", "abc123", "def456"]
+
+
+def test_reap_stale_minio_noop_when_none_found(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _reap_stale_minio_containers()
+
+    # Only the list call; no `docker rm` when nothing matched.
+    assert len(calls) == 1
+    assert calls[0][:3] == ["docker", "ps", "-aq"]
+
+
+def test_reap_stale_minio_never_raises_on_docker_failure(monkeypatch):
+    def boom(argv, **kwargs):
+        raise OSError("docker daemon unreachable")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    # Best-effort: a docker hiccup here must never fail the run it protects.
+    _reap_stale_minio_containers()
