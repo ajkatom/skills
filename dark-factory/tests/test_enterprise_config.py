@@ -700,6 +700,27 @@ def test_enterprise_disjoint_credentials_allowlist_ok(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# M30 (DF-03) hardening: the enterprise entrypoint clears NO_PROXY/no_proxy
+# before exec'ing the builder -- an inherited NO_PROXY could make an
+# HTTP(S)_PROXY-respecting client bypass the proxy and connect DIRECTLY,
+# straight into the iptables default-deny-egress wall the same entrypoint
+# just installed. Offline (rendered-script) check -- no docker required.
+# ---------------------------------------------------------------------------
+
+def test_enterprise_entrypoint_clears_no_proxy_before_exec():
+    script = df_container.enterprise_entrypoint_script("proxyhost:12345")
+    assert "unset NO_PROXY no_proxy" in script
+    # Cleared BEFORE the builder is exec'd (and, for good measure, before
+    # HTTP_PROXY is exported -- order doesn't matter functionally here since
+    # unset/export target different names, but this keeps the script's
+    # narrative order sane: clear the footgun, then set the real proxy vars).
+    unset_pos = script.index("unset NO_PROXY no_proxy")
+    export_pos = script.index("export HTTP_PROXY")
+    exec_pos = script.index('exec setpriv')
+    assert unset_pos < export_pos < exec_pos
+
+
+# ---------------------------------------------------------------------------
 # Live egress/seccomp probe — requires a real docker daemon, skipif absent.
 # ---------------------------------------------------------------------------
 
@@ -760,12 +781,22 @@ def test_probe_enterprise_egress_live(enterprise_probe_image, monkeypatch):
     was dropped). Runs a real container on Docker Desktop's Linux VM."""
     monkeypatch.setenv("DF_ENTERPRISE_LIVE_TEST_TOKEN", "test-token-value")
     upstream_httpd, upstream_port = _start_allowed_stub()
-    proxy_httpd, proxy_port = df_proxy.serve(["127.0.0.1"], "DF_ENTERPRISE_LIVE_TEST_TOKEN")
+    # M30 (DF-03): exact-origin allowlisting -- the stub binds an EPHEMERAL
+    # port, so the allowlist entry must name it explicitly (a bare "127.0.0.1"
+    # now only permits the two DEFAULT ports, 80/443). A capability token is
+    # also mandatory now; the probe is given the SAME one so its in-container
+    # request can present it.
+    cap_token = "df-enterprise-live-probe-capability-token"
+    proxy_httpd, proxy_port = df_proxy.serve(
+        [f"127.0.0.1:{upstream_port}"], "DF_ENTERPRISE_LIVE_TEST_TOKEN",
+        capability_token=cap_token,
+    )
     try:
         proxy_endpoint = f"host.docker.internal:{proxy_port}"
         allowed_url = f"http://127.0.0.1:{upstream_port}/"
         ok, detail = df_container.probe_enterprise_egress(
-            enterprise_probe_image, proxy_endpoint, allowed_url, "1.1.1.1")
+            enterprise_probe_image, proxy_endpoint, allowed_url, "1.1.1.1",
+            capability_token=cap_token)
         assert ok is True, detail
         assert detail.get("allowed_reachable") is True, detail
         assert detail.get("denied_blocked") is True, detail
