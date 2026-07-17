@@ -68,7 +68,7 @@ SEAL_VERSION = "1"
 # object_id is always a sha256 hexdigest: 64 lowercase hex chars. Any caller
 # passing something else (e.g. a manifest field an attacker tampered with)
 # must be refused before it is used to build a filesystem path.
-_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_OBJECT_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class SealError(RuntimeError):
