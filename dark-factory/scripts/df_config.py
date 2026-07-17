@@ -365,6 +365,33 @@ def load_config(control_root: str) -> dict:
             or notification_attempts < 1):
         raise ConfigError("budget.notification_attempts must be an int >= 1")
 
+    # M25 Task 2: optional operator-supplied pricing, dollars per MILLION
+    # tokens, keyed by "<model>" or "default". Purely additive/optional --
+    # absent -> {} (no pricing, no actual_usd computed; see
+    # references/budget.md). dark-factory never embeds or fetches prices
+    # itself (prices change, fetching is network egress) -- the operator is
+    # the sole source of truth here, same posture as credentials.
+    token_pricing_raw = budget_raw.get("token_pricing")
+    token_pricing = {}
+    if token_pricing_raw is not None:
+        if not isinstance(token_pricing_raw, dict):
+            raise ConfigError("budget.token_pricing must be a JSON object")
+        for _key, _entry in token_pricing_raw.items():
+            if not isinstance(_entry, dict):
+                raise ConfigError(
+                    f"budget.token_pricing.{_key} must be a JSON object with "
+                    "input_per_mtok/output_per_mtok"
+                )
+            _parsed = {}
+            for _field in ("input_per_mtok", "output_per_mtok"):
+                _val = _entry.get(_field)
+                if isinstance(_val, bool) or not isinstance(_val, (int, float)) or _val < 0:
+                    raise ConfigError(
+                        f"budget.token_pricing.{_key}.{_field} must be a number >= 0"
+                    )
+                _parsed[_field] = float(_val)
+            token_pricing[_key] = _parsed
+
     sg_raw = raw.get("security_gates", {})
     if not isinstance(sg_raw, dict):
         raise ConfigError("security_gates must be a JSON object")
@@ -961,6 +988,7 @@ def load_config(control_root: str) -> dict:
         "notification_sink": notification_sink,
         "notification_durable": notification_durable,
         "notification_attempts": notification_attempts,
+        "token_pricing": token_pricing,
     }
     cfg["_credentials"] = cfg_credentials
     cfg["_brownfield"] = cfg_brownfield
