@@ -25,11 +25,16 @@ ln -sfn "$PWD/loop-designer" ~/.claude/skills/loop-designer
 
 Runs a StrongDM-style "dark factory" loop: you write a spec, an isolated
 builder agent implements it without ever seeing the hidden acceptance
-scenarios, a verifier runs them, and only behavior-ID feedback crosses back
-until convergence. M1 = walking skeleton (cooperative tier, honestly
-unqualified isolation).
+scenarios, a verifier runs them, and only behavior-ID + failure-taxonomy
+feedback crosses back until convergence. Four assurance tiers ship —
+cooperative, standard (OS sandbox), hardened (Docker, denial by
+construction), and enterprise (+ locked egress + split-custody sign-off) —
+plus cross-model builders (claude/codex/gemini CLIs, or a stdlib HTTP
+adapter straight to the Anthropic/OpenAI APIs, no CLI required).
 
-- Skill: [`dark-factory/SKILL.md`](dark-factory/SKILL.md)
+- README (quickstart, tiers, layout): [`dark-factory/README.md`](dark-factory/README.md)
+- Plain-language overview: [`dark-factory/OVERVIEW.md`](dark-factory/OVERVIEW.md)
+- Skill (operational instructions): [`dark-factory/SKILL.md`](dark-factory/SKILL.md)
 - Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md)
 - Adversarial review log: [`docs/superpowers/specs/2026-07-13-dark-factory-review-log.md`](docs/superpowers/specs/2026-07-13-dark-factory-review-log.md)
 - Tests: `.venv/bin/python -m pytest dark-factory/tests -v`

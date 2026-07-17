@@ -217,6 +217,22 @@ mechanism works end-to-end with a real model, not only a stub; the suite's
 own `test_e2e_api_container.py` deliberately uses the deterministic stub
 instead so CI never makes a paid API call.
 
+### `api_openai`: the same mechanism, a different provider
+
+`scripts/adapters/api_openai` (`references/role-adapters.md`) is the same
+stdlib-HTTP, no-custom-image adapter shape as `api_anthropic`, targeting
+OpenAI's Chat Completions API instead. Steps 1-4 above apply identically
+(`roles.builder.adapter` → `scripts/adapters/api_openai`,
+`hardened.network: "bridge"`, `OPENAI_API_KEY` via the credential allowlist,
+`OPENAI_BASE_URL` at its default unless routed through the enterprise
+proxy), and it is `df_confine.PROFILES["api_openai"]`-supported on the same
+structural grounds. Unlike `api_anthropic`, it does not yet have its own
+in-container e2e test (`test_e2e_api_container.py` covers `api_anthropic`
+only) — the container-level mechanism is identical and already proven for
+`api_anthropic`, but this adapter's in-container path has not been
+separately exercised. See `references/role-adapters.md` for the full honest
+scope note.
+
 ## Twins at hardened
 
 The **verifier's** digital-twin wiring (`references/digital-twins.md`) is
@@ -270,6 +286,6 @@ them:
 - `dark-factory/tests/test_e2e_api_container.py` — the live `api_anthropic`
   in-container proof (M24): stub-brained, real container + network + parse +
   write
-- `references/role-adapters.md` — the `api_anthropic` adapter itself
-- `references/builder-confinement.md` — `api_anthropic`'s structural
-  (non-live-probe) confinement justification
+- `references/role-adapters.md` — the `api_anthropic`/`api_openai` adapters
+- `references/builder-confinement.md` — their structural (non-live-probe)
+  confinement justification

@@ -123,6 +123,15 @@ PROFILES = {
         "mcp_disabled": True,
         "tool_allowlist": [],
     },
+    # Same structural argument as api_anthropic above: api_openai is also a
+    # plain stdlib HTTP client (one urllib POST to a fixed, supervisor-
+    # configured endpoint) with no agentic tool/MCP/sub-agent surface at all.
+    "api_openai": {
+        "supported": True,
+        "structural": True,
+        "mcp_disabled": True,
+        "tool_allowlist": [],
+    },
 }
 
 

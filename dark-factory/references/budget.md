@@ -4,7 +4,7 @@ Bounds a run's builder-call cost. **Admission is always estimated, never metered
 every admission/alert/pause decision below is built on a human-supplied
 `budget.per_call_usd` estimate, reserved *before* each builder call — this is
 unchanged by M25 and never will be (you can't reserve spend you haven't incurred yet).
-Separately, **as of M25, adapters that report real API usage** (`api_anthropic`) surface
+Separately, **as of M25, adapters that report real API usage** (`api_anthropic`, `api_openai`) surface
 authoritative token counts, and an operator-supplied `budget.token_pricing` turns those
 into a real `actual_usd` — RECORDED on the manifest, never used for admission. See
 "Real metering (M25)" below. Schema + validation rules: `references/config-reference.md`
@@ -111,7 +111,11 @@ manifest reflect the full run, across every pause/resume segment.
 **Which adapters report real usage.** `api_anthropic` (M24) calls the real Anthropic
 Messages API, which returns an authoritative `usage: {"input_tokens", "output_tokens"}`
 block with every response; the adapter surfaces it through the protocol-0.1 response as
-`usage: {"known": true, "input_tokens": <int>, "output_tokens": <int>}`. The `claude`,
+`usage: {"known": true, "input_tokens": <int>, "output_tokens": <int>}`. `api_openai`
+does the same against OpenAI's Chat Completions API, which reports usage as
+`{"prompt_tokens", "completion_tokens"}` — the adapter maps these onto the identical
+protocol field names (`input_tokens`/`output_tokens`) before they ever reach the
+supervisor, so this accounting code is fully provider-agnostic. The `claude`,
 `codex`, and `gemini` CLI adapters wrap headless CLI tools whose output does not
 reliably expose token counts — they still report `usage: {"known": false}` and remain
 **estimate-only**, exactly as before M25. Whether usage is knowable is entirely a
@@ -187,9 +191,9 @@ known. The manifest's `estimate_caveat` string exists precisely so nobody mistak
 number to reconcile against instead.
 
 **Cost metering is wired for adapters that report it — CLI adapters stay
-`usage.known=false`.** M25 closes the metering gap for `api_anthropic` (see "Real
-metering" above): its `usage.known=true` and `actual_usd` (with `token_pricing`
-configured) are real, authoritative numbers. The `claude`/`codex`/`gemini` CLI builder
+`usage.known=false`.** M25 closes the metering gap for `api_anthropic` and `api_openai`
+(see "Real metering" above): their `usage.known=true` and `actual_usd` (with
+`token_pricing` configured) are real, authoritative numbers. The `claude`/`codex`/`gemini` CLI builder
 adapters still cannot emit a parseable token/cost usage report in headless mode, so they
 remain `usage.known=false` and estimate-only — this is an honest, adapter-specific gap
 (not "cost metering deferred" globally anymore), and closing it further needs those CLI

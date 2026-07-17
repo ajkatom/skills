@@ -40,7 +40,7 @@ shipping an unverified profile that *looks* like it constrains the CLI, but
 hasn't been proven to, would be worse than shipping nothing.
 
 ## Per-CLI profiles (claude verified; codex + gemini unsupported/refused;
-## api_anthropic supported on structural grounds)
+## api_anthropic + api_openai supported on structural grounds)
 
 ### claude — verified: Bash tool blocked entirely
 
@@ -177,6 +177,19 @@ design. If a future version of this adapter grows any agentic capability
 holding and the profile must be re-derived, probe-verified like claude's, or
 withdrawn — `structural: True` is a claim about *this* adapter's shape, not
 a blanket exemption from ever needing a probe.
+
+### api_openai — same structural argument as api_anthropic
+
+`df_confine.PROFILES["api_openai"]` is the identical `{"supported": True,
+"structural": True, "mcp_disabled": True, "tool_allowlist": []}` shape, for
+the identical reason: `scripts/adapters/api_openai` is also a single stdlib
+`urllib` POST to one fixed, supervisor-configured endpoint
+(`OPENAI_BASE_URL`), with the same "only possible output is a parsed
+`{"files": {...}}` JSON reply" capability bound as `api_anthropic` — no
+shell, no MCP client, no sub-agent spawner inside it either. Everything the
+`api_anthropic` subsection above says about why a live probe would be theater
+here, and why `confinement_flags`/`probe_confinement` short-circuit without
+spawning anything, applies verbatim.
 
 ## The airtight-probe rationale
 
@@ -369,5 +382,5 @@ at the strongest tier.
 - `references/config-reference.md` — `builder_confinement.*` config schema
 - `references/hardened.md` — the container barrier's own MCP-closing effect
   via `hardened.network: "none"`, and the `api_anthropic` in-container e2e
-- `references/role-adapters.md` — the `api_anthropic` adapter itself (protocol,
-  output contract, path-safety, key handling)
+- `references/role-adapters.md` — the `api_anthropic`/`api_openai` adapters
+  themselves (protocol, output contract, path-safety, key handling)
