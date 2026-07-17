@@ -23,7 +23,13 @@ def test_save_and_load_state_roundtrip(tmp_path):
     rd.mkdir(parents=True)
     supervisor.save_state(str(rd), next_iter=3, feedback={"failing_count": 1}, workspace="/ws/x")
     st = supervisor.load_state(str(rd))
-    assert st["state_version"] == "0.1"
+    # M36a Task 3: save_state now writes state_version 0.2 (phase-aware FSM
+    # chain). This call did not request a chain append (chain_append defaults
+    # False), so no fsm_chain.jsonl is created and the recorded head is None.
+    assert st["state_version"] == "0.2"
+    assert st["phase"] == "checkpoint"       # defaults to reason when unspecified
+    assert st["fsm_chain_head"] is None
+    assert st["build_approved_through"] == 0
     assert st["next_iter"] == 3
     assert st["feedback"] == {"failing_count": 1}
     assert st["workspace"] == "/ws/x"

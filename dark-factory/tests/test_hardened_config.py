@@ -410,8 +410,18 @@ def test_builder_wiring_docker_prefix_no_control_root_mount(tmp_path, monkeypatc
 
     run_id = os.listdir(cr / "runs")[0]
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
-    assert m["outcome"] == "COMPLETE_QUALIFIED"
-    assert m["qualified"] is True
+    # M36a (single qualification SM): host_isolation is now folded into
+    # `qualified`. This test uses a FAKE OS backend (_FakeOSBackend) that does
+    # not implement a real default-deny candidate profile, so host_isolation
+    # resolves to legacy_allow_host_read (qualified False) -- honestly NOT a
+    # qualified ship-candidate. The docker builder-mount wiring under test
+    # (asserted above) is unchanged; the seal now correctly reports the
+    # host-isolation limit instead of over-claiming COMPLETE_QUALIFIED.
+    assert m["outcome"] == "HOST_ISOLATION_LIMITED"
+    assert m["qualified"] is False
+    assert m["host_isolation"]["qualified"] is False
+    assert m["qualification"]["code"] == "HOST_ISOLATION_LIMITED"
+    assert m["qualification"]["substates"]["barrier"] is True  # the tier IS probe-proven
     assert m["sandbox_backend"] == df_container.BACKEND_NAME
     assert m["denial_probe_passed"] is True
     assert m["container"] == {"image": df_container.DEFAULT_IMAGE, "network": "none",

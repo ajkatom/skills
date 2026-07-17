@@ -169,3 +169,29 @@ shipped answer, and should be reported as such rather than oversold.
   same-host-scoped as described above
 - `references/credentials.md` — the `-e` argv/`ps`-visibility residual,
   another same-user-privilege limit in the same family
+
+## M36b residuals (deferred from M36a, documented)
+
+M36a landed the four intervention modes, the single qualification state
+machine (folding `host_isolation` into `qualified`), and the phase-aware
+hash-chained FSM checkpoint. The following were deliberately deferred:
+
+- **Signed resume overrides.** A budget-ceiling raise or credential-VALUE
+  refresh at resume is not yet gated by an approver allowlist/threshold with a
+  canonical payload + replay protection independent of the supervisor HMAC.
+  Today raising `budget.max_usd` and `resume`-ing is an unauthenticated local
+  edit (detection-grade, like the rest of the single-user posture).
+- **Spec-fork lineage.** A parent run's sealed artifact object is not yet
+  consumable as a child run's input snapshot with recorded lineage +
+  superseded-parent marking.
+- **Interactive `WAIVER_PENDING` pause.** Security-gate waivers remain
+  attach-time (`df-waiver attach`); M36a adds `WAIVER_PENDING` as a first-class
+  FSM phase name but does NOT add a new interactive waiver pause.
+- **The before-ship (approve-ship) pause.** Deferred for both back-compat and
+  mechanism reasons — see `references/modes.md`. The `AWAIT_SHIP` phase and the
+  `pauses_before_ship()` predicate exist (returning False) for a future
+  milestone that designs seal-reentry.
+
+The **FSM chain is corruption-detection, not forgery-proof** — a same-user
+process that rewrites both `fsm_chain.jsonl` and the recorded head together is
+out of scope, exactly as for the manifest/audit-chain hashes above.

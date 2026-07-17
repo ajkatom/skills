@@ -429,7 +429,15 @@ def test_e2e_standard_run_is_default_deny_and_sealed(tmp_path):
 def test_e2e_optout_is_marked_unqualified(tmp_path):
     manifest, _ = _run_supervisor(
         _std_control(tmp_path, candidate_host_read="allow_host_read"))
-    assert manifest["outcome"] == "COMPLETE_QUALIFIED"
+    # M36a THE SECURITY FIX: pre-M36a this exact run (standard tier, but the
+    # candidate host-read explicitly opted OUT of default-deny) sealed
+    # COMPLETE_QUALIFIED even though host_isolation.qualified was False -- the
+    # top-level `qualified` simply didn't look at host_isolation. The single
+    # qualification SM now folds it in, so an allow_host_read standard run
+    # honestly seals the distinct HOST_ISOLATION_LIMITED, qualified False.
+    assert manifest["outcome"] == "HOST_ISOLATION_LIMITED"
+    assert manifest["qualified"] is False
+    assert manifest["qualification"]["code"] == "HOST_ISOLATION_LIMITED"
     hi = manifest["host_isolation"]
     assert hi["mode"] == "allow_host_read_optout"
     assert hi["qualified"] is False
