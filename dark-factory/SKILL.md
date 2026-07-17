@@ -259,10 +259,15 @@ around the builder, never inside it:
 **Honesty:** at every tier — including `hardened` — this is *guidance*, not
 enforcement of THIS orchestrating session. `hardened` sandboxes the **builder**
 (container barrier) and the **verifier** (OS sandbox); it does not sandbox the
-Claude session running this skill. An **enforced** per-tier skill allowlist with
-content-hash pinning (spec §3B) that constrains the orchestrator itself is an
-`enterprise` capability (not yet built). Never author or reveal holdout scenarios
-in a session that will also drive the builder.
+Claude session running this skill. An **enforced** per-tier skill/tool allowlist
+that constrains the orchestrator itself (spec §3B) **cannot be done in skill
+code** — a skill cannot sandbox the session executing it — so it is an
+**operator step at the harness layer**. If your threat model needs it, follow
+`references/orchestrator-lockdown.md` **before you run a build**: it gives the
+Claude Code recipe (session tool allow/deny, `--strict-mcp-config`, a
+`PreToolUse` hook as the hard gate, and OS-level containment of the orchestrator)
+plus how to probe that the allowlist actually holds. Never author or reveal
+holdout scenarios in a session that will also drive the builder.
 
 ## References
 
@@ -271,6 +276,7 @@ in a session that will also drive the builder.
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, deferred scope (M10)
+- `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
 - `references/security-gates.md` — mandatory security gates on the converged artifact: built-ins, external-gate interface, fail_on/strict_unavailable, `SECURITY_GATE_FAILED` semantics, honest heuristic/floor caveat (M9)
 - `references/credentials.md` — the credential broker: allowlist-only injection, scrubbed artifacts, gitignore/permission gates, launcher-scoped standard-tier env, and honest limits (no rotation, `ps`-visibility, egress) (M11)
