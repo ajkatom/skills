@@ -67,10 +67,15 @@ its network authority narrowed. `cfg["candidate_network"] == "unrestricted"`
   loopback. macOS: `(deny network*)` appended to the sandbox-exec profile.
   Linux: `--unshare-net` (a fresh network namespace with no interfaces
   configured, not even a usable loopback).
-- `loopback` — blocks everything except `127.0.0.1`, so host-bound digital
+- `loopback` — blocks everything except localhost, so host-bound digital
   twins stay reachable while real external egress is cut off. macOS only
   (see the Linux limit below): `(deny network*)(allow network* (remote ip
-  "localhost:*"))`.
+  "localhost:*"))`. Note (see `df_sandbox.py`'s module docstring): because
+  macOS routes the host's OWN non-loopback addresses (its LAN IP) via `lo0`,
+  the `localhost` allow-clause also permits reaching this host on its own
+  addresses — that is still not external egress (which the live probe proves
+  is cut against a real external target), just a slightly broader "local"
+  than literal `127.0.0.1`.
 
 **The live probe.** No mode beyond `unrestricted` is ever trusted without
 proof: `probe_network_denial(backend, deny_root, workspace, mode)` spawns a
