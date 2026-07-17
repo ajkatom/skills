@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""OpenAI Chat Completions builder adapter, protocol 0.1 (mirrors api_anthropic,
+M24). Drives a real model via the OpenAI HTTP API instead of a CLI -- stdlib
+`urllib`/`json` only, no subprocess, no third-party dependency -- so it can
+build inside a minimal container that has python3 but no CLI binary. The
+model sees only the prompt file content (spec + ID feedback), exactly like
+every other builder adapter.
+
+Request: POST {OPENAI_BASE_URL or https://api.openai.com}/v1/chat/completions
+with an `Authorization: Bearer $OPENAI_API_KEY` header and a body naming
+$DF_API_MODEL (default gpt-4o), a system message that imposes a strict output
+contract (the model MUST reply with exactly one JSON object
+{"files": {"<relpath>": "<content>", ...}} and nothing else), and
+`response_format: {"type": "json_object"}` (a Chat Completions feature that
+constrains the provider to emit valid JSON -- belt-and-suspenders on top of
+the same fence-stripping/parsing this adapter still does, since the fence
+stripping and validation must hold even against a provider/model that
+ignores response_format). A model that ignores the contract is an adapter
+error, not a garbage build -- fail-closed, matching every other builder
+adapter's "no partial/best-effort success" posture.
+
+Security-critical: every path the model returns is validated through
+_safe_join (reject absolute paths, ".." traversal, and symlink escape via a
+realpath-under-workdir check) BEFORE any file is written, and validation of
+every path happens before ANY write (all-or-nothing -- an unsafe path in an
+otherwise-fine reply throws away the whole reply, never a partial tree).
+
+No-key-leak: the API key is read from env, sent only in the Authorization
+header, and never appears in a response detail, stdout, stderr, or a written
+file -- not even when the request/response fails. Fail-closed: no key, non-2xx
+HTTP, an unparseable reply, a wrong-shaped reply, or an unsafe path all
+produce a clean {"status":"error","detail":"<short>"} -- this adapter never
+raises uncaught and never exits non-zero (the caller always gets a
+protocol-shaped response on stdout)."""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+_SYSTEM_PROMPT = """You are the code-generation backend of an automated, \
+non-interactive build pipeline -- not a conversational assistant, and no \
+human will read a reply that isn't machine-parseable.
+
+The user message is a build spec (and possibly feedback from a prior \
+attempt). Respond with EXACTLY ONE JSON object and NOTHING ELSE: no prose \
+before or after it, no markdown code fence, no explanation. Shape:
+
+{"files": {"<relative/path/to/file>": "<the complete literal file content>", ...}}
+
+Rules:
+- Every key is a path RELATIVE to the build workspace root: no leading "/", \
+no ".." segments, no drive letters.
+- Every value is the FULL content to write to that file (this pipeline does \
+not apply patches or diffs -- a returned file always fully replaces \
+whatever was there).
+- Include only the files the spec calls for.
+- Even if you cannot fully satisfy the spec, reply with a syntactically \
+valid {"files": {...}} object (possibly with a partial or best-effort set \
+of files) -- never plain prose, never an apology, never a fenced block \
+containing anything other than this one JSON object."""
+
+_DEFAULT_MODEL = "gpt-4o"
+_DEFAULT_BASE_URL = "https://api.openai.com"
+_MAX_TOKENS = 8192
+_SNIPPET_LEN = 200  # bounded snippet for error details; never the full reply
+
+
+def respond(status, detail="", usage=None):
+    print(json.dumps({
+        "adapter_protocol": "0.1",
+        "status": status,
+        "detail": detail,
+        "usage": usage if isinstance(usage, dict) else {"known": False},
+    }))
+
+
+def _extract_usage(parsed):
+    """Return {"known": True, "input_tokens": int, "output_tokens": int} when
+    the Chat Completions response's top-level "usage" block has int-able
+    prompt_tokens/completion_tokens (mapped onto the SAME protocol field
+    names api_anthropic uses -- input_tokens/output_tokens -- so the
+    supervisor's accounting stays provider-agnostic); else {"known": False}.
+    NEVER raises -- an absent or malformed usage block is not a build
+    failure, only an unknown-usage report."""
+    try:
+        usage = parsed.get("usage")
+        if not isinstance(usage, dict):
+            return {"known": False}
+        return {
+            "known": True,
+            "input_tokens": int(usage["prompt_tokens"]),
+            "output_tokens": int(usage["completion_tokens"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return {"known": False}
+
+
+def _snippet(text):
+    text = text if isinstance(text, str) else repr(text)
+    text = text.strip().replace("\n", " ")
+    return text[:_SNIPPET_LEN]
+
+
+def _strip_fence(text):
+    """Tolerate an optional leading/trailing ```json ... ``` fence around the
+    model's reply. Returns the inner text unchanged if there's no fence."""
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _safe_join(workdir_real, relpath):
+    """Return the absolute, symlink-resolved path relpath refers to under
+    workdir_real, or None if relpath is unsafe: absolute, contains a ".."
+    segment, or resolves (once existing symlinks are followed) to somewhere
+    that is not workdir_real itself or strictly under it."""
+    if not isinstance(relpath, str) or not relpath:
+        return None
+    if os.path.isabs(relpath) or relpath.startswith("/") or relpath.startswith("\\"):
+        return None
+    norm = relpath.replace("\\", "/")
+    if any(seg == ".." for seg in norm.split("/")):
+        return None
+    candidate = os.path.realpath(os.path.join(workdir_real, relpath))
+    if candidate == workdir_real or not candidate.startswith(workdir_real + os.sep):
+        return None
+    return candidate
+
+
+def _call_chat_api(base_url, api_key, model, prompt, timeout_s):
+    """POST the Chat Completions API. Returns (status_or_none, body_bytes_or_none,
+    error_detail_or_none). Exactly one of (status, error_detail) signals
+    success vs failure -- error_detail is always a short, key-free string."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": _MAX_TOKENS,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.status, resp.read(), None
+    except urllib.error.HTTPError as e:
+        return None, None, f"api returned HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return None, None, f"api request failed: {type(e).__name__}"
+
+
+def _extract_files(resp_body):
+    """Parse a Chat Completions response body into a ({relpath: content},
+    usage) pair, or raise ValueError with a short, key-free detail message.
+    `usage` is always a well-formed {"known": bool, ...} dict (see
+    _extract_usage) -- never raises on its own, so a malformed usage block
+    never turns a successful build into an error."""
+    try:
+        parsed = json.loads(resp_body)
+        choices = parsed["choices"]
+        text = choices[0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, UnicodeDecodeError) as e:
+        raise ValueError(f"unparseable api response: {type(e).__name__}") from None
+    if not isinstance(text, str):
+        raise ValueError("api response has no text content")
+
+    inner = _strip_fence(text)
+    try:
+        reply = json.loads(inner)
+    except json.JSONDecodeError:
+        raise ValueError(f"model reply is not JSON: {_snippet(inner)!r}") from None
+    if not isinstance(reply, dict) or not isinstance(reply.get("files"), dict):
+        raise ValueError(f"model reply missing a files object: {_snippet(inner)!r}")
+
+    files = reply["files"]
+    for relpath, content in files.items():
+        if not isinstance(relpath, str) or not isinstance(content, str):
+            raise ValueError("model reply files entry is not path->string content")
+    return files, _extract_usage(parsed)
+
+
+def _write_files(workdir, files):
+    """Validate every path BEFORE writing any (all-or-nothing), then write.
+    Raises ValueError (with a short, key-free detail) on any unsafe path."""
+    workdir_real = os.path.realpath(workdir)
+    resolved = []
+    for relpath, content in files.items():
+        target = _safe_join(workdir_real, relpath)
+        if target is None:
+            raise ValueError(f"unsafe file path in model reply: {relpath!r}")
+        resolved.append((target, content))
+    # All-or-nothing at the file level too: if any write hits an OSError
+    # (a path collides with an existing entry of the wrong type, permission
+    # denied, disk full), roll back the files this call already created so the
+    # supervisor never finds a partial tree to build on. (Path-safety is
+    # already guaranteed above; this closes the write-phase half of the
+    # documented "never a partial tree" invariant.)
+    written = []
+    try:
+        for target, content in resolved:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+            written.append(target)
+    except OSError as e:
+        for p in written:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        raise ValueError(f"file write failed: {type(e).__name__}") from None
+
+
+def _run():
+    try:
+        req = json.load(sys.stdin)
+        with open(req["prompt_file"], encoding="utf-8") as f:
+            prompt = f.read()
+        workdir = req["workdir"]
+        timeout_s = req.get("timeout_s", 600)
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+        respond("error", f"bad adapter request: {e}")
+        return
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        respond("error", "no api key: OPENAI_API_KEY not set")
+        return
+
+    base_url = os.environ.get("OPENAI_BASE_URL") or _DEFAULT_BASE_URL
+    model = os.environ.get("DF_API_MODEL") or _DEFAULT_MODEL
+
+    status, resp_body, err = _call_chat_api(base_url, api_key, model, prompt, timeout_s)
+    if err is not None:
+        respond("error", err)
+        return
+    if status != 200:
+        respond("error", f"api returned HTTP {status}")
+        return
+
+    try:
+        files, usage = _extract_files(resp_body)
+        _write_files(workdir, files)
+    except ValueError as e:
+        respond("error", str(e))
+        return
+
+    respond("ok", usage=usage)
+
+
+def main():
+    try:
+        _run()
+    except Exception:
+        # Last-resort fail-closed net: whatever went wrong, the caller still
+        # gets a clean protocol-shaped response on stdout, never a traceback
+        # on stderr and never a non-zero exit -- and never anything that
+        # could possibly echo the api key (it never appears in this message).
+        respond("error", "internal adapter error")
+
+
+if __name__ == "__main__":
+    main()

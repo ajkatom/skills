@@ -18,6 +18,8 @@ Shipped adapters (protocol 0.1, all in `scripts/adapters/`):
   the OS sandbox), no `-m` pin (uses ~/.codex default).
 - `gemini` — Gemini CLI, `--yolo --prompt`.
 - `api_anthropic` (M24) — a stdlib HTTP client, no CLI at all. See below.
+- `api_openai` — a stdlib HTTP client for OpenAI's Chat Completions API, same
+  shape as `api_anthropic`. See below.
 
 Pick the builder with `df_adapters.available_builders()` (installed CLIs) and
 `df_adapters.resolve_builder(name)` — the latter raises rather than substitute a
@@ -25,10 +27,11 @@ different model. Under the `standard` tier the OS sandbox denies the holdout to
 whatever model builds, so cross-model builders inherit isolation. Verification is
 always the deterministic scenario runner — there is no cross-model "judge".
 
-(`api_anthropic` is not in `df_adapters.BUILDERS` — that registry's
-`available_builders()` check is "is this CLI on PATH", which doesn't apply to
-an adapter with no CLI; select it by pointing `roles.builder.adapter` at
-`scripts/adapters/api_anthropic` directly.)
+(`api_anthropic`/`api_openai` are not in `df_adapters.BUILDERS` — that
+registry's `available_builders()` check is "is this CLI on PATH", which
+doesn't apply to an adapter with no CLI; select one by pointing
+`roles.builder.adapter` at `scripts/adapters/api_anthropic` or
+`scripts/adapters/api_openai` directly.)
 
 ## `api_anthropic` — the Messages-API builder adapter (M24)
 
@@ -109,3 +112,56 @@ same way (in-container, over the real Messages API) and passed all 12 hidden
 acceptance scenarios — see `references/hardened.md` for the honest split
 between what the suite proves (the mechanism) and what was proven live but
 not automated (a real paid model).
+
+## `api_openai` — the Chat Completions builder adapter
+
+`scripts/adapters/api_openai` is the OpenAI-equivalent of `api_anthropic`:
+same stdlib-only, no-CLI, structurally-confined design, driving a real model
+over **OpenAI's Chat Completions HTTP API** instead of the Anthropic Messages
+API. It closes the same gap for OpenAI models that `api_anthropic` closes for
+Claude models — a minimal `python:3.12-alpine` container with no CLI can
+still run a real build.
+
+**Protocol.** Identical adapter-protocol 0.1 request/response shape.
+
+**Request.** `POST {OPENAI_BASE_URL}/v1/chat/completions` (`OPENAI_BASE_URL`
+env, default `https://api.openai.com`) with header `Authorization: Bearer
+$OPENAI_API_KEY`, and a body naming `model` (`DF_API_MODEL` env, default
+`gpt-4o`), a `system` message imposing the same strict `{"files": {...}}`
+output contract as `api_anthropic`, plus `response_format:
+{"type":"json_object"}` — a Chat Completions feature that constrains the
+provider to emit valid JSON. This is belt-and-suspenders on top of the same
+fence-stripping/parsing `api_anthropic` uses, not a replacement for it: the
+adapter still validates and parses the reply itself rather than trusting the
+provider flag to hold against every model.
+
+**Output contract, path-safety, key handling, overrides.** Identical to
+`api_anthropic` (see above) — same `_safe_join`, same all-or-nothing write
+with rollback on a mid-write `OSError`, same never-leaks-the-key discipline
+(`OPENAI_API_KEY` only ever appears in the `Authorization` header),
+`OPENAI_BASE_URL`/`DF_API_MODEL` overrides.
+
+**Usage field-name mapping.** OpenAI's Chat Completions response reports
+usage as `{"prompt_tokens": N, "completion_tokens": M}` — the adapter maps
+these onto the SAME protocol-uniform field names `api_anthropic` uses
+(`input_tokens`/`output_tokens`) so the supervisor's cost-metering
+accounting (`references/budget.md`) stays provider-agnostic; it never sees
+the OpenAI-specific field names.
+
+**Confinement.** `df_confine.PROFILES["api_openai"]` is `supported: True` on
+the same structural grounds as `api_anthropic` — a plain HTTP client has no
+agentic tool/MCP/sub-agent surface to strip or probe.
+
+**Proven live.** `dark-factory/tests/test_openai_adapter.py` drives this
+adapter end-to-end (subprocess, protocol 0.1) against a local stub Chat
+Completions endpoint (`tests/fixtures/stub_chat_api`) — deterministic, no
+paid calls, runs in the suite. Unlike `api_anthropic`, this adapter does
+**not** yet have an in-container e2e test or a real-paid-model live proof —
+that is a deliberate, honest scope boundary (not deferred silently): the
+container-level mechanism (`df_container.build_argv` + `host.docker.internal`
+reaching a host-side stub or the real API) is identical to what
+`test_e2e_api_container.py` already proves for `api_anthropic`, so the
+residual risk is low, but it has not been separately exercised for this
+adapter. An operator with an `OPENAI_API_KEY` can run it live the same way
+`api_anthropic` was proven live (point `roles.builder.adapter` at
+`scripts/adapters/api_openai`, set `DF_API_MODEL` if the default doesn't fit).

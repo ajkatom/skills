@@ -58,7 +58,7 @@ def test_unknown_cli_confinement_flags_raise():
     # surface to escape through in the first place (structural, not
     # live-probe-verified — see PROFILES["api_anthropic"]).
     ("claude", True), ("codex", False), ("gemini", False), ("unknown-cli", False),
-    ("api_anthropic", True),
+    ("api_anthropic", True), ("api_openai", True),
 ])
 def test_is_supported_matrix(cli, expected):
     assert df_confine.is_supported(cli) is expected
@@ -329,5 +329,36 @@ def test_api_anthropic_probe_confinement_structural_pass_without_spawning():
 
     ok, reason = df_confine.probe_confinement(
         "api_anthropic", "/nonexistent/workdir", runner=fake_runner)
+    assert ok is True
+    assert "structural" in reason.lower()
+
+
+# ---------- api_openai profile: structural, non-live-probe (mirrors api_anthropic) ----------
+#
+# Same structural argument as api_anthropic: a plain stdlib HTTP client with
+# no agentic tool/MCP/sub-agent surface at all. See PROFILES["api_openai"].
+
+def test_api_openai_is_supported_true():
+    assert df_confine.is_supported("api_openai") is True
+
+
+def test_api_openai_profile_marked_structural_no_agentic_tools():
+    profile = df_confine.profile_for("api_openai")
+    assert profile["supported"] is True
+    assert profile["structural"] is True
+    assert profile["mcp_disabled"] is True
+    assert profile["tool_allowlist"] == []
+
+
+def test_api_openai_confinement_flags_no_flags_to_add():
+    assert df_confine.confinement_flags("api_openai", "PROMPT") == []
+
+
+def test_api_openai_probe_confinement_structural_pass_without_spawning():
+    def fake_runner(*a, **k):
+        raise AssertionError("must not spawn a subprocess for a structural profile")
+
+    ok, reason = df_confine.probe_confinement(
+        "api_openai", "/nonexistent/workdir", runner=fake_runner)
     assert ok is True
     assert "structural" in reason.lower()
