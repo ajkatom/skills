@@ -29,7 +29,9 @@ root to fail confusingly later.
   why, the must-pass behaviors with 1-3 holdout scenarios each (with
   guidance on writing scenarios that are actually discriminating and don't
   leak the answer into the spec), and the optional config blocks
-  (`security_gates`/`twins`/`budget`/`knowledge_base`).
+  (`security_gates`/`twins`/`budget`/`knowledge_base`, plus `candidate_network`
+  to restrict the built app's network and, at `hardened`/`enterprise`,
+  `hardened.dep_cache_dir` for an offline pinned-dependency cache).
 - **A worked example.** `examples/kv-service/answers.json` is a complete,
   copyable answers document for a small KV JSON HTTP API — 7 behaviors, 12
   dev+final scenarios, hand-verified against a real converged
@@ -110,6 +112,19 @@ unchanged below.
      closed (`resolve_builder` raises; the run aborts). Verification stays the
      deterministic scenario runner regardless of builder — dark-factory has no LLM
      judge to swap.
+     - **Also offer the direct-API builders (no CLI needed).** Two adapters,
+       `api_anthropic` and `api_openai`, drive a real model over the provider's
+       HTTP API using only the Python stdlib — so they run even where no
+       `claude`/`codex`/`gemini` binary is installed (notably **inside the
+       hardened/enterprise container**, which the CLI builders can't), and they
+       report **real token usage → cost** (the CLI builders can't). Offer these
+       when the user wants OpenAI as the builder, wants a real-model build inside
+       the hardened container, or wants authoritative cost metering. Point
+       `roles.builder.adapter` at `<skill_dir>/scripts/adapters/api_anthropic`
+       (needs `ANTHROPIC_API_KEY`, optional `DF_API_MODEL`) or `.../api_openai`
+       (needs `OPENAI_API_KEY`). They aren't in `available_builders()` (that only
+       probes for CLIs on PATH) — select them by path directly. See
+       `references/role-adapters.md`.
    - **Vendor diversity (recommended, not required).** Author the spec and the
      holdout scenarios with a *different* model/session than the builder (e.g.
      Claude authors, Codex builds). Different vendors have different blind spots,
@@ -143,6 +158,19 @@ unchanged below.
      `references/hardened.md` for the full model — what it adds over `standard`, the TCB
      growth (the Docker daemon), image/credential/network honesty, and the deferred list
      (credential broker, egress allowlists, off-box audit).
+     - **Pinned dependency cache (optional, M26, spec §7.3).** A hardened/enterprise
+       builder runs with `--network none` (or a locked egress) and so can't
+       `pip install`/`npm install` from a live registry. If the build needs
+       third-party packages, **offer** the read-only dependency cache: the operator
+       pre-provisions the exact pinned versions once with
+       `python3 <skill_dir>/scripts/df_depcache.py --source <spec-or-scaffold-dir> --dest <cache-dir>`
+       (the one deliberate network op, run outside a build), then set
+       `hardened.dep_cache_dir` to that dir. The supervisor bind-mounts it read-only
+       and points pip/npm at it offline — "no direct registry/DNS" holds by
+       construction (a filesystem mount, not a live proxy). Anything not in the cache
+       fails closed (pip/npm's own offline behavior). npm CLI is needed on the
+       operator's host at provisioning time only. See `references/hardened.md`
+       ("Pinned dependency cache").
    - **L5 (`autonomy: 5`, lights-off).** Requires `assurance: "hardened"` — any other
      tier with `autonomy: 5` is rejected at config load. At hardened + L5, `checkpoint`
      defaults to `auto`: the loop runs unattended to convergence/cap/failure in one CLI

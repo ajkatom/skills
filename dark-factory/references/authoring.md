@@ -139,10 +139,26 @@ Optional `answers.options` block, passed through into `config.json`:
   `references/budget.md`.
 - `knowledge_base` — a markdown wiki (or open-brain) to draw on / write a
   barrier-safe run summary to. See `references/knowledge-base.md`.
+- `candidate_network` — restrict the network of the *built app* itself
+  (the candidate), separately from the builder: `"deny"` (no network) or
+  `"loopback"` (only localhost — twin-compatible, macOS only), default
+  `"unrestricted"`. Requires `standard` or above. Offer this when the app
+  shouldn't reach the network during verification. See
+  `references/isolation.md`.
 
-`init` does **not** currently scaffold `hardened.*`, `custody`,
-`credential_proxy`, `audit.sink`, `credentials`, or `brownfield` blocks —
-add those to the scaffolded `config.json` by hand per
+**Builder choice — offer the direct-API adapters too.** Besides the
+`claude`/`codex`/`gemini` CLIs, `api_anthropic` and `api_openai` build over
+the provider HTTP API with no CLI installed (the only builders that work
+*inside* the hardened/enterprise container) and report real token cost. Set
+`answers.builder_adapter` to their adapter path when the user wants OpenAI,
+a real-model build in-container, or authoritative cost metering. See
+`references/role-adapters.md`.
+
+`init` does **not** currently scaffold `hardened.*` (including
+`hardened.dep_cache_dir` — the offline pinned-dependency cache for a
+network-restricted builder, spec §7.3, see `references/hardened.md`),
+`custody`, `credential_proxy`, `audit.sink`, `credentials`, or `brownfield`
+blocks — add those to the scaffolded `config.json` by hand per
 `references/config-reference.md` if your tier or workflow needs them.
 
 ## Then: init → review → run
