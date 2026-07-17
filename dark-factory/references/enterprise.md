@@ -159,11 +159,11 @@ that is the whole point (no single process or operator can ship).
 The manifest carries:
 - `custody = {required_k, approvers, satisfied: false, note}` — counts only, never a key.
 - `proxy = {enabled: true, allowlist: [...]}`.
-- `enterprise_egress = {locked: "configured", probe: "unverified"}` — the config
-  *includes* the egress lockdown; `"unverified"` is honest about the fact that the
-  full live egress probe (`df_container.probe_enterprise_egress`) is not re-run on
-  every production run (it is expensive/network-dependent; it is exercised by the
-  test suite and operator tooling).
+- `enterprise_egress = {probed: true, passed: bool, policy_digest, checked_at}` —
+  **DF-05/M32**: this is a genuinely per-run result, not merely "configured". See
+  "Mandatory per-run egress verification (DF-05/M32)" below for what the probe
+  proves and does not, and its fail-closed refusal on failure
+  (`EGRESS_PROBE_FAILED`, before this run seals `CUSTODY_PENDING` at all).
 
 ### Phase 2a — approvers sign
 
@@ -345,16 +345,85 @@ allowlist; `api_openai` → `authorization` + `api.openai.com`). A wrong
 pairing is a `ConfigError` naming the mismatch, not a mystery failure the
 first time a real enterprise run tries to reach the provider.
 
-**Deferred.** The supervisor's own wiring of `DF_PROXY_DESCRIPTOR` into the
-enterprise builder container (reading `httpd.capability_token` back off the
-`serve()` call and writing the descriptor JSON into the container's env) is
-a separate follow-up milestone, kept out of this one to avoid touching
-`supervisor.py` mid-flight of a parallel change to that same file. This
-milestone makes the proxy and the adapters *compatible* and proves the full
-chain end-to-end in isolation (`tests/test_proxy_transport.py`); the last
-mile — the supervisor actually generating and injecting the descriptor at
-enterprise run time — is the next step to make a live enterprise run with a
-real API adapter fully operable without manual wiring.
+**Supervisor wiring (DF-05/M32).** The supervisor now performs this wiring
+itself, in `_run_loop`'s enterprise builder-call region: when
+`roles.builder.adapter` is `api_anthropic`/`api_openai` (`df_config.
+_adapter_provider`), the run's credential proxy is started with a fresh
+per-run `capability_token` (`secrets.token_urlsafe(32)`) and
+`provider=<anthropic|openai>` (arming the M30 method/path injection lock —
+see "Hardened proxy" above), and the enterprise container is given
+`DF_PROXY_DESCRIPTOR` as a plain `-e` env var built from that same token +
+the proxy's real endpoint + the provider's real `target_base_url`
+(`https://api.anthropic.com` / `https://api.openai.com`). CLI builder
+adapters (claude/codex/gemini) get no descriptor and no provider lock —
+unaffected, byte-identical to before M32. The journal records that a
+descriptor was **wired** (provider, endpoint, target_base_url) — **never**
+the capability token value; the token also never appears in the manifest.
+This is still not the provider secret entering the container: the token is
+a *local workload* credential (proves to the proxy which process may use
+it), and the real provider key is still only ever read host-side by the
+proxy and injected on its own leg to the provider, exactly as before.
+Covered by `tests/test_enterprise_egress.py`.
+
+## Mandatory per-run egress verification (DF-05/M32)
+
+`resolve_isolation`'s enterprise probe deliberately **skips**
+`df_container.probe_enterprise_egress` — it needs a running proxy, and at
+resolve time the proxy isn't up yet. Historically this meant the manifest's
+`enterprise_egress` field was an honest-but-static `{"locked": "configured",
+"probe": "unverified"}` — the egress lockdown was *configured* every
+enterprise run, but never *empirically re-proven* on that specific run.
+
+DF-05/M32 closes that gap: once the run's real credential proxy is started
+(`_run_loop`, `effective == "enterprise"`), `_verify_enterprise_egress` runs
+the deferred probe exactly **once per run** (fresh run or resume — both
+restart the proxy), **before the first builder call**.
+
+**Fail-closed, no downgrade.** If the probe does not verify — proxy path
+broken, egress not actually blocked, a docker error, or any other failure
+mode, including an outright exception from the probe machinery — the run
+**refuses**: it journals `EGRESS_PROBE_FAILED`, seals a terminal manifest
+with `outcome: "EGRESS_PROBE_FAILED"`, `qualified: false`, and
+`enterprise_egress: {probed: true, passed: false, policy_digest, ...}`, and
+exits 2. The builder is **never invoked**. Unlike a failed OS-sandbox/docker/
+seccomp probe at `resolve_isolation` (which can *downgrade* to `hardened`
+under `--allow-downgrade`), there is no downgrade path here: an enterprise
+run whose egress cannot be proven this run is not enterprise, and
+"hardened-but-claiming-egress-was-checked" is not an honest fallback.
+
+**Honest split — what the mandatory probe proves, and what it does not.**
+The mandatory probe is deliberately **not** a live round trip against the
+real provider through the run's real, operator-configured proxy/allowlist:
+- It uses the **same container image and seccomp profile** this run will
+  use for the builder, run through the **same** entrypoint/iptables
+  lockdown machinery (`df_container.build_enterprise_argv` +
+  `probe_enterprise_egress`), so it proves *this run's* transport+lock
+  actually holds live: an allowlisted-via-proxy origin is reachable, a
+  direct connection to a denied host is blocked, and the child cannot
+  re-add an iptables rule (NET_ADMIN dropped).
+- The "allowed" leg is a **throwaway, local, always-200 stub server**
+  fronted by a **throwaway proxy + capability token** that
+  `_verify_enterprise_egress` starts and tears down itself — **not** the
+  run's real proxy/allowlist/provider. This is deliberate: when the builder
+  is an API adapter, the run's real proxy has the M30 provider method/path
+  lock **armed** (see above) — a generic probe request against it would
+  either be refused (method/path mismatch) or, worse, if it happened to
+  match the locked method+path with no client auth header, trigger a REAL
+  credential injection and a real (paid) provider call. Neither is
+  acceptable for a probe that runs on **every** enterprise run at **zero**
+  cost.
+- **It does NOT prove** the real provider accepts the injected key, or that
+  the operator-configured allowlist/header pairing is correct end to end —
+  that is a live, **paid**, real-provider round trip through the run's
+  actual proxy, and is a **separate, optional, operator-invoked** check
+  (`test_enterprise_config.py::test_probe_enterprise_egress_live` exercises
+  `probe_enterprise_egress` this way directly, skipped cleanly when no
+  docker daemon is available).
+
+`policy_digest` is a `sha256` over `{allowlist, header, proxy_endpoint}` —
+the egress policy this specific run is configured with — so the manifest
+records not just *that* a probe ran, but a compact fingerprint of *what* was
+verified. Covered by `tests/test_enterprise_egress.py`.
 
 ## Token never in the sandbox
 

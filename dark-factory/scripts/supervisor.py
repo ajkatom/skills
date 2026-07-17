@@ -6,11 +6,14 @@ M1 walking skeleton, cooperative tier only. FSM:
 """
 import argparse
 import datetime
+import http.server
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 
 import df_audit
@@ -31,7 +34,7 @@ import df_seal
 import df_security
 import df_twins
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
-from df_config import ConfigError, _disjoint, load_config
+from df_config import ConfigError, _adapter_provider, _disjoint, _PROXY_PROVIDER_RULES, load_config
 from id_feedback import project_feedback
 from run_scenarios import OracleError, load_scenarios, run_all
 from snapshot_source import SnapshotError, snapshot
@@ -1268,16 +1271,143 @@ def _seccomp_profile_ok(path):
     document (has "defaultAction" + "syscalls"). This is NOT the live proof
     that the egress lock actually holds on a real kernel — that is
     df_container.probe_enterprise_egress, which needs a running proxy and
-    specific allowed/denied hosts and is exercised by the test suite /
-    operator tooling rather than re-run against arbitrary network targets on
-    every single production `run` invocation. Any error (missing file,
-    invalid JSON, wrong shape) → False, never a silent pass."""
+    specific allowed/denied hosts. (DF-05/M32: the live probe now DOES run
+    once per enterprise run, via `_verify_enterprise_egress` below — against
+    a throwaway stub target, not the real provider/allowlist — see that
+    function's docstring for the honest scope split.) Any error (missing
+    file, invalid JSON, wrong shape) → False, never a silent pass."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return False
     return isinstance(data, dict) and "defaultAction" in data and "syscalls" in data
+
+
+# ---------------------------------------------------------------------------
+# DF-05/M32: mandatory per-run egress verification.
+#
+# resolve_isolation's enterprise probe deliberately skips
+# df_container.probe_enterprise_egress (needs a running proxy, which isn't up
+# yet at resolve time — see _seccomp_profile_ok's docstring). Once the real
+# credential proxy for THIS run is started (_run_loop, effective=="enterprise"),
+# _verify_enterprise_egress runs the deferred probe exactly once, before the
+# first builder call, and the run refuses (fail-closed) if it doesn't verify.
+# ---------------------------------------------------------------------------
+
+_EGRESS_PROBE_DENIED_HOST = "1.1.1.1"
+
+
+def _egress_probe_stub_handler():
+    class _StubHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = b"df-egress-probe-ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
+            pass
+
+    return _StubHandler
+
+
+def _start_egress_probe_stub():
+    """Start a throwaway loopback HTTP stub (always 200 OK) — the mandatory
+    per-run egress probe's "allowed" leg (see _verify_enterprise_egress).
+    Never a real provider. Caller owns shutdown: httpd.shutdown();
+    httpd.server_close()."""
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _egress_probe_stub_handler())
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    return httpd, httpd.server_address[1]
+
+
+def _verify_enterprise_egress(cfg, pcfg, proxy_endpoint):
+    """DF-05/M32 mandatory per-run egress verification. Called ONCE per
+    enterprise `_run_loop` invocation (fresh run or resume — both restart the
+    proxy), before the first builder call, from inside the same try/finally
+    that already owns proxy_httpd/twin cleanup.
+
+    HONEST SCOPE — what this DOES prove: using the SAME container image and
+    seccomp profile this run will use for the builder, wired through a real
+    (Docker) instance of the SAME enterprise entrypoint/iptables lockdown
+    machinery (df_container.build_enterprise_argv +
+    df_container.probe_enterprise_egress), it proves live that (a) an
+    allowlisted-via-proxy origin is reachable and (b) a direct connection to
+    a denied host is blocked and the probed child cannot re-add an iptables
+    ACCEPT rule (NET_ADMIN was dropped).
+
+    What this does NOT prove: it deliberately does NOT exercise the run's
+    REAL credential_proxy process/allowlist/provider (the one started in
+    _run_loop for the actual builder call) — the "allowed" leg here is a
+    local, always-200 stub server this function starts and tears down
+    itself, fronted by a distinct, throwaway proxy + capability token. This
+    is a deliberate choice, not an oversight: when the builder is an API
+    adapter, the run's REAL proxy has the M30 provider method/path
+    injection lock ARMED (see df_proxy._PROVIDER_METHOD_PATH / Part 1's
+    `provider=` wiring below) — a generic probe request against it would
+    either be refused (method/path mismatch) or, worse, if it happened to
+    match the locked method+path with no client auth header, actually
+    trigger a REAL credential injection and a real (paid) provider call.
+    Neither is acceptable for a MANDATORY, every-run, no-cost probe. Proving
+    the run's real proxy+allowlist+injection+provider-lock end to end needs
+    a real provider round trip — that is a SEPARATE, OPTIONAL, operator-
+    invoked, paid check (see test_enterprise_config.py's
+    test_probe_enterprise_egress_live and references/enterprise.md), not run
+    automatically here.
+
+    Returns (ok: bool, detail: dict [diagnostic only, never a secret/token],
+    policy_digest: str [sha256 over the allowlist/header/proxy_endpoint this
+    run is actually configured with]). Never raises: any failure to even set
+    up the probe (stub server, throwaway proxy, docker) resolves to
+    ok=False with a diagnostic detail — fail-closed, like
+    df_container.probe_enterprise_egress's own contract.
+    """
+    policy_digest = sha256_str(canonical_json({
+        "allowlist": list(pcfg["allowlist"]),
+        "header": pcfg["header"],
+        "proxy_endpoint": proxy_endpoint,
+    }))
+    stub_httpd = None
+    probe_proxy_httpd = None
+    # A per-call, randomly-named env var carries the probe's OWN throwaway
+    # "provider" token for its OWN throwaway stub -- never a real credential,
+    # never a name that could collide with an operator-configured env var,
+    # and always removed in the finally below regardless of outcome.
+    token_env_name = f"_DF_EGRESS_PROBE_TOKEN_{uuid.uuid4().hex}"
+    try:
+        stub_httpd, stub_port = _start_egress_probe_stub()
+        os.environ[token_env_name] = secrets.token_urlsafe(16)
+        probe_cap_token = secrets.token_urlsafe(32)
+        probe_proxy_httpd, probe_proxy_port = df_proxy.serve(
+            [f"127.0.0.1:{stub_port}"], token_env_name,
+            capability_token=probe_cap_token)
+        probe_proxy_endpoint = f"{_ENTERPRISE_PROXY_HOST}:{probe_proxy_port}"
+        ok, detail = df_container.probe_enterprise_egress(
+            cfg["_container"]["image"], probe_proxy_endpoint,
+            f"http://127.0.0.1:{stub_port}/", _EGRESS_PROBE_DENIED_HOST,
+            seccomp_profile_path=cfg["_enterprise"]["seccomp"],
+            capability_token=probe_cap_token)
+        return bool(ok), detail, policy_digest
+    except Exception as e:
+        return (False, {"error": f"egress probe setup failed: {e.__class__.__name__}: {e}"},
+                policy_digest)
+    finally:
+        os.environ.pop(token_env_name, None)
+        if probe_proxy_httpd is not None:
+            probe_proxy_httpd.shutdown()
+            probe_proxy_httpd.server_close()
+        if stub_httpd is not None:
+            stub_httpd.shutdown()
+            stub_httpd.server_close()
 
 
 def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
@@ -1820,8 +1950,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # custody/proxy/enterprise_egress, including every pre-build abort
         # branch below (all enterprise-only concepts; None at every
         # non-enterprise tier, and at enterprise for any terminal reached
-        # before the CONVERGED custody gate runs — only _run_loop's CONVERGED
-        # branch ever overrides these with real values).
+        # before the proxy has even started). `proxy`/`enterprise_egress`
+        # are overridden by _run_loop's CONVERGED branch (probe passed) AND
+        # (DF-05/M32) by the EGRESS_PROBE_FAILED terminal — the one other
+        # place a real (failing) probe result exists to report; `custody`
+        # stays CONVERGED-only (custody is never evaluated before that gate).
         "custody": None,
         "proxy": None,
         "enterprise_egress": None,
@@ -2225,14 +2358,30 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     proxy_httpd = None
     proxy_endpoint = None
     entrypoint_path = None
+    pcfg = None
+    # M30/DF-03 supervisor-wiring (M32): a per-run capability token + (when
+    # the builder is one of the two API adapters) the provider name that ARMS
+    # df_proxy's method/path injection lock. `enterprise_provider` is None
+    # for CLI builder adapters (claude/codex/gemini) -- they don't read
+    # DF_PROXY_DESCRIPTOR at all, so there is no provider to lock to and
+    # their enterprise behavior is unchanged (no descriptor, env=None plus
+    # only the dep-cache vars, exactly pre-M32).
+    enterprise_provider = None
+    enterprise_capability_token = None
     if effective == "enterprise":
         pcfg = cfg["_proxy"]
+        enterprise_provider = _adapter_provider(adapter)
+        enterprise_capability_token = secrets.token_urlsafe(32)
         proxy_httpd, proxy_port = df_proxy.serve(
-            pcfg["allowlist"], pcfg["token_env"], header=pcfg["header"])
+            pcfg["allowlist"], pcfg["token_env"], header=pcfg["header"],
+            capability_token=enterprise_capability_token, provider=enterprise_provider)
         proxy_endpoint = f"{_ENTERPRISE_PROXY_HOST}:{proxy_port}"
         entrypoint_path = os.path.join(run_dir, "enterprise-entrypoint.sh")
         df_container.write_enterprise_entrypoint(entrypoint_path, proxy_endpoint)
-        journal.write("PROXY_STARTED", port=proxy_port, allowlist=pcfg["allowlist"])
+        # Never the capability token value -- only that a token now gates
+        # this proxy and (if set) which provider's method/path it is locked to.
+        journal.write("PROXY_STARTED", port=proxy_port, allowlist=pcfg["allowlist"],
+                      capability_token_set=True, provider=enterprise_provider)
     # Twins are SHARED/dev (not holdout): reaping them is non-negotiable — this
     # try/finally must wrap the WHOLE loop so every terminal (return) and any
     # exception still stops the twin processes (and, at enterprise, the proxy
@@ -2248,6 +2397,51 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 twin_defs = df_twins.load_defs(os.path.join(control_root, "twins"))
             except df_twins.TwinError as e:
                 return _twin_error_abort(start_iter, e)
+
+        # DF-05/M32: the mandatory per-run egress probe resolve_isolation
+        # deliberately skipped (the proxy wasn't running yet there -- it is
+        # now). Runs exactly ONCE per _run_loop invocation (fresh run OR
+        # resume -- both start a fresh proxy above), BEFORE the first
+        # builder invoke_adapter, inside this try/finally so an early
+        # refusal here still reaps the proxy/twins via the finally below.
+        # Fail-closed (Global Constraint, spec-equivalent to M14's
+        # confinement-required posture): an enterprise run whose egress
+        # cannot be empirically proven THIS run is not enterprise -- there
+        # is no downgrade here, only refusal. See _verify_enterprise_egress's
+        # docstring for exactly what the probe does and does not prove.
+        enterprise_egress_result = None
+        if effective == "enterprise":
+            egress_ok, egress_detail, policy_digest = _verify_enterprise_egress(
+                cfg, pcfg, proxy_endpoint)
+            enterprise_egress_result = {
+                "probed": True,
+                "passed": bool(egress_ok),
+                "policy_digest": policy_digest,
+                "checked_at": _now(),
+            }
+            if not egress_ok:
+                journal.write("EGRESS_PROBE_FAILED", detail=egress_detail,
+                              policy_digest=policy_digest)
+                mf = dict(mb_clean, outcome="EGRESS_PROBE_FAILED", iterations=start_iter,
+                          qualified=False,
+                          final_exam={"ran": False, "passed": None, "count": 0},
+                          regressions=sorted(regressed),
+                          proxy={"enabled": True, "allowlist": list(pcfg["allowlist"])},
+                          enterprise_egress=enterprise_egress_result,
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens, builder_output_tokens))
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                            digest, audit_key, journal)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                sys.stderr.write(
+                    "dark-factory: enterprise egress probe FAILED — the transport/lock could "
+                    "not be empirically verified this run (fail-closed; the builder was never "
+                    f"invoked). detail: {egress_detail}\n")
+                return anchor_exit or 2
+            journal.write("EGRESS_PROBE_PASSED", policy_digest=policy_digest)
 
         last_report = None
         for i in range(start_iter, cfg["max_iterations"] + 1):
@@ -2414,18 +2608,34 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                         "enterprise: refusing to mount the adapter directory — it "
                         f"overlaps the control root ({adapter_ro_dir}); the "
                         "holdout barrier would be breached by construction")
-                # Enterprise passes NO credential env into the container at
-                # all (env=None) — the credential_proxy is the SOLE credential
-                # path: the raw provider token is read host-side by the proxy
-                # and injected on the proxy->provider leg, never baked into the
-                # container as a `-e` var. (df_config additionally refuses a
-                # config where credential_proxy.token_env also appears in
-                # credentials.allowlist, so the two channels can't collide.)
-                # (§7.3 Task 3) dep_cache_dir carries the SAME ro_mount + env
-                # wiring as hardened above — it is not a credential, so it's
-                # the only thing allowed to ride in `env` here.
+                # Enterprise passes NO PROVIDER credential env into the
+                # container (the credential_proxy is the SOLE provider-
+                # credential path: the raw provider token is read host-side
+                # by the proxy and injected on the proxy->provider leg,
+                # never baked into the container as a `-e` var — df_config
+                # additionally refuses a config where credential_proxy.
+                # token_env also appears in credentials.allowlist, so the
+                # two channels can't collide). (§7.3 Task 3) dep_cache_dir
+                # carries the SAME ro_mount + env wiring as hardened above —
+                # it is not a credential either.
+                #
+                # M30/DF-03 supervisor-wiring (M32, Part 1): when the
+                # builder IS an API adapter (api_anthropic/api_openai --
+                # enterprise_provider is set above), also thread in
+                # DF_PROXY_DESCRIPTOR: {endpoint, provider, target_base_url,
+                # capability_token} as a plain env var. This is NOT the
+                # provider secret -- it is a LOCAL workload capability token
+                # (proves to the proxy which process may use it) plus
+                # non-secret routing (where the proxy listens, which
+                # provider/base-URL to address). The adapter uses it to
+                # speak PLAINTEXT to the local proxy (see api_anthropic/
+                # api_openai's _parse_proxy_descriptor); the proxy is what
+                # opens the real TLS leg and injects the REAL key, host-side,
+                # exactly as before. CLI builder adapters never read this
+                # var (enterprise_provider is None for them) — unchanged
+                # behavior, no descriptor, same as pre-M32.
                 ro_mounts_ent = [adapter_ro_dir]
-                dep_cache_env_ent = None
+                enterprise_env = {}
                 dep_cache_dir = c.get("dep_cache_dir")
                 if dep_cache_dir:
                     if not _disjoint(dep_cache_dir, cfg["_control_root"]):
@@ -2434,12 +2644,26 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                             f"overlaps the control root ({dep_cache_dir}); the "
                             "holdout barrier would be breached by construction")
                     ro_mounts_ent.append(dep_cache_dir)
-                    dep_cache_env_ent = {
+                    enterprise_env.update({
                         "PIP_NO_INDEX": "1",
                         "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
                         "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
                         "npm_config_offline": "true",
+                    })
+                if enterprise_provider is not None:
+                    target_base_url = f"https://{_PROXY_PROVIDER_RULES[enterprise_provider]['host']}"
+                    descriptor = {
+                        "endpoint": f"http://{proxy_endpoint}",
+                        "provider": enterprise_provider,
+                        "target_base_url": target_base_url,
+                        "capability_token": enterprise_capability_token,
                     }
+                    enterprise_env["DF_PROXY_DESCRIPTOR"] = canonical_json(descriptor)
+                    # Descriptor WIRED — never the token value.
+                    journal.write("PROXY_DESCRIPTOR_WIRED", iteration=i,
+                                  provider=enterprise_provider,
+                                  endpoint=descriptor["endpoint"],
+                                  target_base_url=target_base_url)
                 builder_prefix = df_container.build_enterprise_argv(
                     c["image"], workspace,
                     ro_mounts=ro_mounts_ent,
@@ -2447,7 +2671,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     seccomp_profile_path=cfg["_enterprise"]["seccomp"],
                     entrypoint_path=entrypoint_path,
                     memory=c["memory"], pids=c["pids"],
-                    env=dep_cache_env_ent)
+                    env=enterprise_env if enterprise_env else None)
                 if build_env_extra:
                     journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
                                   reason="builder-side twin env not forwarded into "
@@ -2835,14 +3059,17 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # there is only this honest pending terminal.
                     outcome, qualified = "CUSTODY_PENDING", False
                     proxy_field = {"enabled": True, "allowlist": list(cfg["_proxy"]["allowlist"])}
-                    # "locked": "configured" (not True) + "probe": "unverified":
-                    # the container config INCLUDES the egress lockdown, but it
-                    # was NOT empirically re-verified against real hosts on THIS
-                    # run (that live proof is df_container.probe_enterprise_egress
-                    # — expensive/network-dependent, exercised by the test suite
-                    # / operator tooling, never unconditionally per production
-                    # run). Never claim more than what actually ran.
-                    egress_field = {"locked": "configured", "probe": "unverified"}
+                    # DF-05/M32: `enterprise_egress_result` was computed once,
+                    # above, by `_verify_enterprise_egress` BEFORE the first
+                    # builder call — a run only ever reaches this CONVERGED
+                    # branch at eff=="enterprise" if that probe already
+                    # PASSED (a failing probe returns EGRESS_PROBE_FAILED
+                    # long before any builder call, let alone convergence).
+                    # So {"probed": True, "passed": True, ...} here is
+                    # genuinely "verified THIS run", not merely configured —
+                    # see _verify_enterprise_egress's docstring for the
+                    # honest scope of exactly what was (and was not) proven.
+                    egress_field = enterprise_egress_result
                     # Unlike egress_field, "verified" (not "unverified") is
                     # honest here: resolve_isolation only ever returns
                     # "enterprise" once df_container.probe_seccomp already

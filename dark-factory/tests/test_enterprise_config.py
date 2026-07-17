@@ -285,7 +285,8 @@ class _FakeOSBackend:
         return []
 
 
-def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=True):
+def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=True,
+                             egress_ok=True):
     monkeypatch.setattr(supervisor.df_sandbox, "current_backend", lambda: _FakeOSBackend())
     monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: os_ok)
     monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: dk_ok)
@@ -296,6 +297,15 @@ def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=Tru
     # config-composition/custody-gate tests stay fast and docker-free; the
     # real live probe is exercised separately in test_seccomp_probe.py.
     monkeypatch.setattr(supervisor.df_container, "probe_seccomp", lambda *a, **k: seccomp_ok)
+    # DF-05/M32: _run_loop now ALSO live-probes the egress transport+lock
+    # (df_container.probe_enterprise_egress, via supervisor._verify_
+    # enterprise_egress) once per enterprise run, before the first builder
+    # call — patched here for the same reason as probe_seccomp above (fast,
+    # docker-free config/custody-gate tests); the real live probe is
+    # exercised separately by test_probe_enterprise_egress_live below.
+    monkeypatch.setattr(
+        supervisor.df_container, "probe_enterprise_egress",
+        lambda *a, **k: (egress_ok, {"stub": True, "egress_ok": egress_ok}))
 
 
 def test_resolve_isolation_enterprise_both_ok(tmp_path, monkeypatch):
@@ -403,9 +413,15 @@ def test_enterprise_run_always_custody_pending_exit_3(tmp_path, monkeypatch):
         assert m["custody"]["required_k"] == 2
         assert m["custody"]["approvers"] == 3
         assert m["proxy"] == {"enabled": True, "allowlist": ["api.example.test"]}
-        # Minor fix: locked is "configured" (config includes the lockdown), not
-        # a per-run empirically-verified True.
-        assert m["enterprise_egress"] == {"locked": "configured", "probe": "unverified"}
+        # DF-05/M32: the mandatory per-run egress probe (here, monkeypatched
+        # via _patch_enterprise_probes -- egress_ok=True) ran and passed
+        # BEFORE the (monkeypatched) builder call, so the manifest records a
+        # genuinely per-run-verified result, not merely "configured".
+        assert m["enterprise_egress"]["probed"] is True
+        assert m["enterprise_egress"]["passed"] is True
+        assert isinstance(m["enterprise_egress"]["policy_digest"], str)
+        assert m["enterprise_egress"]["policy_digest"]
+        assert "checked_at" in m["enterprise_egress"]
         assert m["container"]["image"] == df_container.DEFAULT_IMAGE
         assert m["sandbox_backend"] == df_container.ENTERPRISE_BACKEND_NAME
         # No attestation exists yet — the manifest never self-qualifies.
