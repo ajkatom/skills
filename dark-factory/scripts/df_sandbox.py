@@ -16,6 +16,21 @@ blocks everything except localhost (so host-bound twin servers stay
 reachable while real network egress is cut off). `probe_network_denial`
 mirrors `probe_denial`'s fail-closed, non-vacuous discipline for this new
 axis.
+
+Honest residual scope (macOS): `(deny network*)` denies the wrapped
+process's OWN socket-level network operations, and the probe proves that
+for TCP connects. Two channels are outside what this profile (built on
+`(allow default)`) restricts or the probe measures: (a) UDP/other socket
+types are denied by the same `network*` primitive by construction but are
+not separately probed; (b) DNS RESOLUTION — `getaddrinfo()` is serviced by
+`mDNSResponder`, a separate, unconfined system daemon reached over Mach
+IPC (not a `network*` operation by the wrapped process), so the daemon may
+issue real DNS queries on the candidate's behalf even under `deny`. A
+hostile candidate could therefore exfiltrate bits via DNS query names
+despite the socket-level denial. Closing that requires denying Mach IPC
+to the resolver (a much broader, app-breaking profile) — documented limit,
+not silently ignored. Linux `--unshare-net` has neither gap (the namespace
+has no route to the resolver or anything else).
 """
 import os
 import shutil
