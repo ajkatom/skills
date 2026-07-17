@@ -123,6 +123,14 @@ unchanged below.
      still uses the latter). If the chosen tier can't be honored, the run fails closed
      unless you pass `run --allow-downgrade` (hardened → standard if the OS sandbox is
      still healthy, else → cooperative; standard → cooperative).
+   - **`candidate_network` (optional, M27, spec §7.4; requires `standard` or above).**
+     `"unrestricted"` (default, no-op), `"deny"` (candidate loses all network
+     including loopback), or `"loopback"` (candidate keeps only `127.0.0.1` —
+     twin-compatible). Restricts the CANDIDATE only — the builder's network for
+     its provider API calls is never touched. Live-probed before the candidate
+     ever runs under it (fail-closed, same discipline as the base denial probe);
+     `"deny"` is refused with `twins.enabled: true` or any http scenario, and
+     `"loopback"` is macOS-only. See `references/isolation.md`.
    - **`hardened` (optional block, only under `assurance: hardened`).** Set
      `hardened.image` (default `python:3.12-alpine` — a real cross-model builder needs a
      user-supplied image with that CLI + credentials baked in), `hardened.network`
@@ -276,7 +284,7 @@ holdout scenarios in a session that will also drive the builder.
 - `references/authoring.md` — the `init` interview script: spec, tier choice, writing discriminating holdout scenarios (dev vs. sealed final), and the optional config blocks; see also `examples/kv-service/answers.json` (M19)
 - `references/config-reference.md` — config schema
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), and the honest trust-domain limits of each (M5a, M13)
-- `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline
+- `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27)
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds
 - `references/budget.md` — budget model: admission control, 85% alert, 100% pause, raise-and-resume, honest estimate caveat (M8)
