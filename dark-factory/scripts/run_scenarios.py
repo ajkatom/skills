@@ -176,11 +176,16 @@ def candidate_env(env_extra: dict | None) -> dict:
             env[name] = value
 
     env_extra = env_extra or {}
+    # Fail-closed, and NOT via `assert` -- assert is compiled out under
+    # `python -O`/PYTHONOPTIMIZE, which would silently merge a denylisted
+    # var into the candidate env (the exact leak this guards against). A
+    # real raise holds regardless of interpreter flags.
     bad = [name for name in env_extra if _is_denylisted_env_name(name)]
-    assert not bad, (
-        f"candidate_env: env_extra contained denylisted name(s) {bad!r} -- "
-        f"the supervisor should never inject these; check the caller"
-    )
+    if bad:
+        raise ValueError(
+            f"candidate_env: env_extra contained denylisted name(s) {bad!r} -- "
+            f"the supervisor must never inject these; check the caller"
+        )
     env.update(env_extra)
     return env
 

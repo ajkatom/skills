@@ -62,3 +62,21 @@ def test_denylisted_var_in_os_environ_never_reaches_result_even_with_env_extra(m
     env = run_scenarios.candidate_env({"DF_TWIN_X": "http://127.0.0.1:9"})
     for name in _DANGEROUS:
         assert name not in env
+
+
+def test_allowlist_and_denylist_are_disjoint():
+    """Regression guard: no allowlisted name may also be denylisted. If a
+    future edit widens the allowlist to a credential-shaped name, this fails
+    loudly rather than silently leaking it into the candidate env."""
+    for name in run_scenarios._CANDIDATE_ENV_ALLOWLIST_NAMES:
+        assert not run_scenarios._is_denylisted_env_name(name), (
+            f"allowlisted env var {name!r} is also denylisted -- overlap would leak it"
+        )
+
+
+def test_env_extra_denylisted_name_raises_not_asserts():
+    """The env_extra guard must be a real raise (holds under python -O),
+    not a bare assert (compiled out under -O)."""
+    import pytest
+    with pytest.raises(ValueError, match="denylisted"):
+        run_scenarios.candidate_env({"AWS_SECRET_ACCESS_KEY": "leak"})
