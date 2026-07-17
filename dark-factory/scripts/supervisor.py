@@ -443,6 +443,97 @@ def _seal_workspace_artifact(control_root: str, workspace: str):
     return object_id, artifact_field
 
 
+# ---------------------------------------------------------------------------
+# DF-01/M28a Task 3: verify-by-identity + custody-by-object-id + retention.
+#
+# Task 2 bound `manifest["artifact"] = {object_id, ...}` into the signed
+# manifest. That binding is worthless as an enforcement mechanism unless
+# something actually re-derives the object's identity from the live object
+# store at verify/custody time and refuses on any drift -- that is what the
+# helpers below do. All fail closed: an object that is missing, mutated, or
+# was never bound in the first place is NEVER treated as a pass.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_OK = "OK"
+_ARTIFACT_UNBOUND = "UNBOUND"
+_ARTIFACT_MISMATCH = "ARTIFACT_MISMATCH"
+_ARTIFACT_UNAVAILABLE = "ARTIFACT_UNAVAILABLE"
+
+
+def _control_root_from_run_dir(run_dir: str):
+    """Best-effort recovery of a run's control root from just its run_dir,
+    for callers (verify-manifest) that historically were only ever given
+    run_dir. Layout is always `<control_root>/runs/<invocation>` (see
+    `run()`/`resume()`), so control_root is exactly two path components up.
+    Returns None -- never raises -- if that doesn't hold (e.g. a relocated
+    or hand-built run_dir); callers must treat None as "no derivable object
+    store", not silently skip the artifact check.
+    """
+    runs_dir = os.path.dirname(os.path.abspath(run_dir))
+    if os.path.basename(runs_dir) != "runs":
+        return None
+    control_root = os.path.dirname(runs_dir)
+    return control_root if os.path.isdir(control_root) else None
+
+
+def _check_manifest_artifact(manifest: dict, object_store: str) -> str:
+    """The verify-by-identity check itself: recompute the bound object's
+    sidecar (via df_seal.verify_object) and require it still matches.
+    PRINTS the human-readable line for whichever status is returned --
+    callers (verify_manifest / the CLI / custody) use the return value to
+    pick a distinct exit code / bool, never re-deriving the message.
+
+    manifest["artifact"] absent or null means the manifest never bound an
+    object at all (pre-M28a, or a pre-workspace terminal like GATE_FAILED /
+    ARTIFACT_UNHASHABLE) -- that is NOT a clean pass, it is UNBOUND: the
+    caller must never treat "nothing to check" as "checked and fine".
+    """
+    artifact = manifest.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        print("UNBOUND: manifest does not bind an artifact object (pre-M28a manifest, or a "
+              "pre-workspace terminal) -- integrity checks passed but artifact identity was "
+              "never established")
+        return _ARTIFACT_UNBOUND
+
+    object_id = artifact["object_id"]
+    if df_seal.verify_object(object_store, object_id):
+        return _ARTIFACT_OK
+
+    obj_path = os.path.join(object_store, "objects", object_id)
+    if os.path.islink(obj_path) or not os.path.isdir(obj_path):
+        print(f"ARTIFACT UNAVAILABLE (object {object_id} not found under {object_store})")
+        return _ARTIFACT_UNAVAILABLE
+    print(f"ARTIFACT MISMATCH (object {object_id} failed identity re-verification -- content, "
+          "mode, or a filename drifted since it was sealed)")
+    return _ARTIFACT_MISMATCH
+
+
+def object_referenced(control_root: str, object_id: str) -> bool:
+    """Retention guard: True iff ANY run manifest under control_root binds
+    `object_id` as its artifact. dark-factory ships no prune/GC subsystem
+    today (deliberately -- see task-3-report.md), but any future prune
+    tooling, or an operator's own cleanup script, MUST consult this before
+    removing an object directory. Never raises: an unreadable/malformed
+    manifest is skipped, not fatal to the scan.
+    """
+    runs_dir = os.path.join(control_root, "runs")
+    if not os.path.isdir(runs_dir):
+        return False
+    for name in os.listdir(runs_dir):
+        mp = os.path.join(runs_dir, name, "manifest.json")
+        if not os.path.isfile(mp):
+            continue
+        try:
+            with open(mp, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        artifact = manifest.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("object_id") == object_id:
+            return True
+    return False
+
+
 def _run_security_gates(cfg, journal, run_dir, workspace, redactor=None):
     """Run mandatory security gates (M9) on the converged artifact, if enabled.
 
@@ -721,11 +812,41 @@ def attach_custody(control_root: str, run_dir: str) -> int:
 
     Not satisfied: prints PENDING with the distinct-count reason, writes NO
     attestation, and returns 3.
+
+    DF-01/M28a Task 3: custody-by-object-id. A manifest whose `artifact` is
+    null/absent PREDATES artifact binding (pre-M28a) and is refused outright
+    -- split custody exists to attest a specific artifact, and there is
+    nothing to bind to. When `artifact` IS present, its bound object_id must
+    independently re-verify against the LIVE object store (df_seal.
+    verify_object) before ANY attestation is written -- a mutated or
+    unavailable object refuses exactly like an unsatisfied K-of-N, never a
+    silent attest-over-drifted-bytes.
     """
     manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
     if manifest_bytes is None:
         sys.stderr.write(f"dark-factory: no manifest.json in {run_dir}\n")
         return 3
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"dark-factory: manifest.json is not valid JSON: {e}\n")
+        return 2
+    artifact = manifest_obj.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        sys.stderr.write(
+            "dark-factory: manifest predates artifact binding (no manifest[\"artifact\"]) — "
+            "re-run under DF-01/M28a to get an object-bound manifest before requesting "
+            "custody.\n")
+        return 3
+    object_id = artifact["object_id"]
+    object_store = _object_store_root(control_root)
+    if not df_seal.verify_object(object_store, object_id):
+        sys.stderr.write(
+            f"dark-factory: artifact object {object_id} failed identity re-verification "
+            "against the live object store — refusing to attest a manifest whose bound "
+            "artifact cannot be confirmed (mismatch or unavailable).\n")
+        return 3
+
     try:
         cfg = load_config(control_root)
     except ConfigError as e:
@@ -774,52 +895,68 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         "qualified": True,
         "ts": _now(),
     }
-    att_text = canonical_json(attestation)
-    att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
-    atomic_write(att_path, att_text)
 
-    # Anchor the attestation into the tamper-evident hash chain (M13). The
-    # audit key is required at enterprise (audit.signing), so a signed chain
-    # link binds this attestation off the manifest it qualifies.
-    audit_key = None
-    if cfg.get("_audit", {}).get("signing"):
-        try:
-            audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
-        except df_audit.AuditKeyError as e:
-            sys.stderr.write(f"dark-factory: audit key error: {e}\n")
-            return 2
-    chain_path = os.path.join(control_root, "audit-chain.jsonl")
-    # Dot-separated (not ':') so the same key is a valid http-append sink key:
-    # the reference receiver's key regex is [A-Za-z0-9._-], and a ':' would be
-    # percent-encoded to %3A and rejected.
-    custody_key = os.path.basename(run_dir) + ".custody"
-    entry = df_audit_chain.append_entry(
-        chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
+    # DF-01/M28a Task 3: writing the attestation + anchoring it into the hash
+    # chain must not race a concurrent attach/run/resume over the same
+    # control root (attach previously took no lock at all). Held for exactly
+    # the write section below -- the reads/checks above are safe unlocked.
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    try:
+        att_text = canonical_json(attestation)
+        att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
+        atomic_write(att_path, att_text)
 
-    # Push the QUALIFICATION event off-box (M13). Qualification is the single
-    # most security-relevant enterprise event, and enterprise MANDATES
-    # audit.sink.required:true — so it must leave the box, failing closed if
-    # the required sink is unreachable (mirrors _anchor_audit's required-sink
-    # handling: a required push failure is a nonzero exit, never a silent
-    # skip). The pushed body is the attestation itself.
-    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
-    if sink.get("kind", "none") != "none":
-        try:
-            receipt = df_audit_sink.push(sink, custody_key, att_text.encode("utf-8"))
-        except df_audit_sink.SinkError as e:
-            if sink.get("required"):
-                sys.stderr.write(
-                    f"dark-factory: CUSTODY ATTESTED locally, but the REQUIRED audit sink push "
-                    f"FAILED ({e}) — enterprise qualification must be recorded off-box; "
-                    f"fix the sink and re-run df-custody attach.\n")
-                return 3
-            sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
-        else:
-            atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"), canonical_json(receipt))
+        # Anchor the attestation into the tamper-evident hash chain (M13).
+        # The audit key is required at enterprise (audit.signing), so a
+        # signed chain link binds this attestation off the manifest it
+        # qualifies.
+        audit_key = None
+        if cfg.get("_audit", {}).get("signing"):
+            try:
+                audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
+            except df_audit.AuditKeyError as e:
+                sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+                return 2
+        chain_path = os.path.join(control_root, "audit-chain.jsonl")
+        # Dot-separated (not ':') so the same key is a valid http-append sink
+        # key: the reference receiver's key regex is [A-Za-z0-9._-], and a
+        # ':' would be percent-encoded to %3A and rejected.
+        custody_key = os.path.basename(run_dir) + ".custody"
+        entry = df_audit_chain.append_entry(
+            chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
 
-    print(f"dark-factory: CUSTODY ATTESTED — {reason}; qualified. "
-          f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…")
-    return 0
+        # Push the QUALIFICATION event off-box (M13). Qualification is the
+        # single most security-relevant enterprise event, and enterprise
+        # MANDATES audit.sink.required:true — so it must leave the box,
+        # failing closed if the required sink is unreachable (mirrors
+        # _anchor_audit's required-sink handling: a required push failure is
+        # a nonzero exit, never a silent skip). The pushed body is the
+        # attestation itself.
+        sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+        if sink.get("kind", "none") != "none":
+            try:
+                receipt = df_audit_sink.push(sink, custody_key, att_text.encode("utf-8"))
+            except df_audit_sink.SinkError as e:
+                if sink.get("required"):
+                    sys.stderr.write(
+                        f"dark-factory: CUSTODY ATTESTED locally, but the REQUIRED audit sink push "
+                        f"FAILED ({e}) — enterprise qualification must be recorded off-box; "
+                        f"fix the sink and re-run df-custody attach.\n")
+                    return 3
+                sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
+            else:
+                atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"),
+                            canonical_json(receipt))
+
+        print(f"dark-factory: CUSTODY ATTESTED — {reason}; qualified. "
+              f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…")
+        return 0
+    finally:
+        release_lock(lock)
 
 
 def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
@@ -832,10 +969,35 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
     against the config's approver allowlist + threshold (so a forged
     attestation, or one carrying signatures over stale bytes, fails). Prints
     QUALIFIED (return True) / a PENDING-or-INVALID reason (return False).
+
+    DF-01/M28a Task 3: custody-by-object-id. Before any of the above, the
+    manifest must bind an artifact object (a null/absent `artifact` is a
+    pre-M28a manifest -- UNBOUND, refused) AND that object_id must
+    independently re-verify against the LIVE object store right now (a
+    mutated or removed object since attach is ARTIFACT UNAVAILABLE/
+    MISMATCH, refused) -- so a retroactively-corrupted object is caught even
+    if the K-of-N attestation itself is still intact.
     """
     manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
     if manifest_bytes is None:
         print(f"NOT FOUND ({os.path.join(run_dir, 'manifest.json')} does not exist)")
+        return False
+
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        print(f"INVALID (manifest.json is not valid JSON: {e})")
+        return False
+    artifact = manifest_obj.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        print("UNBOUND (manifest predates artifact binding — no manifest[\"artifact\"]; re-run "
+              "under DF-01/M28a to bind an object before requesting custody)")
+        return False
+    object_id = artifact["object_id"]
+    object_store = _object_store_root(control_root)
+    if not df_seal.verify_object(object_store, object_id):
+        print(f"ARTIFACT UNAVAILABLE (object {object_id} failed identity re-verification "
+              "against the live object store)")
         return False
 
     try:
@@ -914,36 +1076,69 @@ def _kb_writeback(cfg, journal, manifest_dict, failing):
         journal.write("KB_WRITEBACK_ERROR", detail=str(e))
 
 
-def verify_manifest(run_dir: str, key: bytes = None) -> bool:
+def _verify_manifest_status(run_dir: str, key: bytes = None, object_store: str = None) -> str:
+    """The full body of `verify-manifest`: byte-integrity checks (unchanged
+    from pre-M28a) followed by DF-01/M28a Task 3's verify-by-identity check
+    of the manifest's bound artifact object. Returns one of "OK" / "TAMPERED"
+    / "UNVERIFIED" / _ARTIFACT_MISMATCH / _ARTIFACT_UNAVAILABLE /
+    _ARTIFACT_UNBOUND, and PRINTS the corresponding human-readable line --
+    `verify_manifest` (bool) and the CLI (exit code) both derive from this
+    single source of truth so the printed line and the returned status can
+    never disagree.
+
+    object_store defaults to `_object_store_root(control_root)` where
+    control_root is recovered from run_dir's `<control_root>/runs/<id>`
+    layout (`_control_root_from_run_dir`); pass explicitly (the CLI's
+    --object-store) when run_dir doesn't follow that layout.
+    """
     mp = os.path.join(run_dir, "manifest.json")
     sp = os.path.join(run_dir, "manifest.sha256")
     jp = os.path.join(run_dir, "journal.jsonl")
     if not (os.path.exists(mp) and os.path.exists(sp) and os.path.exists(jp)):
         print("TAMPERED (missing manifest, sidecar, or journal)")
-        return False
+        return "TAMPERED"
     text = open(mp, encoding="utf-8").read()
     if sha256_str(text) != open(sp, encoding="utf-8").read().strip():
         print("TAMPERED (manifest.json does not match manifest.sha256)")
-        return False
+        return "TAMPERED"
     manifest = json.loads(text)
     if sha256_file(jp) != manifest.get("journal_sha256"):
         print("TAMPERED (journal.jsonl does not match manifest)")
-        return False
+        return "TAMPERED"
     hp = os.path.join(run_dir, "manifest.hmac")
     expect_sig = (key is not None) or bool(manifest.get("audit_signing"))
     if os.path.exists(hp):
         if key is None:
             print("UNVERIFIED (signed manifest; supply --key-path)")
-            return False
+            return "UNVERIFIED"
         sig = open(hp, encoding="utf-8").read().strip()
         if not df_audit.verify(key, text.encode("utf-8"), sig):
             print("TAMPERED (bad signature)")
-            return False
+            return "TAMPERED"
     elif expect_sig:
         print("UNVERIFIED (expected a signed manifest; manifest.hmac is missing)")
-        return False
-    print("OK")
-    return True
+        return "UNVERIFIED"
+
+    # Byte-integrity holds. DF-01/M28a Task 3: that only proves manifest.json
+    # itself is untampered -- it says nothing about whether the artifact
+    # object it REFERENCES still matches what was sealed. Verify by
+    # identity, fail-closed.
+    store = object_store
+    if store is None:
+        control_root = _control_root_from_run_dir(run_dir)
+        store = _object_store_root(control_root) if control_root else None
+    if store is None:
+        print("ARTIFACT UNAVAILABLE (control root could not be derived from run_dir; pass "
+              "--object-store explicitly)")
+        return _ARTIFACT_UNAVAILABLE
+    status = _check_manifest_artifact(manifest, store)
+    if status == _ARTIFACT_OK:
+        print("OK")
+    return status
+
+
+def verify_manifest(run_dir: str, key: bytes = None, object_store: str = None) -> bool:
+    return _verify_manifest_status(run_dir, key=key, object_store=object_store) == _ARTIFACT_OK
 
 
 def compose_prompt(spec_text: str, feedback) -> str:
@@ -2942,6 +3137,9 @@ def main():
     p_ver.add_argument("--key-path", default=None,
                        help="path to the audit signing key; required to verify a "
                             "signed (manifest.hmac) run")
+    p_ver.add_argument("--object-store", default=None,
+                       help="DF-01/M28a: path to the content-addressed object store "
+                            "(default <control_root>/objects, derived from --run-dir)")
     p_vc = sub.add_parser("verify-chain", help="check a control root's hash-chained audit log")
     p_vc.add_argument("control_root")
     p_vc.add_argument("--key-path", default=None,
@@ -2995,7 +3193,22 @@ def main():
             except df_audit.AuditKeyError as e:
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 sys.exit(2)
-        sys.exit(0 if verify_manifest(args.run_dir, key=vkey) else 4)
+        status = _verify_manifest_status(args.run_dir, key=vkey, object_store=args.object_store)
+        # DF-01/M28a Task 3: distinct exit codes so a caller can tell "byte
+        # integrity failed" (4, unchanged from pre-M28a) apart from "the
+        # bound artifact object failed identity re-verification" (5) apart
+        # from "this manifest never bound an object at all" (6) -- an
+        # UNBOUND (pre-M28a) manifest is a DISTINCT non-success, never
+        # conflated with either a clean pass or a MISMATCH/UNAVAILABLE drift.
+        exit_codes = {
+            "OK": 0,
+            "TAMPERED": 4,
+            "UNVERIFIED": 4,
+            _ARTIFACT_MISMATCH: 5,
+            _ARTIFACT_UNAVAILABLE: 5,
+            _ARTIFACT_UNBOUND: 6,
+        }
+        sys.exit(exit_codes.get(status, 4))
     elif args.cmd == "verify-chain":
         vkey = None
         if args.key_path:
