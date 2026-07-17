@@ -83,6 +83,13 @@ Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes 
 - The property "the final exam provably ran against exactly the sealed bytes" (copy-on-run per scenario, isolating the final exam's cwd from the live workspace) is **deferred to M29d** — today the final exam and security gates run against the live `workspace` directory, which is byte-identical to the frozen object at that point in the run (nothing mutates `workspace` between `freeze()` and the final exam) but is not itself read-only-enforced during that window.
 - The artifact today is **the whole workspace** — a dedicated output-directory split (sealing only a designated build-output subtree rather than everything the builder touched) is deferred.
 
+See `references/prevention-grade-roadmap.md` for the full picture: why this
+detection-grade boundary is architecturally where a single-user, stdlib-only
+skill has to stop, and the concrete off-host infrastructure (a privileged
+signing service, off-host approver keys, an authenticated WORM sink,
+fs-verity, namespaced execution) a future project would need to reach real
+same-user-hostile prevention.
+
 ## Honest limits
 
 **Tamper-evidence holds only while the key stays secret.** A local process with access to the key can forge a new manifest + signature and defeat the entire scheme. This is intrinsic to symmetric HMAC; asymmetric signing + an off-box audit sink are the enterprise upgrade.

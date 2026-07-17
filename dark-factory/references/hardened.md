@@ -1,10 +1,14 @@
 # dark-factory isolation (hardened tier)
 
-`hardened` is the strongest assurance tier dark-factory ships (M10). It keeps
-`standard`'s host OS read-denial sandbox for the **verifier**, and adds a
-second, independent isolation layer for the **builder**: the builder no
-longer merely runs under a wrapper that denies reads — it runs **inside a
-Docker container that never has the control root mounted at all**.
+`hardened` is the strongest **single-operator** assurance tier dark-factory
+ships (M10) — `enterprise` (`references/enterprise.md`) is stronger still,
+adding kernel-locked egress and split-custody sign-off on top, at the cost
+of off-box infrastructure (a credential proxy, approver keypairs) that a
+single operator running alone doesn't have. `hardened` keeps `standard`'s
+host OS read-denial sandbox for the **verifier**, and adds a second,
+independent isolation layer for the **builder**: the builder no longer
+merely runs under a wrapper that denies reads — it runs **inside a Docker
+container that never has the control root mounted at all**.
 
 ## Denial by construction, not a deny-rule
 
@@ -146,6 +150,22 @@ consequences for the CLI adapters:
   inject or scrub secrets into/out of the container. A proper credential
   broker with scoped, rotated, non-baked-in tokens is **not built yet** —
   that is M11.
+
+**Reproducibility: pin the image by digest.** `hardened.image` defaults to
+`DEFAULT_IMAGE` (`python:3.12-alpine`), a mutable *tag* — the bytes it
+resolves to can change under you as upstream republishes the tag, so two
+runs months apart aren't guaranteed to use the same image even with
+identical config. dark-factory does not hardcode a digest into
+`DEFAULT_IMAGE` itself (a digest is architecture- and time-specific, so
+baking one into the skill would silently break on a different host or once
+the image is superseded) — instead, for a reproducible/attestable run, set
+`hardened.image` explicitly to a digest-pinned reference
+(`python:3.12-alpine@sha256:<digest>`). Whatever you set is recorded
+verbatim on the manifest's `container.image` field (`df_container` reads it
+straight from `hardened.image` via `cfg["_container"]`), so a digest-pinned
+run leaves an auditable, reproducible record of exactly which image bytes
+built the artifact; a tag-pinned run's manifest is honest about the tag it
+asked for, not about which bytes that tag resolved to at run time.
 
 ## `api_anthropic`: real-model-in-container without a custom image (M24)
 
@@ -339,6 +359,8 @@ them:
 - `references/isolation.md` — the `standard` tier (OS read-denial sandbox)
 - `references/config-reference.md` — `hardened.*` config fields, the L5 gate,
   and the hardened ⇒ signed-audit requirement
+- `references/reproducibility.md` — what's reproducible/verifiable today
+  (including digest-pinned images) vs. the honest owner/infra TODO list
 - `references/audit.md` — signed manifest / `verify-manifest` mechanics
 - `dark-factory/scripts/df_container.py` — `build_argv`/`docker_available`/
   `probe_container` implementation
