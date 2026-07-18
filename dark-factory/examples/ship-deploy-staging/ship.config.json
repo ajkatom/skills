@@ -1,0 +1,27 @@
+{
+  "_readme": "Paste the `ship` object below into config.json. The staging deploy is reversible:true (runs unattended, with a rollback if a later action fails). The COMMENTED prod-deploy action shows the reversible:false gate: it requires assurance hardened|enterprise + a signed K-of-N ship.approval (df-release) and would seal SHIP_APPROVAL_PENDING until attached. Brokered creds are env-var NAMES resolved host-side at action time — never a value here. See references/ship.md.",
+  "ship": {
+    "actions": [
+      {
+        "name": "deploy-staging",
+        "run": ["./deploy.sh", "--deploy"],
+        "reversible": true,
+        "rollback": ["./deploy.sh", "--rollback"],
+        "creds": { "env": ["STAGING_DEPLOY_TOKEN"] },
+        "timeout_s": 600
+      }
+    ],
+    "_commented_out_prod_action_example": {
+      "name": "deploy-prod",
+      "run": ["./deploy.sh", "--deploy", "--env", "prod"],
+      "reversible": false,
+      "rollback": ["./deploy.sh", "--rollback", "--env", "prod"],
+      "creds": { "env": ["PROD_DEPLOY_TOKEN"] },
+      "timeout_s": 900
+    },
+    "_commented_out_approval_example": {
+      "approvers": ["<64-hex ed25519 pubkey from `df-release keygen`>"],
+      "threshold": 2
+    }
+  }
+}

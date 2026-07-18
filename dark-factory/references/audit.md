@@ -344,6 +344,38 @@ re-run gates, seal via `df_qualify.derive`) with NO builder re-dispatch
 distinct **`SHIP_DECLINED`** terminal (qualified `False`) that still binds the
 frozen artifact object, so the declined candidate stays auditable.
 
+## The ship phase (M41) — `ship_result.json` + release attestation
+
+When a `ship` block is configured, a **qualified** run continues past the sealed
+artifact into a governed ship phase (see `references/ship.md`). This NEVER
+rewrites `manifest.json` — `qualified` is not re-opened by shipping. Instead it
+writes SEPARATE, audit-chain-anchored sidecars in the run directory:
+
+- `ship_journal.jsonl` — the ship phase's crash-safety journal (SEPARATE from
+  the SEALED `journal.jsonl`, which may never be appended to). Each action
+  journals `SHIP_ACTION_INTENT` (fsync'd, reserved) BEFORE it spawns and
+  `SHIP_ACTION_RESULT` after; also `SHIP_STARTED`, `SHIP_ROLLED_BACK`,
+  `SHIP_ROLLBACK_FAILED`, `SHIP_APPROVAL_PENDING`, and the terminal.
+- `ship_result.json` — the sealed ship record: `{ship_version, outcome,
+  actions:[{name, reversible, status, exit, approval_ref}], rollbacks,
+  rollback_failed, ship_workspace_object_id, ts}`. Anchored into
+  `audit-chain.jsonl` (a `<run_id>.ship.<n>` entry) exactly like
+  `custody_attestation.json`.
+- `release_attestation.json` — written by `df-release attach`: the verified
+  K-of-N approval `{attestation_version, claim, signatures, approvers_satisfied,
+  qualified, ts}` for irreversible actions. Anchored as a `<run_id>.release.<n>`
+  chain entry. The single-use nonce is recorded in `<control_root>/release-nonces.json`.
+- `ship_logs/<action>.stdout|.stderr` — captured, **redacted** action output
+  (brokered credential values are scrubbed before the bytes hit disk).
+
+**Ship outcomes** (in `ship_result.json`, distinct from the manifest outcome):
+`SHIPPED` (exit 0) · `SHIP_FAILED` (exit 3; rollback ran in reverse; a
+`rollback_failed:true` is surfaced loudly) · `SHIP_APPROVAL_PENDING` (exit 3; an
+irreversible action awaits a signed `df-release` approval — the run stays
+qualified, nothing irreversible ran) · `SHIP_UNKNOWN_OUTCOME` (exit 11; an action
+was reserved but its outcome is unknown after a crash — needs `ship --decision
+reconcile|abort`, never a blind re-run).
+
 ## `authored_by` manifest field (M40)
 
 When the hidden scenarios were written by an **agent** author (a `roles.author`
