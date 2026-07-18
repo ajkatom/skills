@@ -84,6 +84,18 @@ IR_VERSION = "0.1"
 # modules may reference; IR_VERSIONS is the accepted set at load time.
 IR_VERSIONS = {"0.1", "0.2", "0.3"}
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
+# M42 Task 1: the scenario `class` taxonomy -- an OPTIONAL, back-compat axis
+# ORTHOGONAL to `cohort` (dev/final = feedback-vs-sealed). `class` says WHAT
+# KIND of case a scenario exercises: a "happy" normal path, a "boundary"
+# edge (empty/max/duplicate/missing/wrong-type input), or a "failure" (the
+# error contract). Canonical home is here (the IR module) so run_scenarios,
+# df_gates (adequacy), and df_author (agent authoring) all agree on one set
+# with no import cycle. ABSENT `class` => "happy": every pre-M42 scenario is
+# implicitly a happy-path case, so nothing that predates M42 changes shape or
+# behavior. The adequacy GATE (df_gates.check_adequacy) is what turns this
+# label into a coverage requirement; validate here only pins the VALUE space.
+SCENARIO_CLASSES = ("happy", "boundary", "failure")
+DEFAULT_SCENARIO_CLASS = "happy"
 CLI_ONLY_THEN_KEYS = {
     "exit_code",
     "stdout_equals",
@@ -246,6 +258,13 @@ def _validate(sc: dict, fname: str) -> None:
         raise OracleError(f"{fname}: invalid behavior_id {sc['behavior_id']!r}")
     if "cohort" in sc and sc["cohort"] not in ("dev", "final"):
         raise OracleError(f"{fname}: cohort must be 'dev' or 'final', got {sc['cohort']!r}")
+    # M42 Task 1: the optional `class` axis is validated for VALUE here (same
+    # load-time, fail-closed discipline as cohort) so a typo'd class ("failur")
+    # is caught BEFORE any build rather than silently defaulting to happy in the
+    # adequacy gate. Absent is fine (=> happy); present must be in the taxonomy.
+    if "class" in sc and sc["class"] not in SCENARIO_CLASSES:
+        raise OracleError(
+            f"{fname}: class must be one of {list(SCENARIO_CLASSES)}, got {sc['class']!r}")
 
     sc_id = sc["id"]
     when = sc["when"]

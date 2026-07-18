@@ -303,6 +303,44 @@ same limit a human faces, minus the human's presumed knowledge of their own
 intent). So with an agent author and no human review, "discriminating + covers
 behaviors + faithful to the spec's stated contract" is the ceiling. The human
 still owns spec + behaviors, and reviewing the generated scenarios stays
-RECOMMENDED. A follow-on **reviewer agent** that grades the author's scenarios
-for intent-fit is out of scope for M40 — intent-fit remains a
-human/recommended check.
+RECOMMENDED. M42 (below) adds the decorrelated **critic** the M40 note
+anticipated, plus class-typed adequacy and a sharpness battery — narrowing this
+ceiling to human spec/behavior fidelity + non-functional properties the oracle
+can't express.
+
+## Class-typed adequacy + the decorrelated critic (M42)
+
+Three additional strengtheners layer on top of the author flow; full detail in
+`references/scenario-adequacy.md`.
+
+- **Class-typed coverage.** Scenarios carry an optional `class ∈
+  {happy,boundary,failure}` (absent ⇒ happy). The M7 adequacy gate requires each
+  behavior to be covered by the policy's `required_classes`. An **agent author**
+  defaults to `["happy","boundary","failure"]` (a human root stays `["happy"]`);
+  override with `scenario_adequacy.required_classes`. A gap fails closed
+  (`ADEQUACY_GATE_FAILED`) before any build. The author prompt states the
+  required classes; a missing class is folded into the barrier-safe retry
+  feedback (behavior-id + class name only).
+- **Sharpness battery.** The oracle gate now requires each `then` to reject a
+  BATTERY of near-miss observation-mutants (per asserted dimension), not one
+  synthetic garbage output — catching an inert sub-assertion (e.g. a
+  `stdout_contains: ""` riding alongside a real check) the old single-mutant
+  check missed. Deterministic, no build; it mutates the OBSERVATION, not the
+  built code.
+- **Decorrelated critic (`roles.critic`).** A SECOND, independent
+  (different-model) agent adversarially reviews the authored set at author time.
+  Its `blocking` findings drive a bounded author↔critic revision loop
+  (`scenario_adequacy.critic.max_rounds`, default 2; non-convergence fails
+  closed). Its `advisories` — likely-missing REQUIREMENTS ("usually also needs
+  auth / idempotency / pagination — confirm intended") — are written to
+  `<control_root>/scenario_review.md` and surfaced to you, **NEVER auto-applied**
+  (the human owns intent). Two fail-closed model-distinctness inequalities apply:
+  critic ≠ builder (collusion) and critic ≠ author (decorrelation); one
+  `roles.critic.allow_same_model_ack: true` waives both. The critic's output is
+  control-plane and never reaches the builder.
+
+Add `critic_adapter` (a path to a third, distinct protocol-0.1 adapter) to the
+answers doc to enable it; the ideal is three distinct models (author=Codex,
+critic=Gemini, builder=Claude). `scenario_review.md` is your operator artifact —
+read the advisories, and if one matters, update `spec.md` + `behaviors.json` and
+re-author.

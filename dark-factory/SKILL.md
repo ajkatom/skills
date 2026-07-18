@@ -87,6 +87,21 @@ root to fail confusingly later.
   Reviewing the generated scenarios stays RECOMMENDED — the gates prove
   discrimination/coverage/no-leak but cannot prove intent-fit. See
   `references/authoring.md` ("Agent-authored scenarios").
+- **Offer class-typed adequacy + a decorrelated critic (M42).** Agent-authored
+  scenarios can now be made much more thorough. Offer the user: (1) **class
+  coverage** — require each behavior to be covered by happy + boundary + failure
+  cases (an agent author defaults to all three; a human root stays happy-only;
+  override with `answers.scenario_adequacy.required_classes`); the M7 adequacy
+  gate fails closed on a gap. (2) A **sharpness battery** (automatic) — every
+  assertion must reject a battery of near-miss mutant OBSERVATIONS, not one
+  garbage output (honest scope: it mutates the observation, NOT the built code —
+  not full code-mutation testing). (3) A **decorrelated critic** — a SECOND,
+  different-model agent (`answers.critic_adapter`, distinct from BOTH builder and
+  author, fail-closed) adversarially reviews the authored set; blocking findings
+  drive a bounded revision loop, and advisories (likely-missing requirements) are
+  written to `scenario_review.md` for the operator, NEVER auto-applied. The
+  honest residual after M42: human spec/behavior fidelity + non-functional
+  properties the oracle can't express. See `references/scenario-adequacy.md`.
 
 This on-ramp only produces the control-plane files; the rest of this
 skill's workflow (running, checkpoints, tiers, security gates, etc.) is

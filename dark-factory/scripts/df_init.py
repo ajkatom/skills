@@ -68,6 +68,22 @@ def _author_adapter(answers: dict):
     return None
 
 
+def _critic_adapter(answers: dict):
+    """The critic adapter path an `answers` doc requests, or None (M42). Accepts
+    the flat `answers.critic_adapter` convenience key or an already-shaped
+    `answers.roles.critic.adapter` -- mirrors _author_adapter. The
+    different-model inequalities + path hygiene are df_config's job."""
+    flat = answers.get("critic_adapter")
+    if flat:
+        return flat
+    roles = answers.get("roles")
+    if isinstance(roles, dict):
+        critic = roles.get("critic")
+        if isinstance(critic, dict):
+            return critic.get("adapter")
+    return None
+
+
 def _scenario_count(answers: dict) -> int:
     """Total scenarios declared across every behavior in `answers` -- the
     signal (together with a configured author) for whether this scaffold is
@@ -408,6 +424,31 @@ def build_config(answers: dict) -> dict:
             if answers.get("author_allow_same_model_ack"):
                 author_role["allow_same_model_ack"] = True
         cfg["roles"]["author"] = author_role
+
+    # M42: optional `roles.critic` -- a decorrelated second-model reviewer of
+    # the agent-authored scenarios. Same convenience/shaped duality as author;
+    # all enforcement (two model-distinctness inequalities + path hygiene)
+    # lives in df_config.load_config. Absent -> no roles.critic, byte-identical.
+    critic_adapter = _critic_adapter(answers)
+    if critic_adapter:
+        shaped_c = (answers.get("roles") or {}).get("critic")
+        if isinstance(shaped_c, dict):
+            critic_role = dict(shaped_c)
+        else:
+            critic_role = {"adapter": critic_adapter}
+            critic_timeout = answers.get("critic_timeout_s")
+            if critic_timeout is not None:
+                critic_role["timeout_s"] = critic_timeout
+            if answers.get("critic_allow_same_model_ack"):
+                critic_role["allow_same_model_ack"] = True
+        cfg["roles"]["critic"] = critic_role
+
+    # M42: optional `scenario_adequacy` policy passthrough. df_config resolves
+    # the defaults (happy-only for human, happy+boundary+failure for agent-
+    # authored, critic-on-if-configured); init only forwards an explicit block.
+    scenario_adequacy = answers.get("scenario_adequacy")
+    if scenario_adequacy is not None:
+        cfg["scenario_adequacy"] = scenario_adequacy
 
     options = answers.get("options") or {}
     if not isinstance(options, dict):

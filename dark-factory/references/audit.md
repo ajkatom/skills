@@ -391,3 +391,29 @@ authoring step's own control-plane journal (`<control_root>/authored.jsonl`,
 `AUTHORED_SCENARIOS`) likewise records adapter/attempts/counts only. The
 barrier is unchanged: agent-authored scenarios seal through the exact path
 human-authored ones do, so `run` and `verify-manifest` are untouched.
+
+## `adequacy` + `critic` manifest fields (M42)
+
+Every terminal that ran the M7 pre-build gate seals `adequacy` — the auditable
+"how thorough were the tests" record:
+
+- `required_classes`, `min_per_class` — the resolved policy.
+- `checked` — false iff there is no `behaviors.json` to key class coverage on.
+- `per_behavior_class_coverage = {behavior: {happy, boundary, failure}}` and
+  `under_covered = [{behavior, missing:[classes]}]` — the class-coverage gate.
+- `sharpness = {scenarios, min_killed, weakest}` — the assertion-mutant battery
+  summary. `min_killed` is the weakest per-scenario kill count; `weakest` is the
+  ids of any non-sharp scenarios (empty on a passing gate, which refuses to
+  build otherwise).
+- `critic` — `null` if no `roles.critic`; otherwise `{enabled, review}` where
+  `review` (read back from `authored.jsonl`'s `CRITIC_REVIEW`) is `{rounds,
+  blocking_resolved, advisories}` or `null` if the critic hasn't run.
+
+A top-level `critic = {adapter, adapter_sha256, same_model_ack}` mirrors
+`authored_by` — WHICH independent model reviewed the scenarios and whether the
+two model-distinctness inequalities were waived. `null` with no `roles.critic`.
+
+None of these records carry any scenario `then` content — mutant KINDS
+("stdout_equals:empty") and class NAMES are category labels, barrier-safe. The
+critic's own advisories live in `<control_root>/scenario_review.md` (control
+plane, never the workspace). See `references/scenario-adequacy.md`.

@@ -12,7 +12,7 @@ Rules: exit 0 even on in-band `status:"error"`; non-zero exit or unparseable
 stdout aborts the run (`ABORTED_BUILD_ERROR`). No silent substitution — the
 configured adapter path is invoked or the run fails (spec section 7.8).
 
-## Roles: `builder`, `verifier`, `author`
+## Roles: `builder`, `verifier`, `author`, `critic`
 
 The `role` field tells an adapter which job it is doing this invocation.
 - **`builder`** — implements `spec.md` in `workdir` (the isolated build
@@ -38,6 +38,22 @@ The `role` field tells an adapter which job it is doing this invocation.
   at the same backing model (the path check can't see `DF_API_MODEL`/base-URL).
   See `references/authoring.md` ("Agent-authored scenarios") for the full
   workflow, the API-adapter caveat, and the honest intent-capture limit.
+- **`critic`** (M42) — a SECOND, independent agent that adversarially reviews
+  the AUTHORED scenarios for gaps. Also an author-time step (`role="critic"`, a
+  fresh scratch workdir), same protocol: it writes exactly one file
+  `critic.json` (`{"blocking":[{behavior_id,kind,detail}],
+  "advisories":[{topic,detail}]}`). `blocking` findings drive a bounded
+  author↔critic revision loop; `advisories` (likely-missing REQUIREMENTS) are
+  surfaced to the operator in `scenario_review.md`, NEVER auto-applied. Its
+  output is control-plane and NEVER reaches the builder (barrier discipline,
+  tested). TWO fail-closed model-distinctness inequalities on resolved paths:
+  `realpath(critic) != realpath(builder)` (collusion — a critic must not bless
+  scenarios its own model will build against) AND `realpath(critic) !=
+  realpath(author)` (decorrelation — a model can't decorrelate from itself);
+  one `roles.critic.allow_same_model_ack: true` waives BOTH (sealed into the
+  manifest's `critic.same_model_ack`). `roles.critic` requires `roles.author`.
+  The ideal is three distinct models (author=Codex, critic=Gemini,
+  builder=Claude). See `references/scenario-adequacy.md`.
 
 Shipped adapters (protocol 0.1, all in `scripts/adapters/`):
 - `claude` — claude CLI, headless, `--permission-mode acceptEdits`.

@@ -25,6 +25,7 @@ import df_brownfield
 import df_confine
 import df_container
 import df_creds
+import df_critic
 import df_custody
 import df_gates
 import df_init
@@ -583,6 +584,73 @@ def _budget_manifest_field(b, builder_calls, estimated_usd):
         "enforced": bool(dollar_enforced or calls_enforced),
         "estimate_caveat": "estimated from per_call_usd; not metered usage",
     }
+
+
+def _read_critic_review(control_root):
+    """The last CRITIC_REVIEW event recorded in <control_root>/authored.jsonl
+    (M42), or None. This is the author-time record of the decorrelated critic
+    loop -- the run-time manifest reads it back (read-only) so the auditable
+    `adequacy.critic` field carries {rounds, blocking_resolved, advisories}
+    without the supervisor re-running the critic at build time (the critic is
+    an author-time concern; the gate at build time is adequacy + sharpness)."""
+    path = os.path.join(control_root, "authored.jsonl")
+    if not os.path.exists(path):
+        return None
+    result = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("state") == "CRITIC_REVIEW":
+                    d = e.get("data", {})
+                    result = {
+                        "rounds": d.get("rounds"),
+                        "blocking_resolved": d.get("blocking_resolved"),
+                        "advisories": d.get("advisories"),
+                        "same_model_ack": d.get("same_model_ack"),
+                    }
+    except OSError:
+        return None
+    return result
+
+
+def _adequacy_manifest_field(cfg, behaviors, scenarios):
+    """The auditable "how thorough were the tests" record (M42), sealed on
+    every terminal that ran the pre-build gate. Combines: the class-coverage
+    report (per-behavior, against the policy), the sharpness battery summary
+    (scenario count + weakest kill count), and the decorrelated-critic record
+    (read back from authored.jsonl). `checked` is False iff there is no
+    behaviors.json to key class coverage on (mirrors `coverage`)."""
+    policy = cfg["_adequacy"]
+    field = {
+        "required_classes": policy["required_classes"],
+        "min_per_class": policy["min_per_class"],
+        "sharpness": df_gates.sharpness_manifest(scenarios),
+    }
+    if behaviors is not None:
+        adq = df_gates.check_adequacy(behaviors, scenarios, policy)
+        field["checked"] = True
+        field["per_behavior_class_coverage"] = adq["per_behavior_class_coverage"]
+        field["under_covered"] = adq["under_covered"]
+    else:
+        field["checked"] = False
+    # The critic is an author-time step; record its outcome (or that it was
+    # configured but hasn't run) for the audit trail.
+    if cfg.get("_critic") is not None:
+        review = _read_critic_review(cfg["_control_root"])
+        field["critic"] = {
+            "enabled": policy["critic"]["enabled"],
+            "review": review,
+        }
+    else:
+        field["critic"] = None
+    return field
 
 
 def _usage_manifest_field(b, usage_known, input_tokens, output_tokens):
@@ -2804,6 +2872,72 @@ def _author_review_confirm(normalized: list) -> bool:
     return answer in ("y", "yes")
 
 
+def _author_once(adapter, spec_text, behaviors, policy, timeout_s, *,
+                 attempt_feedback, critic_feedback):
+    """One author invocation in a FRESH scratch workdir (torn down here -- a
+    pre-run artifact that must never persist or reach the builder). Returns
+    (status, payload):
+      ("adapter_error", detail)          -- transport/env failure (deterministic)
+      ("parse_error", report)            -- unusable scenarios.json (retryable)
+      ("invalid", report)                -- failed a gate (retryable)
+      ("ok", (report, normalized))       -- a validated, installable set
+    `policy` (M42) is threaded into BOTH the prompt (so the author knows the
+    required classes) and validate_authored (so the adequacy gate uses it).
+    `critic_feedback`, when set, carries a prior critic's BLOCKING findings for
+    the author to address in this revision (barrier-safe: verifier-side text)."""
+    workdir = tempfile.mkdtemp(prefix="df-author-")
+    try:
+        prompt = df_author.compose_author_prompt(
+            spec_text, behaviors, policy=policy,
+            attempt_feedback=attempt_feedback, critic_feedback=critic_feedback)
+        prompt_file = os.path.join(workdir, "AUTHOR_PROMPT.md")
+        atomic_write(prompt_file, prompt)
+        resp, err = invoke_adapter(adapter, "author", workdir, prompt_file, timeout_s)
+        if err or resp.get("status") != "ok":
+            return "adapter_error", (err or resp.get("detail", ""))
+        try:
+            scenarios_raw = df_author.parse_author_output(workdir)
+        except df_author.AuthorError as e:
+            report = _empty_author_report()
+            report["schema_errors"] = [str(e)]
+            return "parse_error", report
+        ok, report, normalized = df_author.validate_authored(
+            scenarios_raw, spec_text, behaviors, policy)
+        if not ok:
+            return "invalid", report
+        return "ok", (report, normalized)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _critic_once(critic_adapter, spec_text, behaviors, normalized, policy,
+                 timeout_s, declared_ids):
+    """One critic invocation in a FRESH scratch workdir (torn down here -- its
+    output is control-plane and MUST NEVER reach the builder workspace).
+    Returns (status, payload):
+      ("adapter_error", detail)              -- transport/env failure
+      ("parse_error", detail)                -- unparseable/wrong-shape verdict
+      ("ok", (blocking, advisories))         -- normalized findings
+    The critic sees the AUTHORED scenarios (verifier side); its verdict never
+    crosses the barrier."""
+    workdir = tempfile.mkdtemp(prefix="df-critic-")
+    try:
+        prompt = df_critic.compose_critic_prompt(spec_text, behaviors, normalized, policy=policy)
+        prompt_file = os.path.join(workdir, "CRITIC_PROMPT.md")
+        atomic_write(prompt_file, prompt)
+        resp, err = invoke_adapter(critic_adapter, "critic", workdir, prompt_file, timeout_s)
+        if err or resp.get("status") != "ok":
+            return "adapter_error", (err or resp.get("detail", ""))
+        try:
+            verdict = df_critic.parse_critic_output(workdir)
+            blocking, advisories = df_critic.validate_critic_verdict(verdict, declared_ids)
+        except df_critic.CriticError as e:
+            return "parse_error", str(e)
+        return "ok", (blocking, advisories)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def author_scenarios_cmd(control_root: str, attempts: int = 3, review: bool = False) -> int:
     """CLI body for `author-scenarios` (M40): an AGENT author (a different
     model than the builder, enforced at config load) writes the hidden
@@ -2875,92 +3009,167 @@ def author_scenarios_cmd(control_root: str, attempts: int = 3, review: bool = Fa
     if attempts < 1:
         attempts = 1
 
+    # M42: the adequacy policy (required classes + min_per_class) the authored
+    # set must satisfy, and the decorrelated critic loop toggle. cfg["_adequacy"]
+    # is resolved by df_config (agent-authored -> happy+boundary+failure, critic
+    # on iff roles.critic set, unless overridden).
+    policy = cfg["_adequacy"]
+    critic = cfg.get("_critic")
+    critic_enabled = policy["critic"]["enabled"] and critic is not None
+    max_rounds = policy["critic"]["max_rounds"]
+    declared_ids = {b["id"] for b in behaviors}
+
     journal = Journal(os.path.join(control_root, "authored.jsonl"))
 
-    feedback = None
-    for attempt in range(1, attempts + 1):
-        workdir = tempfile.mkdtemp(prefix="df-author-")
-        try:
-            prompt = df_author.compose_author_prompt(spec_text, behaviors,
-                                                     attempt_feedback=feedback)
-            prompt_file = os.path.join(workdir, "AUTHOR_PROMPT.md")
-            atomic_write(prompt_file, prompt)
+    critic_round = 0            # completed author<->critic revision cycles
+    critic_feedback = None      # blocking findings the author must address
+    total_blocking_raised = 0   # cumulative blocking findings across rounds
+    last_advisories = []        # advisories from the FINAL critic pass
+    validated = None            # (report, normalized) once a set passes the gates
 
-            resp, err = invoke_adapter(adapter, "author", workdir, prompt_file, timeout_s)
-            if err or resp.get("status") != "ok":
-                # An adapter TRANSPORT/environment failure (missing CLI, crash,
-                # protocol mismatch) is deterministic across attempts -- retrying
-                # it just re-hits the same wall. Fail closed immediately, distinct
-                # from a retryable content failure below.
-                detail = err or resp.get("detail", "")
+    # Outer loop: one iteration == "obtain a validated set, then (if enabled)
+    # critique it". Bounded: the inner author loop is capped at `attempts`
+    # invocations; the critic revision count is capped at max_rounds. Every
+    # exit is fail-closed (install-and-return, or return 2 with NOTHING
+    # installed and the pending marker retained).
+    while True:
+        # Inner: reach a validated set within `attempts` author invocations.
+        # Validation feedback resets each critic round (the previous set was
+        # valid -- this round the author is addressing critic blocking, not a
+        # validation defect); critic_feedback persists across the inner tries.
+        validated = None
+        attempt_feedback = None
+        for attempt in range(1, attempts + 1):
+            status, payload = _author_once(
+                adapter, spec_text, behaviors, policy, timeout_s,
+                attempt_feedback=attempt_feedback, critic_feedback=critic_feedback)
+            if status == "adapter_error":
+                # Deterministic transport/env failure -- retrying re-hits the
+                # same wall. Fail closed immediately.
                 journal.write("AUTHORED_SCENARIOS_ABORTED", adapter=adapter,
-                              attempt=attempt, reason="adapter_error", detail=detail[:500])
+                              attempt=attempt, reason="adapter_error",
+                              detail=str(payload)[:500])
                 sys.stderr.write(
                     f"dark-factory: author-scenarios: author adapter failed on attempt "
-                    f"{attempt}: {detail}\n")
+                    f"{attempt}: {payload}\n")
                 return 2
-
-            try:
-                scenarios_raw = df_author.parse_author_output(workdir)
-            except df_author.AuthorError as e:
-                # A garbage/missing scenarios.json IS content the author can fix
-                # -- feed the shape complaint back and retry (bounded).
-                report = _empty_author_report()
-                report["schema_errors"] = [str(e)]
-                feedback = report
+            if status == "parse_error":
+                attempt_feedback = payload
                 journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
                               attempt=attempt, ok=False, reason="parse_error")
                 sys.stderr.write(
                     f"dark-factory: author-scenarios: attempt {attempt} produced "
-                    f"unusable output ({e})\n")
+                    f"unusable output\n")
                 continue
-
-            ok, report, normalized = df_author.validate_authored(
-                scenarios_raw, spec_text, behaviors)
-            journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
-                          attempt=attempt, ok=ok, counts=report["counts"])
-
-            if not ok:
-                feedback = report
+            if status == "invalid":
+                attempt_feedback = payload
+                journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
+                              attempt=attempt, ok=False, counts=payload["counts"])
                 sys.stderr.write(
                     f"dark-factory: author-scenarios: attempt {attempt} FAILED validation:\n")
-                for line in df_author._feedback_lines(report):
+                for line in df_author._feedback_lines(payload):
                     sys.stderr.write(f"  - {line}\n")
                 continue
+            # status == "ok"
+            report, normalized = payload
+            journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
+                          attempt=attempt, ok=True, counts=report["counts"])
+            validated = (report, normalized)
+            break
 
-            # Validated. Optional human review BEFORE anything is installed.
-            if review and not _author_review_confirm(normalized):
-                journal.write("AUTHORED_SCENARIOS_DECLINED", adapter=adapter,
-                              attempt=attempt, counts=report["counts"])
-                sys.stderr.write(
-                    "dark-factory: author-scenarios: review declined -- NO scenarios "
-                    "installed (control root still pending)\n")
-                return 2
+        if validated is None:
+            sys.stderr.write(
+                f"dark-factory: author-scenarios: exhausted {attempts} attempt(s) without "
+                "a valid scenario set -- fail-closed, NO scenarios installed (control root "
+                "still pending)\n")
+            return 2
+        report, normalized = validated
 
-            _install_authored_scenarios(control_root, scenarios_dir, normalized)
-            journal.write("AUTHORED_SCENARIOS", adapter=adapter,
-                          adapter_sha256=(sha256_file(adapter)
-                                          if os.path.exists(adapter) else None),
-                          same_model_ack=author["same_model_ack"],
-                          attempts=attempt, counts=report["counts"])
-            print(f"dark-factory: author-scenarios OK -- {report['counts']['scenarios']} "
-                  f"scenario(s) ({report['counts']['dev']} dev, "
-                  f"{report['counts']['final']} final) installed into {scenarios_dir}")
-            print(f"  authored by (independent model): {adapter}"
-                  + ("  [same-model ack]" if author["same_model_ack"] else ""))
-            print("Review the generated scenarios/*.json, then run:")
-            print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
-            return 0
-        finally:
-            # The author's scratch workdir is discarded after extraction -- it is
-            # a pre-run artifact that must never persist or reach the builder.
-            shutil.rmtree(workdir, ignore_errors=True)
+        if not critic_enabled:
+            break  # no decorrelated review -> straight to install
 
-    sys.stderr.write(
-        f"dark-factory: author-scenarios: exhausted {attempts} attempt(s) without a "
-        "valid scenario set -- fail-closed, NO scenarios installed (control root "
-        "still pending)\n")
-    return 2
+        # Decorrelated critic pass on the validated set.
+        cstatus, cpayload = _critic_once(
+            critic["adapter"], spec_text, behaviors, normalized, policy,
+            critic["timeout_s"], declared_ids)
+        if cstatus in ("adapter_error", "parse_error"):
+            # A critic that can't run or can't emit a valid verdict is a
+            # transport/config problem, not something the author can fix. Fail
+            # closed (NOTHING installed) rather than silently skipping the
+            # decorrelated review the operator asked for.
+            journal.write("CRITIC_ABORTED", adapter=critic["adapter"],
+                          round=critic_round, reason=cstatus, detail=str(cpayload)[:500])
+            sys.stderr.write(
+                f"dark-factory: author-scenarios: critic {cstatus} "
+                f"({cpayload}) -- fail-closed, NO scenarios installed\n")
+            return 2
+        blocking, last_advisories = cpayload
+        journal.write("CRITIC_ATTEMPT", adapter=critic["adapter"], round=critic_round,
+                      blocking=len(blocking), advisories=len(last_advisories))
+
+        if not blocking:
+            break  # converged: the second mind found no blocking gap -> install
+
+        total_blocking_raised += len(blocking)
+        if critic_round >= max_rounds:
+            # The author and critic did not converge within the bound. Fail
+            # closed -- a persistently-contested set is NOT sealed.
+            journal.write("CRITIC_UNRESOLVED", adapter=critic["adapter"],
+                          rounds=critic_round, blocking=len(blocking))
+            sys.stderr.write(
+                f"dark-factory: author-scenarios: critic still reports {len(blocking)} "
+                f"blocking gap(s) after {max_rounds} revision round(s) -- fail-closed, "
+                "NO scenarios installed (control root still pending)\n")
+            return 2
+        critic_round += 1
+        critic_feedback = blocking  # next author cycle must address these
+        # loop back: re-author addressing the blocking findings.
+
+    # ---- install path (validated, and critic-clean if enabled) ----
+    if review and not _author_review_confirm(normalized):
+        journal.write("AUTHORED_SCENARIOS_DECLINED", adapter=adapter,
+                      counts=report["counts"])
+        sys.stderr.write(
+            "dark-factory: author-scenarios: review declined -- NO scenarios "
+            "installed (control root still pending)\n")
+        return 2
+
+    _install_authored_scenarios(control_root, scenarios_dir, normalized)
+
+    if critic_enabled:
+        # scenario_review.md is CONTROL-PLANE ONLY (never installed into the
+        # builder workspace). It records the blocking loop summary + the
+        # advisories -- likely-missing REQUIREMENTS surfaced to the operator,
+        # NEVER auto-applied. The journal events are content-free (counts only).
+        review_md = df_critic.render_scenario_review(
+            last_advisories, rounds=critic_round, blocking_resolved=total_blocking_raised)
+        atomic_write(os.path.join(control_root, "scenario_review.md"), review_md)
+        journal.write("CRITIC_REVIEW", adapter=critic["adapter"],
+                      adapter_sha256=(sha256_file(critic["adapter"])
+                                      if os.path.exists(critic["adapter"]) else None),
+                      same_model_ack=critic["same_model_ack"],
+                      rounds=critic_round, blocking_resolved=total_blocking_raised,
+                      advisories=len(last_advisories))
+        if last_advisories:
+            journal.write("CRITIC_ADVISORY", count=len(last_advisories))
+
+    journal.write("AUTHORED_SCENARIOS", adapter=adapter,
+                  adapter_sha256=(sha256_file(adapter)
+                                  if os.path.exists(adapter) else None),
+                  same_model_ack=author["same_model_ack"],
+                  counts=report["counts"])
+    print(f"dark-factory: author-scenarios OK -- {report['counts']['scenarios']} "
+          f"scenario(s) ({report['counts']['dev']} dev, "
+          f"{report['counts']['final']} final) installed into {scenarios_dir}")
+    print(f"  authored by (independent model): {adapter}"
+          + ("  [same-model ack]" if author["same_model_ack"] else ""))
+    if critic_enabled:
+        print(f"  reviewed by (decorrelated critic): {critic['adapter']} "
+              f"-- {critic_round} revision round(s), {len(last_advisories)} advisory(ies) "
+              f"in scenario_review.md")
+    print("Review the generated scenarios/*.json, then run:")
+    print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
+    return 0
 
 
 def _empty_author_report() -> dict:
@@ -2969,7 +3178,9 @@ def _empty_author_report() -> dict:
     return {
         "schema_errors": [],
         "non_discriminating_titles": [],
+        "non_sharp_survivors": {},
         "uncovered_behaviors": [],
+        "under_covered_classes": [],
         "orphan_titles": [],
         "spec_leak_values": [],
         "counts": {"scenarios": 0, "dev": 0, "final": 0},
@@ -3277,6 +3488,18 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
              "same_model_ack": cfg["_author"]["same_model_ack"]}
             if cfg.get("_author") else None
         ),
+        # Additive (M42): the decorrelated CRITIC role (or None), sealed exactly
+        # like authored_by -- which independent model reviewed the authored
+        # scenarios and whether the two model-distinctness inequalities were
+        # waived. None for a control root with no roles.critic (byte-identical
+        # to pre-M42 on every terminal manifest).
+        "critic": (
+            {"adapter": cfg["_critic"]["adapter"],
+             "adapter_sha256": (sha256_file(cfg["_critic"]["adapter"])
+                                if os.path.exists(cfg["_critic"]["adapter"]) else None),
+             "same_model_ack": cfg["_critic"]["same_model_ack"]}
+            if cfg.get("_critic") else None
+        ),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -3386,9 +3609,46 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     else:
         cov = {"checked": False}
 
+    # --- Adequacy gate (M42): class-typed coverage per the resolved policy,
+    # for BOTH human- and agent-authored scenarios. Runs HERE in the M7 slot
+    # (before any build), after coverage (a class gap is a finer defect than a
+    # missing behavior). Needs behaviors.json to key per-behavior classes on;
+    # absent -> honest {"checked": False} and no gate (the default happy-only
+    # policy is satisfied by every scenario anyway). The sharpness battery
+    # already ran as the oracle gate above (validate_oracle is now battery-
+    # backed); the adequacy manifest field records both.
+    policy = cfg["_adequacy"]
+    if behaviors is not None:
+        adq = df_gates.check_adequacy(behaviors, scenarios, policy)
+        if adq["under_covered"]:
+            journal.write("ADEQUACY_GATE_FAILED",
+                          required_classes=policy["required_classes"],
+                          under_covered=adq["under_covered"])
+            mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
+                      sandbox_backend=None, denial_probe_passed=False, snapshot_sha256=None,
+                      final_exam={"ran": False, "passed": None, "count": 0}, regressions=[],
+                      oracle={"mutation_validated": True, "inert": []}, coverage=cov,
+                      adequacy=_adequacy_manifest_field(cfg, behaviors, scenarios),
+                      security={"checked": False}, container=None,
+                      budget=_budget_manifest_field(cfg["_budget"], 0, 0.0),
+                      usage=_usage_manifest_field(cfg["_budget"], False, 0, 0))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                        digest, audit_key, journal)
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(
+                f"dark-factory: pre-build gate FAILED — scenario adequacy gap "
+                f"(required classes {policy['required_classes']}), no build was run: "
+                f"{adq['under_covered']}\n"
+            )
+            return anchor_exit or 2
+
     journal.write("GATE_PASSED", coverage_checked=cov["checked"], scenarios=len(scenarios))
     manifest_base["coverage"] = cov
     manifest_base["oracle"] = {"mutation_validated": True, "inert": []}
+    # M42: the auditable adequacy record (class coverage + sharpness battery +
+    # decorrelated-critic outcome), threaded onto every terminal from here on.
+    manifest_base["adequacy"] = _adequacy_manifest_field(cfg, behaviors, scenarios)
     # M9 default: {"checked": False} threads into every terminal manifest via
     # mb_clean unless the CONVERGED path overrides it with the real gate
     # report (gates only run after dev converges + final exam passes).
@@ -5013,6 +5273,14 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                  "same_model_ack": cfg["_author"]["same_model_ack"]}
                 if cfg.get("_author") else None
             ),
+            # Additive (M42): same fresh+resume threading as authored_by.
+            "critic": (
+                {"adapter": cfg["_critic"]["adapter"],
+                 "adapter_sha256": (sha256_file(cfg["_critic"]["adapter"])
+                                    if os.path.exists(cfg["_critic"]["adapter"]) else None),
+                 "same_model_ack": cfg["_critic"]["same_model_ack"]}
+                if cfg.get("_critic") else None
+            ),
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -5034,11 +5302,28 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                 cov = (df_gates.check_coverage(gate_behaviors, gate_scenarios)
                        if gate_behaviors is not None else {"checked": False})
             except df_gates.GateError:
+                gate_behaviors = None
                 cov = {"checked": False}
         except OracleError:
+            gate_behaviors, gate_scenarios = None, None
             cov, oracle = {"checked": False}, {"mutation_validated": False, "inert": []}
         manifest_base["coverage"] = cov
         manifest_base["oracle"] = oracle
+        # M42: recompute the adequacy record (deterministic from the control
+        # root + scenarios) for the resumed run's manifests -- same "resume
+        # recomputes rather than re-gates" discipline as coverage/oracle. If
+        # scenarios no longer load, fall back to the policy-only record.
+        if gate_scenarios is not None:
+            manifest_base["adequacy"] = _adequacy_manifest_field(
+                cfg, gate_behaviors, gate_scenarios)
+        else:
+            manifest_base["adequacy"] = {
+                "checked": False,
+                "required_classes": cfg["_adequacy"]["required_classes"],
+                "min_per_class": cfg["_adequacy"]["min_per_class"],
+                "sharpness": {"scenarios": 0, "min_killed": 0, "weakest": []},
+                "critic": None,
+            }
         # M9 default (same reasoning as _run_locked): overridden on a
         # resumed-converge by _run_loop's CONVERGED branch, which is the
         # SAME code both run() and resume() funnel through.

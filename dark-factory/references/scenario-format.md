@@ -117,6 +117,15 @@ everything behaves exactly as before `cohort` existed). `run_all(...,
 cohort="dev"|"final")` filters to one cohort; `cohort=None` (the
 default) runs everything, unchanged for existing callers.
 
+`class` (M42) is an OPTIONAL, ORTHOGONAL axis: `"happy"` | `"boundary"` |
+`"failure"`. Where `cohort` is feedback-vs-sealed, `class` is what-KIND-of-case:
+a normal path (`happy`), an edge — empty/max/duplicate/missing/wrong-type
+(`boundary`), or the error contract (`failure`). Absent ⇒ `happy` (back-compat:
+every pre-M42 scenario is implicitly happy). The class label only matters to the
+**adequacy gate** (`df_gates.check_adequacy`, `references/scenario-adequacy.md`),
+which can require each behavior to be covered by a set of classes; a bad value is
+rejected at load like a bad `cohort`.
+
 Failure taxonomy (the ONLY thing that crosses the barrier, with the
 behavior_id): `timeout` > `crash` > `wrong_exit_code` > `wrong_output` >
 `no_twin_evidence` (priority order when several assertions fail; an http
