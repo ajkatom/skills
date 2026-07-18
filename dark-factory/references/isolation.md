@@ -217,6 +217,19 @@ by M29a Tasks 1-2: a candidate can no longer read the operator's ambient
 secrets via environment variables, and a candidate can no longer leave a
 surviving background/daemon process behind after its scenario ends.
 
+**Validation runs against the SEALED object (M44 RA-01).** The M29d note above
+is now NARROWER. As of M44 the post-convergence security gates and the sealed
+final exam no longer run against the mutable `workspace`: after the artifact is
+frozen, the supervisor materializes two throwaway copies of the SEALED object
+(`R_gates` for the gates, `R_exam` as the final cohort's cwd; both siblings of
+`workspace`, so candidate confinement — which denies the control root — still
+allows them) and validates THOSE. A final-cohort scenario side effect (or a
+hostile candidate) that scrubs `workspace` after the freeze can no longer
+launder a gate result: the gates scan a copy of the shipped bytes. The
+remaining M29d residual is strictly per-SCENARIO copy-on-run WITHIN the final
+cohort (one final scenario mutating state a later one in the same cohort sees);
+the shipped-vs-validated-bytes gap that M44 RA-01 addressed is closed.
+
 ## Default-deny candidate host isolation (M29b, DF-02 host-read half)
 
 Everything above wraps the candidate in `(allow default)` + deny-control-root

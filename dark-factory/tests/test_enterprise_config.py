@@ -277,11 +277,21 @@ class _FakeJournal:
 
 class _FakeOSBackend:
     name = "fake-os-backend"
+    # M44 RA-03: a properly-isolated enterprise run confines the candidate with
+    # a default-deny profile (host_isolation qualifies). The fake backend
+    # advertises that capability so these integration runs model a REAL
+    # enterprise posture — a host-isolation-LIMITED run is now custody-refused,
+    # so the happy path must actually be host-isolated.
+    supports_default_deny = True
 
     def available(self):
         return True
 
-    def wrap_prefix(self, deny_root, workspace):
+    def wrap_prefix(self, deny_root, workspace, network="unrestricted"):
+        return []
+
+    def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
+                              allowed_loopback_ports=None, scratch_dirs=()):
         return []
 
 
@@ -289,6 +299,12 @@ def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=Tru
                              egress_ok=True):
     monkeypatch.setattr(supervisor.df_sandbox, "current_backend", lambda: _FakeOSBackend())
     monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: os_ok)
+    # M44 RA-03: model a candidate default-deny confinement that PASSES, so the
+    # enterprise run seals with host_isolation.qualified True — the honest
+    # posture a properly-isolated enterprise run has (and the one a custody
+    # attestation is allowed to qualify).
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_candidate_confinement",
+                        lambda *a, **k: (True, {"mode": "default_deny", "residuals": []}))
     monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: dk_ok)
     monkeypatch.setattr(supervisor.df_container, "probe_container", lambda *a, **k: dk_ok)
     # M22 Task 1: the enterprise resolve now ALSO live-probes the seccomp
