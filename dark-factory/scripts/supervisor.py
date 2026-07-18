@@ -878,6 +878,33 @@ def _seal_workspace_artifact(control_root: str, workspace: str):
     return object_id, artifact_field
 
 
+def _materialize_validation_root(object_store: str, object_id: str, dest_dir: str) -> None:
+    """M44 RA-01: create `dest_dir` empty and materialize the SEALED object
+    into it so validation (security gates / final exam) can run against a
+    PRISTINE copy of the exact bytes that will ship — never the mutable
+    `workspace`, which a post-freeze side effect (a final-cohort scenario, a
+    hostile candidate) can scrub to look clean AFTER the object is frozen.
+
+    `df_seal.materialize_object` re-verifies object identity against its own
+    sidecar FIRST (and refuses a non-empty dest), so a drifted/absent object
+    raises `df_seal.SealError` here rather than seeding a validation root from
+    untrustworthy bytes — the caller MUST turn that into the fail-closed
+    ARTIFACT_UNHASHABLE terminal (never qualify). A stale copy from a crashed
+    prior attempt is cleared first so the empty-dest precondition holds on a
+    re-converge (resume re-enters this branch under the same workspace path)."""
+    _discard_validation_root(dest_dir)
+    os.makedirs(dest_dir)
+    df_seal.materialize_object(object_store, object_id, dest_dir)
+
+
+def _discard_validation_root(path: str) -> None:
+    """Best-effort teardown of an M44 throwaway validation root (`R_gates` /
+    `R_exam`). They hold only a copy of bytes the object store already holds,
+    so a failed delete is not fatal and never raises — the object whose
+    identity was bound into the manifest is the object store's, not this copy."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # DF-01/M28a Task 3: verify-by-identity + custody-by-object-id + retention.
 #
@@ -1263,6 +1290,105 @@ def _satisfying_approvers(manifest_bytes, signatures, approvers):
     return satisfied
 
 
+# ---------------------------------------------------------------------------
+# M44 RA-02/RA-03: the post-seal attestation paths (custody / waiver / release)
+# must (1) require a successful REQUIRED off-box sink receipt BEFORE a run is
+# locally qualifiable and roll back on failure, and (2) refuse to attest an
+# INELIGIBLE manifest. The helpers below are shared by all three paths so the
+# eligibility/receipt logic is defined once, not re-derived ad hoc.
+# ---------------------------------------------------------------------------
+
+def _precustody_substates(manifest_obj: dict) -> dict:
+    """RA-03: recompute the five qualification substates from a SEALED
+    manifest's OWN fields via df_qualify.derive — never trust a stored
+    `qualification.qualified` boolean (which a hand-edited manifest could
+    lie about; the manifest's HMAC/sidecar is authenticated separately by
+    the caller). Returns df_qualify.derive's `{qualified, substates, code}`.
+
+    app_security mirrors the CONVERGED branch's own rule: vacuously true below
+    a mandatory tier (gates optional there), otherwise "gates checked AND
+    nothing failed". barrier/host_isolation/control_plane read the sealed
+    tier / host_isolation.qualified / bound artifact object_id."""
+    tier = manifest_obj.get("tier")
+    hi = manifest_obj.get("host_isolation") or {}
+    art = manifest_obj.get("artifact")
+    sec = manifest_obj.get("security") or {}
+    app_security = (tier not in MANDATORY_TIERS) or (
+        bool(sec.get("checked")) and not sec.get("failed"))
+    return df_qualify.derive(
+        barrier=tier in _QUALIFYING_TIERS,
+        host_isolation=bool(hi.get("qualified")),
+        control_plane=bool(isinstance(art, dict) and art.get("object_id")),
+        app_security=bool(app_security),
+        waiver_validity=True)
+
+
+def _final_exam_ok(manifest_obj: dict) -> bool:
+    """RA-03: the sealed final exam must have PASSED if it ran. A final cohort
+    that never ran (no held-out scenarios existed) is allowed per policy."""
+    fe = manifest_obj.get("final_exam") or {}
+    if fe.get("ran"):
+        return fe.get("passed") is True
+    return True
+
+
+def _push_qualification_offbox(cfg: dict, sink_key: str, att_text: str):
+    """RA-02 (attach side): push a qualification attestation to the audit sink
+    BEFORE it is treated as valid, so "enterprise qualification must leave the
+    box" is actually enforced rather than best-effort-after-the-fact. Writes
+    NOTHING to disk — the caller persists the attestation/chain/receipt ONLY
+    after this returns a non-required-failure.
+
+    Returns (status, receipt_or_None, detail):
+      "skip"          no sink configured (kind==none) — nothing to push
+      "ok"            pushed; receipt dict (augmented with body_sha256 +
+                      sink_key so a later verify can bind it) to persist
+      "optional_fail" push failed but the sink is NOT required — proceed, warn
+      "required_fail" push failed AND the sink is required — the caller MUST
+                      fail closed and roll back (no attestation, no chain link,
+                      no receipt): the run must NOT be locally qualifiable."""
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+    if sink.get("kind", "none") == "none":
+        return ("skip", None, "")
+    try:
+        receipt = df_audit_sink.push(sink, sink_key, att_text.encode("utf-8"))
+    except df_audit_sink.SinkError as e:
+        return (("required_fail" if sink.get("required") else "optional_fail"), None, str(e))
+    # Bind the persisted receipt to the EXACT attestation bytes that were
+    # pushed (independent of sink kind / server-chosen receipt string), so the
+    # verify side can prove the receipt is for THIS attestation, not a stale one.
+    receipt = dict(receipt, body_sha256=sha256_str(att_text), sink_key=sink_key)
+    return ("ok", receipt, "")
+
+
+def _sink_receipt_bound(run_dir: str, receipt_basename: str, att_text: str):
+    """RA-02 (verify side): True iff `<run_dir>/<receipt_basename>` exists, is
+    well-formed, and is BOUND to `att_text` (its recorded body_sha256 equals
+    the sha256 of the current attestation bytes). Fail-closed: absent,
+    unparseable, or mismatched → (False, reason). Only consulted when the
+    sealed config's `audit.sink.required` is true."""
+    path = os.path.join(run_dir, receipt_basename)
+    if not os.path.exists(path):
+        return (False, f"required off-box sink receipt {receipt_basename} is absent")
+    try:
+        with open(path, encoding="utf-8") as f:
+            receipt = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return (False, f"unreadable sink receipt {receipt_basename}: {e}")
+    if not isinstance(receipt, dict):
+        return (False, f"malformed sink receipt {receipt_basename}")
+    if receipt.get("body_sha256") != sha256_str(att_text):
+        return (False, f"sink receipt {receipt_basename} does not bind these attestation bytes")
+    return (True, "ok")
+
+
+def _sink_required(cfg: dict) -> bool:
+    """Whether the sealed config mandates an off-box audit sink (RA-02). The
+    config is policy-bound to the run via config_sha256, so this reflects the
+    sealed posture, not a post-run edit."""
+    return bool(cfg.get("_audit", {}).get("sink", {}).get("required"))
+
+
 def attach_custody(control_root: str, run_dir: str) -> int:
     """`df-custody attach` — PHASE 2 of the split-custody two-phase ship
     (references/enterprise.md). Reads the run's IMMUTABLE, already-sealed
@@ -1347,6 +1473,29 @@ def attach_custody(control_root: str, run_dir: str) -> int:
               f"re-run df-custody attach.")
         return 3
 
+    # M44 RA-03: K-of-N signatures alone must NOT qualify an INELIGIBLE
+    # manifest. A custody attestation qualifies ONLY the enterprise pending
+    # terminal whose pre-custody evidence all holds; a signed-but-ineligible
+    # manifest (SECURITY_GATE_FAILED, HOST_ISOLATION_LIMITED, a failed final
+    # exam, or any non-CUSTODY_PENDING outcome) is refused, never attested.
+    if manifest_obj.get("outcome") != "CUSTODY_PENDING":
+        sys.stderr.write(
+            f"dark-factory: refusing custody attestation — run outcome is "
+            f"{manifest_obj.get('outcome')!r}, not CUSTODY_PENDING (a custody sign-off "
+            "qualifies only the enterprise pending terminal, never a run that failed a "
+            "gate/exam).\n")
+        return 3
+    subs = _precustody_substates(manifest_obj)
+    if not subs["qualified"] or not _final_exam_ok(manifest_obj):
+        reasons = [k for k, v in subs["substates"].items() if not v]
+        if not _final_exam_ok(manifest_obj):
+            reasons.append("final_exam")
+        sys.stderr.write(
+            "dark-factory: refusing custody attestation — the run's pre-custody evidence "
+            f"is not eligible (failing: {', '.join(reasons) or subs['code']}). A valid K-of-N "
+            "cannot qualify a run that did not otherwise converge cleanly.\n")
+        return 3
+
     satisfied_set = _satisfying_approvers(manifest_bytes, signatures, approvers)
     kept_sigs = [
         {"approver": e["approver"].lower(), "sig": e["sig"]}
@@ -1377,12 +1526,10 @@ def attach_custody(control_root: str, run_dir: str) -> int:
     try:
         att_text = canonical_json(attestation)
         att_path = os.path.join(run_dir, CUSTODY_ATTESTATION_FILE)
-        atomic_write(att_path, att_text)
-
-        # Anchor the attestation into the tamper-evident hash chain (M13).
         # The audit key is required at enterprise (audit.signing), so a
         # signed chain link binds this attestation off the manifest it
-        # qualifies.
+        # qualifies. Loaded up front so a key error fails BEFORE any off-box
+        # push (nothing partially committed).
         audit_key = None
         if cfg.get("_audit", {}).get("signing"):
             try:
@@ -1390,36 +1537,36 @@ def attach_custody(control_root: str, run_dir: str) -> int:
             except df_audit.AuditKeyError as e:
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 return 2
-        chain_path = os.path.join(control_root, "audit-chain.jsonl")
         # Dot-separated (not ':') so the same key is a valid http-append sink
         # key: the reference receiver's key regex is [A-Za-z0-9._-], and a
         # ':' would be percent-encoded to %3A and rejected.
         custody_key = os.path.basename(run_dir) + ".custody"
+
+        # M44 RA-02: push the QUALIFICATION event off-box FIRST. Enterprise
+        # MANDATES audit.sink.required:true, so a required-sink failure means
+        # the run must NOT be locally qualifiable — we return BEFORE writing
+        # the attestation OR anchoring the chain, so nothing on disk implies a
+        # qualification that never left the box (the pre-M44 bug wrote + anchored
+        # the attestation first, then returned 3 on push failure, leaving a
+        # locally-QUALIFIED run). The pushed body is the attestation itself.
+        push_status, receipt, detail = _push_qualification_offbox(cfg, custody_key, att_text)
+        if push_status == "required_fail":
+            sys.stderr.write(
+                f"dark-factory: CUSTODY NOT ATTESTED — the REQUIRED audit sink push FAILED "
+                f"({detail}); enterprise qualification must be recorded off-box. No local "
+                f"attestation was written. Fix the sink and re-run df-custody attach.\n")
+            return 3
+        if push_status == "optional_fail":
+            sys.stderr.write(f"dark-factory: audit sink push warning (not required): {detail}\n")
+
+        # Off-box record is committed (or no/optional sink): now persist locally.
+        atomic_write(att_path, att_text)
+        chain_path = os.path.join(control_root, "audit-chain.jsonl")
         entry = df_audit_chain.append_entry(
             chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
-
-        # Push the QUALIFICATION event off-box (M13). Qualification is the
-        # single most security-relevant enterprise event, and enterprise
-        # MANDATES audit.sink.required:true — so it must leave the box,
-        # failing closed if the required sink is unreachable (mirrors
-        # _anchor_audit's required-sink handling: a required push failure is
-        # a nonzero exit, never a silent skip). The pushed body is the
-        # attestation itself.
-        sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
-        if sink.get("kind", "none") != "none":
-            try:
-                receipt = df_audit_sink.push(sink, custody_key, att_text.encode("utf-8"))
-            except df_audit_sink.SinkError as e:
-                if sink.get("required"):
-                    sys.stderr.write(
-                        f"dark-factory: CUSTODY ATTESTED locally, but the REQUIRED audit sink push "
-                        f"FAILED ({e}) — enterprise qualification must be recorded off-box; "
-                        f"fix the sink and re-run df-custody attach.\n")
-                    return 3
-                sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
-            else:
-                atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"),
-                            canonical_json(receipt))
+        if receipt is not None:
+            atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"),
+                         canonical_json(receipt))
 
         print(f"dark-factory: CUSTODY ATTESTED — {reason}; qualified. "
               f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…")
@@ -1495,7 +1642,8 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
         return False
     try:
         with open(att_path, encoding="utf-8") as f:
-            attestation = json.load(f)
+            att_raw = f.read()
+        attestation = json.loads(att_raw)
     except (OSError, json.JSONDecodeError) as e:
         print(f"INVALID (unreadable {CUSTODY_ATTESTATION_FILE}: {e})")
         return False
@@ -1514,10 +1662,35 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
     # lower K nor introduce rogue approvers.
     satisfied, reason = df_custody.verify_custody(
         manifest_bytes, sigs, cfg["_custody"]["approvers"], cfg["_custody"]["threshold"])
-    if satisfied:
-        print(f"QUALIFIED ({reason}; attestation binds manifest {manifest_sha[:16]}…)")
-        return True
-    print(f"INVALID (attestation signatures no longer satisfy K-of-N: {reason})")
+    if not satisfied:
+        print(f"INVALID (attestation signatures no longer satisfy K-of-N: {reason})")
+        return False
+
+    # M44 RA-03 (defense in depth): even a valid K-of-N attestation must bind an
+    # ELIGIBLE manifest. attach refuses to write one over an ineligible run, but
+    # a hand-planted attestation must not be honored either — recompute from the
+    # sealed manifest fields.
+    if manifest_obj.get("outcome") != "CUSTODY_PENDING" or \
+            not _precustody_substates(manifest_obj)["qualified"] or \
+            not _final_exam_ok(manifest_obj):
+        print("INVALID (attestation binds an ineligible manifest — outcome is not "
+              "CUSTODY_PENDING or its pre-custody evidence does not hold)")
+        return False
+
+    # M44 RA-02: at a run whose sealed config mandates a required off-box sink,
+    # a QUALIFIED verdict REQUIRES the corresponding sink receipt (present, well-
+    # formed, and bound to THESE attestation bytes). Its absence is a distinct
+    # NOT-qualified status — enterprise qualification that never left the box
+    # does not count — never a silent QUALIFIED.
+    if _sink_required(cfg):
+        ok_r, why_r = _sink_receipt_bound(run_dir, "custody_sink_receipt.json", att_raw)
+        if not ok_r:
+            print(f"SINK_RECEIPT_MISSING ({why_r}; a required off-box sink means qualification "
+                  "must be recorded off-box — re-run df-custody attach against a reachable sink)")
+            return False
+
+    print(f"QUALIFIED ({reason}; attestation binds manifest {manifest_sha[:16]}…)")
+    return True
     return False
 
 
@@ -1703,6 +1876,21 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
         print(f"dark-factory: WAIVER NOT ATTACHED ({load_reason or reason}).")
         return 3
 
+    # M44 RA-03: a waiver re-qualifies ONLY the app-security gate it covers; it
+    # must NOT paper over a DIFFERENT per-run failure. The waiver machinery is
+    # deliberately tier-INDEPENDENT (a cooperative run's security finding is
+    # waivable), so tier posture (barrier / host_isolation) is NOT a waiver
+    # eligibility condition — it is recorded honestly and consumed by the
+    # qualification logic elsewhere. The one independent failure a security
+    # waiver must never cover is a FAILED FINAL EXAM (a behaviorally-wrong
+    # artifact). That is structurally excluded already (a failed final exam
+    # seals FINAL_EXAM_FAILED, not SECURITY_GATE_FAILED, and is refused above),
+    # but assert it explicitly so a hand-crafted manifest cannot slip through.
+    if not _final_exam_ok(manifest_obj):
+        print("dark-factory: WAIVER NOT ATTACHED — the sealed final exam did not pass; a "
+              "security waiver cannot cover a behaviorally-rejected artifact.")
+        return 3
+
     # Keep only the {claim,signer,sig} entries that actually contributed
     # (in-scope, valid, unexpired, allowlisted) — never echo unrelated
     # signature material into the attestation.
@@ -1729,8 +1917,6 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
     try:
         att_text = canonical_json(attestation)
         att_path = os.path.join(run_dir, WAIVER_ATTESTATION_FILE)
-        atomic_write(att_path, att_text)
-
         audit_key = None
         if cfg.get("_audit", {}).get("signing"):
             try:
@@ -1740,23 +1926,27 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
                 return 2
         chain_path = os.path.join(control_root, "audit-chain.jsonl")
         waiver_chain_key = os.path.basename(run_dir) + ".waiver"
+
+        # M44 RA-02: push the waiver off-box FIRST; a required-sink failure
+        # leaves NO local attestation and NO chain link, so a waiver whose
+        # off-box record never left the box is not locally waiver-qualifiable
+        # (superset: a run without a required sink is unaffected).
+        push_status, receipt, detail = _push_qualification_offbox(cfg, waiver_chain_key, att_text)
+        if push_status == "required_fail":
+            sys.stderr.write(
+                f"dark-factory: WAIVER NOT ATTACHED — the REQUIRED audit sink push FAILED "
+                f"({detail}); no local attestation was written. Fix the sink and re-run "
+                f"df-waiver attach.\n")
+            return 3
+        if push_status == "optional_fail":
+            sys.stderr.write(f"dark-factory: audit sink push warning (not required): {detail}\n")
+
+        atomic_write(att_path, att_text)
         entry = df_audit_chain.append_entry(
             chain_path, waiver_chain_key, sha256_str(att_text), _now(), audit_key)
-
-        sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
-        if sink.get("kind", "none") != "none":
-            try:
-                receipt = df_audit_sink.push(sink, waiver_chain_key, att_text.encode("utf-8"))
-            except df_audit_sink.SinkError as e:
-                if sink.get("required"):
-                    sys.stderr.write(
-                        f"dark-factory: WAIVER ATTACHED locally, but the REQUIRED audit sink push "
-                        f"FAILED ({e}) — fix the sink and re-run df-waiver attach.\n")
-                    return 3
-                sys.stderr.write(f"dark-factory: audit sink push warning (not required): {e}\n")
-            else:
-                atomic_write(os.path.join(run_dir, "waiver_sink_receipt.json"),
-                            canonical_json(receipt))
+        if receipt is not None:
+            atomic_write(os.path.join(run_dir, "waiver_sink_receipt.json"),
+                         canonical_json(receipt))
 
         print(f"dark-factory: WAIVER ATTACHED — {reason}. "
               f"Attestation: {att_path}  Chain: {entry['chain_hash'][:16]}…  "
@@ -1814,6 +2004,10 @@ _WAIVER_VERIFY_EXIT = {
     "NOT_WAIVED": 1,
     "WAIVER_EXPIRED": 7,
     "WAIVER_INVALID": 8,
+    # M44 RA-02: a required off-box sink whose receipt is absent/unbound is a
+    # DISTINCT not-qualified status (qualification never left the box), never a
+    # silent WAIVED_QUALIFIED.
+    "SINK_RECEIPT_MISSING": 9,
 }
 
 
@@ -1877,9 +2071,18 @@ def verify_waiver_cmd(control_root: str, run_dir: str) -> int:
         return _WAIVER_VERIFY_EXIT["NOT_WAIVED"]
     try:
         with open(att_path, encoding="utf-8") as f:
-            attestation = json.load(f)
+            att_raw = f.read()
+        attestation = json.loads(att_raw)
     except (OSError, json.JSONDecodeError) as e:
         print(f"WAIVER_INVALID (unreadable {WAIVER_ATTESTATION_FILE}: {e})")
+        return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
+
+    # M44 RA-03 (defense in depth): a security waiver must not stand on a
+    # behaviorally-rejected artifact (a failed final exam). Tier posture is NOT
+    # a waiver condition (the waiver is tier-independent by design).
+    if not _final_exam_ok(manifest_obj):
+        print("WAIVER_INVALID (the sealed final exam did not pass — a security waiver cannot "
+              "cover a behaviorally-rejected artifact)")
         return _WAIVER_VERIFY_EXIT["WAIVER_INVALID"]
 
     # The attestation must bind THESE manifest bytes (a single-byte manifest
@@ -1912,6 +2115,14 @@ def verify_waiver_cmd(control_root: str, run_dir: str) -> int:
     now = _now_utc()
     satisfied_now, reason_now, covered, _unc = _eval(now)
     if satisfied_now:
+        # M44 RA-02: when the sealed config mandates a required off-box sink, a
+        # WAIVED_QUALIFIED verdict REQUIRES the bound waiver sink receipt.
+        if _sink_required(cfg):
+            ok_r, why_r = _sink_receipt_bound(run_dir, "waiver_sink_receipt.json", att_raw)
+            if not ok_r:
+                print(f"SINK_RECEIPT_MISSING ({why_r}; a required off-box sink means the "
+                      "waiver must be recorded off-box — re-attach against a reachable sink)")
+                return _WAIVER_VERIFY_EXIT["SINK_RECEIPT_MISSING"]
         print(f"WAIVED_QUALIFIED ({reason_now}; expiry re-checked at {_now()})")
         return _WAIVER_VERIFY_EXIT["WAIVED_QUALIFIED"]
 
@@ -4982,39 +5193,64 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # object_id. See _seal_workspace_artifact + the module-level
                 # ARTIFACT_UNHASHABLE terminal (_artifact_unhashable_abort).
                 #
-                # ENGINEERING NOTE on where the final exam + gates then run
-                # (task-2-report.md has the full writeup): they still run
-                # against `workspace` below, byte-identical to before this
-                # change, rather than being redirected to read from the
-                # frozen copy at objects/<object_id>/. Redirecting is the
-                # long-run goal (a gate/scenario command really should only
-                # ever see the immutable object), but the object store's
-                # copies are NOT filesystem-read-only against the owning
-                # process (df_seal's own documented residual: same-privilege
-                # writes are detection-grade, not prevented) -- so pointing
-                # an arbitrary candidate-produced final-exam command's cwd at
-                # the object dir risks a scenario incidentally writing into
-                # it and silently corrupting the very object whose identity
-                # we just bound into the manifest, which would be worse than
-                # not redirecting at all. The object bound here is the
-                # dev-converged (pre-exam) workspace state, which IS the
-                # correct artifact. HONEST SCOPE (M29d): if a final-cohort
-                # scenario command writes into `workspace` as a side effect,
-                # the exam validates a state that has drifted from the frozen
-                # object, and the `verify_object` re-check below does NOT
-                # detect that (it compares the object to its OWN sidecar, not
-                # to the live workspace). Closing "the exam provably ran
-                # against the sealed bytes" needs copy-on-run per scenario
-                # (M29d) — deferred, documented. What M28a DOES guarantee: the
-                # manifest binds the real object_id, so any POST-qualification
-                # tampering is caught by verify (Task 3). The `verify_object`
-                # re-check below is the fail-closed net for the object itself
-                # (published bytes still match their sidecar).
+                # ENGINEERING NOTE — where the final exam + gates run (M44
+                # RA-01 fix; supersedes the old "M29d deferred" note):
+                # validation now examines the SEALED object, not the mutable
+                # `workspace`. AFTER the freeze below yields `object_id`, we
+                # materialize the sealed object into TWO fresh throwaway roots
+                # (siblings of `workspace`, so they live OUTSIDE the control
+                # root and stay reachable under candidate confinement, which
+                # denies the control root): `R_gates` for the security gates
+                # and `R_exam` (cwd for the final cohort). Each materialize
+                # re-verifies object identity (df_seal.materialize_object) and
+                # refuses a non-empty dest, so a drifted/absent object fails
+                # closed into `_artifact_unhashable_abort` rather than seeding
+                # validation from untrustworthy bytes. Because both roots are
+                # copies of the SEALED bytes, a final-cohort scenario side
+                # effect (or a hostile candidate) that scrubs `workspace`
+                # AFTER the freeze — the reproduced RA-01 attack — is INERT:
+                # the gates scan `R_gates` (still holds the planted secret) and
+                # the exam runs in the discardable `R_exam`, never the shipped
+                # object dir itself (pointing a candidate command's cwd at the
+                # live object store risks a same-privilege write silently
+                # corrupting the very object we just bound — df_seal's
+                # documented residual — so we validate a COPY and discard it).
+                # The dev-loop verify above stays on `workspace`: pre-seal
+                # there is no sealed object, and its results only drive
+                # ID+taxonomy feedback, never qualification.
+                #
+                # DOCUMENTED RESIDUAL (narrowed from the old M29d): M44 closes
+                # the shipped-vs-validated-bytes gap (gates + exam both derive
+                # from the sealed object). Per-SCENARIO copy-on-run WITHIN the
+                # final cohort (a fresh copy per final scenario, so one final
+                # scenario can't mutate state a later one in the SAME cohort
+                # observes) is a further hardening still deferred as full M29d.
                 try:
                     object_id, artifact_field = _seal_workspace_artifact(
                         cfg["_control_root"], workspace)
                 except df_seal.SealError as e:
                     return _artifact_unhashable_abort(i, str(e))
+
+                # M44 RA-01: materialize pristine copies of the SEALED object
+                # for the gates (R_gates) and the final exam (R_exam). Siblings
+                # of `workspace` (workspace_root is disjoint from the control
+                # root — enforced by df_config — so these are reachable by the
+                # confined candidate, whereas a dir under run_dir would be
+                # denied). A materialize failure is object-store drift → the
+                # fail-closed ARTIFACT_UNHASHABLE terminal (never validate, let
+                # alone qualify, off untrustworthy bytes).
+                _object_store = _object_store_root(cfg["_control_root"])
+                r_gates = workspace + "__m44_gates"
+                r_exam = workspace + "__m44_exam"
+                try:
+                    _materialize_validation_root(_object_store, object_id, r_gates)
+                    _materialize_validation_root(_object_store, object_id, r_exam)
+                except df_seal.SealError as e:
+                    _discard_validation_root(r_gates)
+                    _discard_validation_root(r_exam)
+                    return _artifact_unhashable_abort(
+                        i, f"could not materialize the sealed object {object_id} for "
+                           f"validation-on-sealed-bytes: {e}")
 
                 # DEV converged. The sealed FINAL exam runs exactly ONCE, here, and its
                 # results are NEVER fed back: project_feedback is never called on it,
@@ -5029,65 +5265,77 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # serve, so we reuse dev-verify's already-running twins --
                 # byte-identical to the pre-M12 final-exam path (zero restart).
                 final_env_extra = verify_env_extra
-                if twins_enabled:
-                    seed_extra = _variant_seed_extra(twin_defs)
-                    if seed_extra is not None:
-                        try:
-                            final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
-                                                        extra_env=seed_extra, phase="verify")
-                        except df_twins.TwinError as e:
-                            return _twin_error_abort(i, e)
-                # M29b: the final exam pins ITS pass's twin ports too. When no
-                # twin supports variants there was no reset above, so
-                # final_env_extra is dev-verify's endpoints and this re-derives
-                # a wrapper with the same (still-live) ports.
-                final_candidate_prefix = _candidate_prefix_for_twins(
-                    cfg, host_isolation, workspace, candidate_prefix, final_env_extra)
-                final = run_all(scenarios_dir, workspace, exec_wrapper=final_candidate_prefix,
-                                 env_extra=final_env_extra, cohort="final",
-                                 observer_files=ts.observer_files if ts else None)
-                _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
-                final_ran = final["count"] > 0
-                journal.write("FINAL_EXAM", ran=final_ran,
-                              passing=sum(1 for r in final["results"] if r["pass"]),
-                              total=final["count"])
-                # M43a: same value-free property-violation audit record for the
-                # sealed final cohort (behavior-id + invariant + case index --
-                # consistent with FINAL_EXAM_FAILED's behavior-id-only
-                # discipline; final results are still NEVER fed back).
-                _journal_property_violations(journal, mb_clean, final["results"],
-                                             cohort="final", iteration=i)
-                fe = {"ran": final_ran, "passed": bool(final["all_pass"]) if final_ran else None,
-                      "count": final["count"]}
+                # M44 RA-01: the throwaway sealed-object copies (R_gates/R_exam)
+                # are discarded no matter which terminal this block reaches.
+                try:
+                    if twins_enabled:
+                        seed_extra = _variant_seed_extra(twin_defs)
+                        if seed_extra is not None:
+                            try:
+                                final_env_extra = ts.reset(twin_defs, run_dir, twin_timeout,
+                                                            extra_env=seed_extra, phase="verify")
+                            except df_twins.TwinError as e:
+                                return _twin_error_abort(i, e)
+                    # M29b: the final exam pins ITS pass's twin ports too. When no
+                    # twin supports variants there was no reset above, so
+                    # final_env_extra is dev-verify's endpoints and this re-derives
+                    # a wrapper with the same (still-live) ports. M44 RA-01: the
+                    # wrapper is rebuilt around `r_exam` (the exam's cwd), so
+                    # default-deny confinement allowlists the materialized root
+                    # and denies the control root exactly as it did for
+                    # `workspace`; twin ports still flow through unchanged.
+                    final_candidate_prefix = _candidate_prefix_for_twins(
+                        cfg, host_isolation, r_exam, candidate_prefix, final_env_extra)
+                    final = run_all(scenarios_dir, r_exam, exec_wrapper=final_candidate_prefix,
+                                     env_extra=final_env_extra, cohort="final",
+                                     observer_files=ts.observer_files if ts else None)
+                    _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
+                    final_ran = final["count"] > 0
+                    journal.write("FINAL_EXAM", ran=final_ran,
+                                  passing=sum(1 for r in final["results"] if r["pass"]),
+                                  total=final["count"])
+                    # M43a: same value-free property-violation audit record for the
+                    # sealed final cohort (behavior-id + invariant + case index --
+                    # consistent with FINAL_EXAM_FAILED's behavior-id-only
+                    # discipline; final results are still NEVER fed back).
+                    _journal_property_violations(journal, mb_clean, final["results"],
+                                                 cohort="final", iteration=i)
+                    fe = {"ran": final_ran, "passed": bool(final["all_pass"]) if final_ran else None,
+                          "count": final["count"]}
 
-                if final_ran and not final["all_pass"]:
-                    journal.write("FINAL_EXAM_FAILED",
-                                  failing=sorted({r["behavior_id"] for r in final["results"]
-                                                  if not r["pass"]}))
-                    mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
-                              qualified=False, final_exam=fe, regressions=sorted(regressed),
-                              artifact=artifact_field,
-                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                          builder_input_tokens, builder_output_tokens))
-                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                digest, audit_key, journal)
-                    _clear_state()
-                    _kb_writeback(cfg, journal, mf, [])
-                    print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
-                          f"scenarios not disclosed). Run: {run_dir}")
-                    return anchor_exit or 3
+                    if final_ran and not final["all_pass"]:
+                        journal.write("FINAL_EXAM_FAILED",
+                                      failing=sorted({r["behavior_id"] for r in final["results"]
+                                                      if not r["pass"]}))
+                        mf = dict(mb_clean, outcome="FINAL_EXAM_FAILED", iterations=i,
+                                  qualified=False, final_exam=fe, regressions=sorted(regressed),
+                                  artifact=artifact_field,
+                                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                              builder_input_tokens, builder_output_tokens))
+                        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                    digest, audit_key, journal)
+                        _clear_state()
+                        _kb_writeback(cfg, journal, mf, [])
+                        print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
+                              f"scenarios not disclosed). Run: {run_dir}")
+                        return anchor_exit or 3
 
-                # M36b Part C: the whole post-final-exam SEAL tail (mandatory
-                # gates -> object re-verify -> before-ship pause -> seal) lives
-                # in `_finalize_converged` so the AWAIT_SHIP seal-reentry resume
-                # can reuse the IDENTICAL df_qualify.derive path with NO builder
-                # dispatch. The straight-through path runs gates over `workspace`
-                # and allows the before-ship pause; the ship-resume path runs
-                # them over the frozen object and never re-pauses.
-                return _finalize_converged(i, object_id, artifact_field, fe,
-                                           workspace, allow_pause=True)
+                    # M36b Part C: the whole post-final-exam SEAL tail (mandatory
+                    # gates -> object re-verify -> before-ship pause -> seal) lives
+                    # in `_finalize_converged` so the AWAIT_SHIP seal-reentry resume
+                    # can reuse the IDENTICAL df_qualify.derive path with NO builder
+                    # dispatch. M44 RA-01: the straight-through path runs gates over
+                    # `r_gates` (a pristine copy of the sealed object), not the
+                    # mutable `workspace`; the ship-resume path runs them over the
+                    # frozen object dir. Either way the gates certify the shipped
+                    # bytes. It still allows the before-ship pause.
+                    return _finalize_converged(i, object_id, artifact_field, fe,
+                                               r_gates, allow_pause=True)
+                finally:
+                    _discard_validation_root(r_exam)
+                    _discard_validation_root(r_gates)
 
             feedback = project_feedback(report)
             # feedback_iter/*.json and workspace/feedback.json are structurally
@@ -5809,19 +6057,36 @@ def _ship_completed_actions(run_dir):
     return done
 
 
-def _load_release_attestation(run_dir):
+def _load_release_attestation(run_dir, cfg=None):
     """Load <run_dir>/release_attestation.json (df-release attach output), or
     None if absent/unreadable/wrong-shape (fail-closed: an unreadable attestation
-    covers nothing, so an irreversible action stays gated)."""
+    covers nothing, so an irreversible action stays gated).
+
+    M44 RA-02: when `cfg` is provided AND its sealed config mandates a required
+    off-box audit sink, the attestation is honored ONLY if the bound
+    `release_sink_receipt.json` is present and binds these exact attestation
+    bytes — an approval whose off-box record never left the box covers nothing,
+    so the irreversible action stays gated (SHIP_APPROVAL_PENDING), never a
+    silent authorization."""
     path = os.path.join(run_dir, RELEASE_ATTESTATION_FILE)
     if not os.path.exists(path):
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            att = json.load(f)
+            att_raw = f.read()
+        att = json.loads(att_raw)
     except (OSError, json.JSONDecodeError):
         return None
-    return att if isinstance(att, dict) else None
+    if not isinstance(att, dict):
+        return None
+    if cfg is not None and _sink_required(cfg):
+        ok_r, _why = _sink_receipt_bound(run_dir, "release_sink_receipt.json", att_raw)
+        if not ok_r:
+            sys.stderr.write(
+                "dark-factory: release approval ignored — required off-box sink receipt "
+                f"missing/unbound ({_why}); the irreversible action stays gated.\n")
+            return None
+    return att
 
 
 def _authenticate_manifest(cfg, control_root, run_dir):
@@ -5949,14 +6214,20 @@ def _resolve_ship_action_creds(action):
     return df_creds.load_credentials({"source": "env", "allowlist": list(env_names)})
 
 
-def _anchor_ship_record(cfg, control_root, run_dir, run_id, record_text, kind):
+def _anchor_ship_record(cfg, control_root, run_dir, run_id, record_text, kind,
+                        push_offbox=True):
     """Anchor a ship-phase sidecar (the ship record or the release attestation)
     into the tamper-evident per-control-root hash chain, and push it off-box if
     an audit sink is configured — mirroring attach_custody. `kind` is 'ship' or
     'release'; the chain key is uniquified so repeated ship attempts (pending →
     attach → ship) each anchor without colliding. Best-effort on the audit key
     (ship actions may have ALREADY run — never crash after the fact); a required
-    off-box sink failure is surfaced loudly on stderr."""
+    off-box sink failure is surfaced loudly on stderr.
+
+    `push_offbox=False` (M44 RA-02): the caller ALREADY performed the required
+    off-box push fail-closed (attach_release), so this only anchors the local
+    chain and does NOT push again (a second push to the same append-only key
+    would 409). The 'ship' record path keeps the default best-effort push."""
     audit_key = None
     if cfg.get("_audit", {}).get("signing"):
         try:
@@ -5973,6 +6244,8 @@ def _anchor_ship_record(cfg, control_root, run_dir, run_id, record_text, kind):
     except (df_audit_chain.ChainError, OSError) as e:
         sys.stderr.write(f"dark-factory: WARNING — could not anchor the {kind} record into the "
                          f"audit chain ({e}).\n")
+    if not push_offbox:
+        return
     sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
     if sink.get("kind", "none") != "none":
         try:
@@ -6086,7 +6359,7 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
     # The live approval view (invariant #3): the SEALED policy from config + the
     # attached attestation (or none). covers() RE-VERIFIES every call.
     approval_ctx = df_release.ApprovalContext(
-        attestation=_load_release_attestation(run_dir),
+        attestation=_load_release_attestation(run_dir, cfg),
         approvers=ship_cfg["approval"]["approvers"],
         threshold=ship_cfg["approval"]["threshold"],
         run_id=run_id, artifact_object_id=artifact_object_id)
@@ -6246,6 +6519,27 @@ def attach_release(control_root, run_dir):
                          "refused — re-run under the intended config\n")
         return 3
 
+    # M44 RA-03: a release approval authorizes irreversible ship ACTIONS for a
+    # QUALIFIED run only — it must never stand on a run that failed a gate/exam.
+    # Mirror _ship_eligible's qualification requirement (the ship phase also
+    # enforces it) so an ineligible run cannot even collect an approval that
+    # would imply it is a ship candidate.
+    _rtier = manifest_obj.get("tier")
+    if _rtier == "enterprise":
+        _release_eligible = (manifest_obj.get("outcome") == "CUSTODY_PENDING"
+                             and _precustody_substates(manifest_obj)["qualified"]
+                             and _final_exam_ok(manifest_obj))
+    else:
+        _release_eligible = (manifest_obj.get("outcome") == "COMPLETE_QUALIFIED"
+                             and manifest_obj.get("qualified") is True)
+    if not _release_eligible:
+        sys.stderr.write(
+            f"dark-factory: release attach refused — run is not a qualified ship candidate "
+            f"(outcome {manifest_obj.get('outcome')!r}, qualified="
+            f"{manifest_obj.get('qualified')!r}); a release approval cannot qualify a run "
+            "that failed a gate/exam.\n")
+        return 3
+
     approval_path = os.path.join(control_root, RELEASE_APPROVAL_FILE)
     if not os.path.exists(approval_path):
         sys.stderr.write(f"dark-factory: {RELEASE_APPROVAL_FILE} not found in the control root — "
@@ -6310,8 +6604,6 @@ def attach_release(control_root, run_dir):
                 if al not in satisfied_set:
                     satisfied_set.append(al)
 
-        df_release.record_nonce(control_root, nonce, run_id=run_id,
-                                artifact_object_id=object_id, applied_at=_now())
         attestation = {
             "attestation_version": "1",
             "claim": claim,
@@ -6321,8 +6613,35 @@ def attach_release(control_root, run_dir):
             "ts": _now(),
         }
         att_text = canonical_json(attestation)
+
+        # M44 RA-02: push the release approval off-box FIRST. On a REQUIRED sink
+        # failure, roll back fail-closed — do NOT record the one-time nonce or
+        # write the attestation, so an approval whose off-box record never left
+        # the box cannot authorize an irreversible ship (and its nonce stays
+        # unconsumed for a retry once the sink is reachable). No sink / optional
+        # sink is byte-compatible with the pre-M44 flow.
+        release_chain_key = f"{run_id}.release"
+        push_status, receipt, detail = _push_qualification_offbox(
+            cfg, release_chain_key, att_text)
+        if push_status == "required_fail":
+            sys.stderr.write(
+                f"dark-factory: RELEASE NOT ATTESTED — the REQUIRED audit sink push FAILED "
+                f"({detail}); no attestation written and the approval nonce was not consumed. "
+                f"Fix the sink and re-run df-release attach.\n")
+            return 3
+        if push_status == "optional_fail":
+            sys.stderr.write(f"dark-factory: audit sink push warning (not required): {detail}\n")
+
+        df_release.record_nonce(control_root, nonce, run_id=run_id,
+                                artifact_object_id=object_id, applied_at=_now())
         atomic_write(os.path.join(run_dir, RELEASE_ATTESTATION_FILE), att_text)
-        _anchor_ship_record(cfg, control_root, run_dir, run_id, att_text, "release")
+        # Anchor into the tamper-evident chain; the off-box push (if any) already
+        # happened above, so do NOT push again (append-only key would 409).
+        _anchor_ship_record(cfg, control_root, run_dir, run_id, att_text, "release",
+                            push_offbox=False)
+        if receipt is not None:
+            atomic_write(os.path.join(run_dir, "release_sink_receipt.json"),
+                         canonical_json(receipt))
         scope = claim.get("action_names")
         print(f"dark-factory: RELEASE ATTESTED — {reason}; scope="
               f"{scope!r}; nonce recorded. Now ship:\n"

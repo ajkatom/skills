@@ -204,15 +204,35 @@ reading `QUALIFIED` the moment the underlying object drifts.
 `attach` reads the immutable manifest and the collected signatures, runs
 `verify_custody(manifest_bytes, sigs, config-approvers, config-threshold)`, and:
 
-- **≥K distinct valid approver signatures** → writes
+- **≥K distinct valid approver signatures over an ELIGIBLE manifest** → pushes
+  the attestation **off-box first** to the required audit sink, then writes
   `<run_dir>/custody_attestation.json` =
   `{manifest_sha256, threshold, approvers_satisfied, signatures, qualified: true, ts}`,
   anchors it into the per-control-root hash chain (`audit-chain.jsonl`,
-  the M13 tamper-evident chain), **and pushes it off-box** to the required audit
-  sink (fail-closed: a `required` sink that can't be reached aborts `attach` with
-  exit 3, so the single most security-relevant event — qualification — always
-  leaves the box). A `custody_sink_receipt.json` records the push. Exit 0.
+  the M13 tamper-evident chain), and records the push in a
+  `custody_sink_receipt.json` bound to the exact attestation bytes. Exit 0.
 - **fewer than K** → prints PENDING, writes **no** attestation, exit 3.
+
+**Eligibility gate (M44 RA-03).** K-of-N alone does NOT qualify. Before it will
+attest, `attach` requires the manifest to be genuinely eligible: `outcome ==
+CUSTODY_PENDING` AND its own pre-custody evidence holds — final exam passed (or
+no final cohort), `security.failed == []`, and every qualification substate
+(barrier ∧ host_isolation ∧ control_plane ∧ app_security ∧ waiver_validity,
+recomputed from the sealed manifest via `df_qualify`). A signed-but-ineligible
+manifest — `SECURITY_GATE_FAILED`, `HOST_ISOLATION_LIMITED`, a failed final
+exam, or any non-`CUSTODY_PENDING` outcome — is **refused (exit 3), never
+attested**. `verify-custody` re-checks the same eligibility.
+
+**Required-sink fail-closed + rollback (M44 RA-02).** The off-box push happens
+**before** the local attestation is written or chain-anchored. If the required
+sink is unreachable, `attach` returns exit 3 leaving **no** local attestation,
+**no** chain link, and **no** receipt — the run is not locally qualifiable
+(the pre-M44 bug wrote + anchored the attestation first, then returned 3,
+leaving a locally-`QUALIFIED` run). `verify-custody` correspondingly REQUIRES
+the bound `custody_sink_receipt.json` whenever the sealed config's
+`audit.sink.required` is true; its absence is a distinct `SINK_RECEIPT_MISSING`
+verdict, never a silent `QUALIFIED`. The same off-box-first + eligibility
+discipline applies to `df-waiver attach` and `df-release attach`.
 
 The manifest is never modified.
 
