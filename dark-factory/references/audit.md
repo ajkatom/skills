@@ -343,3 +343,19 @@ re-run gates, seal via `df_qualify.derive`) with NO builder re-dispatch
 (`SHIP_RESUME` journaled). `resume --decision abort` from `AWAIT_SHIP` seals a
 distinct **`SHIP_DECLINED`** terminal (qualified `False`) that still binds the
 frozen artifact object, so the declined candidate stays auditable.
+
+## `authored_by` manifest field (M40)
+
+When the hidden scenarios were written by an **agent** author (a `roles.author`
+block, see `references/authoring.md`), every terminal manifest carries
+`authored_by = {adapter, adapter_sha256, same_model_ack}` — the independent
+author adapter's path + content hash, and whether the different-model guarantee
+was explicitly waived (`same_model_ack: true` means the author was allowed to
+be the SAME model as the builder, a weaker guarantee an auditor should notice).
+For a human-authored control root (no `roles.author`) the field is `null` —
+byte-identical to pre-M40 on every terminal, including the pre-build aborts.
+`authored_by` records only WHO wrote the scenarios, never their content; the
+authoring step's own control-plane journal (`<control_root>/authored.jsonl`,
+`AUTHORED_SCENARIOS`) likewise records adapter/attempts/counts only. The
+barrier is unchanged: agent-authored scenarios seal through the exact path
+human-authored ones do, so `run` and `verify-manifest` are untouched.

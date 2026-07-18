@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Deterministic fake AUTHOR adapter that emits a NON-DISCRIMINATING (inert)
+scenario set every time -- a tautological {"stdout_contains": ""} that passes
+regardless of the build. Used to prove author-scenarios rejects a bad set
+fail-closed (exit 2, no scenarios installed) even after bounded retries."""
+import json
+import os
+import sys
+
+SCENARIOS = {"scenarios": [
+    {"behavior_id": "BHV-001", "cohort": "dev",
+     "run": ["python3", "greet.py", "World"],
+     "then": {"stdout_contains": ""}, "title": "inert one"},
+    {"behavior_id": "BHV-002", "cohort": "dev",
+     "run": ["python3", "greet.py"],
+     "then": {"stdout_contains": ""}, "title": "inert two"},
+]}
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    with open(os.path.join(wd, "scenarios.json"), "w", encoding="utf-8") as f:
+        json.dump(SCENARIOS, f)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

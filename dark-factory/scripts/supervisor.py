@@ -20,6 +20,7 @@ import uuid
 import df_audit
 import df_audit_chain
 import df_audit_sink
+import df_author
 import df_brownfield
 import df_confine
 import df_container
@@ -2743,10 +2744,16 @@ def init_cmd(control_root: str, answers_path: str, force: bool = False, force_ke
         return 2
 
     cfg = load_config(control_root)
-    scenarios = load_scenarios(os.path.join(control_root, "scenarios"))
     behaviors = df_gates.load_behaviors(control_root) or []
-    dev_n = sum(1 for s in scenarios if s.get("cohort", "dev") == "dev")
-    final_n = sum(1 for s in scenarios if s.get("cohort") == "final")
+    # M40: a scenarios-pending-author scaffold validated as structurally OK
+    # (validate_scaffold set scenarios_pending) but has NO scenario files yet.
+    # Print the pending summary + the author-scenarios next step instead of
+    # loading a scenario set that doesn't exist.
+    pending = report.get("scenarios_pending")
+    if not pending:
+        scenarios = load_scenarios(os.path.join(control_root, "scenarios"))
+        dev_n = sum(1 for s in scenarios if s.get("cohort", "dev") == "dev")
+        final_n = sum(1 for s in scenarios if s.get("cohort") == "final")
 
     print(f"dark-factory: init OK -- control root {control_root}")
     print(f"  config.json     assurance={cfg['assurance']}  autonomy={cfg['autonomy']}")
@@ -2754,13 +2761,244 @@ def init_cmd(control_root: str, answers_path: str, force: bool = False, force_ke
         print(f"  ** NOT enterprise-qualified ** {cfg['enterprise_downgrade_note']}")
     print("  spec.md         (builder-visible; no scenario content)")
     print(f"  behaviors.json  {len(behaviors)} behavior(s): {', '.join(b['id'] for b in behaviors)}")
-    print(f"  scenarios/      {len(scenarios)} scenario(s) ({dev_n} dev, {final_n} final/sealed)")
-    print("Run:")
-    print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
+    if pending:
+        author_adapter = cfg.get("roles", {}).get("author", {}).get("adapter", "<unset>")
+        print("  scenarios/      PENDING -- an agent author will write them "
+              "(scenarios_pending_author marker present)")
+        print("Next: have the author agent write the hidden scenarios:")
+        print(f"  python3 {os.path.abspath(__file__)} author-scenarios --control-root {control_root}")
+        print(f"  (author adapter, a DIFFERENT model than the builder: {author_adapter})")
+        print("Then, after reviewing scenarios/*.json:")
+        print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
+    else:
+        print(f"  scenarios/      {len(scenarios)} scenario(s) ({dev_n} dev, {final_n} final/sealed)")
+        print("Run:")
+        print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
     print("Prerequisites:")
     for line in _init_prerequisite_lines(cfg):
         print(line)
     return 0
+
+
+def _author_review_confirm(normalized: list) -> bool:
+    """--review gate: print every generated scenario (id/behavior/cohort/title
+    + the literal run/then, control-plane only -- these never reach the
+    builder) and require an interactive 'yes' before install. Honors the
+    documented "human review is RECOMMENDED" limitation without forcing it
+    (off by default). A non-tty stdin or anything but an explicit yes is a
+    fail-closed decline -- authoring never installs an unreviewed set under
+    --review."""
+    print("dark-factory: author-scenarios --review -- generated scenarios "
+          "(NOT yet installed):")
+    for sc in normalized:
+        print(f"  [{sc['id']}] behavior={sc['behavior_id']} cohort={sc['cohort']} "
+              f"title={sc.get('title', '')!r}")
+        print(f"      run:  {sc['when']['run']}")
+        print(f"      then: {json.dumps(sc['then'], sort_keys=True)}")
+    try:
+        answer = input("Install these scenarios? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in ("y", "yes")
+
+
+def author_scenarios_cmd(control_root: str, attempts: int = 3, review: bool = False) -> int:
+    """CLI body for `author-scenarios` (M40): an AGENT author (a different
+    model than the builder, enforced at config load) writes the hidden
+    scenarios into a scaffolded, scenarios-pending control root.
+
+    Flow: load config (must have roles.author) -> load spec.md + behaviors.json
+    -> invoke the author adapter in a FRESH scratch workdir (role="author") ->
+    parse its scenarios.json -> validate through the IDENTICAL init gates
+    (discrimination/coverage/spec-leak/shape). On a validation failure, re-invoke
+    with impoverished, barrier-safe feedback up to `attempts` times. On success,
+    ATOMICALLY install one file per scenario into <control_root>/scenarios/ (the
+    same layout df_init.scaffold produces), clear the pending marker LAST (the
+    commit point -- a crash before it leaves `run` still fail-closed), and journal
+    an AUTHORED_SCENARIOS control-plane event (adapter/attempts/counts -- NEVER
+    scenario content). Exhausted attempts => exit 2, control root left with NO
+    scenarios (never a bad partial set). The barrier is byte-for-byte unchanged:
+    scenarios seal via the existing path and `run` is untouched.
+    """
+    control_root = os.path.abspath(control_root)
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: author-scenarios: config error: {e}\n")
+        return 2
+
+    author = cfg.get("_author")
+    if author is None:
+        sys.stderr.write(
+            "dark-factory: author-scenarios: no roles.author configured in "
+            f"{control_root}/config.json -- add a roles.author block (a DIFFERENT "
+            "adapter than roles.builder) and re-run\n")
+        return 2
+
+    scenarios_dir = os.path.join(control_root, "scenarios")
+    existing = (
+        [n for n in os.listdir(scenarios_dir) if n.endswith(".json")]
+        if os.path.isdir(scenarios_dir) else []
+    )
+    if existing:
+        # Never clobber an already-populated scenarios/ -- whether human- or a
+        # prior author-written. Re-authoring is an explicit, destructive act the
+        # operator must do by clearing scenarios/ (and restoring the pending
+        # marker) themselves; this command only FILLS an empty set.
+        sys.stderr.write(
+            "dark-factory: author-scenarios: control root already has "
+            f"{len(existing)} scenario file(s) -- refusing to overwrite. Clear "
+            "scenarios/ (and re-scaffold pending) to re-author.\n")
+        return 2
+
+    spec_path = os.path.join(control_root, "spec.md")
+    if not os.path.exists(spec_path):
+        sys.stderr.write(f"dark-factory: author-scenarios: missing spec: {spec_path}\n")
+        return 2
+    spec_text = open(spec_path, encoding="utf-8").read()
+
+    try:
+        behaviors = df_gates.load_behaviors(control_root)
+    except df_gates.GateError as e:
+        sys.stderr.write(f"dark-factory: author-scenarios: behaviors.json error: {e}\n")
+        return 2
+    if not behaviors:
+        sys.stderr.write(
+            "dark-factory: author-scenarios: behaviors.json declares no behaviors "
+            "-- there is nothing for an author to write scenarios for\n")
+        return 2
+
+    adapter = author["adapter"]
+    timeout_s = author["timeout_s"]
+    if attempts < 1:
+        attempts = 1
+
+    journal = Journal(os.path.join(control_root, "authored.jsonl"))
+
+    feedback = None
+    for attempt in range(1, attempts + 1):
+        workdir = tempfile.mkdtemp(prefix="df-author-")
+        try:
+            prompt = df_author.compose_author_prompt(spec_text, behaviors,
+                                                     attempt_feedback=feedback)
+            prompt_file = os.path.join(workdir, "AUTHOR_PROMPT.md")
+            atomic_write(prompt_file, prompt)
+
+            resp, err = invoke_adapter(adapter, "author", workdir, prompt_file, timeout_s)
+            if err or resp.get("status") != "ok":
+                # An adapter TRANSPORT/environment failure (missing CLI, crash,
+                # protocol mismatch) is deterministic across attempts -- retrying
+                # it just re-hits the same wall. Fail closed immediately, distinct
+                # from a retryable content failure below.
+                detail = err or resp.get("detail", "")
+                journal.write("AUTHORED_SCENARIOS_ABORTED", adapter=adapter,
+                              attempt=attempt, reason="adapter_error", detail=detail[:500])
+                sys.stderr.write(
+                    f"dark-factory: author-scenarios: author adapter failed on attempt "
+                    f"{attempt}: {detail}\n")
+                return 2
+
+            try:
+                scenarios_raw = df_author.parse_author_output(workdir)
+            except df_author.AuthorError as e:
+                # A garbage/missing scenarios.json IS content the author can fix
+                # -- feed the shape complaint back and retry (bounded).
+                report = _empty_author_report()
+                report["schema_errors"] = [str(e)]
+                feedback = report
+                journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
+                              attempt=attempt, ok=False, reason="parse_error")
+                sys.stderr.write(
+                    f"dark-factory: author-scenarios: attempt {attempt} produced "
+                    f"unusable output ({e})\n")
+                continue
+
+            ok, report, normalized = df_author.validate_authored(
+                scenarios_raw, spec_text, behaviors)
+            journal.write("AUTHORED_SCENARIOS_ATTEMPT", adapter=adapter,
+                          attempt=attempt, ok=ok, counts=report["counts"])
+
+            if not ok:
+                feedback = report
+                sys.stderr.write(
+                    f"dark-factory: author-scenarios: attempt {attempt} FAILED validation:\n")
+                for line in df_author._feedback_lines(report):
+                    sys.stderr.write(f"  - {line}\n")
+                continue
+
+            # Validated. Optional human review BEFORE anything is installed.
+            if review and not _author_review_confirm(normalized):
+                journal.write("AUTHORED_SCENARIOS_DECLINED", adapter=adapter,
+                              attempt=attempt, counts=report["counts"])
+                sys.stderr.write(
+                    "dark-factory: author-scenarios: review declined -- NO scenarios "
+                    "installed (control root still pending)\n")
+                return 2
+
+            _install_authored_scenarios(control_root, scenarios_dir, normalized)
+            journal.write("AUTHORED_SCENARIOS", adapter=adapter,
+                          adapter_sha256=(sha256_file(adapter)
+                                          if os.path.exists(adapter) else None),
+                          same_model_ack=author["same_model_ack"],
+                          attempts=attempt, counts=report["counts"])
+            print(f"dark-factory: author-scenarios OK -- {report['counts']['scenarios']} "
+                  f"scenario(s) ({report['counts']['dev']} dev, "
+                  f"{report['counts']['final']} final) installed into {scenarios_dir}")
+            print(f"  authored by (independent model): {adapter}"
+                  + ("  [same-model ack]" if author["same_model_ack"] else ""))
+            print("Review the generated scenarios/*.json, then run:")
+            print(f"  python3 {os.path.abspath(__file__)} run --control-root {control_root}")
+            return 0
+        finally:
+            # The author's scratch workdir is discarded after extraction -- it is
+            # a pre-run artifact that must never persist or reach the builder.
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    sys.stderr.write(
+        f"dark-factory: author-scenarios: exhausted {attempts} attempt(s) without a "
+        "valid scenario set -- fail-closed, NO scenarios installed (control root "
+        "still pending)\n")
+    return 2
+
+
+def _empty_author_report() -> dict:
+    """A zero-valued validate_authored-shaped report, for the parse-error retry
+    path (which has no normalized scenarios to report counts over)."""
+    return {
+        "schema_errors": [],
+        "non_discriminating_titles": [],
+        "uncovered_behaviors": [],
+        "orphan_titles": [],
+        "spec_leak_values": [],
+        "counts": {"scenarios": 0, "dev": 0, "final": 0},
+    }
+
+
+def _install_authored_scenarios(control_root: str, scenarios_dir: str, normalized: list) -> None:
+    """Atomically install a VALIDATED author scenario set into `scenarios_dir`
+    (same one-file-per-scenario layout df_init.scaffold produces), then clear
+    the pending marker LAST. Staging + per-file os.replace + marker-removal-last
+    means a crash mid-install never yields a bad PARTIAL set that `run` would
+    accept: the pending marker stays until every file has landed, so `run`
+    keeps fail-closing until the install fully commits."""
+    os.makedirs(scenarios_dir, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".df-author-stage-", dir=control_root)
+    try:
+        for sc in normalized:
+            staged = os.path.join(staging, f"{sc['id']}.json")
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump(sc, f, indent=2)
+                f.write("\n")
+        for sc in normalized:
+            os.replace(os.path.join(staging, f"{sc['id']}.json"),
+                       os.path.join(scenarios_dir, f"{sc['id']}.json"))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    # Commit point: with every scenario file now in place, drop the marker so a
+    # subsequent `run` proceeds. Removed last, on purpose (see docstring).
+    marker = os.path.join(control_root, df_init.PENDING_MARKER)
+    if os.path.exists(marker):
+        os.remove(marker)
 
 
 def run(control_root: str, project_src, allow_downgrade: bool = False,
@@ -2772,6 +3010,16 @@ def run(control_root: str, project_src, allow_downgrade: bool = False,
         sys.stderr.write(f"dark-factory: config error: {e}\n")
         return 2
     cfg["_control_root"] = control_root
+
+    # M40: a control root scaffolded pending an agent author has no scenarios
+    # yet -- fail closed BEFORE touching the lock/run_dir. The barrier makes a
+    # scenario-less run meaningless (nothing to verify against), so this is a
+    # clean refusal naming the exact next step, not a silent no-op.
+    if df_init.is_scenarios_pending(control_root):
+        sys.stderr.write(
+            "dark-factory: no scenarios; run author-scenarios first "
+            f"(scenarios pending an author for {control_root})\n")
+        return 2
 
     try:
         lock = acquire_lock(control_root)
@@ -3012,6 +3260,21 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # forked_at} so EVERY terminal manifest of a forked child records its
         # provenance.
         "lineage": fork_seed if fork_seed else None,
+        # Additive (M40): if the hidden scenarios were written by an AGENT
+        # author (roles.author configured), record WHICH independent model and
+        # whether the different-model guarantee was waived -- so an audit shows
+        # the scenarios were agent-written, by which adapter, and (fail-open on
+        # snooping only under an explicit ack) the same_model_ack. None for a
+        # human-authored control root (no roles.author) -- byte-identical to
+        # pre-M40 on every terminal manifest, including the pre-build aborts.
+        # Config-known, so seeded here alongside credentials/mode/custody.
+        "authored_by": (
+            {"adapter": cfg["_author"]["adapter"],
+             "adapter_sha256": (sha256_file(cfg["_author"]["adapter"])
+                                if os.path.exists(cfg["_author"]["adapter"]) else None),
+             "same_model_ack": cfg["_author"]["same_model_ack"]}
+            if cfg.get("_author") else None
+        ),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -4727,6 +4990,16 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
             # Additive (DF-01/M28a Task 2): see the matching seed + comment
             # in the fresh-run manifest_base above.
             "artifact": None,
+            # Additive (M40): same config-known "fresh + resume" threading as
+            # credentials -- a resumed run of an agent-authored control root
+            # still records WHICH independent model wrote the scenarios.
+            "authored_by": (
+                {"adapter": cfg["_author"]["adapter"],
+                 "adapter_sha256": (sha256_file(cfg["_author"]["adapter"])
+                                    if os.path.exists(cfg["_author"]["adapter"]) else None),
+                 "same_model_ack": cfg["_author"]["same_model_ack"]}
+                if cfg.get("_author") else None
+            ),
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -5085,6 +5358,18 @@ def main():
     p_run.add_argument("--allow-downgrade", action="store_true",
                        help="if standard tier is unavailable/probe fails, downgrade to "
                             "cooperative (unqualified) instead of failing closed")
+    p_author = sub.add_parser(
+        "author-scenarios",
+        help="M40: have the configured roles.author agent (a DIFFERENT model than "
+             "the builder) write the hidden scenarios into a scenarios-pending "
+             "control root")
+    p_author.add_argument("--control-root", required=True)
+    p_author.add_argument("--attempts", type=int, default=3,
+                          help="max author invocations (bounded retry on impoverished, "
+                               "barrier-safe feedback); default 3")
+    p_author.add_argument("--review", action="store_true",
+                          help="print each generated scenario and require interactive "
+                               "confirmation before install (off by default)")
     p_ver = sub.add_parser("verify-manifest", help="check a run's audit manifest")
     p_ver.add_argument("--run-dir", required=True)
     p_ver.add_argument("--key-path", default=None,
@@ -5228,6 +5513,9 @@ def main():
     if args.cmd == "init":
         sys.exit(init_cmd(args.control_root, args.answers, force=args.force,
                           force_keep=args.force_keep))
+    elif args.cmd == "author-scenarios":
+        sys.exit(author_scenarios_cmd(args.control_root, attempts=args.attempts,
+                                      review=args.review))
     elif args.cmd == "run":
         sys.exit(run(args.control_root, args.project_src, allow_downgrade=args.allow_downgrade))
     elif args.cmd == "verify-manifest":

@@ -73,6 +73,20 @@ root to fail confusingly later.
   runs a build (it prints the `run` command instead). See
   `references/authoring.md` for the full interview and scenario-writing
   guidance.
+- **Offer agent-authored scenarios (M40).** If the user doesn't want to hand-
+  write the hidden scenarios, an **agent** can — with the same barrier. The
+  human still owns `spec.md` + `behaviors.json`; the agent (a **different
+  model than the builder**, enforced fail-closed) writes only
+  `scenarios/*.json`. Set `answers.author_adapter` (a path to any protocol-0.1
+  adapter distinct from `builder_adapter`) and supply behaviors with **zero**
+  scenarios; `init` scaffolds a scenarios-pending control root, then
+  `supervisor.py author-scenarios --control-root <cr> [--review]` has the
+  agent write them (validated through the identical discrimination/coverage/
+  spec-leak gates, bounded retry on impoverished feedback, fail-closed).
+  `run` refuses until they're installed. The manifest records `authored_by`.
+  Reviewing the generated scenarios stays RECOMMENDED — the gates prove
+  discrimination/coverage/no-leak but cannot prove intent-fit. See
+  `references/authoring.md` ("Agent-authored scenarios").
 
 This on-ramp only produces the control-plane files; the rest of this
 skill's workflow (running, checkpoints, tiers, security gates, etc.) is
