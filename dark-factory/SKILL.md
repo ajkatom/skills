@@ -99,9 +99,19 @@ root to fail confusingly later.
   different-model agent (`answers.critic_adapter`, distinct from BOTH builder and
   author, fail-closed) adversarially reviews the authored set; blocking findings
   drive a bounded revision loop, and advisories (likely-missing requirements) are
-  written to `scenario_review.md` for the operator, NEVER auto-applied. The
-  honest residual after M42: human spec/behavior fidelity + non-functional
-  properties the oracle can't express. See `references/scenario-adequacy.md`.
+  written to `scenario_review.md` for the operator, NEVER auto-applied. See
+  `references/scenario-adequacy.md`.
+- **Offer property / fuzz scenarios (M43a).** A scenario can assert an
+  INVARIANT over MANY generated inputs (`when.property`: declarative seeded
+  generators + a fixed invariant vocabulary — round_trip / idempotent /
+  deterministic / robust / error_contract / monotonic), catching the bugs a
+  fixed example can't (round-trip integrity, idempotency, "never crashes /
+  fails cleanly on malformed input"). Deterministic (required `seed`),
+  bounded (cases ≤ 500 + timeouts), barrier-preserving (a counterexample is
+  control-plane only; feedback carries just `property_violated`). Honest
+  residual after M42+M43a: human spec/behavior fidelity; concurrency lands in
+  M43b; perf/load/scale stays a separate tool, permanently. See
+  `references/scenario-format.md` (the `when.property` section).
 
 This on-ramp only produces the control-plane files; the rest of this
 skill's workflow (running, checkpoints, tiers, security gates, etc.) is

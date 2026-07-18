@@ -7,7 +7,14 @@ given/when/then, no observed output, no model call.
 """
 import re
 
-TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash", "no_twin_evidence")
+# M43a adds "property_violated": a property scenario's invariant failed on
+# some generated case. The taxonomy value is the ENTIRE signal that crosses
+# the barrier -- the counterexample (the generated input/value) is
+# scenario-grade secret and lives only in the control-plane verifier report;
+# validate_feedback's ALLOWED_FAILURE keyset structurally guarantees no other
+# field could smuggle it here.
+TAXONOMY = ("wrong_exit_code", "wrong_output", "timeout", "crash", "no_twin_evidence",
+            "property_violated")
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
 ALLOWED_TOP = {"feedback_version", "channel", "total", "failing_count", "failures"}
 ALLOWED_FAILURE = {"behavior_id", "taxonomy"}

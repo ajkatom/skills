@@ -363,8 +363,11 @@ def test_is_discriminating_true_for_combined_output_and_twin_assertion():
 # ---------------------------------------------------------------------------
 
 def test_taxonomy_includes_no_twin_evidence():
+    # M43a appended "property_violated" (still a FIXED, value-free vocabulary
+    # -- this test pins the exact tuple so any accidental widening is caught).
     assert id_feedback.TAXONOMY == (
-        "wrong_exit_code", "wrong_output", "timeout", "crash", "no_twin_evidence")
+        "wrong_exit_code", "wrong_output", "timeout", "crash", "no_twin_evidence",
+        "property_violated")
 
 
 def test_taxonomy_no_twin_evidence_is_a_valid_feedback_value():

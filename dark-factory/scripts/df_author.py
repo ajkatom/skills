@@ -134,6 +134,46 @@ Field rules (a scenario that breaks any of these is REJECTED, not repaired):
   the spec actually promises.
 - Cover EVERY declared behavior with at least one dev scenario.
 
+### Property / fuzz scenarios (OPTIONAL — invariants a fixed example can't check)
+A scenario MAY replace `run` with `property` (and its `then` is then EXACTLY
+`{"invariant": {...}}` — no other assertion keys). The verifier generates MANY
+inputs from your declarative spec and checks the invariant on every one:
+
+    {"behavior_id": "BHV-...", "cohort": "dev", "class": "failure",
+     "property": {
+       "generate": {"vars": {"k": {"kind": "string", "charset": "alnum",
+                                    "min_len": 1, "max_len": 16},
+                              "bad": {"kind": "malformed", "base": "k"}},
+                    "cases": 25, "seed": 1234},
+       "steps": [{"run": ["python3", "app.py", "put", "{k}", "{bad}"]}],
+       "timeout_s": 10},
+     "then": {"invariant": {"name": "error_contract"}},
+     "title": "rejects malformed values cleanly"}
+
+- `generate.vars` kinds (FIXED vocabulary, never code): `int{min,max}`,
+  `string{charset: ascii_printable|alnum|unicode|bytes, min_len, max_len}`,
+  `json{shape: scalar|scalar_or_object|array}`, `choice{options: [...]}`, and
+  `malformed{base: <var-or-literal>}` (adversarial variants of a base value —
+  the fuzz workhorse). `cases` (1..500) and an int `seed` are REQUIRED — the
+  run is deterministic and replayable from the seed.
+- `steps` are the same run/http actions as normal scenarios; `{var}` is
+  substituted with the generated value (every placeholder must be a declared
+  var).
+- `then.invariant.name` (FIXED vocabulary): `round_trip` (a later step's
+  output reflects the value an earlier step set; args {"value": "<var>",
+  "observe_step": <idx>}), `idempotent` (repeating the terminal step changes
+  nothing), `deterministic` (a second execution matches the first), `robust`/
+  `never_crashes` (no crash/signal-death/stack-trace/5xx on ANY generated
+  input), `error_contract` (malformed input fails CLEANLY: non-zero exit +
+  error on stderr, or 4xx + an error body — never a crash, never silent
+  acceptance), `monotonic`/`sorted` (output ordering).
+- Use `class: "failure"` or `"boundary"` for fuzz/robustness properties —
+  that is what they exercise. A behavior that parses or stores EXTERNAL input
+  should normally carry a `robust` or `error_contract` property.
+- A vacuous invariant is REJECTED (e.g. `round_trip` over a var whose
+  generator can emit the empty string — it could never fail). Make the
+  generated inputs able to violate the invariant on a wrong implementation.
+
 Output ONLY the `scenarios.json` file. Do not write any other file, and do not
 attempt to implement the specification — that is the builder's job, not yours.
 """
@@ -329,18 +369,36 @@ def _normalize(scenarios_raw, declared_ids):
             continue
 
         run = sc.get("run")
-        if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
-            schema_errors.append(f"{label}: 'run' must be a non-empty list of strings")
+        prop = sc.get("property")
+        # M43a: an authored scenario carries EXACTLY ONE of run/property
+        # (the property kind's deep shape -- generate/steps/invariant -- is
+        # validated below by the SAME run_scenarios._validate the installed
+        # set passes at load time, so a malformed property is a collected
+        # schema error driving one retry, never a landmine at run time).
+        if (run is None) == (prop is None):
+            schema_errors.append(
+                f"{label}: must have exactly one of 'run' or 'property'")
             continue
+        if prop is not None:
+            if not isinstance(prop, dict):
+                schema_errors.append(f"{label}: 'property' must be an object")
+                continue
+            when = {"property": prop}
+            ir_version = "0.4"
+        else:
+            if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
+                schema_errors.append(f"{label}: 'run' must be a non-empty list of strings")
+                continue
+            timeout_s = sc.get("timeout_s", 10)
+            if not isinstance(timeout_s, int) or isinstance(timeout_s, bool) or timeout_s < 1:
+                schema_errors.append(f"{label}: 'timeout_s' must be a positive int")
+                continue
+            when = {"run": list(run), "timeout_s": timeout_s}
+            ir_version = "0.1"
 
         then = sc.get("then")
         if not isinstance(then, dict) or not then:
             schema_errors.append(f"{label}: 'then' must be a non-empty object")
-            continue
-
-        timeout_s = sc.get("timeout_s", 10)
-        if not isinstance(timeout_s, int) or isinstance(timeout_s, bool) or timeout_s < 1:
-            schema_errors.append(f"{label}: 'timeout_s' must be a positive int")
             continue
 
         cd = counters.setdefault(bid, {"dev": 0, "final": 0})
@@ -349,14 +407,14 @@ def _normalize(scenarios_raw, declared_ids):
         sc_id = f"{bid}-{suffix}{cd[cohort]}"
 
         normalized.append({
-            "ir_version": "0.1",
+            "ir_version": ir_version,
             "id": sc_id,
             "behavior_id": bid,
             "cohort": cohort,
             "class": cls,
             "title": title,
             "given": sc.get("given", ""),
-            "when": {"run": list(run), "timeout_s": timeout_s},
+            "when": when,
             "then": then,
         })
 

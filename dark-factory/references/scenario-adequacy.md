@@ -156,12 +156,27 @@ does NOT claim to cross these two ceilings — state them plainly:
   (advisories), but a machine cannot invent your intent. If the spec omits a
   requirement, no gate can conjure it; the critic can only flag the likely
   omission for a human to confirm.
-- **Oracle non-functional ceiling** — load, scale, latency-SLA, and real-traffic
-  concurrency are not expressible as input→output scenarios and stay out. This
-  is a *tooling* boundary, not a human-input one. A later **M43** could add
-  property / fuzz / bounded-concurrency scenarios to push the oracle ceiling
-  further; **perf / scale / real-traffic remains a separate tool**, out of scope
-  here.
+- **Oracle non-functional ceiling — pushed by M43a, honestly restated.**
+  **M43a** (the `when.property` kind, `references/scenario-format.md`) closes
+  the fixed-example gap M42 documented: generative property / metamorphic /
+  robustness(fuzz) scenarios now catch round-trip, idempotency, determinism,
+  and "never crashes / honors the error contract on malformed input" bugs a
+  single example can't. A property scenario's sharpness is *invariant
+  discrimination* (`df_invariants.invariant_is_discriminating` — a vacuous,
+  always-true invariant configuration is gate-flagged pre-build, exactly like
+  an inert `then`), and property scenarios count toward class coverage like
+  any other (a fuzz property is naturally `failure`/`boundary`). The barrier
+  is preserved with the same discipline: the generated counterexample and the
+  invariant/expected-output secret stay control-plane (feedback is
+  behavior-id + `property_violated` only). Note the honest boundary — a
+  candidate STEP may persist its generated INPUT into the workspace as
+  ordinary state (`put {k} {v}` → `store.json`), exactly as a fixed input
+  already does; that is safe because a property invariant is generic (holds
+  for all inputs), so a leaked input is not gameable. What
+  REMAINS out: **bounded-concurrency** scenarios (races, lost updates) are
+  **M43b**, built on the same generative engine; **perf / load / scale /
+  latency-SLA / real-traffic remains a separate tool** — a correctness
+  oracle cannot honestly express them — permanently out of scope here.
 
 - **Class labels are self-declared, not semantically verified.** The adequacy
   gate checks class COVERAGE *structurally* — that each behavior carries a
@@ -177,10 +192,12 @@ does NOT claim to cross these two ceilings — state them plainly:
   scenarios it rests on author judgment (and the recommended human review). The
   gate guarantees the SHAPE of coverage, not the intent behind each label.
 
-So after M42, for an oracle-expressible service, the residual reduces to exactly
-"did the human spec/behaviors capture the requirement" + "is it a non-functional
-property the oracle can't express" (plus the self-declared-label caveat above,
-backstopped by the critic for agent-authored runs).
+So after M42 + M43a, for an oracle-expressible service, the residual reduces to
+"did the human spec/behaviors capture the requirement" + "is it concurrency
+(M43b) or perf/load/scale (a different tool, permanently out)" (plus the
+self-declared-label caveat above, backstopped by the critic for agent-authored
+runs). The human spec-fidelity residual is UNCHANGED by M43a — no generated
+input can prove the spec captured intent.
 
 ## Manifest record (`adequacy`)
 

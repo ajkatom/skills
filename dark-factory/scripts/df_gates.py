@@ -32,6 +32,7 @@ import json
 import os
 import re
 
+import df_invariants
 import run_scenarios
 
 _BEHAVIOR_ID_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
@@ -483,11 +484,31 @@ def is_discriminating(then: dict) -> bool:
     return sharpness(then)["passed"]
 
 
+def sharpness_scenario(sc: dict) -> dict:
+    """Scenario-level sharpness dispatch (M43a). A run/http scenario's
+    sharpness is the `then` mutant battery above. A PROPERTY scenario's
+    sharpness is INVARIANT DISCRIMINATION (df_invariants) -- the invariant
+    must reject a constructed violating-observation battery, so a vacuous
+    (always-true) configuration (e.g. round_trip over a var that can generate
+    the empty string) is gate-flagged, not silently green. Discrimination
+    needs the `generate` spec (the round_trip vacuity sweep samples the
+    scenario's own seeded cases), which is why this dispatch is
+    scenario-level, not then-level. Same report shape either way
+    ({passed, killed, total, survivors}), so the M7 gate and author feedback
+    treat every scenario kind uniformly."""
+    if "property" in sc.get("when", {}):
+        return df_invariants.invariant_is_discriminating(
+            sc["then"]["invariant"], sc["when"]["property"]["generate"])
+    return sharpness(sc["then"])
+
+
 def validate_oracle(scenarios: list) -> list[str]:
-    """Return the sorted list of scenario ids whose `then` is NOT sharp (a
-    near-miss mutant survived). Same signature + fail-closed role as before;
-    the check underneath is the M42 battery, not the single compound mutant."""
-    return sorted(sc["id"] for sc in scenarios if not sharpness(sc["then"])["passed"])
+    """Return the sorted list of scenario ids whose oracle is NOT sharp (a
+    near-miss mutant / violating observation survived). Same signature +
+    fail-closed role as before; the check underneath is the M42 battery for
+    run/http scenarios and (M43a) invariant discrimination for property
+    scenarios."""
+    return sorted(sc["id"] for sc in scenarios if not sharpness_scenario(sc)["passed"])
 
 
 def sharpness_survivors(scenarios: list) -> dict:
@@ -495,7 +516,7 @@ def sharpness_survivors(scenarios: list) -> dict:
     (barrier-safe category labels only). Empty dict iff all sharp."""
     out = {}
     for sc in scenarios:
-        rep = sharpness(sc["then"])
+        rep = sharpness_scenario(sc)
         if not rep["passed"]:
             out[sc["id"]] = rep["survivors"]
     return out
@@ -506,7 +527,7 @@ def sharpness_manifest(scenarios: list) -> dict:
     scenario count, the WEAKEST kill count seen, and the ids of any scenarios
     that still have survivors (empty on a passing gate, since the gate refuses
     to build otherwise)."""
-    reports = {sc["id"]: sharpness(sc["then"]) for sc in scenarios}
+    reports = {sc["id"]: sharpness_scenario(sc) for sc in scenarios}
     min_killed = min((r["killed"] for r in reports.values()), default=0)
     weakest = sorted(i for i, r in reports.items() if not r["passed"])
     return {
@@ -533,8 +554,11 @@ def check_adequacy(behaviors: list[dict], scenarios: list[dict], policy: dict) -
 
     Only scenarios whose behavior_id is DECLARED contribute (orphans are the
     coverage gate's concern, not adequacy's). A scenario with no `class`
-    counts as happy (scenario_class). Report is barrier-safe: behavior ids +
-    class names + integer counts only, never any `then` content."""
+    counts as happy (scenario_class). Property scenarios (M43a) count toward
+    class coverage exactly like run/http ones -- a fuzz/robustness property is
+    naturally a `failure`/`boundary` scenario, so a policy requiring those
+    classes is satisfiable by properties. Report is barrier-safe: behavior
+    ids + class names + integer counts only, never any `then` content."""
     required = list(policy.get("required_classes") or ["happy"])
     min_per = int(policy.get("min_per_class", 1))
     declared_ids = {b["id"] for b in behaviors}

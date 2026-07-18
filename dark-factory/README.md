@@ -11,9 +11,13 @@ barrier, by an independent **author** agent (a different model than the
 builder) — and those agent-authored scenarios can be class-typed
 (happy/boundary/failure), sharpness-proven (each assertion must reject a battery
 of near-miss mutants), and adversarially critiqued by a **second** decorrelated
-model, narrowing the gap to human spec fidelity + non-functional properties the
-oracle can't express — see `references/authoring.md` and
-`references/scenario-adequacy.md`.
+model. Scenarios can also be **generative** (`when.property`, M43a): assert an
+invariant — round-trip, idempotency, determinism, "never crashes / fails
+cleanly" — over many seeded, machine-generated (including malformed/fuzz)
+inputs, with any counterexample kept control-plane-only. That narrows the gap
+to human spec fidelity + concurrency (M43b) + perf/load/scale (a separate
+tool) — see `references/authoring.md`, `references/scenario-adequacy.md`, and
+`references/scenario-format.md`.
 
 Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](../docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md).
 Full operational instructions (the doc Claude itself follows when running

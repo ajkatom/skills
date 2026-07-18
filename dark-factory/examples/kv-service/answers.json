@@ -63,6 +63,53 @@
             "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
             "[[\"PUT\", \"/kv/color\", \"{\\\"value\\\": \\\"blue\\\"}\"]]"
           ]
+        },
+        {
+          "id": "BHV-PUT-P1",
+          "cohort": "dev",
+          "class": "boundary",
+          "title": "round-trip property: any generated key/value comes back from a get",
+          "given": "M43a worked example -- put then get in ONE process (module-level store); the stored value must appear in the get response, for every generated pair",
+          "property": {
+            "generate": {
+              "vars": {
+                "k": {
+                  "kind": "string",
+                  "charset": "alnum",
+                  "min_len": 1,
+                  "max_len": 16
+                },
+                "v": {
+                  "kind": "string",
+                  "charset": "alnum",
+                  "min_len": 4,
+                  "max_len": 24
+                }
+              },
+              "cases": 25,
+              "seed": 20260717
+            },
+            "steps": [
+              {
+                "run": [
+                  "python3",
+                  "-c",
+                  "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
+                  "[[\"PUT\", \"/kv/{k}\", \"{\\\"value\\\": \\\"{v}\\\"}\"], [\"GET\", \"/kv/{k}\"]]"
+                ]
+              }
+            ],
+            "timeout_s": 10
+          },
+          "then": {
+            "invariant": {
+              "name": "round_trip",
+              "args": {
+                "value": "v",
+                "observe_step": 0
+              }
+            }
+          }
         }
       ]
     },
@@ -207,6 +254,48 @@
             "import json,sys,app\nst,b=0,''\nfor op in json.loads(sys.argv[1]):\n    st,b=app.handle(op[0],op[1],op[2] if len(op)>2 else None)\nprint(st)\nprint(b)\n",
             "[[\"PUT\", \"/kv/x\", \"{\\\"novalue\\\": 1}\"]]"
           ]
+        },
+        {
+          "id": "BHV-VALIDATION-P1",
+          "cohort": "dev",
+          "class": "failure",
+          "title": "fuzz property: handle() never crashes on malformed PUT bodies",
+          "given": "M43a worked example -- adversarial variants of a valid body (bit-flip/truncate/oversize/wrong-type/control-chars/injection/empty) are fed as the raw body; a correct app answers 400 per the spec, and must NEVER raise",
+          "property": {
+            "generate": {
+              "vars": {
+                "k": {
+                  "kind": "string",
+                  "charset": "alnum",
+                  "min_len": 1,
+                  "max_len": 8
+                },
+                "bad": {
+                  "kind": "malformed",
+                  "base": "{\"value\": \"ok\"}"
+                }
+              },
+              "cases": 30,
+              "seed": 424242
+            },
+            "steps": [
+              {
+                "run": [
+                  "python3",
+                  "-c",
+                  "import sys,app\nst,b=app.handle(\"PUT\",\"/kv/\"+sys.argv[1],sys.argv[2])\nprint(st)\nprint(b)\n",
+                  "{k}",
+                  "{bad}"
+                ]
+              }
+            ],
+            "timeout_s": 10
+          },
+          "then": {
+            "invariant": {
+              "name": "robust"
+            }
+          }
         }
       ]
     },
