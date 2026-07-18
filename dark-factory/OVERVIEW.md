@@ -120,6 +120,12 @@ Some are always on, some optional:
   and to plug in a shared knowledge base if you have one.
 - A signed, tamper-evident **paper trail** of every run, so you can prove
   later exactly what happened and that nobody edited the record afterward.
+- Optionally, a governed **ship phase**: once a run is qualified, it can run
+  your own ship steps (merge, deploy, migrate) on the sealed artifact — audited,
+  crash-safe, and able to roll back on failure. The reversible ones run on their
+  own; anything **irreversible** (a prod deploy) won't run until an authorized
+  person **signs off** — even a fully unattended run stops and waits for that
+  signature rather than pushing to production on its own.
 
 ## What each reference doc covers
 

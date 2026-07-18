@@ -21,6 +21,11 @@ _MEMORY_RE = re.compile(r"^[0-9]+[bkmg]$")
 _CRED_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROBE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# M41: a ship-action name is a slug (it names an action in the release claim's
+# `action_names`, in the ship journal, and in the sealed ship record — so it
+# must be stable, greppable, and free of anything that could be confused with a
+# path or shell token). Deliberately narrower than a free string.
+_SHIP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # M33a (DF-06): at these tiers the security gates are MANDATORY — a run cannot
 # reach COMPLETE_QUALIFIED with them off (supervisor folds app_security into
@@ -1021,6 +1026,224 @@ def load_config(control_root: str) -> dict:
                     "audit.key_path must live outside both the control root and "
                     "workspace_root (the signing key must never be reachable by a run)")
 
+    # M41: optional `ship` block -> cfg["_ship"]: the governed post-seal action
+    # runner (references/ship.md). Absent -> None, and the workflow ends at the
+    # sealed artifact EXACTLY as today (byte-identical). Each action is plain
+    # operator argv (git/kubectl/deploy scripts) — this module validates SHAPE
+    # only; df_ship executes them, gated by qualification (invariant #1),
+    # ordering, the signature gate (df_release), brokered creds, audit, and
+    # rollback. SECURITY posture mirrors the M33a waiver / M36b resume-override
+    # rules exactly: an irreversible action forces a SIGNED release approval
+    # policy AND assurance: hardened|enterprise AND audit.signing.
+    ship_raw = raw.get("ship")
+    if ship_raw is not None:
+        if not isinstance(ship_raw, dict):
+            raise ConfigError("ship must be a JSON object")
+
+        actions_raw = ship_raw.get("actions")
+        if not isinstance(actions_raw, list) or not actions_raw:
+            raise ConfigError("ship.actions must be a non-empty list")
+
+        cfg_ship_actions = []
+        seen_action_names = set()
+        any_irreversible = False
+        for action in actions_raw:
+            if not isinstance(action, dict):
+                raise ConfigError(f"ship.actions entries must be objects: {action!r}")
+
+            a_name = action.get("name")
+            if not isinstance(a_name, str) or not _SHIP_NAME_RE.match(a_name):
+                raise ConfigError(
+                    f"ship.actions[].name must match {_SHIP_NAME_RE.pattern!r}: {a_name!r}")
+            if a_name in seen_action_names:
+                raise ConfigError(
+                    f"ship.actions has a duplicate name (names must be unique): {a_name!r}")
+            seen_action_names.add(a_name)
+
+            a_run = action.get("run")
+            if (not isinstance(a_run, list) or not a_run
+                    or not all(isinstance(x, str) for x in a_run)):
+                raise ConfigError(
+                    f"ship.actions[{a_name!r}].run must be a non-empty list of strings")
+
+            # `reversible` is REQUIRED and must be a real bool — no default, so
+            # nothing is ever ACCIDENTALLY treated as reversible (an operator
+            # must consciously declare an action's blast radius). `bool` is an
+            # `int` subclass, so isinstance(x, bool) accepts True/False only.
+            a_reversible = action.get("reversible")
+            if not isinstance(a_reversible, bool):
+                raise ConfigError(
+                    f"ship.actions[{a_name!r}].reversible is REQUIRED and must be a bool "
+                    "(true|false) — declare an action's reversibility explicitly; there is "
+                    "no default so nothing is silently treated as reversible")
+
+            a_rollback = action.get("rollback")
+            if a_rollback is not None:
+                if (not isinstance(a_rollback, list) or not a_rollback
+                        or not all(isinstance(x, str) for x in a_rollback)):
+                    raise ConfigError(
+                        f"ship.actions[{a_name!r}].rollback must be a non-empty list of strings "
+                        "when present")
+
+            # creds: env-var NAMES only (resolved host-side by df_creds at action
+            # time), NEVER an inline value — same posture as credential_proxy
+            # .token_env and credentials.allowlist. A key that looks like it
+            # carries a literal secret is refused loudly.
+            a_creds_env = []
+            a_creds = action.get("creds")
+            if a_creds is not None:
+                if not isinstance(a_creds, dict):
+                    raise ConfigError(f"ship.actions[{a_name!r}].creds must be a JSON object")
+                for banned in ("value", "values", "token", "secret", "password"):
+                    if banned in a_creds:
+                        raise ConfigError(
+                            f"ship.actions[{a_name!r}].creds.{banned} is a raw secret value and "
+                            "is not allowed inline; list env-var NAMES in creds.env instead "
+                            f"(each matching {_CRED_NAME_RE.pattern!r}), resolved host-side")
+                env_raw = a_creds.get("env")
+                if env_raw is not None:
+                    if (not isinstance(env_raw, list) or not env_raw
+                            or not all(isinstance(x, str) for x in env_raw)):
+                        raise ConfigError(
+                            f"ship.actions[{a_name!r}].creds.env must be a non-empty list of "
+                            "env-var name strings")
+                    seen_env = set()
+                    for env_name in env_raw:
+                        if not _CRED_NAME_RE.match(env_name):
+                            raise ConfigError(
+                                f"ship.actions[{a_name!r}].creds.env entries must be env-var "
+                                f"NAMES matching {_CRED_NAME_RE.pattern!r} (a literal secret is "
+                                f"refused): {env_name!r}")
+                        if env_name in seen_env:
+                            raise ConfigError(
+                                f"ship.actions[{a_name!r}].creds.env has a duplicate: {env_name!r}")
+                        seen_env.add(env_name)
+                        a_creds_env.append(env_name)
+
+            a_timeout = action.get("timeout_s")
+            if (not isinstance(a_timeout, int) or isinstance(a_timeout, bool)
+                    or not (1 <= a_timeout <= 3600)):
+                raise ConfigError(
+                    f"ship.actions[{a_name!r}].timeout_s must be an int in 1..3600")
+
+            # Optional cwd, RELATIVE to the materialized ship workspace and
+            # path-safe: no absolute path, no `..` traversal, no `~`. df_ship
+            # re-checks containment before use (belt-and-suspenders).
+            a_cwd = action.get("cwd")
+            if a_cwd is not None:
+                if not isinstance(a_cwd, str) or not a_cwd:
+                    raise ConfigError(
+                        f"ship.actions[{a_name!r}].cwd must be a non-empty relative path string")
+                if (os.path.isabs(a_cwd) or a_cwd.startswith("~")
+                        or ".." in a_cwd.replace("\\", "/").split("/")):
+                    raise ConfigError(
+                        f"ship.actions[{a_name!r}].cwd must be a RELATIVE, path-safe subpath of "
+                        f"the ship workspace (no absolute path, no '..', no '~'): {a_cwd!r}")
+
+            if not a_reversible:
+                any_irreversible = True
+            cfg_ship_actions.append({
+                "name": a_name,
+                "run": list(a_run),
+                "reversible": a_reversible,
+                "rollback": list(a_rollback) if a_rollback is not None else None,
+                "creds": {"env": a_creds_env},
+                "timeout_s": a_timeout,
+                "cwd": a_cwd,
+            })
+
+        # ship.approval — the K-of-N release-approval policy that gates every
+        # irreversible action (df_release). Shape mirrors `custody` /
+        # `resume_overrides` exactly (64-hex ed25519 pubkeys, unique, threshold
+        # 1..len). Absent -> empty (threshold 0), the fail-closed default:
+        # threshold 0 is NEVER satisfiable in df_release.verify_release, so no
+        # approval is ever accepted unless a policy is explicitly configured.
+        approval_raw = ship_raw.get("approval")
+        ship_approvers = []
+        ship_threshold = 0
+        if approval_raw is not None:
+            if not isinstance(approval_raw, dict):
+                raise ConfigError("ship.approval must be a JSON object")
+            approvers_raw = approval_raw.get("approvers", [])
+            if not isinstance(approvers_raw, list):
+                raise ConfigError(
+                    "ship.approval.approvers must be a list of 64-hex-char ed25519 public keys")
+            ship_seen = set()
+            for entry in approvers_raw:
+                if not isinstance(entry, str) or not _HEX64_RE.match(entry):
+                    raise ConfigError(
+                        "ship.approval.approvers entries must be 64-hex-char ed25519 public "
+                        f"keys: {entry!r}")
+                canonical = entry.lower()
+                if canonical in ship_seen:
+                    raise ConfigError(
+                        "ship.approval.approvers has a duplicate entry (approvers must be "
+                        f"unique): {entry!r}")
+                ship_seen.add(canonical)
+                ship_approvers.append(canonical)
+            ship_threshold = approval_raw.get("threshold", 0)
+            if ship_approvers:
+                if (not isinstance(ship_threshold, int) or isinstance(ship_threshold, bool)
+                        or not (1 <= ship_threshold <= len(ship_approvers))):
+                    raise ConfigError(
+                        "ship.approval.threshold must be an int in 1.."
+                        f"{len(ship_approvers)} (the number of approvers)")
+            else:
+                if ship_threshold:
+                    raise ConfigError(
+                        "ship.approval.threshold requires a non-empty approvers list")
+                ship_threshold = 0
+
+        # An irreversible action with NO one able to approve it is an
+        # unshippable dead end — refuse at load, never at ship time. And an
+        # irreversible prod push off an unqualified-isolation tier is refused:
+        # a reversible:false action requires assurance: hardened|enterprise.
+        if any_irreversible:
+            if not ship_approvers or ship_threshold < 1:
+                raise ConfigError(
+                    "a ship action with reversible:false requires a ship.approval policy with "
+                    "threshold>=1 and approver public keys (you cannot have an irreversible "
+                    "action that no one is able to sign off on)")
+            if tier not in ("hardened", "enterprise"):
+                raise ConfigError(
+                    "a ship action with reversible:false requires assurance: hardened or "
+                    "enterprise (an irreversible prod action off an unqualified-isolation tier "
+                    "is refused)")
+
+        # SECURITY (mirrors M33a waivers / M36b resume-overrides): a NON-EMPTY
+        # release-approval policy REQUIRES a SIGNED audit manifest. The approver
+        # allowlist + threshold that decide who may authorize an irreversible
+        # ship live in config.json, and every terminal manifest seals
+        # config_sha256; that seal is only tamper-PROOF when the manifest is
+        # HMAC-signed. Without signing, an actor with control-root write could
+        # append their OWN pubkey to ship.approval.approvers, self-sign a
+        # release, and ship an irreversible prod action. So: force signing
+        # whenever approvers are configured — an EXPLICIT false is rejected, an
+        # absent/defaulted-false is forced ON (same key_path defaulting +
+        # disjointness guard as the audit/waiver blocks).
+        if ship_approvers:
+            if audit_raw.get("signing") is False:
+                raise ConfigError(
+                    "ship.approval requires audit.signing: true so the sealed config (hence the "
+                    "release-approver allowlist) is HMAC-protected — an unsigned manifest's "
+                    "config_sha256 can be forged by anyone with control-root write")
+            if not audit_signing:
+                audit_signing = True
+                if not audit_key_path:
+                    audit_key_path = os.path.expanduser("~/.dark-factory/audit.key")
+                key_dir = os.path.dirname(os.path.abspath(audit_key_path))
+                if not _disjoint(key_dir, control_root) or not _disjoint(key_dir, ws):
+                    raise ConfigError(
+                        "audit.key_path must live outside both the control root and "
+                        "workspace_root (the signing key must never be reachable by a run)")
+
+        cfg_ship = {
+            "actions": cfg_ship_actions,
+            "approval": {"approvers": ship_approvers, "threshold": ship_threshold},
+        }
+    else:
+        cfg_ship = None
+
     # Optional `credentials` block -> cfg["_credentials"] (M11): a brokered
     # allowlist of provider credentials the builder is permitted to receive.
     # Absent -> None (exactly today's behavior at every tier). Validated here
@@ -1479,6 +1702,10 @@ def load_config(control_root: str) -> dict:
     cfg["_custody"] = cfg_custody
     cfg["_proxy"] = cfg_proxy
     cfg["_enterprise"] = cfg_enterprise
+    # M41: the governed ship-action runner policy (or None). df_ship executes
+    # it after a run qualifies; the supervisor wires the phase + df_release
+    # gate. Absent -> None -> workflow ends at the sealed artifact (byte-identical).
+    cfg["_ship"] = cfg_ship
     # M40: resolved author role (or None) -- the supervisor's `author-scenarios`
     # subcommand reads it, and `_run_locked` seals it into the manifest's
     # `authored_by` field so an audit shows the scenarios were agent-written and

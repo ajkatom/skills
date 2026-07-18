@@ -65,6 +65,28 @@ invariant). M36b adds the **seal-reentry** resume path to do exactly that:
   (qualified `False`) that still binds the frozen artifact object (the declined
   candidate stays auditable) — not `ABORTED_BY_HUMAN`.
 
+## The ship phase in H4 lights-out (M41)
+
+The before-ship gate above governs whether to **enter** shipping. The *ship
+phase itself* (M41, `references/ship.md`) — running operator ship actions on the
+qualified artifact — runs the same way in every mode; the difference is only the
+signature gate on irreversible actions:
+
+- **Reversible actions run straight through, unattended**, in H4 exactly as in
+  H1–H3. After a qualified seal (H3/H4 straight-through, or the H1/H2
+  before-ship approval), reversible ship actions execute with no further human
+  step.
+- **An irreversible (`reversible:false`) action never runs unattended.** The
+  FIRST irreversible action with no covering signed release approval seals
+  **`SHIP_APPROVAL_PENDING`** — the run STAYS `qualified`, nothing irreversible
+  ran, and the phase does not block. A `df-release attach` + a subsequent
+  `supervisor.py ship … --run-dir …` then runs the gated action. This holds in
+  H4: **lights-out does the *doing*, but a human is accountable for an
+  irreversible prod action via a one-time signature, never by running the
+  command.** (`SHIP_APPROVAL_PENDING` is the ship-phase analogue of enterprise's
+  `CUSTODY_PENDING`: a fail-closed "authorized human input required" terminal
+  that never silently proceeds and never blocks.)
+
 Under **H1** a converging run therefore pauses up to three times per final
 cycle: `AWAIT_VERIFY_i`, `AWAIT_BUILD_{i+1}`, then `AWAIT_SHIP`. Under **H2**
 (the default) it pauses at `AWAIT_VERIFY_i` and then `AWAIT_SHIP`. This is a

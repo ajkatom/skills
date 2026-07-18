@@ -34,8 +34,10 @@ import df_notify
 import df_override
 import df_proxy
 import df_qualify
+import df_release
 import df_sandbox
 import df_seal
+import df_ship
 import df_security
 import df_twins
 import df_waiver
@@ -3933,6 +3935,17 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         print(f"dark-factory: CONVERGED "
               f"({'qualified, ' + eff if qualified else 'unqualified, cooperative'} tier). "
               f"Workspace: {workspace}  Run: {run_dir}{note}")
+        # M41: auto-enter the governed ship phase after a CLEAN qualified seal
+        # (invariant #1: only COMPLETE_QUALIFIED + qualified ships here;
+        # enterprise seals CUSTODY_PENDING and never reaches this branch — it
+        # ships via the `ship` subcommand after df-custody attach). Only when the
+        # audit anchor already succeeded (a run that couldn't record its own
+        # qualification off-box must not go on to ship). In H4 lights-out this
+        # runs unattended; the irreversible-action signature gate still holds.
+        if (not anchor_exit and outcome == "COMPLETE_QUALIFIED" and qualified
+                and cfg.get("_ship") is not None):
+            return _ship_phase(cfg, cfg["_control_root"], run_dir, redactor, creds,
+                               decision="continue")
         return anchor_exit or 0
 
     def _resume_ship_seal():
@@ -5339,6 +5352,711 @@ def migrate_config_cmd(control_root) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# M41: the governed SHIP phase (references/ship.md).
+#
+# Runs ONLY after a run is QUALIFIED (invariant #1). Acts on a fresh workspace
+# MATERIALIZED from the sealed artifact object, re-verified by identity
+# (invariant #2). Irreversible actions require a valid, live, K-of-N SIGNED
+# release approval (df_release) — absent/invalid ⇒ SHIP_APPROVAL_PENDING, never
+# run, never block, in EVERY mode incl. H4 (invariant #3). Crash-safe via the
+# M35 reserve-before pattern journaled to a SEPARATE ship_journal.jsonl
+# (invariant #4: journal.jsonl is SEALED at finalize and must never be appended
+# to). Rollback-in-reverse on failure (invariant #5). Brokered cred values reach
+# only the child env; captured logs are redacted (invariant #6). The sealed
+# ship record + the release attestation live in SEPARATE sidecars anchored into
+# the tamper-evident audit chain — the immutable manifest is NEVER rewritten and
+# `qualified` is NOT re-opened by shipping (a SHIP_FAILED run stays qualified).
+# ---------------------------------------------------------------------------
+SHIP_JOURNAL_FILE = "ship_journal.jsonl"
+SHIP_RESULT_FILE = "ship_result.json"
+RELEASE_APPROVAL_FILE = "release-approval.json"        # collected in the control root
+RELEASE_ATTESTATION_FILE = "release_attestation.json"  # written per run_dir by attach
+
+
+def _ship_journal_events(run_dir):
+    """Read the ship crash-safety journal (SEPARATE from the sealed
+    journal.jsonl). Returns a list of event dicts, or [] if absent. A malformed
+    line raises (fail-closed: a corrupt ship journal must never read as 'no
+    actions ran')."""
+    path = os.path.join(run_dir, SHIP_JOURNAL_FILE)
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _unresolved_ship_action(run_dir):
+    """The M35 reserve-before check, for ship actions. Returns the data dict of
+    the LATEST SHIP_ACTION_INTENT that has NO matching SHIP_ACTION_RESULT (same
+    idempotency_key) — meaning a prior process crashed after journaling+fsyncing
+    the intent but before the action's outcome resolved (its real-world effect
+    is UNKNOWN) — else None. Never a blind re-run of a deploy."""
+    latest_intent = None
+    resolved = set()
+    for e in _ship_journal_events(run_dir):
+        data = e.get("data", {})
+        state = e.get("state")
+        if state == "SHIP_ACTION_INTENT":
+            latest_intent = data
+        elif state == "SHIP_ACTION_RESULT":
+            resolved.add(data.get("idempotency_key"))
+    if latest_intent is not None and latest_intent.get("idempotency_key") not in resolved:
+        return latest_intent
+    return None
+
+
+def _ship_completed_actions(run_dir):
+    """Names of actions with a recorded SHIP_ACTION_RESULT status 'ok' (a prior
+    ship attempt succeeded on them) — recovered so a re-ship SKIPS them, never
+    re-runs a succeeded action."""
+    done = set()
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_ACTION_RESULT" and e.get("data", {}).get("status") == "ok":
+            done.add(e["data"].get("action"))
+    done.discard(None)
+    return done
+
+
+def _load_release_attestation(run_dir):
+    """Load <run_dir>/release_attestation.json (df-release attach output), or
+    None if absent/unreadable/wrong-shape (fail-closed: an unreadable attestation
+    covers nothing, so an irreversible action stays gated)."""
+    path = os.path.join(run_dir, RELEASE_ATTESTATION_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            att = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return att if isinstance(att, dict) else None
+
+
+def _authenticate_manifest(cfg, control_root, run_dir):
+    """Fail-closed: AUTHENTICATE the sealed manifest before ANY of its fields
+    (config_sha256, qualified, outcome, artifact.object_id, the sealed ship
+    policy) may be trusted by the ship phase or df-release attach.
+
+    Runs the full `_verify_manifest_status` check — byte integrity + the HMAC
+    signature (when the run is signed) + artifact-identity re-verification — and
+    requires it to be exactly OK. This authenticates the manifest via the HMAC
+    the whole design depends on (df_config forces audit.signing whenever a
+    ship.approval policy exists, precisely so the sealed approver allowlist is
+    HMAC-pinned): a control-root-write attacker who swaps
+    ship.approval.approvers + edits config_sha256/qualified + recomputes the
+    PLAIN manifest.sha256 leaves the HMAC stale, so this returns TAMPERED and we
+    refuse — the irreversible-action signature gate cannot be bypassed, and an
+    unqualified run cannot be flipped to qualified and shipped.
+
+    Key handling: whenever the run is signed (`audit.signing`, or the manifest's
+    own `audit_signing` flag), the audit key MUST be loadable — an absent/broken
+    key is a fail-closed REFUSAL (never a silent proceed on an unverified
+    manifest), and `_verify_manifest_status(key=None)` on a signed manifest
+    returns UNVERIFIED, which is also refused. Returns (ok, reason)."""
+    manifest_obj = None
+    mp = os.path.join(run_dir, "manifest.json")
+    if os.path.exists(mp):
+        try:
+            manifest_obj = json.loads(open(mp, encoding="utf-8").read())
+        except (OSError, json.JSONDecodeError):
+            manifest_obj = None
+    signed = bool(cfg.get("_audit", {}).get("signing")) or bool(
+        isinstance(manifest_obj, dict) and manifest_obj.get("audit_signing"))
+    key = None
+    if signed:
+        # Use load_key (never create): a signed run's key MUST already exist to
+        # authenticate; an absent/broken key is a fail-closed refusal, so an
+        # approver-configured run can NEVER reach a ship/attach decision on an
+        # unverified manifest.
+        try:
+            key = df_audit.load_key(cfg["_audit"]["key_path"])
+        except df_audit.AuditKeyError as e:
+            return (False, f"the audit signing key is required to authenticate this signed "
+                    f"manifest but could not be loaded ({e}); refusing (fail-closed)")
+    status = _verify_manifest_status(run_dir, key=key,
+                                     object_store=_object_store_root(control_root))
+    if status != _ARTIFACT_OK:
+        return (False, f"manifest failed authentication/verification (verify-manifest: {status}); "
+                "refusing to trust its fields (fail-closed)")
+    return (True, "manifest authenticated")
+
+
+def _ship_eligible(cfg, control_root, run_dir):
+    """Invariant #1: decide whether a run's SEALED artifact may ship.
+
+    Returns (ok, reason, artifact_object_id, run_id). Eligible iff: the manifest
+    AUTHENTICATES (byte integrity + HMAC signature when signed + artifact identity,
+    via _authenticate_manifest — so no manifest field can be trusted until its
+    HMAC is verified); the sealed config_sha256 still equals the current config
+    (policy binding, mirrors custody); AND the run is CLEANLY qualified —
+    non-enterprise: outcome COMPLETE_QUALIFIED AND qualified:true; enterprise: a
+    valid K-of-N custody attestation (verify_custody). A waived-but-limited /
+    custody-pending-without-attestation / unqualified run is refused (never
+    ships)."""
+    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        return (False, "no manifest.json (run has not sealed)", None, None)
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        return (False, f"manifest.json is not valid JSON: {e}", None, None)
+
+    # CRITICAL (M41 review fix): authenticate the manifest BEFORE trusting ANY
+    # field of it. The whole irreversible-action gate + qualification precondition
+    # rests on the sealed config_sha256 (approver allowlist) and the sealed
+    # qualified/outcome — but those are only trustworthy once the manifest's HMAC
+    # is verified. Without this, a control-root-write attacker could swap
+    # ship.approval.approvers, edit config_sha256/qualified to match, recompute
+    # the PLAIN manifest.sha256, leave the HMAC stale, and self-approve an
+    # irreversible ship (or ship an unqualified artifact). This authenticates the
+    # HMAC the design depends on and folds in the artifact-identity re-verify.
+    ok, why = _authenticate_manifest(cfg, control_root, run_dir)
+    if not ok:
+        return (False, why, None, None)
+
+    artifact = manifest_obj.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        return (False, "manifest binds no artifact object (nothing content-addressed to ship)",
+                None, None)
+    object_id = artifact["object_id"]
+
+    bound, sealed_sha, current_sha = _custody_config_bound(cfg, manifest_bytes)
+    if not bound:
+        return (False, f"config.json changed since this run (sealed config_sha256 {sealed_sha} != "
+                f"current {current_sha}); refusing to ship under a drifted policy", None, None)
+
+    run_id = os.path.basename(os.path.abspath(run_dir).rstrip(os.sep))
+    tier = manifest_obj.get("tier")
+    if tier == "enterprise":
+        # Enterprise ships ONLY after df-custody attach qualifies it (invariant
+        # #1). qualification lives in custody_attestation.json, never in the
+        # CUSTODY_PENDING manifest itself.
+        if not verify_custody_cmd(control_root, run_dir):
+            return (False, "enterprise run is not custody-qualified — run df-custody attach "
+                    "(>=K approvers) before shipping", None, None)
+        return (True, "enterprise custody-qualified", object_id, run_id)
+
+    if manifest_obj.get("outcome") == "COMPLETE_QUALIFIED" and manifest_obj.get("qualified") is True:
+        return (True, "qualified", object_id, run_id)
+    return (False,
+            f"run outcome {manifest_obj.get('outcome')!r} (qualified="
+            f"{manifest_obj.get('qualified')!r}) is not a clean qualified artifact — a "
+            "waived/pending/unqualified run never ships", None, None)
+
+
+def _resolve_ship_action_creds(action):
+    """Resolve ONE ship action's `creds.env` NAMES to values, host-side, at
+    action time, via the df_creds broker (source 'env' — the operator's launcher
+    environment). Fail-closed: a missing/empty required var raises CredsError. An
+    action with no creds returns {}. The VALUES returned reach ONLY the child
+    subprocess env (df_ship._child_env) and the per-action Redactor — never the
+    config, journal, manifest, or a captured log."""
+    env_names = (action.get("creds") or {}).get("env") or []
+    if not env_names:
+        return {}
+    return df_creds.load_credentials({"source": "env", "allowlist": list(env_names)})
+
+
+def _anchor_ship_record(cfg, control_root, run_dir, run_id, record_text, kind):
+    """Anchor a ship-phase sidecar (the ship record or the release attestation)
+    into the tamper-evident per-control-root hash chain, and push it off-box if
+    an audit sink is configured — mirroring attach_custody. `kind` is 'ship' or
+    'release'; the chain key is uniquified so repeated ship attempts (pending →
+    attach → ship) each anchor without colliding. Best-effort on the audit key
+    (ship actions may have ALREADY run — never crash after the fact); a required
+    off-box sink failure is surfaced loudly on stderr."""
+    audit_key = None
+    if cfg.get("_audit", {}).get("signing"):
+        try:
+            audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
+        except df_audit.AuditKeyError as e:
+            sys.stderr.write(f"dark-factory: WARNING — could not load audit key to anchor the "
+                             f"{kind} record ({e}); the local sidecar stands unanchored.\n")
+            return
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    chain_key = f"{run_id}.{kind}.{uuid.uuid4().hex[:8]}"
+    try:
+        df_audit_chain.append_entry(chain_path, chain_key, sha256_str(record_text), _now(),
+                                    audit_key)
+    except (df_audit_chain.ChainError, OSError) as e:
+        sys.stderr.write(f"dark-factory: WARNING — could not anchor the {kind} record into the "
+                         f"audit chain ({e}).\n")
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+    if sink.get("kind", "none") != "none":
+        try:
+            receipt = df_audit_sink.push(sink, chain_key, record_text.encode("utf-8"))
+        except df_audit_sink.SinkError as e:
+            if sink.get("required"):
+                sys.stderr.write(f"dark-factory: WARNING — the REQUIRED audit sink push of the "
+                                 f"{kind} record FAILED ({e}); record it off-box manually.\n")
+            else:
+                sys.stderr.write(f"dark-factory: audit sink push warning ({kind}, not "
+                                 f"required): {e}\n")
+        else:
+            atomic_write(os.path.join(run_dir, f"{kind}_sink_receipt.json"),
+                         canonical_json(receipt))
+
+
+def _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                      artifact_object_id, redactor):
+    """Write the SEPARATE, immutable ship record (ship_result.json) + anchor it,
+    and journal the terminal ship event. NEVER rewrites the manifest (qualified
+    stays qualified). Returns the record dict."""
+    record = {
+        "ship_version": "1",
+        "outcome": result["outcome"],
+        "actions": result.get("actions", []),
+        "rollbacks": result.get("rollbacks", []),
+        "rollback_failed": bool(result.get("rollback_failed")),
+        "pending_action": result.get("pending_action"),
+        "failed_action": result.get("failed_action"),
+        "ship_workspace_object_id": artifact_object_id,
+        "ts": _now(),
+    }
+    text = _redacted_write(os.path.join(run_dir, SHIP_RESULT_FILE), record, redactor)
+    ship_journal.write(result["outcome"],
+                       actions=[a.get("name") for a in result.get("actions", [])],
+                       rollback_failed=bool(result.get("rollback_failed")),
+                       pending_action=result.get("pending_action"),
+                       failed_action=result.get("failed_action"))
+    _anchor_ship_record(cfg, control_root, run_dir, run_id, text, "ship")
+    return record
+
+
+def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"):
+    """Drive the ship phase for a qualified run_dir. Returns an exit code:
+    0 SHIPPED · 3 SHIP_FAILED/SHIP_APPROVAL_PENDING · 11 SHIP_UNKNOWN_OUTCOME
+    (needs --decision reconcile) · 2 fail-closed refusal. The caller holds the
+    control-root lock. Absent ship policy is a caller error (never reached in
+    normal flow)."""
+    ship_cfg = cfg.get("_ship")
+    if ship_cfg is None:
+        sys.stderr.write("dark-factory: no `ship` block configured; nothing to ship\n")
+        return 2
+
+    ok, reason, artifact_object_id, run_id = _ship_eligible(cfg, control_root, run_dir)
+    if not ok:
+        sys.stderr.write(f"dark-factory: ship refused (fail-closed) — {reason}\n")
+        return 2
+
+    ship_journal = Journal(os.path.join(run_dir, SHIP_JOURNAL_FILE), redactor=redactor)
+
+    # Idempotent terminal: a completed ship never re-ships. SHIP_APPROVAL_PENDING
+    # is NOT terminal (an attach + re-`ship` resumes it), so it falls through.
+    result_path = os.path.join(run_dir, SHIP_RESULT_FILE)
+    if os.path.exists(result_path):
+        try:
+            prior = json.load(open(result_path, encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prior = None
+        if isinstance(prior, dict) and prior.get("outcome") in (df_ship.SHIPPED, df_ship.SHIP_FAILED):
+            print(f"dark-factory: ship already terminal ({prior['outcome']}); "
+                  f"see {result_path}. Not re-shipping.")
+            return 0 if prior["outcome"] == df_ship.SHIPPED else 3
+
+    # Crash-safety (invariant #4): an INTENT with no RESULT is UNKNOWN. Refuse
+    # (exit 11) under plain `continue`; `reconcile` consents to a possible
+    # duplicate; `abort` seals SHIP_FAILED.
+    unresolved = _unresolved_ship_action(run_dir)
+    if unresolved is not None:
+        if decision == "continue":
+            ship_journal.write("SHIP_UNKNOWN_OUTCOME", action=unresolved.get("action"),
+                               idempotency_key=unresolved.get("idempotency_key"))
+            sys.stderr.write(
+                f"dark-factory: ship action {unresolved.get('action')!r} was reserved but did "
+                "not resolve before a crash — its real-world effect is UNKNOWN. Refusing to "
+                "re-run a possibly-applied action. Inspect the target, then `ship --decision "
+                "reconcile` (re-runs, accepting a possible duplicate) or `--decision abort` "
+                "(seals SHIP_FAILED).\n")
+            return UNKNOWN_OUTCOME
+        if decision == "abort":
+            ship_journal.write("SHIP_RECONCILE_ABORT", action=unresolved.get("action"))
+            result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
+                      "failed_action": unresolved.get("action"), "rollbacks": [],
+                      "rollback_failed": False}
+            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                              artifact_object_id, redactor)
+            print("dark-factory: SHIP ABORTED at an unresolved action (sealed SHIP_FAILED).")
+            return 3
+        # reconcile: clear the dangling intent by recording an explicit unknown
+        # RESULT (so the re-scan is satisfied and the action re-runs — it is NOT
+        # in `already_done`), operator consenting to a possible duplicate.
+        ship_journal.write("SHIP_ACTION_RESULT", action=unresolved.get("action"),
+                           idempotency_key=unresolved.get("idempotency_key"),
+                           status="reconciled_unknown", exit=None, timed_out=False)
+        ship_journal.write("SHIP_RECONCILED", action=unresolved.get("action"),
+                           note="operator accepted possible duplicate; re-running")
+        print(f"dark-factory: reconciling unresolved ship action "
+              f"{unresolved.get('action')!r} — re-running (possible duplicate).")
+
+    already_done = _ship_completed_actions(run_dir)
+
+    # The live approval view (invariant #3): the SEALED policy from config + the
+    # attached attestation (or none). covers() RE-VERIFIES every call.
+    approval_ctx = df_release.ApprovalContext(
+        attestation=_load_release_attestation(run_dir),
+        approvers=ship_cfg["approval"]["approvers"],
+        threshold=ship_cfg["approval"]["threshold"],
+        run_id=run_id, artifact_object_id=artifact_object_id)
+
+    # Materialize a FRESH workspace from the SEALED bytes (invariant #2).
+    ship_ws = tempfile.mkdtemp(prefix="df-ship-ws-")
+    try:
+        df_ship.materialize_ship_workspace(_object_store_root(control_root),
+                                           artifact_object_id, ship_ws)
+    except df_ship.ShipError as e:
+        ship_journal.write("SHIP_MATERIALIZE_FAILED", artifact_object_id=artifact_object_id,
+                           detail=str(e))
+        result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
+                  "failed_action": None, "rollbacks": [], "rollback_failed": False}
+        _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                          artifact_object_id, redactor)
+        sys.stderr.write(f"dark-factory: ship failed — {e}\n")
+        return 3
+
+    ship_journal.write("SHIP_STARTED", artifact_object_id=artifact_object_id,
+                       action_count=len(ship_cfg["actions"]),
+                       already_done=sorted(already_done))
+    base_secret_values = list(creds.values()) if creds else []
+    result = df_ship.run_actions(
+        ship_cfg["actions"], ship_ws,
+        approval_ctx=approval_ctx, journal=ship_journal, run_id=run_id,
+        base_env=os.environ.copy(), base_secret_values=base_secret_values,
+        resolve_action_creds=_resolve_ship_action_creds,
+        already_done=already_done,
+        log_dir=os.path.join(run_dir, "ship_logs"),
+        now_fn=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    record = _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                               artifact_object_id, redactor)
+
+    if result["outcome"] == df_ship.SHIPPED:
+        print(f"dark-factory: SHIPPED — {len(result['actions'])} action(s) ran on the sealed "
+              f"artifact {artifact_object_id[:16]}…. Record: {result_path}")
+        return 0
+    if result["outcome"] == df_ship.SHIP_APPROVAL_PENDING:
+        pol = ship_cfg["approval"]
+        manifest_path = os.path.join(run_dir, "manifest.json")
+        print(
+            f"dark-factory: SHIP APPROVAL PENDING — the irreversible action "
+            f"{result['pending_action']!r} needs a signed K-of-N release approval "
+            f"({pol['threshold']} of {len(pol['approvers'])}). The run STAYS qualified; no "
+            f"irreversible action ran. To authorize:\n"
+            f"  supervisor.py df-release sign --manifest {manifest_path} "
+            f"--actions {result['pending_action']} --expires <ISO8601Z> --key-file <privkey>\n"
+            f"collect the {{claim,signatures}} into "
+            f"{os.path.join(control_root, RELEASE_APPROVAL_FILE)} (merge signatures for K>1), "
+            f"then:\n"
+            f"  supervisor.py df-release attach {control_root} --run-dir {run_dir}\n"
+            f"  supervisor.py ship {control_root} --run-dir {run_dir}")
+        return 3
+    # SHIP_FAILED
+    if record.get("rollback_failed"):
+        sys.stderr.write(
+            "dark-factory: SHIP FAILED and a ROLLBACK ITSELF FAILED — infrastructure may be in "
+            f"an inconsistent state. Inspect {os.path.join(run_dir, 'ship_logs')} and the ship "
+            "journal, then intervene MANUALLY.\n")
+    print(f"dark-factory: SHIP FAILED at action {result.get('failed_action')!r} "
+          f"(rollback ran in reverse). The run stays qualified. Record: {result_path}")
+    return 3
+
+
+def ship_cmd(control_root, run_dir, decision="continue"):
+    """`ship` subcommand: run/resume the governed ship phase against a QUALIFIED
+    run as a deliberate, separate step (the ONLY path for an enterprise run,
+    which ships only after df-custody attach; also the resume path for a
+    SHIP_APPROVAL_PENDING or SHIP_UNKNOWN_OUTCOME run)."""
+    control_root = os.path.abspath(control_root)
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    cfg["_control_root"] = control_root
+    if cfg.get("_ship") is None:
+        sys.stderr.write("dark-factory: control root has no `ship` block; nothing to ship\n")
+        return 2
+    run_dir = os.path.abspath(run_dir)
+    if not os.path.isdir(run_dir):
+        sys.stderr.write(f"dark-factory: run-dir not found: {run_dir}\n")
+        return 2
+
+    creds, redactor, creds_err = _resolve_credentials(cfg)
+    if creds_err is not None:
+        sys.stderr.write(f"dark-factory: credentials: {creds_err}\n")
+        return 2
+
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    try:
+        return _ship_phase(cfg, control_root, run_dir, redactor, creds, decision=decision)
+    finally:
+        release_lock(lock)
+
+
+def attach_release(control_root, run_dir):
+    """`df-release attach` — verify the collected {claim, signatures} in
+    <control_root>/release-approval.json against the run's SEALED manifest +
+    SEALED ship.approval policy, and on success write <run_dir>/release_attestation.json
+    (+ record the nonce, + anchor it). Mirrors attach_custody's two-phase shape.
+    Fail-closed on every drift: unqualified run, wrong-artifact/run binding,
+    expired, replayed nonce, config changed, or < threshold distinct approvers."""
+    control_root = os.path.abspath(control_root)
+    run_dir = os.path.abspath(run_dir)
+    manifest_bytes, _manifest_sha = _read_manifest_bytes(run_dir)
+    if manifest_bytes is None:
+        sys.stderr.write(f"dark-factory: no manifest.json in {run_dir}\n")
+        return 3
+    try:
+        manifest_obj = json.loads(manifest_bytes)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"dark-factory: manifest.json is not valid JSON: {e}\n")
+        return 2
+
+    try:
+        cfg = load_config(control_root)
+    except ConfigError as e:
+        sys.stderr.write(f"dark-factory: config error: {e}\n")
+        return 2
+    cfg["_control_root"] = control_root
+    ship_cfg = cfg.get("_ship")
+    if ship_cfg is None or ship_cfg["approval"]["threshold"] < 1:
+        sys.stderr.write("dark-factory: no `ship.approval` policy (threshold>=1) configured; "
+                         "nothing to attach\n")
+        return 2
+
+    # CRITICAL (M41 review fix): authenticate the manifest via its HMAC BEFORE
+    # trusting config_sha256 / artifact / run_id / the sealed policy. An
+    # approver-configured run FORCES audit.signing (df_config), so this always
+    # verifies the HMAC that pins the sealed approver allowlist — a swapped
+    # config.json + re-sha256'd manifest with a stale HMAC is TAMPERED and refused,
+    # so an attacker cannot self-approve an irreversible ship with their own key.
+    ok, why = _authenticate_manifest(cfg, control_root, run_dir)
+    if not ok:
+        sys.stderr.write(f"dark-factory: release attach refused (fail-closed) — {why}\n")
+        return 3
+
+    artifact = manifest_obj.get("artifact")
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
+        sys.stderr.write("dark-factory: manifest binds no artifact object — nothing to approve\n")
+        return 3
+    object_id = artifact["object_id"]  # artifact identity re-verified in _authenticate_manifest
+
+    # Policy binding: the approver allowlist is sealed via config_sha256 — a
+    # post-run config edit fails closed (mirrors custody).
+    bound, sealed_sha, current_sha = _custody_config_bound(cfg, manifest_bytes)
+    if not bound:
+        sys.stderr.write(f"dark-factory: config.json changed since this run (sealed "
+                         f"config_sha256 {sealed_sha} != current {current_sha}); approval "
+                         "refused — re-run under the intended config\n")
+        return 3
+
+    approval_path = os.path.join(control_root, RELEASE_APPROVAL_FILE)
+    if not os.path.exists(approval_path):
+        sys.stderr.write(f"dark-factory: {RELEASE_APPROVAL_FILE} not found in the control root — "
+                         "collect a signed {claim, signatures} there first (df-release sign)\n")
+        return 3
+    try:
+        with open(approval_path, encoding="utf-8") as f:
+            collected = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"dark-factory: unreadable {RELEASE_APPROVAL_FILE}: {e}\n")
+        return 2
+    claim = collected.get("claim") if isinstance(collected, dict) else None
+    signatures = collected.get("signatures") if isinstance(collected, dict) else None
+    if not isinstance(claim, dict) or not isinstance(signatures, list):
+        sys.stderr.write(f"dark-factory: {RELEASE_APPROVAL_FILE} must be "
+                         "{{\"claim\":{{...}},\"signatures\":[...]}}\n")
+        return 2
+
+    run_id = manifest_obj.get("invocation") or os.path.basename(run_dir.rstrip(os.sep))
+    approvers = ship_cfg["approval"]["approvers"]
+    threshold = ship_cfg["approval"]["threshold"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+        lock = acquire_lock(control_root)
+    except LockError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 2
+    try:
+        try:
+            used = df_release.load_used_nonces(control_root)
+        except df_release.ReleaseError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        satisfied, reason, count, nonce = df_release.verify_release(
+            claim=claim, signatures=signatures, approvers=approvers, threshold=threshold,
+            run_id=run_id, artifact_object_id=object_id, now=now, used_nonces=used)
+        if not satisfied:
+            print(f"dark-factory: RELEASE PENDING — not attached ({reason}). Collect "
+                  f">={threshold} distinct approver signatures over the SAME claim, then re-run "
+                  "df-release attach.")
+            return 3
+
+        # Keep only the entries that actually verify against an allowlisted
+        # approver (never a private key; public keys + sigs only).
+        try:
+            signed = df_release.release_signing_bytes(claim)
+        except df_release.ReleaseError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        approver_set = {a.lower() for a in approvers}
+        kept, satisfied_set = [], []
+        for entry in signatures:
+            if not isinstance(entry, dict):
+                continue
+            a, s = entry.get("approver"), entry.get("sig")
+            if not isinstance(a, str) or not isinstance(s, str):
+                continue
+            al = a.lower()
+            if al in approver_set and df_custody.verify_one(al, signed, s):
+                kept.append({"approver": al, "sig": s})
+                if al not in satisfied_set:
+                    satisfied_set.append(al)
+
+        df_release.record_nonce(control_root, nonce, run_id=run_id,
+                                artifact_object_id=object_id, applied_at=_now())
+        attestation = {
+            "attestation_version": "1",
+            "claim": claim,
+            "signatures": kept,
+            "approvers_satisfied": sorted(satisfied_set),
+            "qualified": True,
+            "ts": _now(),
+        }
+        att_text = canonical_json(attestation)
+        atomic_write(os.path.join(run_dir, RELEASE_ATTESTATION_FILE), att_text)
+        _anchor_ship_record(cfg, control_root, run_dir, run_id, att_text, "release")
+        scope = claim.get("action_names")
+        print(f"dark-factory: RELEASE ATTESTED — {reason}; scope="
+              f"{scope!r}; nonce recorded. Now ship:\n"
+              f"  supervisor.py ship {control_root} --run-dir {run_dir}")
+        return 0
+    except df_release.ReleaseError as e:
+        sys.stderr.write(f"dark-factory: {e}\n")
+        return 3
+    finally:
+        release_lock(lock)
+
+
+def _df_release_cli(args):
+    """Dispatch for `df-release` (keygen / sign / attach). keygen delegates to
+    df_custody (an approver key IS an ed25519 keypair). sign recomputes run_id +
+    artifact_object_id FROM the SEALED manifest (never operator-supplied), so an
+    approver can only sign for the exact run+artifact the manifest binds."""
+    if args.release_cmd == "keygen":
+        try:
+            priv, pub = df_custody.generate_keypair()
+        except df_custody.CustodyError as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        if args.out_prefix:
+            atomic_write(args.out_prefix + ".key", priv + "\n")
+            os.chmod(args.out_prefix + ".key", 0o600)
+            atomic_write(args.out_prefix + ".pub", pub + "\n")
+            print(f"dark-factory: wrote {args.out_prefix}.key (private, 0600) + "
+                  f"{args.out_prefix}.pub (public: {pub})")
+        else:
+            print(json.dumps({"private": priv, "public": pub}))
+        return 0
+
+    if args.release_cmd == "attach":
+        return attach_release(args.control_root, args.run_dir)
+
+    if args.release_cmd == "sign":
+        if not os.path.exists(args.manifest):
+            sys.stderr.write(f"dark-factory: manifest not found: {args.manifest}\n")
+            return 2
+        try:
+            with open(args.manifest, "rb") as f:
+                manifest_obj = json.loads(f.read())
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write(f"dark-factory: cannot read manifest: {e}\n")
+            return 2
+        run_id = manifest_obj.get("invocation")
+        artifact = manifest_obj.get("artifact")
+        object_id = artifact.get("object_id") if isinstance(artifact, dict) else None
+        if not isinstance(run_id, str) or not isinstance(object_id, str):
+            sys.stderr.write("dark-factory: manifest lacks invocation/artifact.object_id — a "
+                             "release can only be signed against a sealed, artifact-bound run\n")
+            return 2
+        try:
+            with open(args.key_file, encoding="utf-8") as f:
+                private_hex = f.read().strip()
+        except OSError as e:
+            sys.stderr.write(f"dark-factory: cannot read key file: {e}\n")
+            return 2
+
+        if args.claim_file is not None:
+            # Additional approver: sign the SAME claim (identical nonce/bytes).
+            try:
+                with open(args.claim_file, encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except (OSError, ValueError) as e:
+                sys.stderr.write(f"dark-factory: cannot read --claim file: {e}\n")
+                return 2
+            claim = loaded.get("claim") if isinstance(loaded, dict) and "claim" in loaded else loaded
+            if not isinstance(claim, dict):
+                sys.stderr.write("dark-factory: --claim file has no signable claim object\n")
+                return 2
+            if claim.get("run_id") != run_id or claim.get("artifact_object_id") != object_id:
+                sys.stderr.write("dark-factory: --claim run_id/artifact does not match this "
+                                 "manifest's sealed run+artifact\n")
+                return 2
+        else:
+            expires_dt = df_release._parse_ts(args.expires)
+            if expires_dt is None:
+                sys.stderr.write(f"dark-factory: --expires is not a valid ISO-8601 UTC "
+                                 f"timestamp: {args.expires!r}\n")
+                return 2
+            issued_at = _now()
+            if not (df_release._parse_ts(issued_at) < expires_dt):
+                sys.stderr.write(f"dark-factory: --expires {args.expires!r} is not after the "
+                                 f"issue time {issued_at!r}; the approval would be dead on "
+                                 "arrival\n")
+                return 2
+            if args.all_actions:
+                action_names = df_release.ACTION_WILDCARD
+            else:
+                action_names = [n.strip() for n in (args.actions or "").split(",") if n.strip()]
+            try:
+                df_release.normalize_action_names(action_names)
+            except df_release.ReleaseError as e:
+                sys.stderr.write(f"dark-factory: {e} (use --actions a,b or --all)\n")
+                return 2
+            claim = {
+                "release_version": df_release.RELEASE_VERSION,
+                "run_id": run_id,
+                "artifact_object_id": object_id,
+                "action_names": action_names,
+                "issued_at": issued_at,
+                "expires_at": args.expires,
+                "nonce": uuid.uuid4().hex,
+            }
+        try:
+            signed = df_release.release_signing_bytes(claim)
+            sig = df_custody.sign_manifest(private_hex, signed)
+            approver = df_custody.public_from_private(private_hex)
+        except (df_custody.CustodyError, df_release.ReleaseError) as e:
+            sys.stderr.write(f"dark-factory: {e}\n")
+            return 2
+        print(json.dumps({"claim": claim, "signatures": [{"approver": approver, "sig": sig}]},
+                         indent=2, sort_keys=True))
+        return 0
+
+    return 2
+
+
 def main():
     ap = argparse.ArgumentParser(prog="dark-factory supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -5509,6 +6227,52 @@ def main():
                               "claim) instead of minting a new one, so every approver signs the "
                               "identical nonce/bytes; merge the resulting signatures lists")
 
+    # `ship` — M41: run/resume the governed ship phase against a QUALIFIED run.
+    p_ship = sub.add_parser(
+        "ship",
+        help="run/resume the governed ship phase (operator ship actions) against a "
+             "qualified run; irreversible actions require a signed df-release approval")
+    p_ship.add_argument("control_root")
+    p_ship.add_argument("--run-dir", required=True,
+                        help="the qualified run_dir to ship (under <control_root>/runs)")
+    p_ship.add_argument("--decision", choices=["continue", "reconcile", "abort"],
+                        default="continue",
+                        help="continue (default) · reconcile (accept a possible duplicate after "
+                             "SHIP_UNKNOWN_OUTCOME) · abort (seal SHIP_FAILED at an unresolved action)")
+
+    # `df-release` — M41: the signed release-approval operator CLI (mirror of
+    # df-custody/df-waiver), gating IRREVERSIBLE ship actions. keygen -> sign
+    # -> (collect for K>1 into <control_root>/release-approval.json) -> attach.
+    p_dr = sub.add_parser("df-release",
+                          help="signed K-of-N release approvals for irreversible ship actions "
+                               "(keygen / sign / attach)")
+    dr_sub = p_dr.add_subparsers(dest="release_cmd", required=True)
+    dr_keygen = dr_sub.add_parser("keygen", help="generate a fresh release-approver ed25519 keypair")
+    dr_keygen.add_argument("--out-prefix", default=None,
+                           help="if given, write <prefix>.key (private) + <prefix>.pub (public); "
+                                "otherwise print both to stdout")
+    dr_sign = dr_sub.add_parser(
+        "sign", help="build + sign a release-approval claim bound to a run's SEALED "
+                     "run_id+artifact; prints a {claim, signatures:[{approver,sig}]} file")
+    dr_sign.add_argument("--manifest", required=True, help="path to the run's manifest.json")
+    dr_sign.add_argument("--actions", default=None,
+                         help="comma-separated ship action NAMES this approval covers")
+    dr_sign.add_argument("--all", action="store_true", dest="all_actions",
+                         help="cover EVERY ship action (wildcard scope) instead of --actions")
+    dr_sign.add_argument("--expires", required=True,
+                         help="ISO-8601 UTC expiry, e.g. 2026-09-01T00:00:00Z (approval is void "
+                              "at/after this instant; re-checked at every ship attempt)")
+    dr_sign.add_argument("--key-file", required=True,
+                         help="path to the approver's private key (raw-32-byte hex)")
+    dr_sign.add_argument("--claim", default=None, dest="claim_file",
+                         help="for K>1: sign an EXISTING claim (a prior sign's output) so every "
+                              "approver signs the identical nonce/bytes; merge the signatures lists")
+    dr_attach = dr_sub.add_parser(
+        "attach", help="verify the collected release-approval.json against the sealed run + "
+                       "sealed ship.approval policy and, if satisfied, write release_attestation.json")
+    dr_attach.add_argument("control_root")
+    dr_attach.add_argument("--run-dir", required=True)
+
     args = ap.parse_args()
     if args.cmd == "init":
         sys.exit(init_cmd(args.control_root, args.answers, force=args.force,
@@ -5568,6 +6332,10 @@ def main():
         sys.exit(_df_waiver_cli(args))
     elif args.cmd == "df-override":
         sys.exit(_df_override_cli(args))
+    elif args.cmd == "ship":
+        sys.exit(ship_cmd(args.control_root, args.run_dir, decision=args.decision))
+    elif args.cmd == "df-release":
+        sys.exit(_df_release_cli(args))
 
 
 def _df_override_cli(args) -> int:

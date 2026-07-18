@@ -104,6 +104,18 @@ unchanged below.
    `<path>/dark-factory-runs.md`. If open-brain: you (this session) may read it for
    grounding and, only with the user's OK, `capture_thought` the run outcome — the
    supervisor does not touch MCP. Absence of a KB is never an error.
+   Also ask (optional, default none): should the workflow **continue past the
+   sealed artifact into ship actions** (merge/deploy/migrate)? If yes, add a
+   `ship` block (see `references/ship.md`) — each action is plain operator argv,
+   `reversible` is a REQUIRED per-action bool. **Frame the safety honestly:**
+   ship actions run with real network + credentials and are NOT sandboxed — the
+   protection is that they run only on a *qualified* artifact, on the *sealed*
+   bytes, gated + audited, with rollback. Any **irreversible** action
+   (`reversible:false`) additionally needs `assurance: hardened|enterprise` and a
+   signed K-of-N `ship.approval` policy (which forces `audit.signing`), and will
+   fail-closed to `SHIP_APPROVAL_PENDING` — including under H4 lights-out — until
+   an authorized human signs a `df-release` approval. Credentials are env-var
+   NAMES (`creds.env`) resolved host-side, never values in config/logs.
 2. **Spec.** Interview the user → write `<control_root>/spec.md`. The user
    approves it. Behaviors should be numbered (BHV-001, BHV-002, …).
 3. **Acceptance world — SEPARATE CONTEXT.** Author the holdout scenarios in
@@ -337,6 +349,17 @@ unchanged below.
      The build converged and the artifact is frozen; a human approves the ship.
      `resume --decision continue` seals it WITHOUT rebuilding (no builder call);
      `resume --decision abort` seals `SHIP_DECLINED` (not shipped). See `references/modes.md`.
+6b. **Ship phase (optional, M41).** If a `ship` block is configured, a qualified
+    run continues into a governed ship phase (`references/ship.md`): reversible
+    actions run unattended (auto-after-seal, incl. H4); the ship outcome is a
+    SEPARATE `ship_result.json` (`SHIPPED`/`SHIP_FAILED`/`SHIP_APPROVAL_PENDING`),
+    never a manifest rewrite (the run stays `qualified`). On `SHIP_APPROVAL_PENDING`
+    (an irreversible action awaits sign-off): have K approvers `df-release sign`
+    a claim bound to the run+artifact, collect into `<control_root>/release-approval.json`,
+    `df-release attach`, then `ship <control_root> --run-dir <run_dir>`. On
+    `SHIP_UNKNOWN_OUTCOME` (exit 11, a crash left an action's effect unknown):
+    inspect the target, then `ship --decision reconcile` (accept a possible
+    duplicate) or `--decision abort`. Enterprise ships ONLY after `df-custody attach`.
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
    path, and `verify-manifest --run-dir <run_dir>`. `verify-manifest` (DF-01/M28a) now also
    re-verifies the manifest's bound artifact object against the content-addressed store at
@@ -408,7 +431,8 @@ holdout scenarios in a session that will also drive the builder.
 - `references/authoring.md` — the `init` interview script: spec, tier choice, writing discriminating holdout scenarios (dev vs. sealed final), and the optional config blocks; see also `examples/kv-service/answers.json` (M19)
 - `references/config-reference.md` — config schema
 - `references/modes.md` — the four intervention modes (H1 directed / H2 supervised / H3 guarded / H4 lights-out), the full state-transition (pause-point) table, the legacy `(autonomy,checkpoint)→mode` mapping + `df-migrate-config`, the H4 fail-closed contract, and the deferred before-ship gate (M36a)
-- `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), the honest trust-domain limits of each, the single-SM `qualification` field + codes, and the phase-aware hash-chained FSM checkpoint (M5a, M13, M36a)
+- `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), the honest trust-domain limits of each, the single-SM `qualification` field + codes, the phase-aware hash-chained FSM checkpoint (M5a, M13, M36a), and the ship-phase sidecars/outcomes (M41)
+- `references/ship.md` — the governed post-seal ship phase (M41): the `ship` action schema + validation, the reversibility gate, the `df-release` signed-approval workflow for irreversible actions, crash-safety (reserve-before + `SHIP_UNKNOWN_OUTCOME`), rollback-in-reverse, the honest "real creds + network, gated by qualification+signature not sandboxing" scope, and the incident-response/prod-secret exclusions; worked configs in `examples/ship-merge-pr/` and `examples/ship-deploy-staging/`
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier (DF-02, M29a); default-deny candidate host isolation — `candidate_host_read`, port-pinned loopback, closed keychain/DNS Mach channels, the per-run confinement probe, and the manifest `host_isolation` field (DF-02, M29b macOS + M29c Linux bwrap mount+PID namespace; Linux `loopback`/twins deferred to M29c-2)
 - `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/reproducibility.md` — what's reproducible/verifiable today (stdlib-only tiers, pinned `cryptography` range, content-addressed artifact binding, config/spec/scenario hashes, digest-pinnable images) vs. the honest owner/infra TODO (LICENSE, CI, hash-locked installs, default digest pinning, release SBOM/provenance)

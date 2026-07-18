@@ -190,8 +190,16 @@ documents one thing this skill deliberately does **not** self-provide: a
 skill cannot sandbox the session that is running it (the *orchestrator*,
 as opposed to the *builder*, which dark-factory does confine) — that is a
 harness-layer configuration step, with the operator recipe spelled out
-there. **Non-goals:** merge, deployment, and production operation are out
-of scope — the workflow ends at a qualified, artifact-bound workspace plus
-the reported manifest/checkpoint handoff; what happens to that artifact
-afterward (code review, merge, deploy, running it for real users) is on the
-operator, outside this skill.
+there. **The workflow can optionally continue past the sealed
+artifact into a governed *ship phase*** (M41): after a run qualifies, operator-
+defined ship actions (merge/deploy/migrate — plain argv) run as an audited,
+gated, crash-safe, rollback-capable phase, unattended even under H4 lights-out;
+**irreversible actions are signature-gated** (a K-of-N `df-release` approval,
+fail-closed to `SHIP_APPROVAL_PENDING`). See `references/ship.md`. This is a
+governed *runner*, not a deploy engine, and ship actions are protected by
+qualification + the signature gate + audit, **not** by sandboxing (they run with
+real network + credentials). **Remaining non-goals:** incident response and
+real-user validation/cutover *judgment* (the skill runs a cutover COMMAND under
+the signed gate but provides no monitoring-driven decisioning), and provisioning
+or rotating production **secret values** (broker-name references only) — those
+stay on the operator, outside this skill.

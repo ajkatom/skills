@@ -1,0 +1,13 @@
+{
+  "_readme": "Paste the `ship` object below into your control root's config.json. It runs AFTER the run qualifies (COMPLETE_QUALIFIED). This action is reversible:true, so it runs UNATTENDED in every mode, including H4 lights-out, with NO signature required. Edit the branch/remote for your repo. See references/ship.md.",
+  "ship": {
+    "actions": [
+      {
+        "name": "push-release-branch",
+        "run": ["git", "push", "origin", "HEAD:release/df-candidate"],
+        "reversible": true,
+        "timeout_s": 120
+      }
+    ]
+  }
+}
