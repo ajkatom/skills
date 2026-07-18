@@ -244,3 +244,65 @@ Three questions worth asking about your own answers file before running
    what a correct implementation produces, would every scenario now fail?
    If any wouldn't, that scenario isn't discriminating in practice even if
    `init` didn't reject it.
+
+## Agent-authored scenarios (the `author` role, M40)
+
+You don't have to write the hidden scenarios yourself — an **agent** can write
+them, with the SAME information barrier the builder runs under. You still own
+the ground truth (`spec.md` + `behaviors.json` — WHAT the app must do); the
+agent writes only `scenarios/*.json` (HOW to test each behavior). An agent that
+invented the spec, the behaviors, AND the tests would just grade itself, so
+this is deliberately **scenarios-only**.
+
+**The different-model requirement.** The author must resolve to a **different
+adapter path than the builder**, enforced fail-closed at config load:
+`realpath(roles.author.adapter) != realpath(roles.builder.adapter)` or the run
+refuses (symlink/relative/absolute all resolved on both sides). For the
+**fixed-model CLI adapters** (`claude`/`codex`/`gemini`) a distinct path IS a
+distinct model. For the **env-parameterized API adapters**
+(`api_anthropic`/`api_openai`) the path check alone does NOT guarantee distinct
+models: two different adapter files (or the same file used for both roles) can
+be pointed at the *same* backing model via `DF_API_MODEL` / the base-URL env —
+the realpath check cannot see that, so **the operator is responsible for not
+aiming the author and builder at the same model** when using the API adapters.
+The same adapter file for both roles is refused outright unless you set
+`roles.author.allow_same_model_ack: true` (which records the weaker guarantee
+in the manifest's `authored_by.same_model_ack`). Rationale: an agent grading
+its own model's build is not an independent check.
+
+**The workflow — init → author-scenarios → review → run:**
+
+1. Write an answers doc with `author_adapter` (a path to any protocol-0.1
+   adapter, a DIFFERENT model than `builder_adapter`) and **zero** scenarios
+   in `behaviors[]`. `init` scaffolds `spec.md` + `behaviors.json` + a config
+   carrying `roles.author`, with an EMPTY `scenarios/` and a
+   `scenarios_pending_author` marker. `run` refuses a scenarios-pending
+   control root (`no scenarios; run author-scenarios first`).
+2. `python3 <skill_dir>/scripts/supervisor.py author-scenarios --control-root
+   <cr> [--attempts N] [--review]`. The author agent is invoked in a fresh
+   scratch workdir (discarded after) and writes one `scenarios.json`; its
+   output is validated through the **identical** gates a human's scenarios
+   pass — oracle discrimination, behavior coverage, the spec-leak barrier
+   check, and full oracle-IR shape. On a failure the author is re-invoked with
+   **impoverished, barrier-safe** feedback (uncovered behavior-ids,
+   non-discriminating/orphan scenario titles, spec-leak values — never a
+   corrected answer) up to `--attempts` (default 3). On success the validated
+   set is installed atomically into `scenarios/` and the marker cleared;
+   exhausted attempts ⇒ exit 2 with **no** scenarios installed (never a bad
+   partial set).
+3. **Review the generated `scenarios/*.json` (RECOMMENDED).** `--review`
+   prints each generated scenario and requires interactive confirmation before
+   install. This matters because of the honest limit below.
+4. `run` — the barrier is byte-for-byte unchanged: the agent's scenarios seal
+   through the exact path a human's do, and the builder still never sees them.
+
+**Honest limit (documented, not hidden).** The gates prove the agent's
+scenarios are schema-valid, discriminating, cover every behavior, and don't
+leak — they **cannot** prove the scenarios capture the human's *intent* (the
+same limit a human faces, minus the human's presumed knowledge of their own
+intent). So with an agent author and no human review, "discriminating + covers
+behaviors + faithful to the spec's stated contract" is the ceiling. The human
+still owns spec + behaviors, and reviewing the generated scenarios stays
+RECOMMENDED. A follow-on **reviewer agent** that grades the author's scenarios
+for intent-fit is out of scope for M40 — intent-fit remains a
+human/recommended check.

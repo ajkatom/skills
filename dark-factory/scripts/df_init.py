@@ -43,6 +43,45 @@ class InitError(RuntimeError):
     pass
 
 
+# M40: the marker file that flags a control root scaffolded WITHOUT scenarios
+# because an author agent will write them (via `supervisor.py author-scenarios`)
+# before any `run`. Its presence is what `run` fail-closes on ("no scenarios;
+# run author-scenarios first") and what `author-scenarios` clears once it has
+# atomically installed a validated set. A control root with human-authored
+# scenarios never has this marker.
+PENDING_MARKER = "scenarios_pending_author"
+
+
+def _author_adapter(answers: dict):
+    """The author adapter path an `answers` doc requests, or None. Accepts
+    either the flat `answers.author_adapter` (init's own convenience key) or an
+    already-shaped `answers.roles.author.adapter` -- so an answers doc can name
+    the author role either way and both scaffold identically."""
+    flat = answers.get("author_adapter")
+    if flat:
+        return flat
+    roles = answers.get("roles")
+    if isinstance(roles, dict):
+        author = roles.get("author")
+        if isinstance(author, dict):
+            return author.get("adapter")
+    return None
+
+
+def _scenario_count(answers: dict) -> int:
+    """Total scenarios declared across every behavior in `answers` -- the
+    signal (together with a configured author) for whether this scaffold is
+    'scenarios pending an author' (zero) or an ordinary human-authored one."""
+    return sum(len(b.get("scenarios", []) or []) for b in answers.get("behaviors", []))
+
+
+def is_scenarios_pending(control_root: str) -> bool:
+    """True iff `control_root` was scaffolded pending an agent author (the
+    PENDING_MARKER file exists). The supervisor's `run` and `author-scenarios`
+    both consult this."""
+    return os.path.exists(os.path.join(os.path.abspath(control_root), PENDING_MARKER))
+
+
 # --- assurance: "enterprise" scaffolding (DF-04) ----------------------------
 #
 # df_config.load_config REQUIRES, for assurance: "enterprise": a `custody`
@@ -346,6 +385,30 @@ def build_config(answers: dict) -> dict:
         "budget": {"billing": "subscription"},
     }
 
+    # M40: optional `roles.author` -- an AGENT writes the hidden scenarios
+    # instead of a human. `answers.author_adapter` (a path) turns it on; the
+    # different-model + path-hygiene enforcement lives in df_config.load_config
+    # (the single source of truth), so build_config only assembles the block
+    # here and lets load_config (which scaffold() runs via validate_scaffold)
+    # be the one gate. Absent -> no roles.author, byte-identical to pre-M40.
+    author_adapter = _author_adapter(answers)
+    if author_adapter:
+        # A fully-shaped answers.roles.author passes through intact (preserving
+        # any timeout_s/allow_same_model_ack it carries); the flat
+        # answers.author_* keys are the convenience form. Either way the
+        # different-model + path-hygiene enforcement is df_config's job.
+        shaped = (answers.get("roles") or {}).get("author")
+        if isinstance(shaped, dict):
+            author_role = dict(shaped)
+        else:
+            author_role = {"adapter": author_adapter}
+            author_timeout = answers.get("author_timeout_s")
+            if author_timeout is not None:
+                author_role["timeout_s"] = author_timeout
+            if answers.get("author_allow_same_model_ack"):
+                author_role["allow_same_model_ack"] = True
+        cfg["roles"]["author"] = author_role
+
     options = answers.get("options") or {}
     if not isinstance(options, dict):
         raise InitError("answers.options must be an object")
@@ -446,16 +509,31 @@ def scaffold(control_root: str, answers: dict) -> None:
     """Write config.json, spec.md, behaviors.json, scenarios/<id>.json under
     `control_root`. Refuses (InitError) to overwrite a non-empty control_root
     unless answers.get("force") is truthy. Builds (and validates the pure
-    builder contracts) BEFORE writing a single file."""
+    builder contracts) BEFORE writing a single file.
+
+    M40 scenarios-pending-author mode: when `answers` configures an author
+    role (`author_adapter`/`roles.author`) AND declares ZERO scenarios, the
+    tree is scaffolded with an EMPTY `scenarios/` plus a PENDING_MARKER file,
+    for an agent to fill via `supervisor.py author-scenarios` before any run.
+    You can't have BOTH pending and human scenarios: a configured author WITH
+    scenarios present is an ordinary human-authored scaffold (no marker), and
+    an author configured with zero scenarios is the pending case (no scenario
+    files). `run` fail-closes on the marker until the author installs a set."""
     control_root = os.path.abspath(control_root)
     if os.path.isdir(control_root) and os.listdir(control_root) and not answers.get("force"):
         raise InitError(
             f"control root {control_root!r} is not empty; pass answers['force']=True to overwrite"
         )
 
+    # Pending iff an author is configured AND no scenarios are declared. In
+    # that mode build_scenarios is skipped entirely (it would raise on a
+    # behavior with zero dev scenarios -- but with an author, that gap is what
+    # the author-scenarios step exists to fill, not an init-time error).
+    pending = bool(_author_adapter(answers)) and _scenario_count(answers) == 0
+
     cfg = build_config(answers)
     behaviors = build_behaviors(answers)
-    scenarios = build_scenarios(answers)
+    scenarios = [] if pending else build_scenarios(answers)
     spec_text = answers.get("spec_text", "")
 
     os.makedirs(control_root, exist_ok=True)
@@ -477,6 +555,20 @@ def scaffold(control_root: str, answers: dict) -> None:
         with open(os.path.join(scenarios_dir, f"{sc['id']}.json"), "w", encoding="utf-8") as f:
             json.dump(sc, f, indent=2)
             f.write("\n")
+
+    marker_path = os.path.join(control_root, PENDING_MARKER)
+    if pending:
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(
+                "scenarios pending -- an author agent must write them via "
+                "`supervisor.py author-scenarios --control-root <cr>` before this "
+                "control root can run. Do NOT hand-place scenario files while this "
+                "marker exists.\n"
+            )
+    elif os.path.exists(marker_path):
+        # An overwrite (force) that now supplies human scenarios must not leave
+        # a stale pending marker behind (which would falsely fail-close `run`).
+        os.remove(marker_path)
 
 
 def _iter_then_strings(then: dict):
@@ -525,7 +617,8 @@ def validate_scaffold(control_root: str) -> tuple:
     plus the spec_leak barrier check. Returns (ok, report); never raises --
     any validator failure is captured into the report and ok=False."""
     control_root = os.path.abspath(control_root)
-    report = {"config_ok": False, "inert": [], "coverage": {}, "spec_leak": []}
+    report = {"config_ok": False, "inert": [], "coverage": {}, "spec_leak": [],
+              "scenarios_pending": False}
 
     try:
         df_config.load_config(control_root)
@@ -533,6 +626,22 @@ def validate_scaffold(control_root: str) -> tuple:
     except df_config.ConfigError as e:
         report["config_error"] = str(e)
         return False, report
+
+    # M40 scenarios-pending-author: a control root scaffolded for an agent
+    # author has NO scenarios yet (by design). Its STRUCTURE is valid (config
+    # loaded above; behaviors validated below) but the scenario-dependent gates
+    # (oracle discrimination, coverage, spec-leak) can't run until the author
+    # installs a set -- so this passes as pending rather than failing on an
+    # empty scenarios/. `run` still fail-closes on the marker; `author-scenarios`
+    # is the step that clears it.
+    if is_scenarios_pending(control_root):
+        report["scenarios_pending"] = True
+        try:
+            df_gates.load_behaviors(control_root)
+        except df_gates.GateError as e:
+            report["behaviors_error"] = str(e)
+            return False, report
+        return True, report
 
     try:
         scenarios = run_scenarios.load_scenarios(os.path.join(control_root, "scenarios"))

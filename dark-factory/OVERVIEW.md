@@ -129,6 +129,9 @@ just so you know which one to open.
 
 - **`authoring.md`** — the guided interview for writing your spec and hidden
   test scenarios, and how to turn them into a ready-to-run project folder.
+  You can also have an **independent agent** (a different model than the
+  builder) write the hidden scenarios for you, with the same barrier — see its
+  "Agent-authored scenarios" section.
 - **`scenario-format.md`** — the exact file format for a hidden test
   scenario (the thing the builder is never allowed to see).
 - **`role-adapters.md`** — how dark-factory talks to whichever AI model is

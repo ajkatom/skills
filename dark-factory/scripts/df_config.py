@@ -190,6 +190,66 @@ def load_config(control_root: str) -> dict:
                 "builder container)"
             )
 
+    # M40: optional `roles.author` -- an AGENT (a different model than the
+    # builder) writes the hidden scenarios instead of a human, with the SAME
+    # barrier preserved. Absent -> cfg["_author"] = None and today's behavior is
+    # byte-identical (human-authored, no author role). The author adapter is NOT
+    # mounted into any container (authoring is a discarded pre-run step, never
+    # concurrent with the builder), but it gets the SAME path hygiene as the
+    # builder at hardened+ so a bare command name can't silently resolve against
+    # CWD. The load-bearing gate is DIFFERENT-MODEL enforcement, fail-closed.
+    author_raw = roles.get("author")
+    if author_raw is not None:
+        if not isinstance(author_raw, dict):
+            raise ConfigError("roles.author must be a JSON object")
+        author_adapter = author_raw.get("adapter")
+        if not author_adapter:
+            raise ConfigError("roles.author.adapter is required when roles.author is present")
+        if tier in ("hardened", "enterprise"):
+            a_path = os.path.expanduser(author_adapter)
+            if not os.path.isabs(a_path) or not os.path.isfile(a_path):
+                raise ConfigError(
+                    f"{tier} requires roles.author.adapter to be an absolute path "
+                    "to an existing file"
+                )
+            a_dir = os.path.dirname(os.path.realpath(a_path))
+            if not _disjoint(a_dir, control_root):
+                raise ConfigError(
+                    f"{tier} requires the roles.author.adapter directory to be "
+                    "disjoint from the control root"
+                )
+        author_timeout = author_raw.get("timeout_s", 600)
+        if not isinstance(author_timeout, int) or isinstance(author_timeout, bool) or author_timeout < 1:
+            raise ConfigError("roles.author.timeout_s must be a positive int")
+        allow_same_model_ack = author_raw.get("allow_same_model_ack", False)
+        if not isinstance(allow_same_model_ack, bool):
+            raise ConfigError("roles.author.allow_same_model_ack must be a bool")
+        # Different-model enforcement (owner's strongest-anti-snooping choice),
+        # fail-closed: realpath(author.adapter) must differ from
+        # realpath(builder.adapter). For the shipped adapters a distinct path
+        # ⇒ a distinct model; the SAME adapter (even with a different
+        # DF_API_MODEL) is a same-model case -> refuse UNLESS
+        # allow_same_model_ack explicitly records the weaker guarantee, which
+        # is then sealed into the manifest's `authored_by.same_model_ack` for
+        # an auditor to see.
+        if (os.path.realpath(os.path.expanduser(author_adapter))
+                == os.path.realpath(os.path.expanduser(adapter))):
+            if not allow_same_model_ack:
+                raise ConfigError(
+                    "roles.author.adapter must resolve to a DIFFERENT path than "
+                    "roles.builder.adapter (an agent grading its own model's "
+                    "build is not an independent check) -- set "
+                    "roles.author.allow_same_model_ack: true to accept the "
+                    "weaker guarantee (recorded in the manifest's authored_by)"
+                )
+        cfg_author = {
+            "adapter": author_adapter,
+            "timeout_s": author_timeout,
+            "same_model_ack": allow_same_model_ack,
+        }
+    else:
+        cfg_author = None
+
     # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
     # (lights-off) is available only with a conforming hardened (or, being
     # strictly stronger, enterprise) backend.
@@ -1419,4 +1479,9 @@ def load_config(control_root: str) -> dict:
     cfg["_custody"] = cfg_custody
     cfg["_proxy"] = cfg_proxy
     cfg["_enterprise"] = cfg_enterprise
+    # M40: resolved author role (or None) -- the supervisor's `author-scenarios`
+    # subcommand reads it, and `_run_locked` seals it into the manifest's
+    # `authored_by` field so an audit shows the scenarios were agent-written and
+    # by which independent model.
+    cfg["_author"] = cfg_author
     return cfg

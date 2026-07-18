@@ -6,7 +6,9 @@ it without ever seeing the hidden acceptance scenarios, a **verifier** runs
 those scenarios against what the builder wrote, and only a behavior-ID +
 fixed-taxonomy failure signal crosses back to the builder — never the
 scenario content itself — until the build converges or the run is
-abandoned.
+abandoned. The hidden scenarios can be written by a human or, with the same
+barrier, by an independent **author** agent (a different model than the
+builder) — see `references/authoring.md`.
 
 Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](../docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md).
 Full operational instructions (the doc Claude itself follows when running

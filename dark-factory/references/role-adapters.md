@@ -12,6 +12,33 @@ Rules: exit 0 even on in-band `status:"error"`; non-zero exit or unparseable
 stdout aborts the run (`ABORTED_BUILD_ERROR`). No silent substitution — the
 configured adapter path is invoked or the run fails (spec section 7.8).
 
+## Roles: `builder`, `verifier`, `author`
+
+The `role` field tells an adapter which job it is doing this invocation.
+- **`builder`** — implements `spec.md` in `workdir` (the isolated build
+  workspace); it never sees the hidden scenarios. This is the only role that
+  runs under the tier sandbox / container.
+- **`verifier`** — the deterministic scenario runner (not a cross-model
+  "judge"); it is not a model adapter.
+- **`author`** (M40) — an AGENT writes the hidden `scenarios/*.json` instead of
+  a human. Invoked as a clean **pre-run** step (`supervisor.py
+  author-scenarios`) in a fresh scratch workdir, `role="author"`, with the same
+  request/response protocol: it writes exactly one file `scenarios.json`
+  (`{"scenarios": [{behavior_id, cohort, run, then, title?, given?}, ...]}`)
+  into its workdir, which the supervisor reads back, validates through the same
+  gates a human's scenarios pass, and installs. **Any** protocol-0.1 adapter
+  can author — the CLI adapters write the file natively; the api adapters honor
+  their existing `{"files": {"scenarios.json": "..."}}` return — so there are
+  **no adapter code changes** for the author role. The one hard rule
+  (config-load, fail-closed): `roles.author.adapter` must resolve to a
+  **different path than `roles.builder.adapter`**, unless
+  `roles.author.allow_same_model_ack: true`. For the fixed-model CLI adapters a
+  distinct path is a distinct model; for the env-parameterized API adapters
+  (`api_anthropic`/`api_openai`) the operator must ensure the two aren't aimed
+  at the same backing model (the path check can't see `DF_API_MODEL`/base-URL).
+  See `references/authoring.md` ("Agent-authored scenarios") for the full
+  workflow, the API-adapter caveat, and the honest intent-capture limit.
+
 Shipped adapters (protocol 0.1, all in `scripts/adapters/`):
 - `claude` — claude CLI, headless, `--permission-mode acceptEdits`.
 - `codex` — `codex exec`, Codex's own sandbox disabled (dark-factory provides
