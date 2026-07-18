@@ -138,6 +138,13 @@ just so you know which one to open.
   You can also have an **independent agent** (a different model than the
   builder) write the hidden scenarios for you, with the same barrier — see its
   "Agent-authored scenarios" section.
+- **`scenario-adequacy.md`** — how agent-authored scenarios are made
+  THOROUGH: class-typed coverage (happy/boundary/failure), a sharpness battery
+  (each assertion must reject a battery of near-miss mutants — it mutates the
+  observation, not the built code), and a decorrelated second-model **critic**
+  that adversarially reviews the set (advisories surfaced, never auto-applied).
+  Includes the honest residual: human spec fidelity + non-functional properties
+  the oracle can't express.
 - **`scenario-format.md`** — the exact file format for a hidden test
   scenario (the thing the builder is never allowed to see).
 - **`role-adapters.md`** — how dark-factory talks to whichever AI model is

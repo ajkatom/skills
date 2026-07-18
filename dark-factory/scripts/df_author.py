@@ -72,7 +72,7 @@ Write EXACTLY ONE file named `scenarios.json` in your working directory,
 containing a single JSON object of this exact shape and nothing else:
 
     {"scenarios": [
-      {"behavior_id": "BHV-...", "cohort": "dev",
+      {"behavior_id": "BHV-...", "cohort": "dev", "class": "happy",
        "run": ["python3", "app.py", "..."],
        "then": {"exit_code": 0, "stdout_equals": "..."},
        "title": "short human label", "given": "optional context"},
@@ -87,6 +87,16 @@ Field rules (a scenario that breaks any of these is REJECTED, not repaired):
   after dev converges and never fed back. EVERY declared behavior needs at
   least one "dev" scenario. Reserve "final" for the behaviors you most want
   protected from teaching-to-the-test.
+- `class` (optional, default "happy"): "happy", "boundary", or "failure" --
+  ORTHOGONAL to cohort. It says WHAT KIND of case this scenario exercises:
+  * "happy"    -- a normal, valid input on the intended path.
+  * "boundary" -- an edge: empty input, the maximum/minimum, a duplicate, a
+                  missing field, a wrong-type value, an off-by-one limit.
+  * "failure"  -- the ERROR contract: what the spec promises on invalid use
+                  (a non-zero exit / error status / error message the spec
+                  actually mandates -- do NOT invent wording it doesn't state).
+  The adequacy policy below lists the classes REQUIRED per behavior; cover
+  every one of them.
 - `run` (required): a non-empty list of strings — the literal argv the
   verifier executes with cwd = the builder's workspace (e.g. run the built
   program, or a `python3 -c "..."` harness that imports it).
@@ -99,11 +109,19 @@ Field rules (a scenario that breaks any of these is REJECTED, not repaired):
 
 ### Rules for writing GOOD scenarios (enforced mechanically; obey them)
 - ONE behavior per scenario. Don't fold two behaviors into one run/then.
-- Make every `then` DISCRIMINATING: it must FAIL against a wrong or stub
-  implementation, not just pass against the right one. A `then` that would
-  pass against empty output or a trivial stub (e.g. `{"stdout_contains": ""}`)
-  is rejected as inert. Assert the SPECIFIC value this scenario's own input
-  should produce.
+- Make every `then` SHARP: it must FAIL against a wrong or stub implementation,
+  not just pass against the right one. Every assertion you write is tested
+  against a BATTERY of near-miss mutant outputs -- an empty output, a
+  one-character change, a truncation, a wrong exit/status, a changed/removed
+  JSON field. A `then` that any near-miss SURVIVES (e.g. an inert
+  `{"stdout_contains": ""}`, or asserting only `exit_code` while ignoring the
+  output the behavior is really about) is rejected as not sharp. Assert the
+  SPECIFIC value this scenario's own input should produce, on every dimension
+  that matters -- exit code AND the exact output, status AND the body/JSON.
+- COVER THE REQUIRED CLASSES: for each behavior, write a scenario for every
+  class the adequacy policy lists (happy + boundary + failure unless stated
+  otherwise). A boundary/failure scenario must feed a boundary/invalid INPUT
+  and assert the boundary/error RESULT -- not just re-test the happy path.
 - WATCH THE BARRIER: never assert a string that appears VERBATIM in the
   specification — that would leak the answer straight to the builder and is
   rejected. Prefer asserting on something specific to your scenario's own test
@@ -121,24 +139,53 @@ attempt to implement the specification — that is the builder's job, not yours.
 """
 
 
-def compose_author_prompt(spec_text, behaviors, *, attempt_feedback=None):
+def compose_author_prompt(spec_text, behaviors, *, policy=None, attempt_feedback=None,
+                          critic_feedback=None):
     """Build the author prompt: the authoring rules + the builder-visible
     spec + the declared behavior IDs (the ONLY public inputs; there is no
     holdout yet, so nothing is withheld). `attempt_feedback`, when a prior
     attempt failed validation, is the impoverished, barrier-safe report from
     `validate_authored` — appended so the author can fix the SAME classes of
-    defect (uncovered behaviors, non-discriminating/orphan titles, spec
-    leaks) without ever learning anything a builder could exploit.
+    defect (uncovered behaviors/classes, non-sharp/orphan titles, spec leaks)
+    without ever learning anything a builder could exploit. `critic_feedback`
+    (M42 Task 4), when a decorrelated critic returned BLOCKING findings, is a
+    barrier-safe list of {behavior_id, kind, detail} lines the author must
+    address in the next revision.
+
+    `policy` (M42 Task 1), when given, is the adequacy policy
+    ({required_classes, min_per_class}) so the prompt can state exactly which
+    classes each behavior must be covered by.
 
     `behaviors` is the parsed behaviors.json `behaviors` list ([{id, description?}]).
     """
-    lines = [_AUTHOR_RULES, "\n## Declared behaviors (write scenarios for EACH)"]
+    lines = [_AUTHOR_RULES]
+    if policy is not None:
+        req = ", ".join(policy.get("required_classes", ["happy"]))
+        n = policy.get("min_per_class", 1)
+        lines.append(
+            f"\n## Adequacy policy (ENFORCED)\nEach declared behavior must be covered "
+            f"by at least {n} scenario(s) of EACH of these classes: {req}."
+        )
+    lines.append("\n## Declared behaviors (write scenarios for EACH)")
     for b in behaviors:
         bid = b.get("id", "")
         desc = b.get("description")
         lines.append(f"- {bid}" + (f": {desc}" if desc else ""))
     lines.append("\n## Specification (builder-visible — do NOT quote verbatim in a `then`)\n")
     lines.append(spec_text)
+
+    if critic_feedback:
+        # A SECOND, independent (different-model) critic flagged these as
+        # blocking. This is verifier-side text that never reaches the builder,
+        # so it is safe to hand the author in full -- addressing it is required
+        # before the set can install.
+        lines.append(
+            "\n## A decorrelated critic flagged BLOCKING gaps — address each and re-emit\n")
+        for f in critic_feedback:
+            bid = f.get("behavior_id", "")
+            kind = f.get("kind", "")
+            detail = f.get("detail", "")
+            lines.append(f"- [{bid}] ({kind}) {detail}")
 
     if attempt_feedback is not None:
         # Impoverished feedback: only the shapes of what failed, never a
@@ -174,11 +221,29 @@ def _feedback_lines(report):
             f"scenario titled {title!r} names a behavior_id that is NOT in the "
             f"declared behaviors list — fix its behavior_id or remove it"
         )
+    # M42: a non-sharp `then` -- the survivor mutant KINDS are barrier-safe
+    # category labels ("stdout_equals:empty", "json_contains:value_changed"),
+    # never a holdout value, so they can be fed back verbatim to sharpen the
+    # assertion. We name the shape that survived, NOT a corrected assertion.
+    non_sharp = report.get("non_sharp_survivors", {})
     for title in report.get("non_discriminating_titles", []):
+        kinds = non_sharp.get(title)
+        detail = (f" — near-miss mutant(s) it accepted: {', '.join(kinds)}"
+                  if kinds else "")
         out.append(
-            f"scenario titled {title!r} has a non-discriminating `then` (it would "
-            f"pass against a wrong/stub build) — assert the specific value your "
-            f"input should produce"
+            f"scenario titled {title!r} has a non-sharp `then` (a near-miss wrong "
+            f"output would still pass it){detail} — assert the specific value your "
+            f"input should produce, on every dimension that matters"
+        )
+    # M42: a behavior missing a required CLASS. Barrier-safe: behavior-id +
+    # class name only (never a suggested assertion).
+    for entry in report.get("under_covered_classes", []):
+        bid = entry.get("behavior")
+        missing = ", ".join(entry.get("missing", []))
+        out.append(
+            f"behavior {bid} is missing required scenario class(es): {missing} — "
+            f"add a scenario of each missing class (feed that KIND of input and "
+            f"assert its result)"
         )
     for value in report.get("spec_leak_values", []):
         out.append(
@@ -253,6 +318,16 @@ def _normalize(scenarios_raw, declared_ids):
             schema_errors.append(f"{label}: cohort must be 'dev' or 'final', got {cohort!r}")
             continue
 
+        # M42: the optional class axis (default happy). Validated here so a
+        # typo is a collected schema error (one retry fixes all), matching how
+        # cohort is handled -- rather than surfacing later as an OracleError.
+        cls = sc.get("class", run_scenarios.DEFAULT_SCENARIO_CLASS)
+        if cls not in run_scenarios.SCENARIO_CLASSES:
+            schema_errors.append(
+                f"{label}: class must be one of {list(run_scenarios.SCENARIO_CLASSES)}, "
+                f"got {cls!r}")
+            continue
+
         run = sc.get("run")
         if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
             schema_errors.append(f"{label}: 'run' must be a non-empty list of strings")
@@ -278,6 +353,7 @@ def _normalize(scenarios_raw, declared_ids):
             "id": sc_id,
             "behavior_id": bid,
             "cohort": cohort,
+            "class": cls,
             "title": title,
             "given": sc.get("given", ""),
             "when": {"run": list(run), "timeout_s": timeout_s},
@@ -287,22 +363,33 @@ def _normalize(scenarios_raw, declared_ids):
     return normalized, schema_errors
 
 
-def validate_authored(scenarios_raw, spec_text, behaviors):
+def validate_authored(scenarios_raw, spec_text, behaviors, policy=None):
     """Run the author's raw scenarios through the IDENTICAL gates df_init
     applies to human-authored scenarios, returning (ok, report, normalized).
 
+    `policy` (M42 Task 1), when given, is the adequacy policy
+    ({required_classes, min_per_class}) the authored set must satisfy per
+    behavior. Absent -> the back-compat happy-only default (which any covering
+    set already meets), so pre-M42 callers are byte-identical.
+
     The report is impoverished + barrier-safe (see module docstring):
       - schema_errors: list[str] shape violations (behavior-id refs only)
-      - non_discriminating_titles: titles of scenarios whose `then` is inert
+      - non_discriminating_titles: titles of scenarios whose `then` is NOT
+        sharp (a near-miss survived)
+      - non_sharp_survivors: {title: [mutant-kind, ...]} -- the barrier-safe
+        category labels of the near-miss(es) each non-sharp `then` accepted
       - uncovered_behaviors: declared behavior ids with no dev scenario
+      - under_covered_classes: [{behavior, missing:[class,...]}] per the policy
       - orphan_titles: titles of scenarios naming an undeclared behavior id
       - spec_leak_values: `then` string values that appear verbatim in spec.md
       - counts: {scenarios, dev, final}
 
     ok is True iff NOTHING failed — same fail-closed conjunction
-    df_init.validate_scaffold enforces (config_ok, no inert, full dev
-    coverage, no orphans, no spec leak). `normalized` is the installable
+    df_init.validate_scaffold enforces, PLUS (M42) sharpness on every `then`
+    and class adequacy per the policy. `normalized` is the installable
     oracle-IR scenario list (only meaningful when ok)."""
+    if policy is None:
+        policy = df_gates.default_adequacy_policy()
     declared_ids = {b["id"] for b in behaviors}
     normalized, schema_errors = _normalize(scenarios_raw, declared_ids)
 
@@ -331,7 +418,9 @@ def validate_authored(scenarios_raw, spec_text, behaviors):
     report = {
         "schema_errors": schema_errors,
         "non_discriminating_titles": [],
+        "non_sharp_survivors": {},
         "uncovered_behaviors": [],
+        "under_covered_classes": [],
         "orphan_titles": [],
         "spec_leak_values": [],
         "counts": {
@@ -341,13 +430,18 @@ def validate_authored(scenarios_raw, spec_text, behaviors):
         },
     }
 
-    # id -> title, so discrimination/coverage findings can be reported by the
+    # id -> title, so sharpness/coverage findings can be reported by the
     # author-facing TITLE (barrier-safe author text) rather than the internal id.
     id_to_title = {s["id"]: (s["title"] or s["id"]) for s in normalized}
 
-    # Discrimination: the SAME df_gates.validate_oracle df_init/run use.
-    inert_ids = df_gates.validate_oracle(normalized)
-    report["non_discriminating_titles"] = sorted(id_to_title[i] for i in inert_ids)
+    # Sharpness (M42): the SAME df_gates battery run/df_init use. Report the
+    # per-scenario survivor mutant-KINDS (barrier-safe labels) keyed by title,
+    # so the retry feedback can name exactly which near-miss slipped through.
+    survivors_by_id = df_gates.sharpness_survivors(normalized)
+    report["non_discriminating_titles"] = sorted(id_to_title[i] for i in survivors_by_id)
+    report["non_sharp_survivors"] = {
+        id_to_title[i]: kinds for i, kinds in survivors_by_id.items()
+    }
 
     # Coverage: the SAME df_gates.check_coverage. uncovered_dev = declared
     # behaviors with no dev scenario; orphan_scenarios = scenarios naming an
@@ -355,6 +449,12 @@ def validate_authored(scenarios_raw, spec_text, behaviors):
     cov = df_gates.check_coverage(behaviors, normalized)
     report["uncovered_behaviors"] = list(cov["uncovered_dev"])
     report["orphan_titles"] = sorted(id_to_title[i] for i in cov["orphan_scenarios"])
+
+    # Adequacy (M42): per-behavior class coverage against the policy. Reported
+    # barrier-safe (behavior-id + class names only).
+    adq = df_gates.check_adequacy(behaviors, normalized, policy)
+    report["under_covered_classes"] = adq["under_covered"]
+    report["adequacy"] = adq
 
     # Barrier: the SAME df_init._find_spec_leaks — any `then` string literal
     # that appears verbatim in the builder-visible spec.md is a leak.
@@ -365,6 +465,7 @@ def validate_authored(scenarios_raw, spec_text, behaviors):
         not report["schema_errors"]
         and not report["non_discriminating_titles"]
         and not report["uncovered_behaviors"]
+        and not report["under_covered_classes"]
         and not report["orphan_titles"]
         and not report["spec_leak_values"]
     )

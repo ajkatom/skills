@@ -8,7 +8,12 @@ fixed-taxonomy failure signal crosses back to the builder — never the
 scenario content itself — until the build converges or the run is
 abandoned. The hidden scenarios can be written by a human or, with the same
 barrier, by an independent **author** agent (a different model than the
-builder) — see `references/authoring.md`.
+builder) — and those agent-authored scenarios can be class-typed
+(happy/boundary/failure), sharpness-proven (each assertion must reject a battery
+of near-miss mutants), and adversarially critiqued by a **second** decorrelated
+model, narrowing the gap to human spec fidelity + non-functional properties the
+oracle can't express — see `references/authoring.md` and
+`references/scenario-adequacy.md`.
 
 Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](../docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md).
 Full operational instructions (the doc Claude itself follows when running

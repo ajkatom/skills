@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Deterministic fake CRITIC adapter (M42) that models a REAL blocking->revise
+loop. It reads the critic prompt (which lists the authored scenarios). If the
+author has NOT yet added the revision scenario (its title 'revised extra' is
+absent), it returns ONE blocking finding (kind missing_case on BHV-001). Once
+the author's revised set contains 'revised extra', it returns a CLEAN verdict
+plus an advisory. This drives exactly one author<->critic revision round and
+proves blocking findings gate while advisories only inform."""
+import json
+import os
+import sys
+
+MARKER = "revised extra"
+
+BLOCKING = {
+    "blocking": [
+        {"behavior_id": "BHV-001", "kind": "missing_case",
+         "detail": "no scenario exercises an additional important input for "
+                   "this behavior -- add one"}
+    ],
+    "advisories": [],
+}
+CLEAN = {
+    "blocking": [],
+    "advisories": [
+        {"topic": "idempotency",
+         "detail": "confirm whether repeated invocations must be idempotent"}
+    ],
+}
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    prompt = ""
+    try:
+        with open(req["prompt_file"], encoding="utf-8") as f:
+            prompt = f.read()
+    except OSError:
+        pass
+    verdict = CLEAN if MARKER in prompt else BLOCKING
+    with open(os.path.join(wd, "critic.json"), "w", encoding="utf-8") as f:
+        json.dump(verdict, f)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

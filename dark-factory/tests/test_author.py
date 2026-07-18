@@ -57,7 +57,7 @@ def test_prompt_embeds_spec_behaviors_and_contract():
     assert "Build greet.py" in p           # the spec
     assert "BHV-001" in p and "BHV-002" in p  # every behavior id
     assert "scenarios.json" in p           # the output contract
-    assert "DISCRIMINATING" in p           # the authoring rules
+    assert "SHARP" in p                    # the authoring rules (M42: sharpness)
     # No prior-attempt feedback section on the first invocation.
     assert "FAILED validation" not in p
 

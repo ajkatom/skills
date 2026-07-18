@@ -48,6 +48,12 @@ def _answers(tmp_path, author_adapter):
             {"id": "BHV-001", "description": "greets a name"},
             {"id": "BHV-002", "description": "errors on no args"},
         ],
+        # M42: these tests exercise the M40 AUTHOR flow (barrier/retry/install),
+        # which predates M42's stricter agent-authored default (happy+boundary+
+        # failure). Pin the back-compat happy-only policy so they keep testing
+        # exactly the author flow; class-typed adequacy + the critic loop are
+        # covered by test_adequacy.py / test_e2e_critic.py.
+        "scenario_adequacy": {"required_classes": ["happy"]},
         # no scenarios -> scenarios-pending-author
     }
 

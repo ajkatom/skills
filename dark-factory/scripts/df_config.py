@@ -79,6 +79,85 @@ def _disjoint(a: str, b: str) -> bool:
     return not (a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep))
 
 
+# M42 Task 1/5: the scenario `class` taxonomy the adequacy policy draws from.
+# Canonical value space lives in run_scenarios.SCENARIO_CLASSES; df_config
+# avoids importing it (no import cycle, and load_config stays stdlib-shaped),
+# so the tuple is restated here and cross-checked by tests.
+_SCENARIO_CLASSES = ("happy", "boundary", "failure")
+
+
+def _resolve_adequacy(raw_adq, cfg_author, cfg_critic) -> dict:
+    """Resolve cfg["_adequacy"] from an optional `scenario_adequacy` block plus
+    the author/critic presence. Returns
+    {"required_classes": [...], "min_per_class": int,
+     "critic": {"enabled": bool, "max_rounds": int}}.
+
+    Defaults are back-compat-first (see the call site): happy-only + critic off
+    for a human-authored root; happy+boundary+failure + critic-on-if-configured
+    for an agent-authored one. An explicit block overrides per key, fail-closed
+    on any malformed value (a silently-wrong adequacy policy would weaken the
+    gate)."""
+    agent_authored = cfg_author is not None
+    default_classes = (
+        ["happy", "boundary", "failure"] if agent_authored else ["happy"]
+    )
+    required = list(default_classes)
+    min_per = 1
+    critic_enabled = agent_authored and cfg_critic is not None
+    max_rounds = 2
+
+    if raw_adq is not None:
+        if not isinstance(raw_adq, dict):
+            raise ConfigError("scenario_adequacy must be a JSON object")
+        if "required_classes" in raw_adq:
+            rc = raw_adq["required_classes"]
+            if (not isinstance(rc, list) or not rc
+                    or not all(isinstance(c, str) for c in rc)):
+                raise ConfigError(
+                    "scenario_adequacy.required_classes must be a non-empty list of strings")
+            bad = [c for c in rc if c not in _SCENARIO_CLASSES]
+            if bad:
+                raise ConfigError(
+                    f"scenario_adequacy.required_classes has unknown class(es) {bad!r}; "
+                    f"allowed: {list(_SCENARIO_CLASSES)}")
+            # De-dup while preserving order (a repeated class is a no-op, not
+            # an error, but the resolved policy is canonicalized).
+            seen = set()
+            required = [c for c in rc if not (c in seen or seen.add(c))]
+        if "min_per_class" in raw_adq:
+            mp = raw_adq["min_per_class"]
+            if not isinstance(mp, int) or isinstance(mp, bool) or mp < 1:
+                raise ConfigError("scenario_adequacy.min_per_class must be a positive int")
+            min_per = mp
+        if "critic" in raw_adq:
+            crit = raw_adq["critic"]
+            if not isinstance(crit, dict):
+                raise ConfigError("scenario_adequacy.critic must be a JSON object")
+            if "enabled" in crit:
+                if not isinstance(crit["enabled"], bool):
+                    raise ConfigError("scenario_adequacy.critic.enabled must be a bool")
+                critic_enabled = crit["enabled"]
+            if "max_rounds" in crit:
+                mr = crit["max_rounds"]
+                if not isinstance(mr, int) or isinstance(mr, bool) or mr < 1:
+                    raise ConfigError("scenario_adequacy.critic.max_rounds must be a positive int")
+                max_rounds = mr
+
+    # Fail-closed coherence: the critic loop cannot run without a critic
+    # adapter. Enabling it (explicitly or by agent-authored default) with no
+    # roles.critic is an operator error, not a silent no-op.
+    if critic_enabled and cfg_critic is None:
+        raise ConfigError(
+            "scenario_adequacy.critic.enabled is true but no roles.critic adapter "
+            "is configured -- add roles.critic or disable the critic")
+
+    return {
+        "required_classes": required,
+        "min_per_class": min_per,
+        "critic": {"enabled": critic_enabled, "max_rounds": max_rounds},
+    }
+
+
 # M30 (DF-03) Part C: the shipped API adapters each expect ONE specific
 # (injection header, provider host) pairing -- see scripts/adapters/
 # api_anthropic and api_openai. A credential_proxy configured with the WRONG
@@ -254,6 +333,85 @@ def load_config(control_root: str) -> dict:
         }
     else:
         cfg_author = None
+
+    # M42 Task 4/5: optional `roles.critic` -- a SECOND, independent
+    # (different-model) agent that adversarially reviews the AUTHORED scenarios
+    # before they seal. Absent -> cfg["_critic"] = None (byte-identical to pre-
+    # M42; no critic loop). Same path hygiene as author at hardened+. The
+    # load-bearing gate is TWO fail-closed model-distinctness inequalities:
+    #   realpath(critic) != realpath(builder)  -- COLLUSION (a critic must not
+    #       bless scenarios its own model will build against), AND
+    #   realpath(critic) != realpath(author)   -- DECORRELATION (the whole
+    #       point is a second, independent mind).
+    # A single `allow_same_model_ack` waives BOTH (recording the weaker
+    # guarantee in the manifest's critic.same_model_ack), mirroring M40's
+    # author check exactly.
+    critic_raw = roles.get("critic")
+    if critic_raw is not None:
+        if not isinstance(critic_raw, dict):
+            raise ConfigError("roles.critic must be a JSON object")
+        critic_adapter = critic_raw.get("adapter")
+        if not critic_adapter:
+            raise ConfigError("roles.critic.adapter is required when roles.critic is present")
+        if cfg_author is None:
+            # A critic reviews an AGENT-authored set; without roles.author there
+            # is nothing for it to review (human-authored scenarios go through
+            # the human review path, not this loop). Fail-closed rather than
+            # silently ignore a configured critic.
+            raise ConfigError(
+                "roles.critic requires roles.author (the critic reviews the "
+                "agent-authored scenarios)")
+        if tier in ("hardened", "enterprise"):
+            c_path = os.path.expanduser(critic_adapter)
+            if not os.path.isabs(c_path) or not os.path.isfile(c_path):
+                raise ConfigError(
+                    f"{tier} requires roles.critic.adapter to be an absolute path "
+                    "to an existing file")
+            c_dir = os.path.dirname(os.path.realpath(c_path))
+            if not _disjoint(c_dir, control_root):
+                raise ConfigError(
+                    f"{tier} requires the roles.critic.adapter directory to be "
+                    "disjoint from the control root")
+        critic_timeout = critic_raw.get("timeout_s", 600)
+        if not isinstance(critic_timeout, int) or isinstance(critic_timeout, bool) or critic_timeout < 1:
+            raise ConfigError("roles.critic.timeout_s must be a positive int")
+        critic_ack = critic_raw.get("allow_same_model_ack", False)
+        if not isinstance(critic_ack, bool):
+            raise ConfigError("roles.critic.allow_same_model_ack must be a bool")
+        critic_real = os.path.realpath(os.path.expanduser(critic_adapter))
+        builder_real = os.path.realpath(os.path.expanduser(adapter))
+        author_real = os.path.realpath(os.path.expanduser(cfg_author["adapter"]))
+        if critic_real == builder_real and not critic_ack:
+            raise ConfigError(
+                "roles.critic.adapter must resolve to a DIFFERENT path than "
+                "roles.builder.adapter (a critic blessing scenarios its own "
+                "model will build against is collusion, not an independent "
+                "check) -- set roles.critic.allow_same_model_ack: true to accept "
+                "the weaker guarantee (recorded in the manifest's critic field)")
+        if critic_real == author_real and not critic_ack:
+            raise ConfigError(
+                "roles.critic.adapter must resolve to a DIFFERENT path than "
+                "roles.author.adapter (the critic exists to be a DECORRELATED "
+                "second mind; the same model can't decorrelate from itself) -- "
+                "set roles.critic.allow_same_model_ack: true to accept the "
+                "weaker guarantee (recorded in the manifest's critic field)")
+        cfg_critic = {
+            "adapter": critic_adapter,
+            "timeout_s": critic_timeout,
+            "same_model_ack": critic_ack,
+        }
+    else:
+        cfg_critic = None
+
+    # M42 Task 1/5: the scenario-adequacy policy (class-typed coverage + the
+    # critic loop toggle) -> cfg["_adequacy"]. DEFAULTS are back-compat-first:
+    #   - absent `scenario_adequacy` + NO agent author  -> happy-only, critic
+    #     off (today's behavior exactly; every pre-M42 scenario satisfies it).
+    #   - absent `scenario_adequacy` + an agent author   -> the stricter
+    #     happy+boundary+failure, and the critic loop ON iff roles.critic is
+    #     set (an agent writing the tests gets the strongest machine floor).
+    # An explicit `scenario_adequacy` block overrides these per key.
+    cfg_adequacy = _resolve_adequacy(raw.get("scenario_adequacy"), cfg_author, cfg_critic)
 
     # L5 gate (spec 2.2): autonomy must be int 4 or 5 (absent -> 4). autonomy 5
     # (lights-off) is available only with a conforming hardened (or, being
@@ -1711,4 +1869,10 @@ def load_config(control_root: str) -> dict:
     # `authored_by` field so an audit shows the scenarios were agent-written and
     # by which independent model.
     cfg["_author"] = cfg_author
+    # M42: the decorrelated critic role (or None) + the resolved scenario-
+    # adequacy policy. author-scenarios reads _critic + _adequacy["critic"] to
+    # drive the review loop; the M7 pre-build gate reads _adequacy's
+    # required_classes/min_per_class for BOTH human- and agent-authored roots.
+    cfg["_critic"] = cfg_critic
+    cfg["_adequacy"] = cfg_adequacy
     return cfg
