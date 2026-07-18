@@ -146,7 +146,9 @@ just so you know which one to open.
   Includes the honest residual: human spec fidelity + non-functional properties
   the oracle can't express.
 - **`scenario-format.md`** — the exact file format for a hidden test
-  scenario (the thing the builder is never allowed to see).
+  scenario (the thing the builder is never allowed to see), including the
+  generative property/fuzz kind (M43a): assert an invariant over many
+  seeded machine-generated inputs — the bugs one fixed example can't catch.
 - **`role-adapters.md`** — how dark-factory talks to whichever AI model is
   doing the building or verifying, including the two API-only adapters that
   need no command-line tool installed.

@@ -80,7 +80,11 @@ def test_init_kv_example_is_ok_and_run_accepts_the_control_root(tmp_path):
     cfg = df_config.load_config(control_root)
     assert cfg["assurance"] == "cooperative"
     scenarios = run_scenarios.load_scenarios(os.path.join(control_root, "scenarios"))
-    assert len(scenarios) == 12
+    # 12 fixed-example scenarios + the 2 M43a property scenarios the worked
+    # example gained (a round_trip property on BHV-PUT + a robust fuzz on
+    # BHV-VALIDATION).
+    assert len(scenarios) == 14
+    assert sum(1 for sc in scenarios if "property" in sc["when"]) == 2
     assert df_gates.validate_oracle(scenarios) == []
     behaviors = df_gates.load_behaviors(control_root)
     coverage = df_gates.check_coverage(behaviors, scenarios)

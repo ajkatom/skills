@@ -653,6 +653,59 @@ def _adequacy_manifest_field(cfg, behaviors, scenarios):
     return field
 
 
+def _property_manifest_field(scenarios):
+    """M43a: the reproducibility + audit record for property scenarios.
+
+    `scenarios` maps each property scenario id to {cases, seed, invariant} --
+    with the seed recorded, a property run (and any counterexample) is
+    replayable bit-for-bit (df_generate is a pure function of seed+spec).
+    `violations` starts empty and is appended IN PLACE by the run loop when a
+    property fails: the inner dict is SHARED (shallow-copied) into every
+    terminal manifest via mb_clean/dict(mb_clean, ...), so a violation
+    recorded mid-loop lands on whatever terminal the run reaches -- without
+    threading a new argument through every terminal branch. Entries are
+    VALUE-FREE (behavior-id + invariant name + case index +
+    counterexample_recorded flag); the counterexample CONTENT lives only in
+    the control-plane verifier report (run_dir), never here, never in
+    feedback."""
+    props = {}
+    for sc in scenarios:
+        prop = sc.get("when", {}).get("property")
+        if prop:
+            props[sc["id"]] = {
+                "cases": prop["generate"]["cases"],
+                "seed": prop["generate"]["seed"],
+                "invariant": sc["then"]["invariant"]["name"],
+            }
+    return {"scenarios": props, "violations": []}
+
+
+def _journal_property_violations(journal, mb, results, *, cohort, iteration):
+    """M43a: journal PROPERTY_VIOLATED (VALUE-FREE: behavior-id + invariant
+    name + case index -- never the generated input) for each failed property
+    scenario in `results`, and mirror the same value-free record into the
+    shared manifest `property.violations` list (see _property_manifest_field
+    for why in-place append reaches every terminal manifest)."""
+    violations = mb.setdefault("property", {"scenarios": {}, "violations": []})["violations"]
+    for r in results:
+        pinfo = (r.get("observed") or {}).get("property")
+        if not pinfo or r.get("taxonomy") != "property_violated":
+            continue
+        cx = pinfo.get("counterexample") or {}
+        entry = {
+            "cohort": cohort,
+            "iteration": iteration,
+            "behavior_id": r["behavior_id"],
+            "invariant": pinfo.get("invariant"),
+            "case_index": cx.get("case_index"),
+            # The counterexample EXISTS (auditors: look in the run report);
+            # its content is deliberately not reproduced here.
+            "counterexample_recorded": cx != {},
+        }
+        journal.write("PROPERTY_VIOLATED", **entry)
+        violations.append(entry)
+
+
 def _usage_manifest_field(b, usage_known, input_tokens, output_tokens):
     """M25 Task 2: authoritative usage (known/input_tokens/output_tokens --
     accumulated in _run_loop from adapter-reported `resp["usage"]`, e.g.
@@ -3534,7 +3587,14 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # already loaded) rather than at config-load time (df_config never
     # reads scenarios).
     if cfg["candidate_network"] == "deny":
-        http_scenario_ids = [sc["id"] for sc in scenarios if "http" in sc["when"]]
+        # M43a: a property scenario whose STEPS include an http action needs
+        # loopback for exactly the same reason as a when.http scenario.
+        http_scenario_ids = [
+            sc["id"] for sc in scenarios
+            if "http" in sc["when"]
+            or ("property" in sc["when"]
+                and any("http" in step for step in sc["when"]["property"]["steps"]))
+        ]
         if http_scenario_ids:
             journal.write("CANDIDATE_NETWORK_GATE_FAILED", scenarios=http_scenario_ids)
             mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
@@ -3649,6 +3709,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # M42: the auditable adequacy record (class coverage + sharpness battery +
     # decorrelated-critic outcome), threaded onto every terminal from here on.
     manifest_base["adequacy"] = _adequacy_manifest_field(cfg, behaviors, scenarios)
+    # M43a: per-property-scenario {cases, seed, invariant} (reproducibility)
+    # plus the shared in-place `violations` audit list -- see
+    # _property_manifest_field. Empty-but-present when no property scenarios
+    # exist (additive; run/http-only control roots gain a benign field).
+    manifest_base["property"] = _property_manifest_field(scenarios)
     # M9 default: {"checked": False} threads into every terminal manifest via
     # mb_clean unless the CONVERGED path overrides it with the real gate
     # report (gates only run after dev converges + final exam passes).
@@ -4865,6 +4930,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             _redacted_write(os.path.join(run_dir, f"verifier_report_iter_{i}.json"), report, redactor)
             passing = sum(1 for r in report["results"] if r["pass"])
             journal.write("VERIFY", iteration=i, passing=passing, total=len(report["results"]))
+            # M43a: journal PROPERTY_VIOLATED (behavior-id + invariant name +
+            # case index ONLY -- value-free) for each failed property scenario
+            # and mirror it into the shared manifest property.violations list.
+            # The counterexample content stays in verifier_report_iter_*.json
+            # (control-plane); the builder feedback below carries only the
+            # "property_violated" taxonomy.
+            _journal_property_violations(journal, mb_clean, report["results"],
+                                         cohort="dev", iteration=i)
 
             # Regression tracking (green->red on dev): a behavior passes this
             # iteration iff EVERY one of its dev scenarios passed. Any behavior
@@ -4963,6 +5036,12 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 journal.write("FINAL_EXAM", ran=final_ran,
                               passing=sum(1 for r in final["results"] if r["pass"]),
                               total=final["count"])
+                # M43a: same value-free property-violation audit record for the
+                # sealed final cohort (behavior-id + invariant + case index --
+                # consistent with FINAL_EXAM_FAILED's behavior-id-only
+                # discipline; final results are still NEVER fed back).
+                _journal_property_violations(journal, mb_clean, final["results"],
+                                             cohort="final", iteration=i)
                 fe = {"ran": final_ran, "passed": bool(final["all_pass"]) if final_ran else None,
                       "count": final["count"]}
 
@@ -5324,6 +5403,13 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                 "sharpness": {"scenarios": 0, "min_killed": 0, "weakest": []},
                 "critic": None,
             }
+        # M43a: recompute the property record on resume too (deterministic
+        # from the scenarios, same discipline as coverage/adequacy above).
+        # Violations recorded before the pause live in the PARENT segment's
+        # journal/manifest; this segment's list starts empty.
+        manifest_base["property"] = (
+            _property_manifest_field(gate_scenarios) if gate_scenarios is not None
+            else {"scenarios": {}, "violations": []})
         # M9 default (same reasoning as _run_locked): overridden on a
         # resumed-converge by _run_loop's CONVERGED branch, which is the
         # SAME code both run() and resume() funnel through.

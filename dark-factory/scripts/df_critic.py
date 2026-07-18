@@ -82,7 +82,16 @@ a single JSON object of this exact shape and nothing else:
                         too little; e.g. checks only an exit code, not output).
   * "missing_case"    — an important input the behavior implies is untested
                         (an empty/duplicate/oversized/malformed input, an error
-                        path the spec promises).
+                        path the spec promises). This INCLUDES a missing
+                        robustness/fuzz PROPERTY: when a behavior parses or
+                        stores EXTERNAL input and no scenario asserts a
+                        `robust` or `error_contract` invariant over GENERATED
+                        (including malformed) inputs, raise missing_case
+                        naming that gap ("no fuzz/robustness property for
+                        BHV-x") — a fixed example cannot show the app fails
+                        cleanly on inputs nobody wrote down. When it is a
+                        judgment call whether the behavior really handles
+                        external input, make it an advisory instead.
   Every blocking finding MUST name a declared `behavior_id`. Be specific and
   concrete; do NOT restate the whole spec. Do NOT propose the exact assertion
   string (the author must write it) — name the GAP, not the answer.
@@ -128,6 +137,10 @@ def compose_critic_prompt(spec_text, behaviors, scenarios, *, policy=None):
             lines.append(f"    run:  {json.dumps(when['run'])}")
         elif "http" in when:
             lines.append(f"    http: {json.dumps(when['http'])}")
+        elif "property" in when:
+            # M43a: the critic sees the full generative spec (generators,
+            # cases, seed, steps) -- all verifier-side, same as run/then.
+            lines.append(f"    property: {json.dumps(when['property'], sort_keys=True)}")
         lines.append(f"    then: {json.dumps(sc['then'], sort_keys=True)}")
     lines.append("\n## Specification (builder-visible)\n")
     lines.append(spec_text)

@@ -514,12 +514,19 @@ def build_scenarios(answers: dict) -> list:
                     f"behavior {bid}: scenario cohort must be 'dev' or 'final', got {cohort!r}"
                 )
             run = sc_ans.get("run")
-            if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
-                raise InitError(f"behavior {bid}: a scenario's 'run' must be a non-empty list of str")
+            prop = sc_ans.get("property")
+            # M43a: an answers.json scenario carries EXACTLY ONE of
+            # run/property (mirrors run_scenarios' exactly-one-of rule).
+            if (run is None) == (prop is None):
+                raise InitError(
+                    f"behavior {bid}: a scenario needs exactly one of 'run' or 'property'")
+            if prop is None:
+                if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
+                    raise InitError(f"behavior {bid}: a scenario's 'run' must be a non-empty list of str")
             then = sc_ans.get("then")
             if not isinstance(then, dict) or not then:
                 raise InitError(f"behavior {bid}: a scenario's 'then' must be a non-empty object")
-            if not df_gates.is_discriminating(then):
+            if prop is None and not df_gates.is_discriminating(then):
                 raise InitError(
                     f"behavior {bid}: scenario 'then' ({then!r}) is not discriminating "
                     "-- it would pass regardless of the actual observed output"
@@ -529,16 +536,45 @@ def build_scenarios(answers: dict) -> list:
             suffix = "S" if cohort == "dev" else "F"
             sc_id = f"{bid}-{suffix}{counters[cohort]}"
 
-            scenarios.append({
-                "ir_version": "0.1",
+            if prop is not None:
+                when = {"property": prop}
+                ir_version = "0.4"
+            else:
+                when = {"run": list(run), "timeout_s": sc_ans.get("timeout_s", 10)}
+                ir_version = "0.1"
+
+            sc = {
+                "ir_version": ir_version,
                 "id": sc_id,
                 "behavior_id": bid,
                 "cohort": cohort,
                 "title": sc_ans.get("title", ""),
                 "given": sc_ans.get("given", ""),
-                "when": {"run": list(run), "timeout_s": sc_ans.get("timeout_s", 10)},
+                "when": when,
                 "then": then,
-            })
+            }
+
+            if prop is not None:
+                # M43a: a property scenario's deep shape (generate bounds,
+                # steps templating, invariant vocabulary) is validated by the
+                # SAME run_scenarios._validate the installed set passes at
+                # load time, and its discrimination is the invariant battery
+                # (df_gates.sharpness_scenario) -- is_discriminating(then)
+                # above only speaks the CLI/HTTP mutant vocabulary and would
+                # be VACUOUS on an {"invariant": ...} then, so it must not be
+                # the gate here.
+                try:
+                    run_scenarios._validate(sc, f"{sc_id}.json")
+                except run_scenarios.OracleError as e:
+                    raise InitError(f"behavior {bid}: {e}") from e
+                rep = df_gates.sharpness_scenario(sc)
+                if not rep["passed"]:
+                    raise InitError(
+                        f"behavior {bid}: property invariant is not discriminating "
+                        f"(vacuous on: {', '.join(rep['survivors'])})"
+                    )
+
+            scenarios.append(sc)
 
         if counters["dev"] < 1:
             raise InitError(f"behavior {bid}: needs >=1 dev-cohort scenario")
@@ -644,7 +680,15 @@ def _find_spec_leaks(spec_text: str, scenarios: list) -> list:
     """
     leaks = []
     for sc in scenarios:
-        for value in _iter_then_strings(sc.get("then", {})):
+        then = sc.get("then", {})
+        # M43a: a property scenario's `then` is {"invariant": {...}} -- its
+        # strings are VOCABULARY names and generate-var REFERENCES ("robust",
+        # "k"), not asserted holdout output values. There is no answer in
+        # them to leak, and a one-character var name would false-positively
+        # "appear verbatim" in essentially any spec text -- so skip them.
+        if set(then) == {"invariant"}:
+            continue
+        for value in _iter_then_strings(then):
             normalized = value[:-1] if value.endswith("\n") else value
             if normalized and normalized in spec_text:
                 leaks.append({"scenario_id": sc["id"], "value": value})

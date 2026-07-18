@@ -59,13 +59,40 @@ analogue of an exit code); a body/json/json_path mismatch ->
 "wrong_output"; a `twin_observed` mismatch -> "no_twin_evidence".
 
 M20 Task 2: `load_scenarios`/`_validate` now enforces, BEFORE any build,
-across all cohorts: a scenario's `when` has EXACTLY ONE of `run`/`http`
-(both or neither -> `OracleError` naming the id); an http scenario's `then`
-must use >=1 http key and no CLI-only key, and vice versa for a `when.run`
-scenario (mismatched then/when -> `OracleError`); `when.http` requires
-`start` (non-empty argv list) + `request` (method+path); `ir_version`
-accepts `"0.1"`/`"0.2"`/`"0.3"`. Existing `when.run` scenarios are
-completely unaffected (same code path, unchanged).
+across all cohorts: a scenario's `when` has EXACTLY ONE of `run`/`http`/
+`property` (M43a; several or none -> `OracleError` naming the id); an http
+scenario's `then` must use >=1 http key and no CLI-only key, and vice versa
+for a `when.run` scenario (mismatched then/when -> `OracleError`);
+`when.http` requires `start` (non-empty argv list) + `request`
+(method+path); `ir_version` accepts `"0.1"`/`"0.2"`/`"0.3"`/`"0.4"`.
+Existing `when.run` scenarios are completely unaffected (same code path,
+unchanged).
+
+M43a: a THIRD, additive `when.property` scenario kind — generative property
+/ metamorphic / robustness(fuzz) testing. Instead of one fixed input, the
+verifier generates MANY inputs (df_generate: a fixed, seeded, declarative
+generator vocabulary — never code) and asserts an INVARIANT (df_invariants:
+a fixed vocabulary — round_trip / idempotent / deterministic / robust /
+error_contract / monotonic) over each case's step observations. Shape:
+  "when": {"property": {
+      "generate": {"vars": {...}, "cases": N, "seed": S},   # df_generate IR
+      "steps": [{"run": [..., "{var}", ...]} | {"http": {...}}],
+      "timeout_s": 10}},                                    # per-CASE
+  "then": {"invariant": {"name": "...", "args": {...}}}     # EXACTLY this
+Steps are the SAME run/http actions the oracle already executes, with
+`{var}` placeholders literally substituted from the generated case (a
+placeholder that isn't a declared var is an OracleError at load time). A
+property PASSES iff the invariant holds for ALL cases; the first violation
+stops the run with taxonomy "property_violated" and records the
+COUNTEREXAMPLE (the generated input + per-step observations) — which is
+SCENARIO-GRADE SECRET: it lives only in this runner's `observed` dict (the
+control-plane verifier report); id_feedback's projection carries only
+behavior-id + taxonomy, so the builder never sees a generated value.
+Bounded: per-case timeout (covers that case's steps AND repeats), a
+validated `cases` ceiling (df_generate.MAX_CASES), and a total wall-clock
+budget (PROPERTY_MAX_TOTAL_S) — never unbounded. Deterministic: generation
+is a pure function of (seed, spec), so a failure replays from the recorded
+seed.
 """
 import glob
 import http.client
@@ -77,12 +104,16 @@ import socket
 import subprocess
 import time
 
+import df_generate
+import df_invariants
+
 IR_VERSION = "0.1"
-# M20 Task 2: ir_version 0.2/0.3 are additive bumps (twin evidence, then the
-# http scenario type) -- a control root written against any of them loads
-# unchanged. IR_VERSION is kept as the "current/default" constant other
-# modules may reference; IR_VERSIONS is the accepted set at load time.
-IR_VERSIONS = {"0.1", "0.2", "0.3"}
+# M20 Task 2 / M43a: ir_version 0.2/0.3/0.4 are additive bumps (twin
+# evidence, the http scenario type, then the property scenario kind) -- a
+# control root written against any of them loads unchanged. IR_VERSION is
+# kept as the "current/default" constant other modules may reference;
+# IR_VERSIONS is the accepted set at load time.
+IR_VERSIONS = {"0.1", "0.2", "0.3", "0.4"}
 BEHAVIOR_RE = re.compile(r"^BHV-[A-Za-z0-9-]{1,32}$")
 # M42 Task 1: the scenario `class` taxonomy -- an OPTIONAL, back-compat axis
 # ORTHOGONAL to `cohort` (dev/final = feedback-vs-sealed). `class` says WHAT
@@ -105,6 +136,22 @@ CLI_ONLY_THEN_KEYS = {
 }
 TWIN_THEN_KEYS = {"twin_observed", "stdout_echoes_twin"}
 ASSERT_KEYS = CLI_ONLY_THEN_KEYS | TWIN_THEN_KEYS
+# M43a: a property scenario's `then` is EXACTLY this one key (the fixed
+# invariant vocabulary lives in df_invariants) -- any CLI/HTTP assertion key
+# alongside it is a mismatched-kind OracleError, same discipline as the
+# run/http then/when cross-checks.
+PROPERTY_THEN_KEYS = {"invariant"}
+# Per-case default timeout (seconds) for a property scenario -- covers ALL of
+# that case's steps plus any invariant-required repeat executions.
+PROPERTY_DEFAULT_TIMEOUT_S = 10
+# Hard total wall-clock ceiling for one property scenario, regardless of
+# cases x timeout_s -- the "never unbounded" backstop. Hitting it mid-run is
+# taxonomy "timeout" (fail-closed), never a silent truncation-to-pass.
+PROPERTY_MAX_TOTAL_S = 600
+# {var} placeholder grammar for property steps: identifier-shaped only, so a
+# JSON body literal like {"key": ...} can never be mistaken for a placeholder
+# (a quote/space after the brace fails the match).
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class OracleError(ValueError):
@@ -248,6 +295,79 @@ def _validate_http_when(http_spec, fname: str, sc_id: str) -> None:
         raise OracleError(f"{fname} ({sc_id}): when.http.request.path must be a non-empty string")
 
 
+def _http_template_strings(http_spec: dict):
+    """Every string in an http step spec that undergoes {var} substitution --
+    used both by placeholder VALIDATION (each placeholder must name a
+    declared generate var) and by SUBSTITUTION itself (_substitute_http), so
+    the two can never disagree about which fields are templated. `port_env`
+    is deliberately NOT templated (it names an env var, not scenario data)."""
+    yield from http_spec.get("start", [])
+    if isinstance(http_spec.get("ready_path"), str):
+        yield http_spec["ready_path"]
+    request = http_spec.get("request", {})
+    for key in ("method", "path", "body"):
+        if isinstance(request.get(key), str):
+            yield request[key]
+    headers = request.get("headers") or {}
+    if isinstance(headers, dict):
+        for v in headers.values():
+            if isinstance(v, str):
+                yield v
+
+
+def _validate_property_when(prop, fname: str, sc_id: str) -> None:
+    """Load-time, fail-closed validation for `when.property` (M43a).
+
+    Delegates the `generate` block to df_generate.validate_generate (kinds,
+    bounds, cases <= MAX_CASES, seed present-and-int) and the invariant to
+    df_invariants (done by the caller, which also knows the `then`). Checked
+    here: `steps` is a non-empty list of exactly-one-of run/http actions
+    (each shaped like its when.run/when.http counterpart), and EVERY {var}
+    placeholder in any templated string names a declared generate var — a
+    typo'd placeholder is an oracle defect caught before any build, not a
+    literal "{ky}" silently handed to the candidate."""
+    where = f"{fname} ({sc_id})"
+    if not isinstance(prop, dict):
+        raise OracleError(f"{where}: when.property must be an object")
+    unknown = set(prop) - {"generate", "steps", "timeout_s"}
+    if unknown:
+        raise OracleError(f"{where}: when.property has unknown key(s) {sorted(unknown)}")
+    try:
+        df_generate.validate_generate(prop.get("generate"), where)
+    except df_generate.GenerateError as e:
+        raise OracleError(str(e)) from e
+    declared = set(prop["generate"]["vars"])
+
+    steps = prop.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise OracleError(f"{where}: when.property.steps must be a non-empty list")
+    for i, step in enumerate(steps):
+        swhere = f"{where} step {i}"
+        if not isinstance(step, dict) or set(step) not in ({"run"}, {"http"}):
+            raise OracleError(
+                f"{swhere}: each step must be exactly {{'run': [...]}} or "
+                f"{{'http': {{...}}}}")
+        if "run" in step:
+            run = step["run"]
+            if not isinstance(run, list) or not run or not all(isinstance(x, str) for x in run):
+                raise OracleError(f"{swhere}: run must be a non-empty list of strings")
+            templated = run
+        else:
+            _validate_http_when(step["http"], fname, sc_id)
+            templated = list(_http_template_strings(step["http"]))
+        for text in templated:
+            for m in _PLACEHOLDER_RE.finditer(text):
+                if m.group(1) not in declared:
+                    raise OracleError(
+                        f"{swhere}: placeholder {{{m.group(1)}}} is not a declared "
+                        f"generate var (declared: {sorted(declared)})")
+
+    timeout_s = prop.get("timeout_s", PROPERTY_DEFAULT_TIMEOUT_S)
+    if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool)
+            or timeout_s <= 0):
+        raise OracleError(f"{where}: when.property.timeout_s must be a positive number")
+
+
 def _validate(sc: dict, fname: str) -> None:
     if sc.get("ir_version") not in IR_VERSIONS:
         raise OracleError(f"{fname}: ir_version must be one of {sorted(IR_VERSIONS)}")
@@ -270,14 +390,16 @@ def _validate(sc: dict, fname: str) -> None:
     when = sc["when"]
     has_run = "run" in when
     has_http = "http" in when
-    # M20 Task 2: a scenario has EXACTLY ONE of when.run / when.http -- both
-    # or neither is an oracle defect (ambiguous or dead scenario), caught
-    # BEFORE any build, naming the scenario id so it's unambiguous which
-    # scenario file is at fault even if several share similar filenames.
-    if has_run == has_http:
+    has_property = "property" in when
+    # M20 Task 2 / M43a: a scenario has EXACTLY ONE of when.run / when.http /
+    # when.property -- several or none is an oracle defect (ambiguous or dead
+    # scenario), caught BEFORE any build, naming the scenario id so it's
+    # unambiguous which scenario file is at fault even if several share
+    # similar filenames.
+    if (has_run + has_http + has_property) != 1:
         raise OracleError(
-            f"{fname} ({sc_id}): when must have EXACTLY ONE of 'run' or 'http', "
-            f"got run={has_run} http={has_http}"
+            f"{fname} ({sc_id}): when must have EXACTLY ONE of 'run', 'http', or "
+            f"'property', got run={has_run} http={has_http} property={has_property}"
         )
 
     then = sc["then"]
@@ -285,7 +407,25 @@ def _validate(sc: dict, fname: str) -> None:
         raise OracleError(f"{fname} ({sc_id}): then must be an object")
     then_keys = set(then)
 
-    if has_http:
+    if has_property:
+        # M43a: a property scenario's then is EXACTLY {"invariant": {...}} --
+        # any CLI/HTTP assertion key here is a mismatched kind (those assert
+        # one fixed observation; a property asserts an invariant over many),
+        # rejected with the same then/when cross-check discipline as run/http.
+        _validate_property_when(when["property"], fname, sc_id)
+        if then_keys != PROPERTY_THEN_KEYS:
+            raise OracleError(
+                f"{fname} ({sc_id}): a property scenario's then must be exactly "
+                f"{{'invariant': {{...}}}} -- got key(s) {sorted(then_keys)} "
+                f"(CLI/HTTP assertion keys are a mismatched then/when)"
+            )
+        try:
+            df_invariants.validate_invariant(
+                then["invariant"], when["property"]["generate"],
+                len(when["property"]["steps"]), f"{fname} ({sc_id})")
+        except df_invariants.InvariantError as e:
+            raise OracleError(str(e)) from e
+    elif has_http:
         _validate_http_when(when["http"], fname, sc_id)
         mismatched = then_keys & CLI_ONLY_THEN_KEYS
         if mismatched:
@@ -644,7 +784,14 @@ def _run_http_scenario(
                 _http_probe("127.0.0.1", port, ready_path, timeout=min(1.0, remaining))
                 ready = True
                 break
-            except (OSError, ConnectionError, http.client.HTTPException):
+            # ValueError: http.client raises a plain ValueError (NOT an
+            # HTTPException subclass) when a request line / header value
+            # carries control chars or CRLF -- exactly what a property
+            # scenario's malformed:control_chars / bytes-charset generator can
+            # substitute into a templated ready_path. A hostile generated
+            # value must NEVER crash the runner (same discipline as the CLI
+            # step's ValueError guard); map it to not-ready -> "crash".
+            except (OSError, ConnectionError, http.client.HTTPException, ValueError):
                 time.sleep(0.05)
 
         if not ready:
@@ -666,7 +813,16 @@ def _run_http_scenario(
                     observed["json"] = None
             finally:
                 conn.close()
-        except (OSError, ConnectionError, http.client.HTTPException):
+        # ValueError: http.client.request raises a bare ValueError ("Invalid
+        # method"/"Invalid header value ...") when the templated method / path
+        # / header value / body carries control chars or CRLF -- precisely the
+        # bytes-charset / malformed:control_chars fuzz inputs. Without this the
+        # exception propagates out of run_all (which the supervisor only
+        # guards for OracleError), aborting the whole verify pass AND embedding
+        # the generated value in the traceback. Fold it into the same
+        # connection-level failure -> http_status stays None -> "crash",
+        # matching the CLI step's "a hostile value never crashes the runner".
+        except (OSError, ConnectionError, http.client.HTTPException, ValueError):
             pass  # request failed at the connection level -> status stays None
 
         return observed
@@ -740,8 +896,248 @@ def _read_twin_deltas(observer_files: dict | None, offsets: dict) -> tuple[dict,
     return observations, tokens
 
 
+def _substitute(text: str, case: dict) -> str:
+    """Literal {var} -> generated-value interpolation. Load-time validation
+    guarantees every placeholder is a declared var; if this is ever reached
+    unvalidated (a caller skipped load_scenarios), fail CLOSED with a real
+    OracleError rather than handing the candidate a literal '{k}'."""
+    def repl(m):
+        name = m.group(1)
+        if name not in case:
+            raise OracleError(
+                f"placeholder {{{name}}} references an undeclared generate var")
+        return case[name]
+    return _PLACEHOLDER_RE.sub(repl, text)
+
+
+def _substitute_http(http_spec: dict, case: dict) -> dict:
+    """A deep copy of an http step spec with {var} substituted into exactly
+    the fields _http_template_strings enumerates (start argv, ready_path,
+    request method/path/body, header values) -- the validator and this
+    substitution share that enumeration, so a field can't be validated as
+    templated but then substituted differently (or vice versa)."""
+    out = json.loads(json.dumps(http_spec))  # cheap, faithful deep copy
+    out["start"] = [_substitute(a, case) for a in out.get("start", [])]
+    if isinstance(out.get("ready_path"), str):
+        out["ready_path"] = _substitute(out["ready_path"], case)
+    request = out.get("request", {})
+    for key in ("method", "path", "body"):
+        if isinstance(request.get(key), str):
+            request[key] = _substitute(request[key], case)
+    headers = request.get("headers")
+    if isinstance(headers, dict):
+        request["headers"] = {k: (_substitute(v, case) if isinstance(v, str) else v)
+                              for k, v in headers.items()}
+    return out
+
+
+def _run_cli_step(argv: list, workspace: str, exec_wrapper: list | None,
+                  env_extra: dict | None, timeout: float):
+    """Run ONE property-scenario CLI step under the SAME candidate discipline
+    as run_scenario's when.run body: candidate_env sanitization, the
+    exec_wrapper (candidate sandbox) prefix, start_new_session + process-group
+    reaping in `finally` (no orphan, ever). Returns (observed, taxonomy):
+    observed is the evaluate_then-shaped dict on a completed run (ANY exit
+    code -- a signal death is an observation the `robust` invariant exists to
+    judge, not a dispatch error), taxonomy is "timeout"/"crash" (observed
+    None) when the step never completed at all."""
+    command = (list(exec_wrapper) if exec_wrapper else []) + argv
+    env = candidate_env(env_extra)
+    proc = None
+    pgid = None
+    try:
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            # Capture pgid NOW while the child is definitely alive -- see
+            # _reap_process_group for why this must not be re-resolved later.
+            pgid = proc.pid
+            stdout, stderr = proc.communicate(timeout=max(0.05, timeout))
+            return {"exit_code": proc.returncode, "stdout": stdout, "stderr": stderr}, None
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+        # ValueError: Popen refuses argv/env it cannot deliver (e.g. an
+        # embedded NUL). df_generate never emits raw NUL for exactly this
+        # reason, but a hostile-looking generated value must NEVER be able to
+        # crash the RUNNER -- fail closed as "crash", like any unlaunchable
+        # command.
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
+            return None, "crash"
+    finally:
+        if proc is not None:
+            _reap_process_group(proc, pgid)
+
+
+def _run_property_steps(steps: list, case: dict, workspace: str,
+                        exec_wrapper: list | None, env_extra: dict | None,
+                        deadline: float):
+    """Execute a step list for ONE generated case, substituting {var}s.
+    Returns (observations, taxonomy): taxonomy "timeout"/"crash" aborts the
+    case (and the scenario -- bounded, fail-closed), None means every step
+    completed and produced an observation for the invariant."""
+    observations = []
+    for step in steps:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return observations, "timeout"
+        if "run" in step:
+            argv = [_substitute(a, case) for a in step["run"]]
+            obs, taxonomy = _run_cli_step(argv, workspace, exec_wrapper, env_extra, remaining)
+            if taxonomy is not None:
+                return observations, taxonomy
+            observations.append(obs)
+        else:
+            # An http step starts its OWN service instance, issues its one
+            # request, and always reaps it -- byte-for-byte the machinery of a
+            # when.http scenario (_run_http_scenario), templated. A service
+            # that never becomes ready / never answers is "crash", the same
+            # fail-closed mapping evaluate_http uses -- never handed to the
+            # invariant as a vacuous empty observation.
+            http_spec = _substitute_http(step["http"], case)
+            pseudo = {"when": {"http": http_spec}}
+            obs = _run_http_scenario(pseudo, workspace, exec_wrapper, env_extra,
+                                     max(0.05, remaining))
+            if obs["http_status"] is None:
+                return observations, "crash"
+            observations.append(obs)
+    return observations, None
+
+
+def _run_property_and_evaluate(
+    sc: dict,
+    workspace: str,
+    exec_wrapper: list | None,
+    env_extra: dict | None,
+    observer_files: dict | None,
+) -> dict:
+    """Execute a `when.property` scenario (M43a): generate the cases (pure
+    function of seed+spec), run each case's steps under the SAME candidate
+    confinement as any scenario, evaluate the invariant, stop at the first
+    violation or pass after all cases.
+
+    BARRIER (the load-bearing property of this function -- stated precisely):
+    the result's `observed["property"]` carries the seed/cases/invariant
+    metadata plus -- on failure -- the COUNTEREXAMPLE (case index, generated
+    vars, per-step observations, detail). That dict flows ONLY into the
+    verifier report (control-plane, run_dir); id_feedback.project_feedback
+    reads exclusively behavior_id/pass/taxonomy, and validate_feedback
+    structurally rejects any other key -- so the FEEDBACK can never carry a
+    generated value, and the HIGH-VALUE secret (the invariant/args, the
+    counterexample detail, and -- like every scenario kind -- the expected
+    OUTPUTS) never reaches the builder.
+
+    Honest scope on "the workspace": this RUNNER writes nothing to `workspace`
+    itself. But a candidate STEP may legitimately persist its generated INPUT
+    as ordinary program state -- e.g. `put {k} {v}` leaves k/v in
+    `workspace/store.json`, which the builder reads next iteration -- exactly
+    as a fixed `when.run`/`when.http` input already persists into the
+    workspace. That is SAFE and NOT a leak worth closing: a property invariant
+    is GENERIC (it must hold for ALL inputs), so a builder that sees a past
+    generated input learns nothing gameable -- there is no per-input expected
+    answer to memorize, unlike a fixed scenario's holdout output. Resetting
+    candidate state between cases/iterations would break intended
+    cross-iteration behavior and is deliberately NOT done. What the barrier
+    guarantees is therefore: no generated value in feedback/journal/manifest,
+    and no expected-output/invariant-detail secret in the workspace -- NOT
+    that a candidate's own state never retains an input it was handed.
+
+    BOUNDED: per-case `timeout_s` (covers that case's steps AND any
+    invariant-required repeats) and a total budget of
+    min(cases * timeout_s, PROPERTY_MAX_TOTAL_S); crossing either boundary is
+    taxonomy "timeout" -- fail-closed, never a silent truncation-to-pass."""
+    prop = sc["when"]["property"]
+    gen = prop["generate"]
+    inv = sc["then"]["invariant"]
+    per_case = prop.get("timeout_s", PROPERTY_DEFAULT_TIMEOUT_S)
+    cases = df_generate.generate_cases(gen)
+    total_budget = min(len(cases) * per_case, PROPERTY_MAX_TOTAL_S)
+    # idempotent/deterministic are relations over RE-EXECUTION -- the runner
+    # (not the invariant) owns running the extra steps; see
+    # df_invariants.NEEDS_REPEAT.
+    repeat_mode = df_invariants.NEEDS_REPEAT.get(
+        df_invariants.canonical_name(inv["name"]))
+
+    offsets = _observer_offsets(observer_files)
+    deadline = time.time() + total_budget
+    taxonomy = None
+    counterexample = None
+    cases_run = 0
+
+    for idx, case in enumerate(cases):
+        if time.time() >= deadline:
+            taxonomy = "timeout"
+            break
+        cases_run = idx + 1
+        case_deadline = min(deadline, time.time() + per_case)
+        step_obs, step_tax = _run_property_steps(
+            prop["steps"], case, workspace, exec_wrapper, env_extra, case_deadline)
+        repeat_obs = []
+        if step_tax is None and repeat_mode is not None:
+            repeat_steps = prop["steps"][-1:] if repeat_mode == "terminal" else prop["steps"]
+            repeat_obs, step_tax = _run_property_steps(
+                repeat_steps, case, workspace, exec_wrapper, env_extra, case_deadline)
+        if step_tax is not None:
+            # A step that never completed (hang / failed launch / dead
+            # service). Record WHICH generated input did it -- control-plane
+            # counterexample -- under the honest existing taxonomy.
+            taxonomy = step_tax
+            counterexample = {
+                "case_index": idx,
+                "vars": dict(case),
+                "detail": f"step did not complete ({step_tax})",
+                "observations": step_obs + repeat_obs,
+            }
+            break
+        ok, detail = df_invariants.evaluate_invariant(
+            inv, case, {"steps": step_obs, "repeat": repeat_obs})
+        if not ok:
+            taxonomy = "property_violated"
+            counterexample = {
+                "case_index": idx,
+                "vars": dict(case),
+                "detail": detail,
+                "observations": step_obs + repeat_obs,
+            }
+            break
+
+    twin_observations, twin_tokens = _read_twin_deltas(observer_files, offsets)
+    observed = {
+        # Reproducibility record: seed + case counts, mirrored into the
+        # manifest by the supervisor. `counterexample` (None on pass) is
+        # scenario-grade secret -- control-plane report only (see docstring).
+        "property": {
+            "invariant": inv["name"],
+            "seed": gen["seed"],
+            "cases": len(cases),
+            "cases_run": cases_run,
+            "counterexample": counterexample,
+        },
+        "twin_observations": twin_observations,
+        "twin_tokens": twin_tokens,
+    }
+    return {
+        "id": sc["id"],
+        "behavior_id": sc["behavior_id"],
+        "pass": taxonomy is None,
+        "taxonomy": taxonomy,
+        "observed": observed,
+    }
+
+
 def run_scenario(sc: dict, workspace: str, exec_wrapper: list | None = None, env_extra: dict | None = None,
                  observer_files: dict | None = None) -> dict:
+    # M43a: `when.property` is a NEW, additive path -- dispatched first so
+    # `run_all` (unchanged) picks it up automatically, like when.http below.
+    if "property" in sc["when"]:
+        return _run_property_and_evaluate(sc, workspace, exec_wrapper, env_extra,
+                                          observer_files)
     # M20 Task 1: `when.http` is a NEW, additive path -- dispatched here so
     # `run_all` (which just calls run_scenario per scenario, unchanged)
     # picks it up automatically. Every existing `when.run` scenario falls

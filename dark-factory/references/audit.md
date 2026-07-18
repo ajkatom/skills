@@ -417,3 +417,27 @@ None of these records carry any scenario `then` content — mutant KINDS
 ("stdout_equals:empty") and class NAMES are category labels, barrier-safe. The
 critic's own advisories live in `<control_root>/scenario_review.md` (control
 plane, never the workspace). See `references/scenario-adequacy.md`.
+
+## `property` manifest field + `PROPERTY_VIOLATED` journal event (M43a)
+
+Every terminal that ran the M7 pre-build gate seals `property` — the
+reproducibility + audit record for generative property/fuzz scenarios
+(`references/scenario-format.md`):
+
+- `scenarios = {scenario_id: {cases, seed, invariant}}` — with the seed
+  recorded, a property run (and any counterexample) is replayable
+  bit-for-bit: generation is a pure function of (seed, spec). Empty (but
+  present) when the control root has no property scenarios.
+- `violations = [{cohort, iteration, behavior_id, invariant, case_index,
+  counterexample_recorded}]` — one entry per failed property scenario per
+  verify pass, VALUE-FREE: it says a counterexample EXISTS and where the
+  operator can find it, never what the generated input was.
+
+Each violation is also journaled as **`PROPERTY_VIOLATED`** with the same
+value-free fields. The counterexample CONTENT (the generated vars + per-step
+observations + detail) lands in exactly one place: the control-plane
+verifier report (`verifier_report_iter_*.json` / `final_exam_report.json` in
+the run dir). It never enters the builder workspace, `feedback.json`
+(id_feedback's `ALLOWED_FAILURE` keyset structurally forbids it — the
+feedback carries only behavior-id + the fixed taxonomy `property_violated`),
+the journal, or the manifest.
