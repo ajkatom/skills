@@ -14,9 +14,12 @@ of near-miss mutants), and adversarially critiqued by a **second** decorrelated
 model. Scenarios can also be **generative** (`when.property`, M43a): assert an
 invariant — round-trip, idempotency, determinism, "never crashes / fails
 cleanly" — over many seeded, machine-generated (including malformed/fuzz)
-inputs, with any counterexample kept control-plane-only. That narrows the gap
-to human spec fidelity + concurrency (M43b) + perf/load/scale (a separate
-tool) — see `references/authoring.md`, `references/scenario-adequacy.md`, and
+inputs, with any counterexample kept control-plane-only. A generative property
+may add a `concurrency` block (M43b) that runs the steps IN PARALLEL to catch
+lost updates / crashes-under-parallelism / non-idempotent retries (ONE STRIKE =
+fail; a PASS is probabilistic detection, not a race-freedom proof). That
+narrows the gap to human spec fidelity + perf/load/scale (a separate tool) —
+see `references/authoring.md`, `references/scenario-adequacy.md`, and
 `references/scenario-format.md`.
 
 Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](../docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md).

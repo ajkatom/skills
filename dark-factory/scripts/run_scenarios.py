@@ -94,6 +94,7 @@ budget (PROPERTY_MAX_TOTAL_S) — never unbounded. Deterministic: generation
 is a pure function of (seed, spec), so a failure replays from the recorded
 seed.
 """
+import concurrent.futures
 import glob
 import http.client
 import json
@@ -329,7 +330,7 @@ def _validate_property_when(prop, fname: str, sc_id: str) -> None:
     where = f"{fname} ({sc_id})"
     if not isinstance(prop, dict):
         raise OracleError(f"{where}: when.property must be an object")
-    unknown = set(prop) - {"generate", "steps", "timeout_s"}
+    unknown = set(prop) - {"generate", "steps", "timeout_s", "concurrency"}
     if unknown:
         raise OracleError(f"{where}: when.property has unknown key(s) {sorted(unknown)}")
     try:
@@ -337,6 +338,17 @@ def _validate_property_when(prop, fname: str, sc_id: str) -> None:
     except df_generate.GenerateError as e:
         raise OracleError(str(e)) from e
     declared = set(prop["generate"]["vars"])
+
+    # M43b: the OPTIONAL concurrency block (shape + workers/attempts ceilings +
+    # per_worker_vars subset). Absent ⇒ M43a byte-identical. The invariant
+    # coupling (concurrency block <-> concurrency invariant) is cross-checked
+    # in _validate, which also holds the `then`.
+    if "concurrency" in prop:
+        try:
+            df_generate.validate_concurrency(
+                prop["concurrency"], prop["generate"]["vars"], where)
+        except df_generate.GenerateError as e:
+            raise OracleError(str(e)) from e
 
     steps = prop.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -419,10 +431,34 @@ def _validate(sc: dict, fname: str) -> None:
                 f"{{'invariant': {{...}}}} -- got key(s) {sorted(then_keys)} "
                 f"(CLI/HTTP assertion keys are a mismatched then/when)"
             )
+        # M43b: a property scenario uses EXACTLY ONE invariant family. A
+        # concurrency block <=> a concurrency invariant; either without the
+        # other is a mismatched kind (a sequential invariant cannot judge a
+        # parallel run, and a concurrency invariant has no per-worker evidence
+        # without the block), caught before any build with the same then/when
+        # cross-check discipline as run/http.
+        prop = when["property"]
+        inv = then["invariant"]
+        has_concurrency = "concurrency" in prop
+        inv_name = inv.get("name") if isinstance(inv, dict) else None
+        is_conc_inv = inv_name in df_invariants.CONCURRENCY_INVARIANT_NAMES
+        if has_concurrency and not is_conc_inv:
+            raise OracleError(
+                f"{fname} ({sc_id}): a when.property.concurrency block requires a "
+                f"concurrency invariant {list(df_invariants.CONCURRENCY_INVARIANT_NAMES)}, "
+                f"got invariant {inv_name!r}")
+        if is_conc_inv and not has_concurrency:
+            raise OracleError(
+                f"{fname} ({sc_id}): concurrency invariant {inv_name!r} requires a "
+                f"when.property.concurrency block (it judges a parallel run)")
         try:
-            df_invariants.validate_invariant(
-                then["invariant"], when["property"]["generate"],
-                len(when["property"]["steps"]), f"{fname} ({sc_id})")
+            if has_concurrency:
+                df_invariants.validate_concurrency_invariant(
+                    inv, prop["concurrency"], prop["generate"],
+                    len(prop["steps"]), f"{fname} ({sc_id})")
+            else:
+                df_invariants.validate_invariant(
+                    inv, prop["generate"], len(prop["steps"]), f"{fname} ({sc_id})")
         except df_invariants.InvariantError as e:
             raise OracleError(str(e)) from e
     elif has_http:
@@ -1010,6 +1046,88 @@ def _run_property_steps(steps: list, case: dict, workspace: str,
     return observations, None
 
 
+def _run_concurrency_attempts(prop: dict, inv: dict, gen: dict, case_index: int,
+                              base_case: dict, workspace: str,
+                              exec_wrapper: list | None, env_extra: dict | None,
+                              per_case: float, deadline: float):
+    """M43b: run one generated case's PARALLEL interleaving attempts and judge
+    the concurrency invariant. Returns (taxonomy, counterexample):
+      - (None, None)                    -> every attempt passed
+      - ("property_violated", cx)       -> ONE STRIKE: the first attempt whose
+                                           invariant check failed (incl. a hung
+                                           or crashed worker, which the
+                                           invariant itself flags)
+      - ("timeout", cx)                 -> the TOTAL budget deadline was crossed
+                                           before this case's attempts finished
+
+    DRIVER: each attempt launches `workers` executions of the step sequence via
+    a ThreadPoolExecutor. The threads only marshal I/O — the REAL parallelism is
+    the `workers` candidate SUBPROCESSES racing over shared state. Each worker
+    runs under the SAME exec_wrapper (candidate sandbox) + candidate_env as any
+    scenario (via _run_property_steps -> _run_cli_step / _run_http_scenario),
+    and each worker's process group is reaped in that path's `finally` — a hung
+    worker is KILLED at the per-case deadline (its result taxonomy becomes
+    "timeout", which no_crash_no_hang turns into a failure), never an orphan,
+    never a stuck run. We wait for ALL futures before evaluating, so even on a
+    one-strike failure every launched worker has been reaped first."""
+    conc = prop["concurrency"]
+    workers = conc["workers"]
+    attempts = conc["attempts"]
+    pwv = conc.get("per_worker_vars", [])
+    args = inv.get("args", {})
+
+    # Per-worker var OVERRIDES for this case — deterministic in (seed, case,
+    # worker); the shared vars stay from base_case. Same for every attempt of
+    # this case (WHAT is generated is seeded; only the OS interleaving varies,
+    # which is the whole point of running `attempts` of them).
+    overrides = df_generate.per_worker_values(gen, case_index, pwv, workers)
+    worker_cases = [dict(base_case, **overrides[w]) for w in range(workers)]
+
+    for attempt in range(attempts):
+        if time.time() >= deadline:
+            return "timeout", {
+                "case_index": case_index,
+                "attempt_index": attempt,
+                "vars": dict(base_case),
+                "detail": "concurrency budget deadline reached before attempt ran",
+                "workers": [],
+            }
+        case_deadline = min(deadline, time.time() + per_case)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_run_property_steps, prop["steps"], wc, workspace,
+                            exec_wrapper, env_extra, case_deadline)
+                for wc in worker_cases
+            ]
+            # result() re-raises a worker thread's exception; _run_property_steps
+            # is written not to raise (hostile values fold to a taxonomy), but
+            # fail CLOSED if one ever does rather than silently dropping a worker.
+            results = [f.result() for f in futures]
+
+        worker_observations = [
+            {"steps": obs, "taxonomy": tax, "vars": worker_cases[w]}
+            for w, (obs, tax) in enumerate(results)
+        ]
+        ok, detail = df_invariants.evaluate_concurrency_invariant(
+            inv, base_case, worker_observations, args)
+        if not ok:
+            # ONE STRIKE — a single observed violation IS a real bug. Record the
+            # full per-worker evidence (control-plane counterexample: case +
+            # attempt index, each worker's vars + observations, the detail).
+            return "property_violated", {
+                "case_index": case_index,
+                "attempt_index": attempt,
+                "vars": dict(base_case),
+                "detail": detail,
+                "workers": [
+                    {"vars": w["vars"], "taxonomy": w["taxonomy"],
+                     "observations": w["steps"]}
+                    for w in worker_observations
+                ],
+            }
+    return None, None
+
+
 def _run_property_and_evaluate(
     sc: dict,
     workspace: str,
@@ -1050,17 +1168,30 @@ def _run_property_and_evaluate(
 
     BOUNDED: per-case `timeout_s` (covers that case's steps AND any
     invariant-required repeats) and a total budget of
-    min(cases * timeout_s, PROPERTY_MAX_TOTAL_S); crossing either boundary is
-    taxonomy "timeout" -- fail-closed, never a silent truncation-to-pass."""
+    min(cases * attempts * timeout_s, PROPERTY_MAX_TOTAL_S) (attempts == 1
+    without a concurrency block); crossing either boundary is taxonomy
+    "timeout" -- fail-closed, never a silent truncation-to-pass.
+
+    M43b (concurrency): when `when.property.concurrency` is present, each case
+    instead runs `attempts` PARALLEL interleavings via _run_concurrency_attempts
+    and judges a concurrency invariant (ONE STRIKE = fail). A hung worker is
+    killed at the per-case deadline (reaped, never an orphan) and folded into
+    the invariant as a failure, not a scenario-level "timeout". A PASS is
+    PROBABILISTIC (absence of an observed race is not proof of race-freedom);
+    workers x attempts x cases are recorded so the effort is auditable."""
     prop = sc["when"]["property"]
     gen = prop["generate"]
     inv = sc["then"]["invariant"]
+    conc = prop.get("concurrency")  # M43b: absent ⇒ M43a path byte-identical
     per_case = prop.get("timeout_s", PROPERTY_DEFAULT_TIMEOUT_S)
     cases = df_generate.generate_cases(gen)
-    total_budget = min(len(cases) * per_case, PROPERTY_MAX_TOTAL_S)
+    # The total wall-clock budget. Concurrency multiplies by `attempts` (each
+    # case runs that many interleavings), still capped at PROPERTY_MAX_TOTAL_S.
+    attempts = conc["attempts"] if conc else 1
+    total_budget = min(len(cases) * attempts * per_case, PROPERTY_MAX_TOTAL_S)
     # idempotent/deterministic are relations over RE-EXECUTION -- the runner
     # (not the invariant) owns running the extra steps; see
-    # df_invariants.NEEDS_REPEAT.
+    # df_invariants.NEEDS_REPEAT. (Concurrency invariants never NEEDS_REPEAT.)
     repeat_mode = df_invariants.NEEDS_REPEAT.get(
         df_invariants.canonical_name(inv["name"]))
 
@@ -1075,6 +1206,16 @@ def _run_property_and_evaluate(
             taxonomy = "timeout"
             break
         cases_run = idx + 1
+        if conc is not None:
+            # M43b parallel path: run this case's `attempts` interleavings; one
+            # observed violation (incl. a hung/crashed worker) fails the
+            # scenario (ONE STRIKE) with the existing property_violated taxonomy.
+            taxonomy, counterexample = _run_concurrency_attempts(
+                prop, inv, gen, idx, case, workspace, exec_wrapper, env_extra,
+                per_case, deadline)
+            if taxonomy is not None:
+                break
+            continue
         case_deadline = min(deadline, time.time() + per_case)
         step_obs, step_tax = _run_property_steps(
             prop["steps"], case, workspace, exec_wrapper, env_extra, case_deadline)
@@ -1108,17 +1249,25 @@ def _run_property_and_evaluate(
             break
 
     twin_observations, twin_tokens = _read_twin_deltas(observer_files, offsets)
-    observed = {
+    property_record = {
         # Reproducibility record: seed + case counts, mirrored into the
         # manifest by the supervisor. `counterexample` (None on pass) is
         # scenario-grade secret -- control-plane report only (see docstring).
-        "property": {
-            "invariant": inv["name"],
-            "seed": gen["seed"],
-            "cases": len(cases),
-            "cases_run": cases_run,
-            "counterexample": counterexample,
-        },
+        "invariant": inv["name"],
+        "seed": gen["seed"],
+        "cases": len(cases),
+        "cases_run": cases_run,
+        "counterexample": counterexample,
+    }
+    if conc is not None:
+        # M43b: record the audited detection effort (workers x attempts x
+        # cases). An HONEST caveat, documented in scenario-adequacy: a PASS is
+        # PROBABILISTIC — absence of an observed race is not proof of
+        # race-freedom; these numbers quantify how hard the oracle looked.
+        property_record["workers"] = conc["workers"]
+        property_record["attempts"] = conc["attempts"]
+    observed = {
+        "property": property_record,
         "twin_observations": twin_observations,
         "twin_tokens": twin_tokens,
     }

@@ -211,13 +211,70 @@ contract" under malformed input).
   configuration (e.g. `round_trip` over a var whose generator can emit the
   empty string) refuses to build.
 
-**Honest scope (M43a):** property/fuzz scenarios close the fixed-example
-gap for single-process invariants. Bounded-CONCURRENCY scenarios (races,
-lost updates) are **M43b**, built on this engine.
-Throughput/load/latency-SLA/soak testing is a DIFFERENT tool (statistical
-rigor + real infra), permanently out of scope for this correctness oracle.
-The human spec-fidelity residual is unchanged — no invariant can prove the
-spec captured the human's intent.
+### `when.property.concurrency` — bounded-concurrency oracle (M43b)
+
+A property MAY add an OPTIONAL `concurrency` block that executes the `steps`
+**in parallel** to detect concurrency bugs (lost updates, corruption/crash
+under parallel access, non-idempotent concurrent retries). Absent the block,
+behavior is M43a byte-identical.
+
+```jsonc
+"when": {"property": {
+  "generate": {"vars": {"item": {"kind": "string", "charset": "alnum",
+                                 "min_len": 8, "max_len": 16}},
+               "cases": 10, "seed": 42},
+  "steps": [{"run": ["python3", "app.py", "add", "shared", "{item}"]}],
+  "concurrency": {"workers": 4, "attempts": 8, "per_worker_vars": ["item"]},
+  "timeout_s": 10}},
+"then": {"invariant": {"name": "no_lost_update", "args": {"value": "item"}}}
+```
+
+- **Block shape** (validated at load): `workers` (2..16) parallel executions
+  per attempt; `attempts` (1..20) re-interleavings per case; `per_worker_vars`
+  (optional) names vars each worker gets a DISTINCT generated value for — a
+  var here may not be `malformed`. Everything about WHAT is generated is seeded
+  and reproducible (per-worker values are a deterministic function of
+  seed→case→worker via a SHA-256-derived sub-stream that never perturbs the
+  M43a base stream); only the OS interleaving varies — which is the point.
+- **Concurrency invariant vocabulary** (`then.invariant.name`, a DISTINCT
+  family — a concurrency block requires a concurrency invariant, and vice
+  versa, cross-checked at load):
+  * `no_lost_update` (`args: {value, observe_step?}`) — N workers each write
+    a DISTINCT value (`value` names that per-worker var, which MUST be in
+    `per_worker_vars`); some read must reflect ALL of them at once — a
+    read-modify-write race, where each write overwrites the others, never
+    reaches the full set.
+  * `serializable_counter` (`args: {observe_step?}`) — N concurrent increments
+    print N DISTINCT CONTIGUOUS values; a duplicate = a lost update, a gap =
+    a vanished write. The canonical lost-update detector.
+  * `idempotent_under_concurrency` (`args: {observe_step?}`) — N workers
+    running the SAME op converge to ONE consistent observed result; divergent
+    observations = a non-idempotent concurrent handler.
+  * `no_crash_no_hang` (`args: {allowed_exits?}`) — no worker crashes, returns
+    5xx, or HANGS. A hang is a FAILURE, enforced by the per-case deadline: a
+    hung worker is killed (process-group reaped, never an orphan) and its
+    result taxonomy becomes the failure.
+- **ONE STRIKE (owner decision, 2026-07-17)**: the FIRST attempt (in any case)
+  whose invariant check fails records the counterexample (case index, attempt
+  index, per-worker vars + observations) and the scenario FAILS with the
+  existing `property_violated` taxonomy — a single observed violation IS a
+  real bug. All attempts passing ⇒ PASS.
+- **A PASS is PROBABILISTIC detection, not proof.** Absence of an observed
+  race is not proof of race-freedom; the oracle raises the detection floor.
+  The manifest records `workers × attempts × cases` so the effort is
+  auditable. The suite's own tests use ENGINEERED-RELIABLE races (a deliberate
+  sleep between read and write makes the lost update reliable) so they are
+  deterministic; real candidate races are inherently probabilistic.
+- **Barrier**: identical to M43a — the per-worker observations/counterexample
+  are control-plane only; the `PROPERTY_VIOLATED` journal event gains a
+  value-free `attempt_index` (an int), never a generated value.
+
+**Honest scope (M43b):** property scenarios close the fixed-example gap for
+single-process invariants (M43a) and now for bounded-concurrency correctness
+(M43b). Throughput/load/latency-SLA/soak testing is a DIFFERENT tool
+(statistical rigor + real infra), permanently out of scope for this
+correctness oracle. The human spec-fidelity residual is unchanged — no
+invariant can prove the spec captured the human's intent.
 
 `cohort` is the train/dev/test split: `dev` scenarios are the ones the
 loop iterates against every step (feedback is drawn from these). `final`
@@ -273,4 +330,9 @@ is **invariant discrimination** (`df_invariants.invariant_is_discriminating`
 via `df_gates.sharpness_scenario`): the invariant must reject a constructed
 battery of violating observations (crashes, changed repeats, absent values,
 unsorted output), so a vacuous invariant configuration is caught pre-build
-exactly like an inert `then`.
+exactly like an inert `then`. A concurrency property (M43b) is gated the same
+way against a violating PER-WORKER battery
+(`df_invariants.concurrency_invariant_is_discriminating`): the concurrency
+invariant must reject a hung/crashed worker, a duplicate counter value, a torn
+read, divergent worker observations — so a vacuous concurrency invariant
+refuses to build.

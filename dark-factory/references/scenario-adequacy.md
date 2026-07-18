@@ -173,10 +173,39 @@ does NOT claim to cross these two ceilings — state them plainly:
   ordinary state (`put {k} {v}` → `store.json`), exactly as a fixed input
   already does; that is safe because a property invariant is generic (holds
   for all inputs), so a leaked input is not gameable. What
-  REMAINS out: **bounded-concurrency** scenarios (races, lost updates) are
-  **M43b**, built on the same generative engine; **perf / load / scale /
-  latency-SLA / real-traffic remains a separate tool** — a correctness
-  oracle cannot honestly express them — permanently out of scope here.
+  REMAINS out after M43a is bounded-concurrency — now closed by **M43b**.
+
+- **Bounded-concurrency correctness — M43b, with an HONEST probabilistic
+  caveat.** A `when.property` may add a `concurrency` block that runs the steps
+  in PARALLEL (`workers` executions × `attempts` interleavings per case) and
+  asserts a concurrency invariant (`no_lost_update`, `serializable_counter`,
+  `idempotent_under_concurrency`, `no_crash_no_hang`). **ONE STRIKE = FAIL**
+  (owner decision): a single observed violation across all cases × attempts
+  fails the scenario — a lost update seen once IS a real bug. But a **PASS is
+  PROBABILISTIC detection, not proof**: the interleaving is OS-scheduled, so
+  absence of an observed race is NOT proof of race-freedom. The oracle RAISES
+  THE DETECTION FLOOR; it does not certify race-freedom. The manifest records
+  `workers × attempts × cases` so the effort is auditable, and a concurrency
+  invariant's sharpness is *concurrency* discrimination
+  (`df_invariants.concurrency_invariant_is_discriminating` — a vacuous
+  concurrency invariant is gate-flagged pre-build). The suite's own tests use
+  ENGINEERED-RELIABLE races (a deliberate sleep between read and write) so they
+  are deterministic, never flaky — but that reliability is a testing device,
+  not a claim about real candidates.
+  - **Honest boundary of the concurrency invariants.**
+    `idempotent_under_concurrency` detects DIVERGENCE among workers — it does
+    NOT detect concurrency-induced-but-CONSISTENT degradation: if parallelism
+    makes ALL N workers return the SAME wrong result or the same error, their
+    signatures collapse to one and the invariant PASSES. Likewise
+    `no_crash_no_hang` treats a clean non-zero exit (`0 <= code < 128`) as
+    non-crashing (matching M43a `robust`), so a UNIFORM "conflict"/"busy" exit
+    1 across all workers is a pass, not a crash. Both are the kind of defect a
+    SEQUENTIAL scenario (a fixed `then` asserting the correct result/exit)
+    normally catches — pair a concurrency property with the ordinary scenarios,
+    don't lean on it alone for correctness-of-result.
+  - What REMAINS out: **perf / load / scale / latency-SLA / real-traffic
+    remains a separate tool** — a correctness oracle cannot honestly express
+    them — permanently out of scope here.
 
 - **Class labels are self-declared, not semantically verified.** The adequacy
   gate checks class COVERAGE *structurally* — that each behavior carries a
@@ -192,12 +221,13 @@ does NOT claim to cross these two ceilings — state them plainly:
   scenarios it rests on author judgment (and the recommended human review). The
   gate guarantees the SHAPE of coverage, not the intent behind each label.
 
-So after M42 + M43a, for an oracle-expressible service, the residual reduces to
-"did the human spec/behaviors capture the requirement" + "is it concurrency
-(M43b) or perf/load/scale (a different tool, permanently out)" (plus the
-self-declared-label caveat above, backstopped by the critic for agent-authored
-runs). The human spec-fidelity residual is UNCHANGED by M43a — no generated
-input can prove the spec captured intent.
+So after M42 + M43a + M43b, for an oracle-expressible service, the residual
+reduces to "did the human spec/behaviors capture the requirement" +
+"perf/load/scale (a different tool, permanently out)" + "a concurrency PASS is
+probabilistic, not a race-freedom proof" (plus the self-declared-label caveat
+above, backstopped by the critic for agent-authored runs). The human
+spec-fidelity residual is UNCHANGED by M43a/M43b — no generated input and no
+observed interleaving can prove the spec captured intent.
 
 ## Manifest record (`adequacy`)
 

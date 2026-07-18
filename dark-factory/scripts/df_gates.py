@@ -497,8 +497,20 @@ def sharpness_scenario(sc: dict) -> dict:
     ({passed, killed, total, survivors}), so the M7 gate and author feedback
     treat every scenario kind uniformly."""
     if "property" in sc.get("when", {}):
+        inv = sc["then"]["invariant"]
+        # M43b: a concurrency property's sharpness is CONCURRENCY invariant
+        # discrimination (a violating per-worker battery the invariant must
+        # reject — a lost update, a hang, a torn read), so a vacuous
+        # concurrency invariant is gate-flagged just like a vacuous M43a one.
+        if inv["name"] in df_invariants.CONCURRENCY_INVARIANT_NAMES:
+            # Pass `generate` (like the M43a path) so the degenerate-domain
+            # vacuity the synthetic battery cannot see (a zero-entropy
+            # per-worker value var -> identical writes -> a genuinely-racy
+            # candidate false-passes no_lost_update) is gate-flagged.
+            return df_invariants.concurrency_invariant_is_discriminating(
+                inv, sc["when"]["property"]["generate"])
         return df_invariants.invariant_is_discriminating(
-            sc["then"]["invariant"], sc["when"]["property"]["generate"])
+            inv, sc["when"]["property"]["generate"])
     return sharpness(sc["then"])
 
 

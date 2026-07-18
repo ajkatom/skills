@@ -177,3 +177,83 @@ def test_max_cases_boundary_accepted():
     g = {"vars": {"n": {"kind": "int", "min": 0, "max": 1}},
          "cases": df_generate.MAX_CASES, "seed": 3}
     assert len(df_generate.generate_cases(g)) == df_generate.MAX_CASES
+
+
+# --- M43b: concurrency block validation -------------------------------------
+
+CONC_VARS = {
+    "item": {"kind": "string", "charset": "alnum", "min_len": 8, "max_len": 16},
+    "shared": {"kind": "int", "min": 0, "max": 9},
+    "bad": {"kind": "malformed", "base": "item"},
+}
+
+
+@pytest.mark.parametrize("conc,fragment", [
+    ({"workers": 1, "attempts": 2}, "workers"),
+    ({"workers": df_generate.MAX_WORKERS + 1, "attempts": 2}, "workers"),
+    ({"workers": True, "attempts": 2}, "workers"),
+    ({"workers": 2, "attempts": 0}, "attempts"),
+    ({"workers": 2, "attempts": df_generate.MAX_ATTEMPTS + 1}, "attempts"),
+    ({"workers": 2, "attempts": 2, "per_worker_vars": ["nope"]}, "declared"),
+    ({"workers": 2, "attempts": 2, "per_worker_vars": ["item", "item"]}, "duplicate"),
+    ({"workers": 2, "attempts": 2, "per_worker_vars": ["bad"]}, "malformed"),
+    ({"workers": 2, "attempts": 2, "per_worker_vars": "item"}, "list"),
+    ({"workers": 2, "attempts": 2, "extra": 1}, "unknown"),
+])
+def test_validate_concurrency_rejects_bad_blocks(conc, fragment):
+    with pytest.raises(df_generate.GenerateError, match=fragment):
+        df_generate.validate_concurrency(conc, CONC_VARS, "t")
+
+
+def test_validate_concurrency_accepts_good_block():
+    df_generate.validate_concurrency(
+        {"workers": 4, "attempts": 8, "per_worker_vars": ["item", "shared"]},
+        CONC_VARS, "t")
+    # per_worker_vars is optional (all vars shared).
+    df_generate.validate_concurrency({"workers": 2, "attempts": 1}, CONC_VARS, "t")
+
+
+def test_workers_attempts_boundaries_accepted():
+    df_generate.validate_concurrency(
+        {"workers": 2, "attempts": 1}, CONC_VARS, "t")
+    df_generate.validate_concurrency(
+        {"workers": df_generate.MAX_WORKERS,
+         "attempts": df_generate.MAX_ATTEMPTS}, CONC_VARS, "t")
+
+
+# --- M43b: per-worker value determinism -------------------------------------
+
+CONC_GEN = {"vars": CONC_VARS, "cases": 5, "seed": 77}
+
+
+def test_per_worker_values_are_deterministic_in_seed_case_worker():
+    a = df_generate.per_worker_values(CONC_GEN, 2, ["item", "shared"], 4)
+    b = df_generate.per_worker_values(CONC_GEN, 2, ["item", "shared"], 4)
+    assert a == b
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    assert len(a) == 4
+    assert all(set(w) == {"item", "shared"} for w in a)
+
+
+def test_per_worker_values_differ_across_cases_and_seeds():
+    c2 = df_generate.per_worker_values(CONC_GEN, 2, ["item"], 4)
+    c3 = df_generate.per_worker_values(CONC_GEN, 3, ["item"], 4)
+    assert c2 != c3
+    other = df_generate.per_worker_values(dict(CONC_GEN, seed=78), 2, ["item"], 4)
+    assert c2 != other
+
+
+def test_per_worker_values_distinct_for_wide_domain():
+    # A string min_len 8 makes collisions astronomically unlikely, so the
+    # per-worker WRITE identities are distinct (the no_lost_update premise).
+    for case_index in range(5):
+        ws = df_generate.per_worker_values(CONC_GEN, case_index, ["item"], 8)
+        vals = [w["item"] for w in ws]
+        assert len(set(vals)) == len(vals)
+
+
+def test_per_worker_values_derive_seed_is_hash_salt_independent():
+    # SHA-256-based derivation, not Python's salted hash(): identical across
+    # processes/runs. Same inputs -> same 64-bit seed.
+    assert df_generate._derive_seed(77, 2) == df_generate._derive_seed(77, 2)
+    assert df_generate._derive_seed(77, 2) != df_generate._derive_seed(77, 3)

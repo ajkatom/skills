@@ -89,9 +89,18 @@ a single JSON object of this exact shape and nothing else:
                         (including malformed) inputs, raise missing_case
                         naming that gap ("no fuzz/robustness property for
                         BHV-x") — a fixed example cannot show the app fails
-                        cleanly on inputs nobody wrote down. When it is a
-                        judgment call whether the behavior really handles
-                        external input, make it an advisory instead.
+                        cleanly on inputs nobody wrote down. It ALSO includes a
+                        missing CONCURRENCY property: when a behavior mutates
+                        SHARED state that concurrent callers can obviously race
+                        on (a counter, a store/collection updated read-modify-
+                        write, an idempotency-keyed create) and no scenario
+                        asserts a concurrency invariant (`no_lost_update`,
+                        `serializable_counter`, `idempotent_under_concurrency`,
+                        `no_crash_no_hang`), raise missing_case ("no concurrency
+                        property for shared-mutable-state BHV-x"). When whether
+                        the behavior truly has shared-mutable-state or handles
+                        external input is a judgment call, make it an advisory
+                        instead.
   Every blocking finding MUST name a declared `behavior_id`. Be specific and
   concrete; do NOT restate the whole spec. Do NOT propose the exact assertion
   string (the author must write it) — name the GAP, not the answer.
