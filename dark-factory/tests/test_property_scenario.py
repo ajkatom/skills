@@ -546,3 +546,342 @@ def test_property_counts_toward_class_coverage():
     assert adq["under_covered"] == []
     adq2 = df_gates.check_adequacy(behaviors, [happy], policy)
     assert adq2["under_covered"] == [{"behavior": "BHV-KV", "missing": ["boundary"]}]
+
+
+# ============================================================================
+# M43b — concurrency oracle: PARALLEL execution with ENGINEERED-RELIABLE races
+# ============================================================================
+# Determinism discipline (the plan's hard requirement — NO flaky tests): the
+# racy stubs put a deliberate 0.2s sleep BETWEEN the read and the write of a
+# read-modify-write, so with a 0.2s window and near-simultaneous worker spawns
+# every worker READS before any worker WRITES — the lost update / duplicate is
+# RELIABLE, not luck. The locked (fcntl.flock) variants serialize regardless of
+# timing, so they PASS reliably. The GENERATED inputs are seeded, so which
+# distinct values the workers write is reproducible.
+
+# A shared counter incremented read-modify-write. RACY: the sleep guarantees
+# all workers read the same value and all write value+1 -> duplicate values ->
+# serializable_counter sees the lost update.
+RACY_COUNTER = """\
+import os, time
+F = "counter.txt"
+n = int(open(F).read()) if os.path.exists(F) else 0
+time.sleep(0.2)
+open(F, "w").write(str(n + 1))
+print(n + 1)
+"""
+
+# ATOMIC: an exclusive flock serializes the read-modify-write -> the N workers
+# print 1..N (distinct, contiguous) regardless of interleaving.
+ATOMIC_COUNTER = """\
+import os, time, fcntl
+fd = open("counter.txt", "a+")
+fcntl.flock(fd, fcntl.LOCK_EX)
+fd.seek(0)
+data = fd.read().strip()
+n = int(data) if data else 0
+time.sleep(0.02)
+n += 1
+fd.seek(0); fd.truncate(); fd.write(str(n)); fd.flush()
+fcntl.flock(fd, fcntl.LOCK_UN)
+print(n)
+"""
+
+# A shared collection appended read-modify-write, printing the resulting list
+# (one item per line). RACY: each worker's read reflects only its OWN append ->
+# no single read ever shows all writes -> no_lost_update fires.
+RACY_APPEND = """\
+import os, sys, time, json
+F = "coll.json"
+item = sys.argv[1]
+d = json.load(open(F)) if os.path.exists(F) else []
+time.sleep(0.2)
+d.append(item)
+json.dump(d, open(F, "w"))
+for x in d:
+    print(x)
+"""
+
+# ATOMIC: flock serializes; the LAST writer reads back every prior append plus
+# its own -> some read reflects all N writes -> no_lost_update holds.
+ATOMIC_APPEND = """\
+import os, sys, time, json, fcntl
+item = sys.argv[1]
+fd = open("coll.json", "a+")
+fcntl.flock(fd, fcntl.LOCK_EX)
+fd.seek(0)
+data = fd.read().strip()
+d = json.loads(data) if data else []
+time.sleep(0.02)
+d.append(item)
+fd.seek(0); fd.truncate(); fd.write(json.dumps(d)); fd.flush()
+fcntl.flock(fd, fcntl.LOCK_UN)
+for x in d:
+    print(x)
+"""
+
+# Same logical op (append a FIXED item) under a lock, WITHOUT dedup: serialized
+# accumulation means each worker reads back a different length -> divergent ->
+# idempotent_under_concurrency fires (reliably, no timing needed).
+NONIDEMPOTENT = """\
+import sys, json, os, fcntl
+item = sys.argv[1]
+fd = open("coll.json", "a+")
+fcntl.flock(fd, fcntl.LOCK_EX)
+fd.seek(0)
+data = fd.read().strip()
+d = json.loads(data) if data else []
+d.append(item)
+fd.seek(0); fd.truncate(); fd.write(json.dumps(d)); fd.flush()
+fcntl.flock(fd, fcntl.LOCK_UN)
+print(len(d))
+"""
+
+# Idempotent: an UPSERT into a set — N identical ops converge to ONE member, so
+# every worker reads back the same single value.
+IDEMPOTENT = """\
+import sys, json, os, fcntl
+item = sys.argv[1]
+fd = open("coll.json", "a+")
+fcntl.flock(fd, fcntl.LOCK_EX)
+fd.seek(0)
+data = fd.read().strip()
+d = set(json.loads(data)) if data else set()
+d.add(item)
+fd.seek(0); fd.truncate(); fd.write(json.dumps(sorted(d))); fd.flush()
+fcntl.flock(fd, fcntl.LOCK_UN)
+print(",".join(sorted(d)))
+"""
+
+HANG = "import time\ntime.sleep(60)\n"
+
+
+def conc_scenario(argv, invariant, *, vars_, per_worker_vars, workers=3,
+                  attempts=3, cases=2, seed=1, timeout_s=10, args=None):
+    inv = {"name": invariant}
+    if args is not None:
+        inv["args"] = args
+    return {
+        "ir_version": "0.4", "id": "BHV-C-P1", "behavior_id": "BHV-C",
+        "title": "concurrency", "given": "", "class": "failure",
+        "when": {"property": {
+            "generate": {"vars": vars_, "cases": cases, "seed": seed},
+            "steps": [{"run": argv}],
+            "concurrency": {"workers": workers, "attempts": attempts,
+                            "per_worker_vars": per_worker_vars},
+            "timeout_s": timeout_s,
+        }},
+        "then": {"invariant": inv},
+    }
+
+
+def stub_ws(tmp_path, body, name="app.py", sub="ws"):
+    ws = tmp_path / sub
+    ws.mkdir(exist_ok=True)
+    (ws / name).write_text(body, encoding="utf-8")
+    return ws
+
+
+# --- serializable_counter (the canonical lost-update detector) ---------------
+
+def _counter_scenario(invariant="serializable_counter"):
+    # A dummy declared var (generate.vars must be non-empty); the counter is
+    # SHARED, so per_worker_vars is empty and no arg is templated.
+    return conc_scenario(["python3", "app.py"], invariant,
+                         vars_={"w": {"kind": "int", "min": 0, "max": 9}},
+                         per_worker_vars=[], workers=3, attempts=3)
+
+
+def test_racy_counter_fails_serializable_reliably(tmp_path):
+    ws = stub_ws(tmp_path, RACY_COUNTER)
+    res = run_scenarios.run_scenario(_counter_scenario(), str(ws))
+    assert res["taxonomy"] == "property_violated", res
+    cx = res["observed"]["property"]["counterexample"]
+    assert cx is not None
+    assert "attempt_index" in cx and isinstance(cx["case_index"], int)
+    assert len(cx["workers"]) == 3  # full per-worker evidence recorded
+
+
+def test_atomic_counter_passes_serializable_reliably(tmp_path):
+    ws = stub_ws(tmp_path, ATOMIC_COUNTER)
+    res = run_scenarios.run_scenario(_counter_scenario(), str(ws))
+    assert res["pass"], res
+    pinfo = res["observed"]["property"]
+    assert pinfo["counterexample"] is None
+    assert pinfo["workers"] == 3 and pinfo["attempts"] == 3
+
+
+# --- no_lost_update ---------------------------------------------------------
+
+def _append_scenario():
+    return conc_scenario(
+        ["python3", "app.py", "{item}"], "no_lost_update",
+        vars_={"item": {"kind": "string", "charset": "alnum",
+                        "min_len": 8, "max_len": 12}},
+        per_worker_vars=["item"], workers=3, attempts=3, args={"value": "item"})
+
+
+def test_racy_append_fails_no_lost_update_reliably(tmp_path):
+    ws = stub_ws(tmp_path, RACY_APPEND)
+    res = run_scenarios.run_scenario(_append_scenario(), str(ws))
+    assert res["taxonomy"] == "property_violated", res
+    assert "lost" in res["observed"]["property"]["counterexample"]["detail"]
+
+
+def test_atomic_append_passes_no_lost_update_reliably(tmp_path):
+    ws = stub_ws(tmp_path, ATOMIC_APPEND)
+    res = run_scenarios.run_scenario(_append_scenario(), str(ws))
+    assert res["pass"], res
+
+
+# --- idempotent_under_concurrency -------------------------------------------
+
+def _idem_scenario():
+    return conc_scenario(
+        ["python3", "app.py", "{k}"], "idempotent_under_concurrency",
+        vars_={"k": {"kind": "string", "charset": "alnum", "min_len": 4, "max_len": 6}},
+        per_worker_vars=[], workers=3, attempts=2)  # k SHARED (same op)
+
+
+def test_nonidempotent_stub_fails(tmp_path):
+    ws = stub_ws(tmp_path, NONIDEMPOTENT)
+    res = run_scenarios.run_scenario(_idem_scenario(), str(ws))
+    assert res["taxonomy"] == "property_violated", res
+    assert "divergent" in res["observed"]["property"]["counterexample"]["detail"]
+
+
+def test_idempotent_stub_passes(tmp_path):
+    ws = stub_ws(tmp_path, IDEMPOTENT)
+    res = run_scenarios.run_scenario(_idem_scenario(), str(ws))
+    assert res["pass"], res
+
+
+# --- no_crash_no_hang: a HANG is a failure, BOUNDED by the per-case deadline -
+
+def test_hanging_worker_fails_no_crash_no_hang_and_is_bounded(tmp_path):
+    sc = conc_scenario(["python3", "app.py"], "no_crash_no_hang",
+                       vars_={"w": {"kind": "int", "min": 0, "max": 9}},
+                       per_worker_vars=[], workers=3, attempts=1, cases=1,
+                       timeout_s=0.5)
+    ws = stub_ws(tmp_path, HANG)
+    import time as _t
+    t0 = _t.time()
+    res = run_scenarios.run_scenario(sc, str(ws))
+    elapsed = _t.time() - t0
+    assert res["taxonomy"] == "property_violated", res
+    assert "timeout" in res["observed"]["property"]["counterexample"]["detail"]
+    # Bounded: killed at the ~0.5s per-case deadline (plus reap grace), nowhere
+    # near 3 workers x 60s of sleep — proof the hung worker was reaped, not left
+    # to run.
+    assert elapsed < 20, elapsed
+
+
+def test_clean_stub_passes_no_crash_no_hang(tmp_path):
+    sc = conc_scenario(["python3", "app.py"], "no_crash_no_hang",
+                       vars_={"w": {"kind": "int", "min": 0, "max": 9}},
+                       per_worker_vars=[], workers=3, attempts=2)
+    ws = stub_ws(tmp_path, "print('ok')\n")
+    res = run_scenarios.run_scenario(sc, str(ws))
+    assert res["pass"], res
+
+
+# --- validation: the concurrency block <-> concurrency invariant coupling ----
+
+def test_concurrency_block_requires_concurrency_invariant(tmp_path):
+    sc = _counter_scenario()
+    sc["then"] = {"invariant": {"name": "robust"}}  # sequential invariant
+    with pytest.raises(run_scenarios.OracleError, match="concurrency invariant"):
+        write_and_load(tmp_path, sc)
+
+
+def test_concurrency_invariant_requires_concurrency_block(tmp_path):
+    sc = _counter_scenario()
+    del sc["when"]["property"]["concurrency"]
+    with pytest.raises(run_scenarios.OracleError, match="concurrency block"):
+        write_and_load(tmp_path, sc)
+
+
+def test_bad_workers_rejected_at_load(tmp_path):
+    sc = _counter_scenario()
+    sc["when"]["property"]["concurrency"]["workers"] = 99
+    with pytest.raises(run_scenarios.OracleError, match="workers"):
+        write_and_load(tmp_path, sc)
+
+
+def test_no_lost_update_value_not_per_worker_rejected(tmp_path):
+    sc = _append_scenario()
+    sc["when"]["property"]["concurrency"]["per_worker_vars"] = []
+    with pytest.raises(run_scenarios.OracleError, match="per_worker_vars"):
+        write_and_load(tmp_path, sc)
+
+
+def test_concurrency_scenario_loads_and_is_sharp(tmp_path):
+    scs = write_and_load(tmp_path, _counter_scenario())
+    assert scs[0]["id"] == "BHV-C-P1"
+    # The M7 discrimination gate treats it uniformly and finds it sharp.
+    assert df_gates.validate_oracle(scs) == []
+
+
+# --- Finding 1 regression: a degenerate per-worker domain is not a false GREEN
+
+def _degenerate_no_lost_update():
+    # value var `item` has a ZERO-ENTROPY domain (min==max) => every worker
+    # writes the SAME value => a lost update is unobservable => a genuinely-racy
+    # candidate would PASS vacuously without the fix.
+    sc = conc_scenario(
+        ["python3", "app.py", "{item}"], "no_lost_update",
+        vars_={"item": {"kind": "int", "min": 5, "max": 5}},
+        per_worker_vars=["item"], workers=3, attempts=3, args={"value": "item"})
+    return sc
+
+
+def test_degenerate_domain_no_lost_update_rejected_at_load(tmp_path):
+    # Belt-and-suspenders: the scenario cannot even LOAD, so it never reaches a
+    # build/run where a racy candidate could false-pass.
+    with pytest.raises(run_scenarios.OracleError, match="zero-entropy"):
+        write_and_load(tmp_path, _degenerate_no_lost_update())
+
+
+def test_degenerate_domain_flagged_by_gate_every_seed():
+    # And the M7 discrimination gate flags it directly (for a scenario built in
+    # memory, bypassing load), for every seed — parity with M43a's structural
+    # vacuity check.
+    for seed in range(20):
+        sc = _degenerate_no_lost_update()
+        sc["when"]["property"]["generate"]["seed"] = seed
+        assert df_gates.validate_oracle([sc]) == ["BHV-C-P1"], seed
+
+
+def test_racy_candidate_with_degenerate_domain_would_pass_proving_the_gap(tmp_path):
+    # Demonstrates WHY the load/gate rejection matters: if such a scenario DID
+    # run, the racy read-modify-write candidate returns a false GREEN (the lost
+    # update is invisible because every worker writes the identical value). This
+    # is the exact hole the load-time rejection + gate flag close upstream.
+    sc = _degenerate_no_lost_update()  # not loaded => validation bypassed
+    ws = stub_ws(tmp_path, RACY_APPEND)
+    res = run_scenarios.run_scenario(sc, str(ws))
+    assert res["pass"] is True  # vacuous pass — WHY it must be blocked at load
+    # ...and it IS blocked at load (the guard above), so this can never be a
+    # real run.
+
+
+# --- back-compat: absent concurrency => M43a observed shape (no conc fields) --
+
+def test_absent_concurrency_is_m43a_shape(tmp_path):
+    ws = make_ws(tmp_path, GOOD_KV)
+    res = run_scenarios.run_scenario(prop_scenario(), str(ws))
+    assert "workers" not in res["observed"]["property"]
+    assert "attempts" not in res["observed"]["property"]
+
+
+# --- THE BARRIER: per-worker counterexample stays control-plane --------------
+
+def test_concurrency_counterexample_stays_control_plane(tmp_path):
+    ws = stub_ws(tmp_path, RACY_COUNTER)
+    res = run_scenarios.run_scenario(_counter_scenario(), str(ws))
+    assert res["taxonomy"] == "property_violated"
+    report = {"report_version": "0.1", "all_pass": False, "results": [res]}
+    fb = id_feedback.project_feedback(report)
+    id_feedback.validate_feedback(fb)  # structural: only behavior_id + taxonomy
+    assert fb["failures"] == [{"behavior_id": "BHV-C",
+                               "taxonomy": ["property_violated"]}]

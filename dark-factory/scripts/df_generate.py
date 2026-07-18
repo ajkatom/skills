@@ -27,6 +27,7 @@ is rendered to its canonical text here, once, deterministically.
 Stdlib only. Pure (no I/O). Runtime guards `raise` GenerateError (never bare
 `assert` — the suite runs under `python -O`).
 """
+import hashlib
 import json
 import random
 import string
@@ -42,6 +43,16 @@ MAX_CASES = 500
 # variant) — bounds memory and argv size; an OS argv limit overflow would
 # surface as a confusing spawn failure, not a clean validation error.
 MAX_STRING_LEN = 4096
+
+# M43b concurrency ceilings — validated at LOAD time (like MAX_CASES) so a
+# concurrency block asking for more is rejected before any build, never
+# discovered mid-run. Each (case, attempt) launches `workers` REAL candidate
+# processes in parallel, so `workers` is the parallelism width and `attempts`
+# the number of re-interleavings per case; the product with `cases` is the
+# audited detection effort. 16/20 keep a worst-case run (500*20*16 spawns)
+# bounded by the runner's PROPERTY_MAX_TOTAL_S wall-clock cap regardless.
+MAX_WORKERS = 16
+MAX_ATTEMPTS = 20
 
 GENERATOR_KINDS = ("int", "string", "json", "choice", "malformed")
 STRING_CHARSETS = ("ascii_printable", "alnum", "unicode", "bytes")
@@ -360,3 +371,113 @@ _GENERATORS = {
     "json": _gen_json,
     "choice": _gen_choice,
 }
+
+
+# --- M43b: the `when.property.concurrency` block ----------------------------
+# WHY additive here (not folded into generate_cases): M43a's generate_cases is
+# a byte-identical, load-bearing reproducibility contract; touching its stream
+# order would change every existing property run's cases. So the per-worker
+# values come from a SEPARATE, DERIVED stream (per case) that never perturbs
+# the base stream. Absent a concurrency block, nothing below is reached and
+# M43a behavior is byte-for-byte unchanged.
+
+
+def validate_concurrency(conc, variables: dict, where: str) -> None:
+    """Fail-closed shape+bounds validation for `when.property.concurrency`.
+
+    Enforces: `workers` is an int in 2..MAX_WORKERS (1 worker is not a
+    concurrency test — reject it as a config bug rather than silently running a
+    sequential probe under the concurrency invariant); `attempts` is an int in
+    1..MAX_ATTEMPTS; `per_worker_vars` (optional) is a list of DISTINCT declared
+    var names, none of them `malformed` (malformed values are adversarial fuzz
+    variants, not distinct-writer identities — a malformed per-worker value has
+    no meaningful "distinctness", and its `empty` variant would collapse the
+    lost-update signal). Runs at load time, so a bad block is caught before any
+    build — same posture as validate_generate."""
+    if not isinstance(conc, dict):
+        raise GenerateError(f"{where}: concurrency must be an object")
+    unknown = set(conc) - {"workers", "attempts", "per_worker_vars"}
+    if unknown:
+        raise GenerateError(
+            f"{where}: concurrency has unknown key(s) {sorted(unknown)}")
+
+    workers = conc.get("workers")
+    if (not isinstance(workers, int) or isinstance(workers, bool)
+            or not (2 <= workers <= MAX_WORKERS)):
+        raise GenerateError(
+            f"{where}: concurrency.workers must be an int in 2..{MAX_WORKERS}")
+
+    attempts = conc.get("attempts")
+    if (not isinstance(attempts, int) or isinstance(attempts, bool)
+            or not (1 <= attempts <= MAX_ATTEMPTS)):
+        raise GenerateError(
+            f"{where}: concurrency.attempts must be an int in 1..{MAX_ATTEMPTS}")
+
+    pwv = conc.get("per_worker_vars", [])
+    if not isinstance(pwv, list) or not all(isinstance(v, str) for v in pwv):
+        raise GenerateError(
+            f"{where}: concurrency.per_worker_vars must be a list of strings")
+    if len(set(pwv)) != len(pwv):
+        raise GenerateError(
+            f"{where}: concurrency.per_worker_vars has duplicate name(s)")
+    for name in pwv:
+        if name not in variables:
+            raise GenerateError(
+                f"{where}: per_worker_vars entry {name!r} is not a declared "
+                f"generate var (declared: {sorted(variables)})")
+        if variables[name].get("kind") == "malformed":
+            raise GenerateError(
+                f"{where}: per_worker_vars entry {name!r} is a malformed var — "
+                f"malformed values cannot serve as distinct per-worker identities")
+
+
+def _derive_seed(base_seed: int, case_index: int) -> int:
+    """A stable 64-bit sub-seed for one case's per-worker stream, derived from
+    (base_seed, case_index) via SHA-256. WHY not `hash((base_seed, case_index))`
+    or `random.Random((base_seed, case_index))`: Python's builtin hash of
+    tuples/strings is salted per-process (PYTHONHASHSEED), so it would make the
+    per-worker values differ run-to-run — fatal to the reproducibility
+    contract. SHA-256 over a canonical repr is identical across runs and
+    platforms, so a concurrency counterexample is replayable from the recorded
+    seed alone, exactly like M43a's base cases."""
+    digest = hashlib.sha256(repr(("df_pwv", base_seed, case_index)).encode()).hexdigest()
+    return int(digest[:16], 16)
+
+
+def per_worker_values(gen: dict, case_index: int, per_worker_vars: list,
+                      workers: int) -> list:
+    """The per-worker OVERRIDES for one case: a list of length `workers`, each a
+    dict {var: value} covering exactly `per_worker_vars` (the shared vars come
+    from the base case and are NOT here). Values are drawn from a per-case
+    derived stream (see _derive_seed), in worker order then sorted-var order —
+    so the result is a deterministic function of (seed, case_index,
+    worker_index, var), replayable bit-for-bit.
+
+    DISTINCTNESS is best-effort-but-deterministic: for each var, a worker's
+    draw is retried up to a fixed cap if it collides with an earlier worker's
+    value for that same var, then accepted regardless. A caller that needs
+    reliably-distinct writers (no_lost_update / serializable_counter) chooses a
+    var domain wide enough that collisions are astronomically unlikely (e.g.
+    string min_len>=8); the cap guarantees TERMINATION and DETERMINISM even
+    when the domain is smaller than `workers` (distinctness is simply not
+    achievable then, and the invariant's own bar adjusts to the distinct count
+    actually written)."""
+    variables = gen["vars"]
+    rng = random.Random(_derive_seed(gen["seed"], case_index))
+    names = sorted(per_worker_vars)
+    used = {n: set() for n in names}
+    out = []
+    for _ in range(workers):
+        wvals = {}
+        for name in names:
+            spec = variables[name]
+            gen_fn = _GENERATORS[spec["kind"]]
+            value = gen_fn(rng, spec)
+            for _retry in range(64):
+                if value not in used[name]:
+                    break
+                value = gen_fn(rng, spec)
+            used[name].add(value)
+            wvals[name] = value
+        out.append(wvals)
+    return out

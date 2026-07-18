@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Deterministic fake builder for the M43b concurrency e2e. Speaks adapter
+protocol 0.1.
+
+Behavior: without <workdir>/feedback.json writes a RACY counter app.py that
+does a read-modify-write with a deliberate sleep between read and write -- so
+N parallel increments RELIABLY lose updates (all read the same value, all
+write value+1), the lost-update bug a fixed example cannot catch but the
+concurrency oracle does. With feedback present (which can only say behavior-id
++ "property_violated", never the generated input or the per-worker
+counterexample) writes the LOCKED version whose flock serializes the
+read-modify-write so N increments yield N distinct contiguous values. Never
+reads scenarios (cannot -- they are not reachable from the workspace).
+"""
+import json
+import os
+import sys
+
+RACY = (
+    "import os, time\n"
+    "F = 'counter.txt'\n"
+    "n = int(open(F).read()) if os.path.exists(F) else 0\n"
+    "time.sleep(0.2)\n"
+    "open(F, 'w').write(str(n + 1))\n"
+    "print(n + 1)\n"
+)
+
+LOCKED = (
+    "import os, time, fcntl\n"
+    "fd = open('counter.txt', 'a+')\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+    "fd.seek(0)\n"
+    "data = fd.read().strip()\n"
+    "n = int(data) if data else 0\n"
+    "time.sleep(0.02)\n"
+    "n += 1\n"
+    "fd.seek(0); fd.truncate(); fd.write(str(n)); fd.flush()\n"
+    "fcntl.flock(fd, fcntl.LOCK_UN)\n"
+    "print(n)\n"
+)
+
+
+def main():
+    req = json.load(sys.stdin)
+    wd = req["workdir"]
+    body = LOCKED if os.path.exists(os.path.join(wd, "feedback.json")) else RACY
+    with open(os.path.join(wd, "app.py"), "w", encoding="utf-8") as f:
+        f.write(body)
+    print(json.dumps({"adapter_protocol": "0.1", "status": "ok", "detail": "",
+                      "usage": {"known": False}}))
+
+
+if __name__ == "__main__":
+    main()

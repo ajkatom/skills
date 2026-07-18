@@ -108,10 +108,16 @@ root to fail confusingly later.
   fixed example can't (round-trip integrity, idempotency, "never crashes /
   fails cleanly on malformed input"). Deterministic (required `seed`),
   bounded (cases ≤ 500 + timeouts), barrier-preserving (a counterexample is
-  control-plane only; feedback carries just `property_violated`). Honest
-  residual after M42+M43a: human spec/behavior fidelity; concurrency lands in
-  M43b; perf/load/scale stays a separate tool, permanently. See
-  `references/scenario-format.md` (the `when.property` section).
+  control-plane only; feedback carries just `property_violated`). A property
+  MAY add a `concurrency` block (M43b) that runs the steps IN PARALLEL
+  (`workers` × `attempts`) and asserts a concurrency invariant
+  (`no_lost_update` / `serializable_counter` / `idempotent_under_concurrency` /
+  `no_crash_no_hang`): ONE STRIKE = fail, and a PASS is probabilistic detection
+  (not a race-freedom proof) — the manifest records workers × attempts × cases.
+  Honest residual after M42+M43a+M43b: human spec/behavior fidelity; a
+  concurrency PASS is probabilistic; perf/load/scale stays a separate tool,
+  permanently. See `references/scenario-format.md` (the `when.property`
+  section).
 
 This on-ramp only produces the control-plane files; the rest of this
 skill's workflow (running, checkpoints, tiers, security gates, etc.) is

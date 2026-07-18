@@ -672,11 +672,20 @@ def _property_manifest_field(scenarios):
     for sc in scenarios:
         prop = sc.get("when", {}).get("property")
         if prop:
-            props[sc["id"]] = {
+            entry = {
                 "cases": prop["generate"]["cases"],
                 "seed": prop["generate"]["seed"],
                 "invariant": sc["then"]["invariant"]["name"],
             }
+            # M43b: a concurrency property records workers x attempts so the
+            # PROBABILISTIC detection strength is auditable (a PASS is absence
+            # of an observed race over cases x attempts x workers, not proof of
+            # race-freedom — the honest framing, quantified here).
+            conc = prop.get("concurrency")
+            if conc:
+                entry["workers"] = conc["workers"]
+                entry["attempts"] = conc["attempts"]
+            props[sc["id"]] = entry
     return {"scenarios": props, "violations": []}
 
 
@@ -702,6 +711,12 @@ def _journal_property_violations(journal, mb, results, *, cohort, iteration):
             # its content is deliberately not reproduced here.
             "counterexample_recorded": cx != {},
         }
+        # M43b: a concurrency violation also records WHICH interleaving attempt
+        # struck (value-free — an int index, never a generated input). Only
+        # present for concurrency scenarios, so M43a's exact value-free key set
+        # is unchanged for sequential property violations.
+        if "attempt_index" in cx:
+            entry["attempt_index"] = cx["attempt_index"]
         journal.write("PROPERTY_VIOLATED", **entry)
         violations.append(entry)
 

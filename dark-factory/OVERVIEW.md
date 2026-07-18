@@ -148,7 +148,10 @@ just so you know which one to open.
 - **`scenario-format.md`** — the exact file format for a hidden test
   scenario (the thing the builder is never allowed to see), including the
   generative property/fuzz kind (M43a): assert an invariant over many
-  seeded machine-generated inputs — the bugs one fixed example can't catch.
+  seeded machine-generated inputs — the bugs one fixed example can't catch —
+  and its optional `concurrency` block (M43b) that runs the steps in PARALLEL
+  to catch lost updates / crashes-under-parallelism (ONE STRIKE = fail; a PASS
+  is probabilistic detection, not a race-freedom proof).
 - **`role-adapters.md`** — how dark-factory talks to whichever AI model is
   doing the building or verifying, including the two API-only adapters that
   need no command-line tool installed.

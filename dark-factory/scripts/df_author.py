@@ -174,6 +174,43 @@ inputs from your declarative spec and checks the invariant on every one:
   generator can emit the empty string — it could never fail). Make the
   generated inputs able to violate the invariant on a wrong implementation.
 
+#### Concurrency properties (OPTIONAL — races the sequential checks can't see)
+A property MAY add a `concurrency` block that runs the `steps` IN PARALLEL to
+detect concurrency bugs (lost updates, corruption/crash under parallel access,
+non-idempotent concurrent retries). Its `then.invariant.name` is then a
+CONCURRENCY invariant (a different fixed vocabulary):
+
+    {"behavior_id": "BHV-KV", "cohort": "dev", "class": "failure",
+     "property": {
+       "generate": {"vars": {"item": {"kind": "string", "charset": "alnum",
+                                       "min_len": 8, "max_len": 16}},
+                    "cases": 10, "seed": 42},
+       "steps": [{"run": ["python3", "app.py", "add", "shared", "{item}"]},
+                 {"run": ["python3", "app.py", "list", "shared"]}],
+       "concurrency": {"workers": 4, "attempts": 8, "per_worker_vars": ["item"]},
+       "timeout_s": 10},
+     "then": {"invariant": {"name": "no_lost_update", "args": {"value": "item"}}},
+     "title": "concurrent adds are not lost"}
+
+- `concurrency.workers` (2..16) parallel executions per attempt; `attempts`
+  (1..20) re-interleavings per case; `per_worker_vars` names vars each worker
+  gets a DISTINCT generated value for (all other vars are shared). A var in
+  `per_worker_vars` may not be `malformed`.
+- Concurrency `then.invariant.name` (FIXED vocabulary): `no_lost_update`
+  (N workers each write a DISTINCT value — `args.value` names that per-worker
+  var — and a read must reflect all of them, never a lost/torn one);
+  `serializable_counter` (N concurrent increments yield N distinct contiguous
+  values — no duplicate = no lost update); `idempotent_under_concurrency`
+  (N workers running the SAME op converge to ONE consistent observed result);
+  `no_crash_no_hang` (no worker crashes, 5xx's, or HANGS under parallelism —
+  a hang is a failure by the per-case deadline).
+- ONE STRIKE: a single observed violation across all cases x attempts FAILS
+  the scenario. A PASS is PROBABILISTIC detection (absence of an observed race
+  is not proof of race-freedom) — the manifest records workers x attempts x
+  cases so the effort is auditable. Reach for a concurrency property when a
+  behavior mutates SHARED state (a counter, a store, a collection) that
+  concurrent callers can race on.
+
 Output ONLY the `scenarios.json` file. Do not write any other file, and do not
 attempt to implement the specification — that is the builder's job, not yours.
 """

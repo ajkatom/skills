@@ -295,3 +295,234 @@ def test_discrimination_error_contract_with_marker():
     assert rep["passed"]
     # The wrong-error battery entry only exists when a marker is declared.
     assert rep["total"] == 6
+
+
+# ============================================================================
+# M43b — concurrency invariants (over PER-WORKER observation lists)
+# ============================================================================
+
+CONC_GEN = {"vars": {"item": {"kind": "string", "charset": "alnum",
+                              "min_len": 8, "max_len": 16}},
+            "cases": 10, "seed": 5}
+CONC_BLOCK = {"workers": 2, "attempts": 4, "per_worker_vars": ["item"]}
+
+
+def worker(steps, taxonomy=None, vars=None):
+    return {"steps": list(steps), "taxonomy": taxonomy, "vars": dict(vars or {})}
+
+
+def cev(name, workers, args=None, case_vars=None):
+    inv = {"name": name}
+    if args is not None:
+        inv["args"] = args
+    return df_invariants.evaluate_concurrency_invariant(
+        inv, case_vars or {}, workers, args or {})
+
+
+# --- validation -------------------------------------------------------------
+
+def test_validate_concurrency_invariant_accepts_each_name():
+    for name in df_invariants.CONCURRENCY_INVARIANT_NAMES:
+        inv = {"name": name}
+        if name == "no_lost_update":
+            inv["args"] = {"value": "item"}
+        df_invariants.validate_concurrency_invariant(inv, CONC_BLOCK, CONC_GEN, 2, "t")
+
+
+@pytest.mark.parametrize("inv,fragment", [
+    ({"name": "robust"}, "must be one of"),          # sequential name here = error
+    ({"name": "no_lost_update"}, "value"),           # value required
+    ({"name": "no_lost_update", "args": {"value": "nope"}}, "declared"),
+    ({"name": "no_crash_no_hang", "args": {"bogus": 1}}, "unknown arg"),
+    ({"name": "no_crash_no_hang", "args": {"allowed_exits": []}}, "allowed_exits"),
+    ({"name": "serializable_counter", "args": {"observe_step": 9}}, "observe_step"),
+])
+def test_validate_concurrency_invariant_rejects_bad(inv, fragment):
+    with pytest.raises(df_invariants.InvariantError, match=fragment):
+        df_invariants.validate_concurrency_invariant(inv, CONC_BLOCK, CONC_GEN, 2, "t")
+
+
+def test_no_lost_update_value_must_be_per_worker():
+    # value declared but NOT in per_worker_vars => every worker writes the same
+    # value => a lost update is unobservable => rejected at load.
+    inv = {"name": "no_lost_update", "args": {"value": "item"}}
+    block_no_pwv = {"workers": 2, "attempts": 2, "per_worker_vars": []}
+    with pytest.raises(df_invariants.InvariantError, match="per_worker_vars"):
+        df_invariants.validate_concurrency_invariant(inv, block_no_pwv, CONC_GEN, 2, "t")
+
+
+# --- no_crash_no_hang -------------------------------------------------------
+
+def test_no_crash_no_hang_holds_on_clean_workers():
+    ok, _ = cev("no_crash_no_hang", [worker([cli(0, "ok")]), worker([cli(0, "ok")])])
+    assert ok
+
+
+@pytest.mark.parametrize("bad_worker,fragment", [
+    (worker([], taxonomy="timeout"), "did not complete (timeout)"),
+    (worker([], taxonomy="crash"), "did not complete (crash)"),
+    (worker([cli(None)]), "never produced an exit code"),
+    (worker([cli(-11)]), "abnormally"),
+    (worker([cli(0, "", "Traceback (most recent call last):\n boom")]), "stack trace"),
+    (worker([http(500)]), "HTTP 500"),
+])
+def test_no_crash_no_hang_rejects_bad_workers(bad_worker, fragment):
+    ok, detail = cev("no_crash_no_hang", [worker([cli(0, "ok")]), bad_worker])
+    assert not ok and fragment in detail
+
+
+def test_no_crash_no_hang_hang_is_a_failure():
+    # The load-bearing addition over `robust`: a HANG (timeout taxonomy) fails.
+    ok, detail = cev("no_crash_no_hang", [worker([], taxonomy="timeout")])
+    assert not ok and "timeout" in detail
+
+
+# --- serializable_counter ---------------------------------------------------
+
+def test_serializable_counter_holds_on_contiguous_distinct():
+    ok, _ = cev("serializable_counter",
+                [worker([cli(0, "1")]), worker([cli(0, "2")]), worker([cli(0, "3")])])
+    assert ok
+
+
+@pytest.mark.parametrize("outs,fragment", [
+    (["1", "1"], "duplicate"),           # two workers both wrote value+1
+    (["1", "3"], "contiguous"),          # a write vanished
+    (["x", "y"], "no integer"),          # not a counter at all
+])
+def test_serializable_counter_rejects(outs, fragment):
+    ok, detail = cev("serializable_counter", [worker([cli(0, o)]) for o in outs])
+    assert not ok and fragment in detail
+
+
+def test_serializable_counter_incomplete_worker_fails():
+    ok, detail = cev("serializable_counter",
+                     [worker([cli(0, "1")]), worker([], taxonomy="timeout")])
+    assert not ok and "did not complete" in detail
+
+
+# --- no_lost_update ---------------------------------------------------------
+
+def test_no_lost_update_holds_when_a_read_reflects_all_writes():
+    # The last serialized writer read back BOTH values -> nothing lost.
+    ws = [worker([cli(0, "A")], vars={"item": "A"}),
+          worker([cli(0, "A\nB")], vars={"item": "B"})]
+    ok, _ = cev("no_lost_update", ws, args={"value": "item"})
+    assert ok
+
+
+def test_no_lost_update_violated_when_each_read_sees_only_its_own():
+    # A read-modify-write race: neither read ever contained both -> lost update.
+    ws = [worker([cli(0, "A")], vars={"item": "A"}),
+          worker([cli(0, "B")], vars={"item": "B"})]
+    ok, detail = cev("no_lost_update", ws, args={"value": "item"})
+    assert not ok and "lost" in detail
+
+
+def test_no_lost_update_empty_reads_fail():
+    ws = [worker([cli(0, "")], vars={"item": "A"}),
+          worker([cli(0, "")], vars={"item": "B"})]
+    ok, _ = cev("no_lost_update", ws, args={"value": "item"})
+    assert not ok
+
+
+def test_no_lost_update_incomplete_worker_fails():
+    ws = [worker([cli(0, "A")], vars={"item": "A"}),
+          worker([], taxonomy="crash", vars={"item": "B"})]
+    ok, detail = cev("no_lost_update", ws, args={"value": "item"})
+    assert not ok and "did not complete" in detail
+
+
+# --- idempotent_under_concurrency -------------------------------------------
+
+def test_idempotent_under_concurrency_holds_when_all_converge():
+    ws = [worker([cli(0, "state=1")]), worker([cli(0, "state=1")])]
+    ok, _ = cev("idempotent_under_concurrency", ws)
+    assert ok
+
+
+def test_idempotent_under_concurrency_violated_when_divergent():
+    ws = [worker([cli(0, "count=1")]), worker([cli(0, "count=2")])]
+    ok, detail = cev("idempotent_under_concurrency", ws)
+    assert not ok and "divergent" in detail
+
+
+def test_idempotent_under_concurrency_crash_fails():
+    ws = [worker([cli(0, "state=1")]), worker([], taxonomy="crash")]
+    ok, detail = cev("idempotent_under_concurrency", ws)
+    assert not ok and "did not complete" in detail
+
+
+# --- concurrency discrimination (the vacuous-invariant gate) ----------------
+
+def test_concurrency_discrimination_passes_real_configs():
+    for inv in (
+        {"name": "no_crash_no_hang"},
+        {"name": "serializable_counter"},
+        {"name": "no_lost_update", "args": {"value": "item"}},
+        {"name": "idempotent_under_concurrency"},
+    ):
+        rep = df_invariants.concurrency_invariant_is_discriminating(inv, CONC_GEN)
+        assert rep["passed"], (inv, rep["survivors"])
+        assert rep["killed"] == rep["total"] > 0
+        assert rep["survivors"] == []
+
+
+def test_concurrency_discrimination_is_deterministic():
+    inv = {"name": "no_lost_update", "args": {"value": "item"}}
+    a = df_invariants.concurrency_invariant_is_discriminating(inv, CONC_GEN)
+    b = df_invariants.concurrency_invariant_is_discriminating(inv, CONC_GEN)
+    assert a == b
+
+
+# --- Finding 1 regression: no_lost_update over a ZERO-ENTROPY value var -------
+# The synthetic battery hardcodes distinct worker values, so WITHOUT the
+# generator-spec structural check the gate cannot see that a min==max int (or a
+# single-distinct-option choice, or a max_len==0 string) makes every worker
+# write the SAME value -> `written` collapses to one -> a genuinely-racy
+# candidate PASSES vacuously (a false GREEN in a verifier). Flagged for EVERY
+# seed because it is structural (reads the spec), not sampled.
+
+@pytest.mark.parametrize("value_spec", [
+    {"kind": "int", "min": 5, "max": 5},                 # single int
+    {"kind": "choice", "options": ["only"]},             # single choice
+    {"kind": "choice", "options": ["x", "x"]},           # no DISTINCT options
+    {"kind": "string", "charset": "alnum", "min_len": 0, "max_len": 0},  # only ""
+])
+def test_no_lost_update_degenerate_domain_flagged_every_seed(value_spec):
+    for seed in range(30):
+        gen = {"vars": {"item": value_spec}, "cases": 5, "seed": seed}
+        inv = {"name": "no_lost_update", "args": {"value": "item"}}
+        rep = df_invariants.concurrency_invariant_is_discriminating(inv, gen)
+        assert not rep["passed"], f"seed {seed} not flagged"
+        assert "no_lost_update:degenerate_domain" in rep["survivors"]
+
+
+@pytest.mark.parametrize("value_spec,vacuous", [
+    ({"kind": "int", "min": 5, "max": 5}, True),
+    ({"kind": "int", "min": 0, "max": 9}, False),
+    ({"kind": "choice", "options": ["a"]}, True),
+    ({"kind": "choice", "options": ["a", "b"]}, False),
+    ({"kind": "string", "charset": "alnum", "min_len": 0, "max_len": 0}, True),
+    ({"kind": "string", "charset": "alnum", "min_len": 1, "max_len": 8}, False),
+    ({"kind": "json", "shape": "scalar"}, False),
+    ({"kind": "malformed", "base": "seed"}, False),
+])
+def test_var_can_emit_distinct_detection(value_spec, vacuous):
+    gen = {"vars": {"seed": {"kind": "string", "charset": "alnum",
+                             "min_len": 1, "max_len": 4},
+                    "item": value_spec},
+           "cases": 5, "seed": 3}
+    inv = {"name": "no_lost_update", "args": {"value": "item"}}
+    rep = df_invariants.concurrency_invariant_is_discriminating(inv, gen)
+    assert rep["passed"] != vacuous
+    assert ("no_lost_update:degenerate_domain" in rep["survivors"]) == vacuous
+
+
+def test_validate_concurrency_invariant_rejects_zero_entropy_value_at_load():
+    inv = {"name": "no_lost_update", "args": {"value": "item"}}
+    block = {"workers": 2, "attempts": 2, "per_worker_vars": ["item"]}
+    gen = {"vars": {"item": {"kind": "int", "min": 5, "max": 5}},
+           "cases": 5, "seed": 1}
+    with pytest.raises(df_invariants.InvariantError, match="zero-entropy"):
+        df_invariants.validate_concurrency_invariant(inv, block, gen, 1, "t")

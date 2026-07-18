@@ -427,11 +427,18 @@ reproducibility + audit record for generative property/fuzz scenarios
 - `scenarios = {scenario_id: {cases, seed, invariant}}` — with the seed
   recorded, a property run (and any counterexample) is replayable
   bit-for-bit: generation is a pure function of (seed, spec). Empty (but
-  present) when the control root has no property scenarios.
+  present) when the control root has no property scenarios. **A concurrency
+  scenario (M43b) additionally records `{workers, attempts}`** — so the
+  PROBABILISTIC detection strength of a PASS is auditable: absence of an
+  observed race is not proof of race-freedom, and `workers × attempts × cases`
+  quantifies how hard the oracle looked.
 - `violations = [{cohort, iteration, behavior_id, invariant, case_index,
   counterexample_recorded}]` — one entry per failed property scenario per
   verify pass, VALUE-FREE: it says a counterexample EXISTS and where the
-  operator can find it, never what the generated input was.
+  operator can find it, never what the generated input was. **A concurrency
+  violation (M43b) additionally carries a value-free `attempt_index`** (the
+  int index of the interleaving attempt that struck — ONE STRIKE = fail),
+  never a generated value or a per-worker observation.
 
 Each violation is also journaled as **`PROPERTY_VIOLATED`** with the same
 value-free fields. The counterexample CONTENT (the generated vars + per-step
