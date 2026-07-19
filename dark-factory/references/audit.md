@@ -375,6 +375,53 @@ re-run gates, seal via `df_qualify.derive`) with NO builder re-dispatch
 distinct **`SHIP_DECLINED`** terminal (qualified `False`) that still binds the
 frozen artifact object, so the declined candidate stays auditable.
 
+## Crash-safe builder dispatch (M35 + M46) — idempotent across the whole interval
+
+Each paid builder call is bracketed in `journal.jsonl` by a `DISPATCH_INTENT`
+(written, with the reserved spend committed to `state.json`, **before** the
+call) and a `DISPATCH_RESULT` (written **after** the adapter returns). The key
+is a deterministic `idempotency_key = sha256(invocation:iteration)`, stable
+across a crash + resume, so re-entering the same iteration reuses the same key
+rather than minting a new one. Two crash windows are handled distinctly:
+
+- **Crash BETWEEN intent and result (M35, UNRESOLVED).** `resume --decision
+  continue` finds an intent with no matching result and **fails closed** at
+  `UNKNOWN_OUTCOME` (the reserved spend is already counted — never understated).
+  The operator must `resume --decision reconcile` to re-dispatch (accepting a
+  possible duplicate paid call, journaled `DISPATCH_RECONCILED`) or `--decision
+  abort`. This never auto-re-dispatches.
+
+- **Crash AFTER `DISPATCH_RESULT ok` but before the iteration finalized and
+  `next_iter` advanced (M46/RA-06, RESOLVED).** The paid call already completed
+  and its output is already in the persisted workspace, yet `state.json` is
+  still at this iteration. Here `resume --decision continue` must NOT re-dispatch
+  (that would re-pay for work already done). Instead, before dispatching,
+  `_resolved_dispatch_result` looks up a successful `DISPATCH_RESULT` for this
+  iteration's key; if found, the builder call is **skipped** and the run proceeds
+  straight to verifying the existing workspace, journaling a value-free
+  **`DISPATCH_REPLAYED`** (with the idempotency key). The reservation committed
+  at intent time is reloaded and **not re-committed**, so replay does not
+  double-count spend. If the resolved result exists but the workspace is missing,
+  the run fails closed (an inconsistent state is never verified). Only a
+  *successful* result triggers replay — an errored `DISPATCH_RESULT` already
+  terminated its run and is never resumed into a re-dispatch.
+
+Net effect: the entire intent → result → verify → finalize interval is
+idempotent under crash + `resume --decision continue`. The happy path (no crash)
+never produces a `DISPATCH_REPLAYED` and is byte-for-byte unchanged.
+
+Honest residual (documented, not weaponizable): on a replay, the dev-cohort
+verify re-runs against the *persisted* workspace rather than a freshly-built
+one. If the crash occurred mid-dev-verify after a destructive dev scenario had
+already mutated the workspace, replay re-verifies that partially-mutated tree —
+a state a single-pass run never produces. This fails *toward*
+non-convergence (never a false qualify): the SEALED final exam still runs on a
+fresh materialization of the content-addressed object (M44) against holdout
+scenarios the dev cohort cannot target, and a hostile builder cannot steer
+dev-scenario mutations. It is within the same "dev scenarios may mutate the
+live workspace" envelope M44's seal-first copies already close for
+qualification.
+
 ## The ship phase (M41) — `ship_result.json` + release attestation
 
 When a `ship` block is configured, a **qualified** run continues past the sealed

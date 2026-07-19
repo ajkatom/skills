@@ -14,6 +14,14 @@ off-box sink, required builder confinement):
    the lock cannot be undone), under a restrictive, **configurable and
    live-probed** seccomp profile (M22 Task 1 — see below).
 
+Because `enterprise` inherits the container barrier from `hardened`, it also
+inherits RA-07/M46's mount narrowing: the builder container ro-mounts the
+**adapter executable FILE**, never its parent directory, so an adapter placed
+in a broad directory cannot leak its siblings into the (untrusted, but
+egress-locked) builder. As in `hardened`, a multi-file adapter must declare its
+extra files explicitly rather than rely on a directory mount. See
+`references/hardened.md`.
+
 `enterprise` is **fail-closed**: `df_config` refuses to load an enterprise config
 that is missing or weakens any required guarantee (custody block,
 `credential_proxy.enabled: true`, `audit.sink.required: true`,
