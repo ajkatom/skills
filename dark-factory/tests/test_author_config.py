@@ -75,7 +75,7 @@ def test_different_adapters_load(tmp_path):
     })
     cfg = df_config.load_config(str(cr))
     assert cfg["_author"] == {"adapter": "/bin/cat", "timeout_s": 120,
-                              "same_model_ack": False}
+                              "same_model_ack": False, "expected_sha256": None}
 
 
 def test_absent_author_is_none(tmp_path):

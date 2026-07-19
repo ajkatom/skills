@@ -74,6 +74,12 @@ def test_bwrap_denial_live_on_linux(linux_probe_image):
     assert "DF-PROBE bwrap PASS" in proc.stdout
 
 
+# M47 condition #10: this probe makes a REAL external baseline connect to
+# 1.1.1.1 (the non-vacuity half), so it is gated behind DF_ALLOW_NETWORK_TESTS to
+# keep the default suite hermetic. The primitive is still exercised in the
+# opt-in/CI run.
+@pytest.mark.skipif(not os.environ.get("DF_ALLOW_NETWORK_TESTS"),
+                    reason="reaches 1.1.1.1; set DF_ALLOW_NETWORK_TESTS=1")
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
 def test_egress_denial_live(linux_probe_image):
     """Live coverage for the M17 iptables-egress-denial primitive. The probe

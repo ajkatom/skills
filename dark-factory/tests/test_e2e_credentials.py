@@ -44,7 +44,7 @@ import pytest
 
 import df_container
 from test_e2e_hardened import _make_hardened, _prepull_image  # noqa: F401 (fixture)
-from test_supervisor import FAKE, setup_control
+from test_supervisor import FAKE, external_reachable, needs_network, setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_ENVDUMP = os.path.join(HERE, "fixtures", "fake_builder_envdump")
@@ -106,10 +106,14 @@ def _assert_value_absent_and_redacted_present(run_dir, proc, secret):
 # (a) hardened brokered env — live docker, allowlist-only + smuggle proof
 # ---------------------------------------------------------------------------
 
+@needs_network
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
 def test_live_hardened_brokered_env_allowlist_only_and_redacted(tmp_path):
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
     cr = setup_control(tmp_path, FAKE_ENVDUMP, checkpoint="auto")
-    _make_hardened(cr, tmp_path)
+    # M47 RA-08(a): confine candidate egress so the hardened run QUALIFIES.
+    _make_hardened(cr, tmp_path, candidate_network="deny")
 
     secret = "supersecret-" + uuid.uuid4().hex
     env_file = tmp_path / "creds" / ".env"  # 3rd tmp dir, disjoint from cr and ws

@@ -85,7 +85,8 @@ actually ran under:
 
 ```json
 {"mode": "default_deny", "probed": true, "passed": true,
- "residuals": ["file_metadata_outside_home"], "qualified": true}
+ "residuals": ["file_metadata_outside_home", "process_group_escape"],
+ "process_containment": "process_group_besteffort", "qualified": true}
 ```
 
 - `mode` — `"default_deny"` (macOS standard+, the default: the candidate ran
@@ -104,10 +105,19 @@ actually ran under:
   closed on the reference macOS backend), `file_metadata_outside_home`
   (structural: stat/existence visibility outside `$HOME`, contents denied),
   `network_unrestricted_open` (candidate_network was configured
-  unrestricted — that axis' own choice).
+  unrestricted — that axis' own choice), `process_group_escape` (M47 RA-08(b):
+  a HOST backend can only best-effort `killpg` a candidate's process group, so
+  a deliberate `setsid()`/double-fork escapes the reap — soft, see below).
+- `process_containment` (M47 RA-08(b)) — how a candidate's descendants are
+  contained: `"namespace"` (a PID-namespace backend — Linux `--unshare-pid`
+  netns, or a hardened/enterprise container — reaps every descendant by
+  construction) vs `"process_group_besteffort"` (a host backend — macOS
+  `sandbox-exec`, the standard-tier host path — which carries the soft
+  `process_group_escape` residual) vs `"none"` (no OS sandbox backend). See
+  `references/isolation.md`, "Honest residual — process-group escape".
 - `qualified` — true ONLY for `default_deny` + probe-passed + no
-  disqualifying residual (the metadata and unrestricted-network ones are
-  the two structural non-disqualifying entries). This is the
+  disqualifying residual (the metadata, unrestricted-network, and
+  process_group_escape ones are the structural NON-disqualifying entries). This is the
   `host_isolation_qualified` signal **M36's single qualification FSM will
   fold into the overall `qualified` boolean** — M29b computes and seals it
   but does not re-derive top-level `qualified` from it.
@@ -143,7 +153,7 @@ Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes 
 **Custody binds to the object, not just the manifest.** `attach_custody` refuses to attach with a `null` artifact ("predates artifact binding") and independently re-verifies the bound object before writing `custody_attestation.json`; `verify-custody` re-verifies the object on every check, not just once at attach time. See `references/enterprise.md`'s custody section for the full contract.
 
 **Attestation eligibility + required off-box receipt (M44 RA-02/RA-03).** Two hardenings on top of the object binding, applied uniformly to all three post-seal attestation paths (`attach_custody`, `df-waiver attach`, `attach_release`):
-- **Eligibility (RA-03).** A valid K-of-N (or waiver/release) signature set no longer qualifies an INELIGIBLE manifest. `attach_custody` requires `outcome == CUSTODY_PENDING` AND the manifest's own pre-custody evidence to hold — final exam passed (or no final cohort), `security.failed == []`, and every qualification substate (barrier ∧ host_isolation ∧ control_plane ∧ app_security ∧ waiver_validity), recomputed from the sealed manifest via `df_qualify.derive` — before it will attest. A `SECURITY_GATE_FAILED`, `HOST_ISOLATION_LIMITED`, or failed-final manifest is refused (exit 3), never attested. A security **waiver** only re-qualifies app-security, so its eligibility check is narrower (it must not cover a failed final exam) and is deliberately tier-independent; a **release** approval requires a qualified ship candidate.
+- **Eligibility (RA-03).** A valid K-of-N (or waiver/release) signature set no longer qualifies an INELIGIBLE manifest. `attach_custody` requires `outcome == CUSTODY_PENDING` AND the manifest's own pre-custody evidence to hold — final exam passed (or no final cohort), `security.failed == []`, and every qualification substate (barrier ∧ host_isolation ∧ candidate_egress ∧ control_plane ∧ app_security ∧ waiver_validity), recomputed from the sealed manifest via `df_qualify.derive` — before it will attest. A `SECURITY_GATE_FAILED`, `HOST_ISOLATION_LIMITED`, or failed-final manifest is refused (exit 3), never attested. A security **waiver** only re-qualifies app-security, so its eligibility check is narrower (it must not cover a failed final exam) and is deliberately tier-independent; a **release** approval requires a qualified ship candidate.
 - **Required off-box receipt (RA-02).** When the sealed config's `audit.sink.required` is true, the attestation is pushed off-box **first**; a required-sink push failure rolls back fail-closed, leaving NO local attestation, NO chain link, and NO receipt (the pre-M44 bug wrote + anchored the attestation, then returned nonzero, leaving a locally-QUALIFIED run). Each attach writes a `*_sink_receipt.json` bound to the exact attestation bytes (`body_sha256`), and the corresponding verify path (`verify-custody`, `df-waiver verify`, the ship-phase release check) REQUIRES that receipt when the sink is required — its absence is a distinct not-qualified status (`SINK_RECEIPT_MISSING`), never a silent QUALIFIED.
 
 **Honest scope — detection-grade, not same-user prevention.** This is the SAME boundary `finalize_manifest`'s HMAC signing already documents for the manifest itself (see "Honest limits" below), now extended to the artifact object: `df_seal` defends against a symlink/special-file/hostile-permission entry escaping the tree during freeze, a partially-written object being reused, or the published object silently drifting from its sidecar without detection. It does **not** defend against a party with the SAME filesystem write access used to publish the object store deliberately overwriting bytes at that SAME privilege level — there is no cross-user MAC/DAC enforcement here. `verify_object`/`verify-manifest` are the detector for that residual risk (in-model detection: a confined candidate, an accident, or a mutating gate leaves evidence that gets caught, fail-closed), not a same-user-prevention guarantee. Two further scope notes:
@@ -239,13 +249,13 @@ pure function (`df_qualify.derive`):
 ```json
 "qualification": {
   "qualified": false,
-  "substates": {"barrier": true, "host_isolation": false, "control_plane": true,
-                "app_security": true, "waiver_validity": true},
+  "substates": {"barrier": true, "host_isolation": false, "candidate_egress": false,
+                "control_plane": true, "app_security": true, "waiver_validity": true},
   "code": "HOST_ISOLATION_LIMITED"
 }
 ```
 
-`qualified` is the AND of five sub-states, evaluated in a fixed precedence
+`qualified` is the AND of six sub-states, evaluated in a fixed precedence
 (first-failing wins the `code`):
 
 1. `barrier` — the effective tier is probe-proven isolated (`_QUALIFYING_TIERS`).
@@ -256,14 +266,23 @@ pure function (`df_qualify.derive`):
    `barrier ∧ app_security` and simply ignored host isolation, so a standard run
    downgraded to `allow_host_read` still sealed `COMPLETE_QUALIFIED`. It now
    gates `qualified`; fail → distinct outcome `HOST_ISOLATION_LIMITED`.
-3. `control_plane` — a real content-addressed artifact object_id is bound.
+3. `candidate_egress` — the built app's network is confined (`candidate_network
+   ∈ {deny, loopback}`). **This is the M47 RA-08(a) fix:** pre-M47 an
+   `unrestricted` candidate egress was non-disqualifying, so a standard+ run
+   could seal `COMPLETE_QUALIFIED` while the artifact it certified could reach
+   anywhere. It now gates `qualified`; fail → distinct outcome
+   `CANDIDATE_EGRESS_OPEN`. `unrestricted` stays the config default (no config
+   error; cooperative back-compat), but at a qualifying tier it seals
+   unqualified.
+4. `control_plane` — a real content-addressed artifact object_id is bound.
    Fail → `CONTROL_PLANE_UNVERIFIED`.
-4. `app_security` — `app_security_qualified` (M33a). Fail → `SECURITY_GATE_FAILED`.
-5. `waiver_validity` — no waiver in play, or a valid attestation covers every
+5. `app_security` — `app_security_qualified` (M33a). Fail → `SECURITY_GATE_FAILED`.
+6. `waiver_validity` — no waiver in play, or a valid attestation covers every
    finding. Fail → `WAIVER_INVALID`.
 
 **Superset (fail-closed) invariant:** because the old expression's two booleans
-were exactly `barrier` and `app_security` and `derive` only ADDs conjuncts, it
+were exactly `barrier` and `app_security` and `derive` only ADDs conjuncts
+(`host_isolation`, `candidate_egress`, `control_plane`, `waiver_validity`), it
 can newly FAIL a run the old code passed but can never newly PASS one the old
 code failed. On the CONVERGED terminal the supervisor passes the exact decided
 booleans; every other terminal gets an auditability record derived from manifest

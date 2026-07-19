@@ -18,7 +18,7 @@ import df_custody
 import df_sandbox
 import supervisor
 from test_ship import STUB, build_sealed_run, _base_config
-from test_supervisor import FAKE, setup_control
+from test_supervisor import FAKE, setup_control, stub_network_probe
 
 SUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "supervisor.py")
 _CRYPTO = df_custody._CRYPTOGRAPHY_IMPORT_ERROR is None
@@ -35,15 +35,19 @@ def _sandbox_ok():
 
 
 @pytest.mark.skipif(not _sandbox_ok(), reason="needs a real OS sandbox backend")
-def test_real_qualified_run_auto_ships_reversible_unattended(tmp_path):
+def test_real_qualified_run_auto_ships_reversible_unattended(tmp_path, monkeypatch):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")  # H3: unattended, no pause
     marker = tmp_path / "shipped_marker"
     cfg = json.loads((cr / "config.json").read_text())
     cfg["assurance"] = "standard"
+    # M47 RA-08(a): confine candidate egress so the run QUALIFIES (and can ship);
+    # stub the egress-denial probe so this in-process test stays hermetic.
+    cfg["candidate_network"] = "deny"
     cfg["ship"] = {"actions": [{"name": "merge",
                                 "run": [sys.executable, STUB, "touch", str(marker)],
                                 "reversible": True, "timeout_s": 30}]}
     (cr / "config.json").write_text(json.dumps(cfg))
+    stub_network_probe(monkeypatch)
 
     rc = supervisor.run(str(cr), None)
     assert rc == 0, "auto-ship of a reversible action after a qualified seal should exit 0"

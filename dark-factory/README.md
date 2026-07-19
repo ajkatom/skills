@@ -118,10 +118,13 @@ points, failure handling, timeouts, qualification consequences).
 
 A run's `qualified` flag is one authoritative AND over derived sub-states —
 `barrier` (probe-proven isolation) ∧ `host_isolation` (candidate default-deny
-held) ∧ `control_plane` (signed manifest + bound artifact) ∧ `app_security`
-(mandatory gates passed or every finding waived) ∧ `waiver_validity`. When
-one is false the run seals a **distinct** non-qualified code (e.g.
-`HOST_ISOLATION_LIMITED`, `SECURITY_GATE_FAILED`), never an ambiguous partial
+held) ∧ `candidate_egress` (the built app's network is confined to
+`deny`/`loopback` — an **unrestricted** candidate egress at `standard`+ is
+disqualifying, sealing `CANDIDATE_EGRESS_OPEN`) ∧ `control_plane` (signed
+manifest + bound artifact) ∧ `app_security` (mandatory gates passed or every
+finding waived) ∧ `waiver_validity`. When one is false the run seals a
+**distinct** non-qualified code (e.g. `HOST_ISOLATION_LIMITED`,
+`CANDIDATE_EGRESS_OPEN`, `SECURITY_GATE_FAILED`), never an ambiguous partial
 "qualified." At `standard`+ the security gates are **mandatory** (a converged
 artifact with a planted secret is rejected); an accepted-risk finding can be
 cleared only by a separate **signed, scoped, expiring waiver** (`df-waiver`),
@@ -197,7 +200,27 @@ This skill enforces an information barrier and, at `standard`+, real OS/
 container isolation — it does not judge whether your scenarios actually
 capture what you meant by the spec (that is still a human call: review
 `scenarios/*.json` before trusting them), and it does not evaluate code
-quality beyond what your scenarios exercise. `references/orchestrator-lockdown.md`
+quality beyond what your scenarios exercise.
+
+**What a `QUALIFIED` seal now binds (M44–M47).** Qualification derives from
+evidence bound to the exact **sealed content-addressed object** (M44 RA-01),
+not the mutable workspace; a custody/waiver/release attestation requires an
+**off-box sink receipt** and a manifest that is independently **eligible** to
+be attested (M44 RA-02/RA-03); at `standard`+ candidate **confinement can't be
+configured off** and the hidden **scenario bundle is sealed** (M45); crash
+recovery is **idempotent** across the whole builder-dispatch interval (M46); the
+adapter **mount is minimal** and the adapter can be **content-pinned** by sha256
+(M46/M47 #7); and an **unrestricted candidate egress is disqualifying** (M47
+RA-08(a)). **Honest remaining residuals**, named not hidden: human spec /
+behavior fidelity (your call); performance / load / scale (a separate tool, not
+this one); the **same-user detection-grade ceiling** — the single-user, stdlib
+control plane is same-user-forgeable, so its guarantees are detection-grade, not
+same-user-prevention (see `references/prevention-grade-roadmap.md`); the
+**host-backend process-group escape** (a setsid'd candidate child; closed only
+by a PID-namespace/container backend — M47 RA-08(b)); and enterprise
+**trusted-time** for expiry. This is detection-grade where it says so and
+denial-by-construction where the tier provides it — no claim of prevention-grade
+or production authority beyond what these mechanisms actually prove. `references/orchestrator-lockdown.md`
 documents one thing this skill deliberately does **not** self-provide: a
 skill cannot sandbox the session that is running it (the *orchestrator*,
 as opposed to the *builder*, which dark-factory does confine) — that is a

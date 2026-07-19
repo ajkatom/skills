@@ -23,7 +23,8 @@ import pytest
 import df_config
 import df_sandbox
 import supervisor
-from test_supervisor import FAKE, setup_control
+from test_supervisor import (
+    FAKE, external_reachable, needs_network, setup_control, stub_network_probe)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUP = os.path.join(HERE, "..", "scripts", "supervisor.py")
@@ -521,9 +522,15 @@ def _run_supervisor(cr):
     return manifest, run_dir
 
 
+@needs_network
 @needs_live
 def test_e2e_standard_run_is_default_deny_and_sealed(tmp_path):
-    manifest, run_dir = _run_supervisor(_std_control(tmp_path))
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
+    # M47 RA-08(a): confine candidate egress so the run reaches COMPLETE_QUALIFIED
+    # (a real deny run runs the egress-denial probe -> external connect -> this
+    # test is gated behind DF_ALLOW_NETWORK_TESTS).
+    manifest, run_dir = _run_supervisor(_std_control(tmp_path, candidate_network="deny"))
     assert manifest["outcome"] == "COMPLETE_QUALIFIED"
     hi = manifest["host_isolation"]
     assert hi["mode"] == "default_deny"
@@ -553,3 +560,62 @@ def test_e2e_optout_is_marked_unqualified(tmp_path):
     assert hi["mode"] == "allow_host_read_optout"
     assert hi["qualified"] is False
     assert df_sandbox.RESIDUAL_HOST_READ_OPEN in hi["residuals"]
+
+
+# --- M47 RA-08(a): candidate-egress gate, HERMETIC end-to-end regressions.
+# unrestricted at standard is now DISQUALIFYING (no network needed -- an
+# unrestricted candidate is never probed); deny with the egress probe stubbed
+# qualifies. These pin the tightening WITHOUT reaching outside localhost.
+
+@needs_live
+def test_e2e_standard_unrestricted_candidate_egress_is_disqualifying(tmp_path):
+    # RED before M47 (sealed COMPLETE_QUALIFIED), GREEN after: an unrestricted
+    # candidate egress at a qualifying tier seals the distinct CANDIDATE_EGRESS_OPEN.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text())
+    cfg["assurance"] = "standard"          # candidate_network defaults unrestricted
+    p.write_text(json.dumps(cfg))
+    assert supervisor.run(str(cr), None) == 0    # converges, just not qualified
+    m = json.loads((cr / "runs" / os.listdir(cr / "runs")[0] / "manifest.json").read_text())
+    assert m["qualified"] is False
+    assert m["outcome"] == "CANDIDATE_EGRESS_OPEN"
+    assert m["qualification"]["code"] == "CANDIDATE_EGRESS_OPEN"
+    assert m["qualification"]["substates"]["candidate_egress"] is False
+    # host_isolation IS qualified here -- the ONLY failing dimension is egress.
+    assert m["qualification"]["substates"]["host_isolation"] is True
+
+
+@needs_live
+def test_e2e_standard_confined_candidate_egress_qualifies(tmp_path, monkeypatch):
+    # The pass twin: a deny candidate egress qualifies (egress probe stubbed so
+    # this stays hermetic -- the probe's own live proof lives in the network e2e).
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text())
+    cfg["assurance"] = "standard"
+    cfg["candidate_network"] = "deny"
+    p.write_text(json.dumps(cfg))
+    stub_network_probe(monkeypatch)
+    assert supervisor.run(str(cr), None) == 0
+    m = json.loads((cr / "runs" / os.listdir(cr / "runs")[0] / "manifest.json").read_text())
+    assert m["qualified"] is True
+    assert m["outcome"] == "COMPLETE_QUALIFIED"
+    assert m["qualification"]["substates"]["candidate_egress"] is True
+
+
+@needs_live
+def test_e2e_process_containment_labelled_on_host_backend(tmp_path):
+    # M47 RA-08(b): a macOS host-backend default-deny run records the honest
+    # process_containment label + the (soft) process_group_escape residual,
+    # and stays host_isolation-qualified (the residual does not disqualify).
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    p = cr / "config.json"
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    assert supervisor.run(str(cr), None) == 0
+    m = json.loads((cr / "runs" / os.listdir(cr / "runs")[0] / "manifest.json").read_text())
+    hi = m["host_isolation"]
+    if hi["mode"] == "default_deny":  # macOS backend
+        assert hi["process_containment"] == "process_group_besteffort"
+        assert df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE in hi["residuals"]
+        assert hi["qualified"] is True   # process_group_escape is SOFT

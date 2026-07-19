@@ -21,7 +21,7 @@ import df_custody
 import df_sandbox
 import df_waiver
 import supervisor
-from test_supervisor import FAKE, setup_control
+from test_supervisor import FAKE, external_reachable, needs_network, setup_control
 
 pytest.importorskip("cryptography")
 
@@ -103,16 +103,21 @@ def _write_sigs(cr, entries):
 # --- Task 3: mandatory gates at standard+ ---------------------------------
 
 
+@needs_network
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
 def test_standard_clean_run_qualified_with_app_security(tmp_path):
     b = df_sandbox.current_backend()
     if not (b and b.available()):
         pytest.skip("no OS sandbox primitive")
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     # NO security_gates block: standard tier must SYNTHESIZE the mandatory
-    # minimum and still qualify a clean artifact.
+    # minimum and still qualify a clean artifact. M47 RA-08(a): confine candidate
+    # egress so the run QUALIFIES.
     p = cr / "config.json"
-    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"
+    cfg["candidate_network"] = "deny"; p.write_text(json.dumps(cfg))
     proc = _run(cr, "run")
     assert proc.returncode == 0, proc.stderr
     run_id = os.listdir(cr / "runs")[0]

@@ -642,6 +642,24 @@ def write_ship_checkpoint_report(run_dir, iteration, fe, sec_report, object_id, 
     return path
 
 
+# M47 RA-08(a): the candidate_network modes that CONFINE the built app's egress.
+# `unrestricted` (the config default, kept for back-compat and the only value a
+# cooperative tier accepts) leaves the shipped artifact's network wide open and
+# is DISQUALIFYING at a qualifying tier -- df_qualify folds this into the single
+# qualification AND as the `candidate_egress` sub-state (code CANDIDATE_EGRESS_OPEN).
+_CONFINED_CANDIDATE_NETWORK = ("deny", "loopback")
+
+
+def _candidate_egress_qualified(candidate_network) -> bool:
+    """True iff the candidate's egress is OS-confined to deny/loopback. An
+    `unrestricted` candidate is False -> the candidate_egress sub-state is
+    False -> at a qualifying tier (where barrier is True) the run is NOT
+    qualified, sealing CANDIDATE_EGRESS_OPEN. At a non-qualifying tier barrier
+    already fails first by precedence, so this value can never newly PASS a run
+    -- only the fail-closed direction df_qualify's superset invariant guarantees."""
+    return candidate_network in _CONFINED_CANDIDATE_NETWORK
+
+
 def _qualification_field(mb_clean, effective, app_security=None, waiver_validity=True,
                          artifact_field=None):
     """M36a Task 2: the sealed `qualification` object for a terminal manifest,
@@ -663,6 +681,7 @@ def _qualification_field(mb_clean, effective, app_security=None, waiver_validity
     return df_qualify.derive(
         barrier=effective in _QUALIFYING_TIERS,
         host_isolation=bool(hi.get("qualified")),
+        candidate_egress=_candidate_egress_qualified(mb_clean.get("candidate_network")),
         control_plane=control_plane,
         app_security=bool(app_security),
         waiver_validity=bool(waiver_validity))
@@ -1210,6 +1229,7 @@ def finalize_manifest(run_dir: str, extra: dict, audit_key: bytes = None, redact
         manifest["qualification"] = df_qualify.derive(
             barrier=bool(manifest.get("denial_probe_passed")),
             host_isolation=bool((manifest.get("host_isolation") or {}).get("qualified")),
+            candidate_egress=_candidate_egress_qualified(manifest.get("candidate_network")),
             control_plane=bool(isinstance(_art, dict) and _art.get("object_id")),
             app_security=bool(manifest.get("app_security_qualified", False)),
             waiver_validity=True)
@@ -1427,6 +1447,7 @@ def _precustody_substates(manifest_obj: dict) -> dict:
     return df_qualify.derive(
         barrier=tier in _QUALIFYING_TIERS,
         host_isolation=bool(hi.get("qualified")),
+        candidate_egress=_candidate_egress_qualified(manifest_obj.get("candidate_network")),
         control_plane=bool(isinstance(art, dict) and art.get("object_id")),
         app_security=bool(app_security),
         waiver_validity=True)
@@ -2888,6 +2909,11 @@ def _resolve_candidate_network_prefix(cfg, control_root, workspace, exec_prefix,
 _HOST_ISOLATION_SOFT_RESIDUALS = frozenset({
     df_sandbox.RESIDUAL_METADATA,
     df_sandbox.RESIDUAL_NET_UNRESTRICTED,
+    # M47 RA-08(b): a host backend's process-group escape is NAMED honestly as a
+    # residual but does NOT disqualify -- host_isolation already gates on host
+    # READ containment; the process-group best-effort is a separately-documented
+    # residual (references/isolation.md) that a namespace backend closes.
+    df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE,
 })
 
 
@@ -2897,6 +2923,38 @@ def _host_isolation_qualified(mode, passed, residuals):
         and passed
         and not [r for r in residuals if r not in _HOST_ISOLATION_SOFT_RESIDUALS]
     )
+
+
+def _annotate_process_containment(hi, backend=None):
+    """M47 RA-08(b): stamp the honest `process_containment` label onto a
+    host_isolation dict, and for a best-effort (host) backend append the (soft)
+    process_group_escape residual so the residual is auditable.
+
+    A candidate that ACTUALLY ran default-deny on a PID-namespace backend (Linux
+    --unshare-pid netns; a hardened/enterprise container's own PID namespace)
+    has every descendant -- setsid()/double-fork included -- reaped by
+    construction: "namespace". Every other case (macOS sandbox-exec, the
+    standard-tier host path, an allow-host-read opt-out, cooperative's unwrapped
+    candidate) can only best-effort killpg the process group, which a deliberate
+    setsid()/double-fork escapes: "process_group_besteffort" (+ the residual).
+    "none" only when there is no OS sandbox backend at all. Conservative by
+    design -- it never OVER-claims "namespace" (the fail-closed direction).
+    Idempotent (dedups the residual). Returns the same dict for convenience."""
+    if backend is None:
+        backend = df_sandbox.current_backend()
+    if backend is None:
+        hi["process_containment"] = "none"
+        return hi
+    namespace = (getattr(backend, "provides_pid_namespace", False)
+                 and hi.get("mode") == "default_deny")
+    if namespace:
+        hi["process_containment"] = "namespace"
+        return hi
+    hi["process_containment"] = "process_group_besteffort"
+    residuals = hi.setdefault("residuals", [])
+    if df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE not in residuals:
+        residuals.append(df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE)
+    return hi
 
 
 def _host_isolation_preliminary(cfg):
@@ -2912,8 +2970,9 @@ def _host_isolation_preliminary(cfg):
     else:
         mode = "none"
     residuals = [] if mode == "default_deny" else [df_sandbox.RESIDUAL_HOST_READ_OPEN]
-    return {"mode": mode, "probed": False, "passed": None,
-            "residuals": residuals, "qualified": False}
+    return _annotate_process_containment(
+        {"mode": mode, "probed": False, "passed": None,
+         "residuals": residuals, "qualified": False})
 
 
 def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier,
@@ -2976,7 +3035,10 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
         else:
             hi = {"mode": "allow_host_read_optout", "probed": False, "passed": None,
                   "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
-        return prefix, hi
+        # M47 RA-08(b): neither branch runs the candidate in a PID namespace
+        # (opt-out / cooperative-downgrade), so process containment is
+        # best-effort -- labelled honestly with the process_group_escape residual.
+        return prefix, _annotate_process_containment(hi)
 
     os_backend = df_sandbox.current_backend()
     if os_backend is None:
@@ -3003,7 +3065,7 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
             cfg, control_root, workspace, exec_prefix, eff_tier, journal)
         hi = {"mode": "legacy_allow_host_read", "probed": True, "passed": True,
               "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
-        return prefix, hi
+        return prefix, _annotate_process_containment(hi, os_backend)
 
     ok, report = df_sandbox.probe_candidate_confinement(
         os_backend, control_root, workspace, net_mode)
@@ -3022,7 +3084,7 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
                 cfg, control_root, workspace, exec_prefix, eff_tier, journal)
             hi = {"mode": "allow_host_read_downgrade", "probed": True, "passed": False,
                   "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
-            return prefix, hi
+            return prefix, _annotate_process_containment(hi, os_backend)
         raise df_sandbox.SandboxError(
             "candidate_host_read 'default_deny' live confinement probe failed -- "
             f"refusing to run the candidate with unproven host isolation: {reason} "
@@ -3040,7 +3102,11 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
     residuals = list(report.get("residuals", []))
     hi = {"mode": mode, "probed": True, "passed": True, "residuals": residuals,
           "qualified": _host_isolation_qualified(mode, True, residuals)}
-    return prefix, hi
+    # M47 RA-08(b): on a namespace backend (Linux --unshare-pid) this stamps
+    # "namespace"; on macOS sandbox-exec (a host backend) "process_group_
+    # besteffort" + the soft process_group_escape residual. qualified was
+    # computed above and the residual is SOFT, so labelling never flips it.
+    return prefix, _annotate_process_containment(hi, os_backend)
 
 
 def _candidate_prefix_for_twins(cfg, host_isolation, workspace, base_prefix, twin_env):
@@ -3409,6 +3475,19 @@ def author_scenarios_cmd(control_root: str, attempts: int = 3, review: bool = Fa
 
     journal = Journal(os.path.join(control_root, "authored.jsonl"))
 
+    # M47 condition #7 (review fix): enforce any pinned adapter digest BEFORE the
+    # author/critic adapters are ever invoked. The builder-run path enforces this
+    # at run start, but author-scenarios is a SEPARATE command that executes the
+    # author (and critic) adapters here — an operator who pins
+    # roles.author.adapter_sha256 to bind "only these exact bytes may author my
+    # hidden scenarios" must be protected AT authoring time, not only at a later
+    # `run` (a swap-then-swap-back would otherwise author the barrier scenarios
+    # with a substituted model undetected). Fail-closed, exit 2.
+    _digest_err = _enforce_adapter_digests(cfg, journal)
+    if _digest_err is not None:
+        sys.stderr.write(f"dark-factory: author-scenarios: {_digest_err}\n")
+        return 2
+
     critic_round = 0            # completed author<->critic revision cycles
     critic_feedback = None      # blocking findings the author must address
     total_blocking_raised = 0   # cumulative blocking findings across rounds
@@ -3721,6 +3800,36 @@ def _variant_seed_extra(twin_defs):
     return None
 
 
+def _enforce_adapter_digests(cfg, journal):
+    """M47 condition #7: if a role pinned `adapter_sha256`, the adapter FILE's
+    actual content sha256 must match at run start, else REFUSE (fail-closed).
+    Returns None when every pin matches (or none are set), otherwise an error
+    string; the caller journals ADAPTER_DIGEST_MISMATCH (done here) and exits 2.
+
+    An absent/unreadable file counts as a mismatch (actual=None != expected):
+    pinning a digest means the exact bytes MUST be present, so a substituted or
+    tampered adapter -- or a missing one -- can never run under the pin."""
+    digests = cfg.get("_adapter_digests") or {}
+    roles = cfg.get("roles") or {}
+    checks = []
+    if digests.get("builder"):
+        checks.append(("builder", (roles.get("builder") or {}).get("adapter"),
+                       digests["builder"]))
+    if digests.get("author") and cfg.get("_author"):
+        checks.append(("author", cfg["_author"]["adapter"], digests["author"]))
+    if digests.get("critic") and cfg.get("_critic"):
+        checks.append(("critic", cfg["_critic"]["adapter"], digests["critic"]))
+    for role, path, expected in checks:
+        actual = sha256_file(path) if (path and os.path.exists(path)) else None
+        if actual != expected:
+            journal.write("ADAPTER_DIGEST_MISMATCH", role=role, expected=expected,
+                          actual=actual, adapter=path)
+            return (f"roles.{role}.adapter_sha256 pin does not match the adapter "
+                    f"file content (expected {expected}, actual {actual}) -- "
+                    "refusing to run a substituted or tampered adapter")
+    return None
+
+
 def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = False,
                 fork_seed=None) -> int:
     creds, redactor, creds_err = _resolve_credentials(cfg)
@@ -3751,6 +3860,13 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     adapter = cfg["roles"]["builder"]["adapter"]
     timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
     cli = os.path.basename(adapter)
+
+    # M47 condition #7: authenticate every pinned adapter by CONTENT before the
+    # run touches it -- fail closed on any mismatch (or missing file).
+    _digest_err = _enforce_adapter_digests(cfg, journal)
+    if _digest_err is not None:
+        sys.stderr.write(f"dark-factory: {_digest_err}\n")
+        return 2
 
     journal.write(
         "INIT",
@@ -4575,6 +4691,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             qualification = df_qualify.derive(
                 barrier=eff in _QUALIFYING_TIERS,
                 host_isolation=bool((mb_clean.get("host_isolation") or {}).get("qualified")),
+                candidate_egress=_candidate_egress_qualified(cfg["candidate_network"]),
                 control_plane=bool(isinstance(artifact_field, dict)
                                    and artifact_field.get("object_id")),
                 app_security=app_security_qualified,
@@ -4622,7 +4739,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
 
         note = "" if fe.get("ran") else " [no sealed final exam administered]"
         print(f"dark-factory: CONVERGED "
-              f"({'qualified, ' + eff if qualified else 'unqualified, cooperative'} tier). "
+              f"({'qualified, ' + eff if qualified else 'unqualified, ' + eff} tier). "
               f"Workspace: {workspace}  Run: {run_dir}{note}")
         # M41: auto-enter the governed ship phase after a CLEAN qualified seal
         # (invariant #1: only COMPLETE_QUALIFIED + qualified ships here;

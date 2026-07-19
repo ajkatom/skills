@@ -46,7 +46,8 @@ from test_enterprise_config import (
     _patch_enterprise_probes,
     _sink_receiver,
 )
-from test_supervisor import FAKE, MARKER, read_journal, setup_control
+from test_supervisor import (
+    FAKE, MARKER, external_reachable, needs_network, read_journal, setup_control)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYMLINK_BUILDER = os.path.join(HERE, "fixtures", "fake_builder_symlink_artifact")
@@ -420,7 +421,10 @@ def _enterprise_run_custody_pending(tmp_path, monkeypatch):
     approvers = [pub_a, pub_b, pub_c]
     ctx = _sink_receiver(tmp_path)
     sink_url, _store = ctx.__enter__()
-    cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+    # M47 RA-08(a): confine candidate egress so a pristine object is custody-
+    # qualifiable (enterprise probes are patched -> "deny" reaches no network).
+    cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url,
+                             candidate_network="deny")
     _patch_enterprise_probes(monkeypatch)
     monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
     assert supervisor.run(str(cr), None) == 3
@@ -600,6 +604,7 @@ def test_attach_custody_takes_control_root_lock_around_writes(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 
+@needs_network
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
 def test_e2e_standard_tier_cli_run_binds_object_and_verify_manifest_pins_exit_codes(tmp_path):
     """Acceptance items (a) + (b): a REAL converged standard-tier run,
@@ -614,11 +619,17 @@ def test_e2e_standard_tier_cli_run_binds_object_and_verify_manifest_pins_exit_co
     b = df_sandbox.current_backend()
     if not (b and b.available()):
         pytest.skip("no OS sandbox primitive")
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
 
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     p = cr / "config.json"
     cfg = json.loads(p.read_text())
     cfg["assurance"] = "standard"
+    # M47 RA-08(a): confine candidate egress so the run QUALIFIES (a real
+    # deny run runs the egress-denial probe -> external connect -> this test is
+    # gated behind DF_ALLOW_NETWORK_TESTS).
+    cfg["candidate_network"] = "deny"
     p.write_text(json.dumps(cfg))
 
     proc = subprocess.run([sys.executable, SUP, "run", "--control-root", str(cr)],

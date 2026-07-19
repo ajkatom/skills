@@ -216,13 +216,17 @@ unchanged below.
      unless you pass `run --allow-downgrade` (hardened → standard if the OS sandbox is
      still healthy, else → cooperative; standard → cooperative).
    - **`candidate_network` (optional, M27, spec §7.4; requires `standard` or above).**
-     `"unrestricted"` (default, no-op), `"deny"` (candidate loses all network
+     `"unrestricted"` (default), `"deny"` (candidate loses all network
      including loopback), or `"loopback"` (candidate keeps only `127.0.0.1` —
      twin-compatible). Restricts the CANDIDATE only — the builder's network for
-     its provider API calls is never touched. Live-probed before the candidate
-     ever runs under it (fail-closed, same discipline as the base denial probe);
-     `"deny"` is refused with `twins.enabled: true` or any http scenario, and
-     `"loopback"` is macOS-only. See `references/isolation.md`.
+     its provider API calls is never touched. **M47 RA-08(a): an `"unrestricted"`
+     candidate egress at `standard`+ is now DISQUALIFYING** — it seals the
+     distinct `CANDIDATE_EGRESS_OPEN` (qualified `false`) rather than
+     `COMPLETE_QUALIFIED`, so **set `"deny"` (or `"loopback"` for twins) to
+     qualify a `standard`+ run**. Live-probed before the candidate ever runs
+     under it (fail-closed, same discipline as the base denial probe); `"deny"`
+     is refused with `twins.enabled: true` or any http scenario, and `"loopback"`
+     is macOS-only. See `references/isolation.md`.
    - **`candidate_host_read` (optional, M29b/M29c, DF-02; `standard`+).** At
      standard+ the CANDIDATE runs under a **default-deny** host-read sandbox by
      default on BOTH macOS and Linux: `~/.ssh`/dotfiles/other-repos OS-denied,

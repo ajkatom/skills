@@ -44,6 +44,7 @@ import sys
 import pytest
 
 import df_sandbox
+from test_supervisor import needs_network
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUP = os.path.join(HERE, "..", "scripts", "supervisor.py")
@@ -109,16 +110,19 @@ def _external_reachable():
         return False
 
 
-def _run_and_assert_converged(cr, expected_candidate_network):
+def _run_and_assert_converged(cr, expected_candidate_network,
+                              expected_outcome="COMPLETE_QUALIFIED",
+                              expected_qualified=True, expected_rc=0):
     proc = subprocess.run(
         [sys.executable, SUP, "run", "--control-root", str(cr)],
         capture_output=True, text=True, timeout=60,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == expected_rc, proc.stdout + proc.stderr
     run_id = os.listdir(cr / "runs")[0]
     run_dir = cr / "runs" / run_id
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["outcome"] == "COMPLETE_QUALIFIED" and manifest["qualified"] is True
+    assert manifest["outcome"] == expected_outcome
+    assert manifest["qualified"] is expected_qualified
     assert manifest["denial_probe_passed"] is True
     assert manifest["candidate_network"] == expected_candidate_network
 
@@ -128,19 +132,29 @@ def _run_and_assert_converged(cr, expected_candidate_network):
     return manifest
 
 
+@needs_network
 @pytest.mark.skipif(sys.platform != "darwin", reason="live macOS sandbox-exec candidate-network e2e")
 def test_candidate_network_deny_bites_through_real_run_path(tmp_path):
     if not _external_reachable():
         pytest.skip("no external reachability for a non-vacuous candidate-network e2e")
 
+    # M47 RA-08(a): a confined (deny) candidate egress is now REQUIRED to qualify,
+    # so this run both proves denial AND seals COMPLETE_QUALIFIED.
     cr = _setup_control(tmp_path, expected_stdout="DENIED", candidate_network="deny")
     _run_and_assert_converged(cr, expected_candidate_network="deny")
 
 
+@needs_network
 @pytest.mark.skipif(sys.platform != "darwin", reason="live macOS sandbox-exec candidate-network e2e")
 def test_candidate_network_unrestricted_is_the_nonvacuous_twin(tmp_path):
     if not _external_reachable():
         pytest.skip("no external reachability for a non-vacuous candidate-network e2e")
 
+    # The non-vacuity twin: unrestricted -> the candidate CAN connect (CONNECTED),
+    # and the run still CONVERGES -- but M47 RA-08(a) now makes an unrestricted
+    # candidate egress DISQUALIFYING, so it honestly seals CANDIDATE_EGRESS_OPEN
+    # (qualified False), not COMPLETE_QUALIFIED. This is the exact tightening.
     cr = _setup_control(tmp_path, expected_stdout="CONNECTED", candidate_network=None)
-    _run_and_assert_converged(cr, expected_candidate_network="unrestricted")
+    _run_and_assert_converged(cr, expected_candidate_network="unrestricted",
+                              expected_outcome="CANDIDATE_EGRESS_OPEN",
+                              expected_qualified=False)
