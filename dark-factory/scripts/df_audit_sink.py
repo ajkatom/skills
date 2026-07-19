@@ -74,15 +74,22 @@ def _push_http_append(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int) 
     if status not in (200, 201):
         raise SinkError(f"http-append sink returned HTTP {status} for {key}")
 
+    # DF-R4-04: a SERVER-issued receipt (the sink actually returned a `receipt`
+    # field) is off-box evidence; a locally-computed sha256 fallback is NOT (a
+    # same-user attacker can fabricate it). server_issued distinguishes the two so
+    # a REQUIRED sink can refuse a purely-local receipt fail-closed.
     receipt = hashlib.sha256(body).hexdigest()
+    server_issued = False
     try:
         parsed = json.loads(resp_body)
         if isinstance(parsed, dict) and parsed.get("receipt"):
             receipt = parsed["receipt"]
+            server_issued = True
     except (json.JSONDecodeError, UnicodeDecodeError):
-        pass  # fall back to the locally computed receipt
+        pass  # fall back to the locally computed receipt (server_issued stays False)
 
-    return {"kind": "http-append", "status": status, "receipt": receipt}
+    return {"kind": "http-append", "status": status, "receipt": receipt,
+            "server_issued": server_issued}
 
 
 def _split_endpoint(endpoint: str):
@@ -135,6 +142,7 @@ def _push_s3_objectlock(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             status = resp.status
             etag = resp.headers.get("ETag", "")
+            version_id = resp.headers.get("x-amz-version-id", "")
     except urllib.error.HTTPError as e:
         raise SinkError(
             f"s3-objectlock sink returned HTTP {e.code} for {key}"
@@ -145,7 +153,13 @@ def _push_s3_objectlock(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int
     if not (200 <= status < 300):
         raise SinkError(f"s3-objectlock sink returned HTTP {status} for {key}")
 
-    return {"kind": "s3-objectlock", "status": status, "etag": etag}
+    # DF-R4-04: the store's own VersionId (object-lock buckets are versioned) or
+    # ETag is the server-issued proof the object landed off-box. server_issued is
+    # True only if the store actually returned one; a 2xx with neither is treated
+    # as non-authoritative (a REQUIRED sink then fails closed rather than trust it).
+    server_issued = bool(version_id or etag)
+    return {"kind": "s3-objectlock", "status": status, "etag": etag,
+            "version_id": version_id, "server_issued": server_issued}
 
 
 def _sigv4_headers(
