@@ -34,12 +34,20 @@ Directed … H4 Lights-out) for how much a human is in the loop. Security
 gates are mandatory at standard+ (a converged artifact with a planted secret
 is rejected, cleared only by a signed, expiring waiver), and `qualified` is
 one authoritative state machine over isolation + host-read + control-plane +
-app-security + waiver validity. Cross-model builders too: claude/codex/gemini
-CLIs, or a stdlib HTTP adapter straight to the Anthropic/OpenAI APIs, no CLI
-required.
+app-security + waiver validity. The hidden scenarios can be written by a human
+or by an independent **author** agent (a different model than the builder),
+adversarially reviewed by a second **decorrelated critic** model, and can be
+**generative** — seeded property/fuzz and bounded-concurrency scenarios that
+assert an invariant (round-trip, idempotency, no-lost-update, "never crashes")
+over many machine-generated inputs. Past the sealed artifact, an optional
+**governed ship phase** runs operator-defined actions (merge/deploy/…),
+reversible ones unattended and irreversible ones behind a signed K-of-N
+release approval. Cross-model builders too: claude/codex/gemini CLIs, or a
+stdlib HTTP adapter straight to the Anthropic/OpenAI APIs, no CLI required.
 
 - README (quickstart, tiers, layout): [`dark-factory/README.md`](dark-factory/README.md)
 - Plain-language overview: [`dark-factory/OVERVIEW.md`](dark-factory/OVERVIEW.md)
+- Security glossary: [`dark-factory/GLOSSARY.md`](dark-factory/GLOSSARY.md)
 - Skill (operational instructions): [`dark-factory/SKILL.md`](dark-factory/SKILL.md)
 - Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md)
 - Adversarial review log: [`docs/superpowers/specs/2026-07-13-dark-factory-review-log.md`](docs/superpowers/specs/2026-07-13-dark-factory-review-log.md)

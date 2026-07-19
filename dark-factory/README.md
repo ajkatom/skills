@@ -26,7 +26,8 @@ Design spec: [`docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`](
 Full operational instructions (the doc Claude itself follows when running
 this skill): [`SKILL.md`](SKILL.md). A plain-language overview of what this
 does and what each reference doc covers, if `SKILL.md` and this README are
-too technical: [`OVERVIEW.md`](OVERVIEW.md).
+too technical: [`OVERVIEW.md`](OVERVIEW.md). A consolidated glossary of the
+security terminology used throughout: [`GLOSSARY.md`](GLOSSARY.md).
 
 ("Level-5" above is the industry-generic term for fully-autonomous coding,
 not dark-factory's own config. Inside dark-factory, two separate axes

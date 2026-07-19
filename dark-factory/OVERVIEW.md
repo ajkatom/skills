@@ -136,6 +136,10 @@ Some are always on, some optional:
 
 ## What each reference doc covers
 
+A consolidated **[`GLOSSARY.md`](GLOSSARY.md)** (in `dark-factory/`, alongside
+this file) defines the security terminology used throughout — start there if a
+term below is unfamiliar.
+
 Every file below lives in `references/`. They're written for someone
 implementing or auditing the mechanism, not for a first read — this list is
 just so you know which one to open.
