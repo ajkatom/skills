@@ -1,5 +1,6 @@
 import ctypes
 import os
+import platform
 import stat
 
 import pytest
@@ -301,6 +302,9 @@ def test_freeze_raises_when_renamex_np_symbol_missing(tmp_path, monkeypatch):
     class _FakeLib:
         pass  # no renamex_np attribute -> AttributeError inside df_seal
 
+    # Force the Darwin branch so this exercises the renamex_np path on any
+    # host OS (on Linux, freeze() would otherwise take the renameat2 branch).
+    monkeypatch.setattr(df_seal.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(df_seal.ctypes, "CDLL", lambda *a, **k: _FakeLib())
     with pytest.raises(df_seal.SealError, match="renamex_np unavailable"):
         df_seal.freeze(str(t1), str(store))
@@ -371,6 +375,8 @@ def test_race_mutation_during_manifest_scan_source_never_used(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(platform.system() != "Darwin",
+                    reason="renamex_np is a macOS-only libc call")
 def test_renamex_np_no_replace_refuses_existing_destination(tmp_path):
     src = tmp_path / "src"
     dst = tmp_path / "dst"
@@ -383,6 +389,8 @@ def test_renamex_np_no_replace_refuses_existing_destination(tmp_path):
     assert list(dst.iterdir()) == []
 
 
+@pytest.mark.skipif(platform.system() != "Darwin",
+                    reason="renamex_np is a macOS-only libc call")
 def test_renamex_np_no_replace_succeeds_when_destination_absent(tmp_path):
     src = tmp_path / "src"
     dst = tmp_path / "dst"

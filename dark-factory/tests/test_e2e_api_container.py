@@ -41,6 +41,7 @@ wiring pointed at the real Anthropic API -- see references/hardened.md.
 import json
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -52,6 +53,12 @@ ADAPTER = os.path.realpath(os.path.join(HERE, "..", "scripts", "adapters", "api_
 IMAGE = "python:3.12-alpine"
 
 DOCKER_LIVE = df_container.docker_available()
+# `host.docker.internal` is provided by Docker Desktop (macOS/Windows). Plain
+# Linux Docker Engine (e.g. CI runners) does not resolve it until the
+# `--add-host=host.docker.internal:host-gateway` wiring lands (the named M16
+# deferral in scripts/supervisor.py) -- so the stub-backed tests below skip
+# there instead of failing (or vacuously passing on the error path).
+HOST_DNS_LIVE = DOCKER_LIVE and sys.platform == "darwin"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -97,7 +104,8 @@ def _run_adapter_in_container(workdir, prompt_file, container_base_url, timeout_
     )
 
 
-@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+@pytest.mark.skipif(not HOST_DNS_LIVE,
+                    reason="needs docker + host.docker.internal (Docker Desktop; M16)")
 def test_api_anthropic_builds_inside_container_against_stub(tmp_path):
     stub_proc, base_on_host = _start_stub(tmp_path, "greet")
     try:
@@ -146,7 +154,8 @@ def test_api_anthropic_builds_inside_container_against_stub(tmp_path):
         _stop_stub(stub_proc)
 
 
-@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+@pytest.mark.skipif(not HOST_DNS_LIVE,
+                    reason="needs docker + host.docker.internal (Docker Desktop; M16)")
 def test_api_anthropic_container_run_key_absent_even_on_adapter_error(tmp_path):
     """Same in-container mechanism, but the stub replies with an unsafe path
     (mode="unsafe") so the adapter reports status:"error" -- the no-key-leak

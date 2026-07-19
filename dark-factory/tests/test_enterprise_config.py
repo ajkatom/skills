@@ -855,6 +855,11 @@ def test_enterprise_entrypoint_clears_no_proxy_before_exec():
 # ---------------------------------------------------------------------------
 
 DOCKER_LIVE = df_container.docker_available()
+# The live probe reaches the host-side stub via `host.docker.internal`, a
+# Docker Desktop (macOS/Windows) name that plain Linux Docker Engine does not
+# resolve until the `--add-host=...:host-gateway` wiring lands (M16 deferral,
+# see scripts/supervisor.py). Skip rather than fail on such hosts.
+HOST_DNS_LIVE = DOCKER_LIVE and sys.platform == "darwin"
 
 _ENTERPRISE_DOCKERFILE = """FROM python:3.12-alpine
 RUN apk add --no-cache iptables util-linux
@@ -904,7 +909,8 @@ def _start_allowed_stub():
     return httpd, httpd.server_address[1]
 
 
-@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+@pytest.mark.skipif(not HOST_DNS_LIVE,
+                    reason="needs docker + host.docker.internal (Docker Desktop; M16)")
 def test_probe_enterprise_egress_live(enterprise_probe_image, monkeypatch):
     """The live self-check: allowlisted-via-proxy reachable, direct-to-
     denied-host DENIED, and the child CANNOT re-add iptables rules (NET_ADMIN

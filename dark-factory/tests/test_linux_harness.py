@@ -67,7 +67,12 @@ def test_bwrap_denial_live_on_linux(linux_probe_image):
     skipped unit coverage on macOS."""
     proc = _run_probe(
         linux_probe_image,
-        ["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"],
+        # apparmor=unconfined: on AppArmor hosts (Ubuntu runners) the default
+        # docker profile denies mount(2), which bwrap needs even with
+        # CAP_SYS_ADMIN. Docker Desktop's VM has no AppArmor, so this flag is
+        # a no-op there.
+        ["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined",
+         "--security-opt", "apparmor=unconfined"],
         ["sh", "-c", "mkdir -p /tmp/deny /tmp/ws && python3 /df/df_linux_probes.py bwrap /tmp/deny /tmp/ws"],
     )
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
@@ -125,7 +130,11 @@ def test_probe_catches_cap_sys_admin_remount_escape(linux_probe_image):
     goes green with the escape working, the fail-closed guarantee is broken."""
     proc = _run_probe(
         linux_probe_image,
-        ["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"],
+        # apparmor=unconfined for the same reason as the denial test above:
+        # without it, bwrap cannot mount at all and probe_denial returns False
+        # vacuously (launch failure), not because the remount check caught it.
+        ["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined",
+         "--security-opt", "apparmor=unconfined"],
         ["sh", "-c", "mkdir -p /tmp/deny /tmp/ws && python3 -c "
                      + "\"" + _CAP_DROP_REGRESSION_SNIPPET.replace('"', '\\"') + "\""],
     )

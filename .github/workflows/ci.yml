@@ -1,8 +1,9 @@
 # M47 condition #10: minimal CI that runs the dark-factory HERMETIC test suite
-# on every push and PR. The runtime is STDLIB-ONLY (no third-party imports in
-# scripts/ -- verified below), so there are no dependencies to pin or lock: the
-# stock python3 on the runner is the whole toolchain. This workflow IS the "CI
-# validation" the external audit asked for.
+# on every push and PR. The RUNTIME is stdlib-only except for the one declared
+# enterprise dependency (`cryptography`, used solely by scripts/df_custody.py
+# and pinned in requirements-enterprise.txt) -- verified below. The test suite
+# exercises the enterprise tier, so CI installs that one pinned requirement.
+# This workflow IS the "CI validation" the external audit asked for.
 #
 # Hermetic by construction: DF_ALLOW_NETWORK_TESTS is NOT set, so the handful of
 # tests that reach outside localhost (live OSV/api probes, the live candidate-
@@ -19,20 +20,25 @@ jobs:
   hermetic-suite:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Assert the runtime is stdlib-only (nothing to pin)
+      - name: Assert the runtime is stdlib-only apart from the pinned enterprise dep
         run: |
           cd dark-factory
-          # No third-party import anywhere under scripts/: if this greps a hit,
-          # the "stdlib-only, nothing to pin" claim is false and CI must fail.
+          # No undeclared third-party import anywhere under scripts/: if this
+          # greps a hit, the "stdlib-only apart from requirements-enterprise"
+          # claim is false and CI must fail. `cryptography` is deliberately
+          # absent from this pattern: it is the one declared, pinned exception.
           ! grep -rEn '^\s*(import|from)\s+(requests|numpy|pandas|pytest|yaml|docker)\b' scripts/
       - name: Run the hermetic test suite
         run: |
           cd dark-factory
           # Default pytest: DF_ALLOW_NETWORK_TESTS unset -> external-network
           # tests skip -> the run touches nothing outside localhost.
+          # requirements-enterprise.txt supplies `cryptography` for the
+          # enterprise-tier (custody / proxy / seccomp) tests.
           python -m pip install --upgrade pytest
+          python -m pip install -r requirements-enterprise.txt
           python -m pytest -q
