@@ -101,6 +101,9 @@ def _finalize_container_manifest(cfg, eff_tier):
     if eff_tier not in _CONTAINER_TIERS:
         return None
     c = dict(cfg["_container"])
+    # Internal, run-time cache keys (DF-R4-10) never belong on the manifest.
+    c.pop("_effective_image", None)
+    c.pop("_resolved_image_digest", None)
     image = c["image"]
     # A digest pin is an `@sha256:` reference; anything else is a mutable tag
     # whose bytes can change under you as upstream republishes it.
@@ -113,10 +116,52 @@ def _finalize_container_manifest(cfg, eff_tier):
             "build environment (advisory only — the run continues, and the "
             "manifest records the resolved digest either way).\n"
         )
+    # DF-R4-10: report the SAME digest EVERY dispatch/probe in this run used. If a
+    # dispatch already resolved it (cached by _effective_image on first use), reuse
+    # that EXACT value so the manifest cannot disagree with what actually ran; on a
+    # no-dispatch path (e.g. this called before any container op) resolve once here.
     # Best-effort, fail-open: resolve_image_digest returns None on any error and
     # never raises, so a missing digest / unreachable docker cannot block a run.
-    c["resolved_image_digest"] = df_container.resolve_image_digest(image)
+    cc = cfg["_container"]
+    if "_resolved_image_digest" in cc:
+        c["resolved_image_digest"] = cc["_resolved_image_digest"]
+    else:
+        c["resolved_image_digest"] = df_container.resolve_image_digest(image)
     return c
+
+
+def _effective_image(cfg):
+    """DF-R4-10: the SINGLE, digest-pinned image reference used for EVERY container
+    dispatch + probe in a run — resolved ONCE and cached on cfg["_container"].
+
+    A mutable tag can move between digest-inspection and dispatch (or between the
+    probe and the real builder run, or between iterations). Resolving the digest
+    once here and threading THIS reference to build_argv/build_enterprise_argv and
+    every probe guarantees the manifest's recorded digest == the bytes that ran.
+
+      - config already pinned (`@sha256:` present) -> dispatched verbatim;
+      - otherwise resolve the digest once: a RepoDigest ('repo@sha256:...') or a
+        local image id ('sha256:...') is dispatched as the pinned reference and
+        recorded on the manifest;
+      - unresolvable (offline / never-pulled) -> fall back to the mutable tag
+        (fail-OPEN, back-compat) and the manifest stays honest (resolved digest
+        null); WHEN a digest is available, though, ALL dispatches use it.
+
+    resolve_image_digest is fail-open (returns None, never raises) so this cannot
+    block a run even with docker down."""
+    c = cfg["_container"]
+    if "_effective_image" in c:
+        return c["_effective_image"]
+    image = c["image"]
+    # Resolve once (verbatim-pinned config still records its digest for the
+    # manifest). None on any failure -> keep the operator's reference as-is.
+    digest = df_container.resolve_image_digest(image)
+    if "@sha256:" in image:
+        c["_effective_image"] = image
+    else:
+        c["_effective_image"] = digest if digest else image
+    c["_resolved_image_digest"] = digest
+    return c["_effective_image"]
 
 
 BUILDER_RULES = """## Builder rules
@@ -2836,7 +2881,7 @@ def _verify_enterprise_egress(cfg, pcfg, proxy_endpoint):
             capability_token=probe_cap_token)
         probe_proxy_endpoint = f"{_ENTERPRISE_PROXY_HOST}:{probe_proxy_port}"
         ok, detail = df_container.probe_enterprise_egress(
-            cfg["_container"]["image"], probe_proxy_endpoint,
+            _effective_image(cfg), probe_proxy_endpoint,
             f"http://127.0.0.1:{stub_port}/", _EGRESS_PROBE_DENIED_HOST,
             seccomp_profile_path=cfg["_enterprise"]["seccomp"],
             capability_token=probe_cap_token)
@@ -2861,8 +2906,11 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         os_ok = os_backend is not None and os_backend.available() and df_sandbox.probe_denial(
             os_backend, control_root, workspace)
         c = cfg["_container"]
+        # DF-R4-10: pin the digest ONCE, before the first container op, and use
+        # the pinned reference for every probe + the real builder dispatch.
+        eff_image = _effective_image(cfg)
         dk_ok = df_container.docker_available() and df_container.probe_container(
-            c["image"], control_root, workspace)
+            eff_image, control_root, workspace)
         seccomp_path = cfg["_enterprise"]["seccomp"]
         # M22 Task 1: the offline shape-check (_seccomp_profile_ok) is a
         # fast, no-docker-needed rejection of a missing/malformed profile
@@ -2876,7 +2924,7 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         seccomp_ok = (
             _seccomp_profile_ok(seccomp_path)
             and dk_ok
-            and df_container.probe_seccomp(c["image"], seccomp_path)
+            and df_container.probe_seccomp(eff_image, seccomp_path)
         )
         if os_ok and dk_ok and seccomp_ok:
             return ("enterprise", os_backend.wrap_prefix(control_root, workspace),
@@ -2926,8 +2974,9 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         os_ok = os_backend is not None and os_backend.available() and df_sandbox.probe_denial(
             os_backend, control_root, workspace)
         c = cfg["_container"]
+        # DF-R4-10: pin the digest ONCE and probe the pinned reference.
         dk_ok = df_container.docker_available() and df_container.probe_container(
-            c["image"], control_root, workspace)
+            _effective_image(cfg), control_root, workspace)
         if os_ok and dk_ok:
             return ("hardened", os_backend.wrap_prefix(control_root, workspace),
                     df_container.BACKEND_NAME, True)
@@ -4150,6 +4199,16 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
              "same_model_ack": cfg["_critic"]["same_model_ack"],
              "model_identity": cfg["_critic"]["model_identity"]}
             if cfg.get("_critic") else None
+        ),
+        # DF-R4-09 (M55): the BUILDER's operator-ASSERTED model_identity (or None),
+        # sealed VERBATIM so an auditor can compare all three roles' declared
+        # identities from the terminal manifest. Operator-ASSERTED, NOT system-
+        # verified (a black-box API key can reach any model — same caveat as
+        # authored_by/critic model_identity). Absent -> None -> byte-identical
+        # manifest to pre-M55.
+        "builder_identity": (
+            {"model_identity": cfg["_builder_model_identity"]}
+            if cfg.get("_builder_model_identity") else None
         ),
     }
 
@@ -5390,7 +5449,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     if dep_cache_env:
                         merged_env.update(dep_cache_env)
                     builder_prefix = df_container.build_argv(
-                        c["image"], workspace,
+                        _effective_image(cfg), workspace,
                         ro_mounts=ro_mounts,
                         network=c["network"], memory=c["memory"], pids=c["pids"],
                         env=merged_env if merged_env else None)
@@ -5481,7 +5540,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                       endpoint=descriptor["endpoint"],
                                       target_base_url=target_base_url)
                     builder_prefix = df_container.build_enterprise_argv(
-                        c["image"], workspace,
+                        _effective_image(cfg), workspace,
                         ro_mounts=ro_mounts_ent,
                         proxy_endpoint=proxy_endpoint,
                         seccomp_profile_path=cfg["_enterprise"]["seccomp"],
@@ -6272,6 +6331,12 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                  "model_identity": cfg["_critic"]["model_identity"]}
                 if cfg.get("_critic") else None
             ),
+            # DF-R4-09 (M55): same fresh+resume threading as authored_by/critic —
+            # the builder's operator-ASSERTED model_identity, sealed on resume too.
+            "builder_identity": (
+                {"model_identity": cfg["_builder_model_identity"]}
+                if cfg.get("_builder_model_identity") else None
+            ),
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -6972,12 +7037,17 @@ def _push_ship_offbox(cfg, run_dir, run_id, record_text, kind):
 
 
 def _ship_toolchain_identity(actions):
-    """M49 DF-R3-06: record WHAT ran per action for the audit trail — the resolved
-    executable identity of each action's `run[0]`. Best-effort and HONEST: a
-    PATH-resolved (or absolute) regular readable file gets a sha256; anything not
-    resolvable/hashable is recorded as such (never a false claim). This does NOT
-    make the external tool immutable — it stays operator-controlled; this records
-    its identity at ship time, nothing more (see references/ship.md)."""
+    """M49 DF-R3-06 / DF-R4-08 FALLBACK ONLY: seal-time (post-hoc) resolution of
+    each action's `run[0]` identity. Since M55 the AUTHORITATIVE toolchain is
+    captured PRE-exec inside df_ship.run_actions (resolved against the action's
+    cwd, hashed before the spawn) and threaded out on the run result; this
+    seal-time resolver is used solely on the no-run SHIP_FAILED paths
+    (materialize-failure / reconcile-abort) where no action executed, so its
+    weaker semantics (supervisor cwd, post-run bytes) never describe a real run.
+    Best-effort and HONEST: a PATH-resolved (or absolute) regular readable file
+    gets a sha256; anything not resolvable/hashable is recorded as such (never a
+    false claim). This does NOT make the external tool immutable — it stays
+    operator-controlled (see references/ship.md)."""
     out = []
     for action in actions:
         argv = action.get("run") or []
@@ -7195,7 +7265,17 @@ def _ship_record_bytes(result, artifact_object_id, ship_actions, redactor):
         "ship_workspace_object_id": artifact_object_id,
         "ts": _now(),
     }
-    if ship_actions is not None:
+    # DF-R4-08: the toolchain identity is the PRE-exec resolution captured by
+    # df_ship.run_actions AS each action spawned (resolved against the action's
+    # cwd, hashed before exec) — NOT a post-run re-read at seal time. Only the
+    # no-run SHIP_FAILED paths (materialize-failure, reconcile-abort) carry no
+    # per-action toolchain in `result`; there fall back to the seal-time resolver
+    # (nothing ran, so it is purely informational).
+    if "toolchain" in result:
+        record["toolchain"] = result["toolchain"]
+        if result.get("rollback_toolchain"):
+            record["rollback_toolchain"] = result["rollback_toolchain"]
+    elif ship_actions is not None:
         record["toolchain"] = _ship_toolchain_identity(ship_actions)
     obj = redactor.redact_obj(record) if redactor is not None else record
     return record, canonical_json(obj)

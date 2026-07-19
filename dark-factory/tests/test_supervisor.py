@@ -125,6 +125,33 @@ def test_converging_run_exits_zero_and_journals(tmp_path):
     assert states.count("BUILD") == 2 and states.count("FEEDBACK") == 1
 
 
+def test_builder_model_identity_sealed_into_manifest(tmp_path):
+    # DF-R4-09 (M55): an operator-ASSERTED roles.builder.model_identity is sealed
+    # VERBATIM into the terminal manifest's `builder_identity`, so an auditor can
+    # compare all three roles' declared identities from the manifest alone.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    cfg_path = cr / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["roles"]["builder"]["model_identity"] = "anthropic/claude-opus-4"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    assert supervisor.run(str(cr), None) == 0
+    _entries, run_id = read_journal(cr)
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    # Verbatim, operator-asserted (not verified) identity on the sealed manifest.
+    assert manifest["builder_identity"] == {"model_identity": "anthropic/claude-opus-4"}
+
+
+def test_builder_identity_absent_is_none_backcompat(tmp_path):
+    # Absent roles.builder.model_identity -> builder_identity is None (byte-
+    # identical manifest surface to pre-M55).
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    assert supervisor.run(str(cr), None) == 0
+    _entries, run_id = read_journal(cr)
+    manifest = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
+    assert manifest["builder_identity"] is None
+
+
 def test_stubborn_run_hits_cap_with_exit_3(tmp_path):
     cr = setup_control(tmp_path, STUBBORN, max_iterations=2, checkpoint="auto")
     rc = supervisor.run(str(cr), None)

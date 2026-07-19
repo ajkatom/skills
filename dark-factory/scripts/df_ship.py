@@ -32,15 +32,65 @@ audit trail, NOT confinement. A ship action runs as a normal host subprocess.
 See references/ship.md.
 """
 import os
+import shutil
 import subprocess
 import time
 
+import df_common
 import df_creds
 import df_seal
 
 
 class ShipError(RuntimeError):
     pass
+
+
+def toolchain_identity(action_name, argv0, cwd):
+    """DF-R4-08: resolve + hash an executable's identity as it is ABOUT to run.
+
+    Records WHAT is spawning, resolved EXACTLY as the OS will resolve argv[0] for
+    a child launched with cwd=`cwd`:
+      - a name WITH a path separator is relative to the ACTION's cwd (the ship
+        workspace), NOT the supervisor cwd — matching execve semantics;
+      - a bare command is looked up on PATH (the child inherits it), via which().
+    The sha256 is the PRE-exec bytes, so a self-modifying deploy tool that rewrites
+    its own bytes AFTER running cannot make the manifest record the post-run image.
+    HONEST: a non-resolvable / non-regular / unreadable target is recorded with a
+    `note` and a null sha256, never a false claim. This does NOT make the external
+    tool immutable — it records its identity at spawn time, nothing more (the tool
+    stays operator-controlled; see references/ship.md)."""
+    entry = {"action": action_name, "argv0": argv0,
+             "resolved_path": None, "sha256": None, "note": None}
+    if not argv0:
+        entry["note"] = "action has no run argv"
+        return entry
+    has_sep = (os.sep in argv0) or (os.altsep is not None and os.altsep in argv0)
+    if os.path.isabs(argv0):
+        resolved = os.path.realpath(argv0) if os.path.exists(argv0) else None
+        miss = "absolute argv0 does not exist (operator-controlled)"
+    elif has_sep:
+        # A relative path WITH a separator: the OS resolves it against the child's
+        # cwd (the action ship workspace), so resolve it the same way here — NOT
+        # against the supervisor cwd (the pre-M55 bug).
+        candidate = os.path.realpath(os.path.join(cwd, argv0))
+        resolved = candidate if os.path.exists(candidate) else None
+        miss = "relative argv0 not found under the action cwd (operator-controlled)"
+    else:
+        # A bare command: the child searches PATH (inherited), so do the same.
+        resolved = shutil.which(argv0)
+        miss = "argv0 not resolvable to a file on PATH (operator-controlled)"
+    if resolved is None:
+        entry["note"] = miss
+        return entry
+    entry["resolved_path"] = resolved
+    try:
+        if os.path.isfile(resolved) and os.access(resolved, os.R_OK):
+            entry["sha256"] = df_common.sha256_file(resolved)
+        else:
+            entry["note"] = "resolved path is not a regular readable file"
+    except OSError as e:
+        entry["note"] = f"unhashable ({e})"
+    return entry
 
 
 # Terminal ship outcomes (also the sealed ship-record `outcome` values).
@@ -185,6 +235,11 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
     now_fn = now_fn or _utcnow
     already = set(already_done or ())
     records = []
+    # DF-R4-08: the per-action executable identity, resolved + hashed BEFORE each
+    # spawn (never re-resolved after the fact at seal time). One entry per action
+    # actually reached this attempt, in order; the caller seals this list as the
+    # ship record's `toolchain`.
+    toolchain = []
     # Actions that have SUCCEEDED (this attempt or a prior one) AND define a
     # rollback — the reverse-order rollback stack for invariant #5.
     rollback_stack = []
@@ -192,11 +247,19 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
     for index, action in enumerate(actions):
         name = action["name"]
         reversible = action["reversible"]
+        argv0 = (action.get("run") or [None])[0]
 
         if name in already:
             records.append({"name": name, "reversible": reversible,
                             "status": "already_done", "exit": 0, "approval_ref": None,
                             "duration_s": None})
+            # HONEST: this action ran in a PRIOR attempt; its PRE-exec bytes are
+            # not re-derivable now, so record the identity slot with a note rather
+            # than a misleading post-hoc re-resolution.
+            toolchain.append({"action": name, "argv0": argv0, "resolved_path": None,
+                              "sha256": None,
+                              "note": "action completed in a prior attempt; "
+                                      "toolchain not re-resolved this attempt"})
             if action.get("rollback"):
                 rollback_stack.append(action)
             continue
@@ -216,7 +279,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                                 "approval_ref": None, "duration_s": None})
                 return {"outcome": SHIP_APPROVAL_PENDING, "actions": records,
                         "pending_action": name, "failed_action": None,
-                        "rollbacks": [], "rollback_failed": False}
+                        "rollbacks": [], "rollback_failed": False,
+                        "toolchain": toolchain, "rollback_toolchain": []}
             approval_ref = _approval_ref(approval_ctx)
 
         # Resolve THIS action's creds host-side, at action time, fail-closed. A
@@ -234,7 +298,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                            resolve_action_creds=resolve_action_creds, log_dir=log_dir)
             return {"outcome": SHIP_FAILED, "actions": records, "pending_action": None,
                     "failed_action": name, "rollbacks": rb["records"],
-                    "rollback_failed": rb["failed"]}
+                    "rollback_failed": rb["failed"],
+                    "toolchain": toolchain, "rollback_toolchain": rb["toolchain"]}
 
         redactor = df_creds.Redactor(list(base_secret_values or []) + list(cred_values.values()))
 
@@ -250,14 +315,21 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                            resolve_action_creds=resolve_action_creds, log_dir=log_dir)
             return {"outcome": SHIP_FAILED, "actions": records, "pending_action": None,
                     "failed_action": name, "rollbacks": rb["records"],
-                    "rollback_failed": rb["failed"]}
+                    "rollback_failed": rb["failed"],
+                    "toolchain": toolchain, "rollback_toolchain": rb["toolchain"]}
+
+        # DF-R4-08: resolve + hash argv[0] NOW — against the action's cwd, and
+        # BEFORE the spawn — so a self-modifying tool's recorded sha256 is the
+        # bytes that actually started this action, not a post-run re-read.
+        tc_entry = toolchain_identity(name, argv0, cwd)
+        toolchain.append(tc_entry)
 
         idk = idempotency_key(run_id, name, index)
         # RESERVE-BEFORE (invariant #4): journal the intent (fsync'd) BEFORE the
         # subprocess is spawned. On a crash between here and the RESULT, resume
         # sees an unresolved intent and refuses (SHIP_UNKNOWN_OUTCOME).
         journal.write("SHIP_ACTION_INTENT", action=name, index=index, idempotency_key=idk,
-                      reversible=reversible, approval_ref=approval_ref)
+                      reversible=reversible, approval_ref=approval_ref, toolchain=tc_entry)
 
         exit_code, timed_out, out, err, dur = _run_one(
             action["run"], cwd=cwd, child_env=_child_env(base_env, cred_values),
@@ -290,10 +362,12 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                        resolve_action_creds=resolve_action_creds, log_dir=log_dir)
         return {"outcome": SHIP_FAILED, "actions": records, "pending_action": None,
                 "failed_action": name, "rollbacks": rb["records"],
-                "rollback_failed": rb["failed"]}
+                "rollback_failed": rb["failed"],
+                "toolchain": toolchain, "rollback_toolchain": rb["toolchain"]}
 
     return {"outcome": SHIPPED, "actions": records, "pending_action": None,
-            "failed_action": None, "rollbacks": [], "rollback_failed": False}
+            "failed_action": None, "rollbacks": [], "rollback_failed": False,
+            "toolchain": toolchain, "rollback_toolchain": []}
 
 
 def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
@@ -310,6 +384,7 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
     targets.extend(reversed(stack))
 
     rb_records = []
+    rb_toolchain = []
     any_failed = False
     for action in targets:
         name = action["name"]
@@ -332,7 +407,12 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
             rb_records.append({"name": name, "status": "rollback_cwd_invalid", "exit": None})
             any_failed = True
             continue
-        journal.write("SHIP_ROLLBACK_INTENT", action=name)
+        # DF-R4-08: record the rollback executable's identity BEFORE it runs, too
+        # (a rollback tool is as security-relevant as the forward action) —
+        # resolved against the rollback's cwd, pre-exec.
+        rb_tc_entry = toolchain_identity(name, rollback_argv[0] if rollback_argv else None, cwd)
+        rb_toolchain.append(rb_tc_entry)
+        journal.write("SHIP_ROLLBACK_INTENT", action=name, toolchain=rb_tc_entry)
         exit_code, timed_out, out, err, dur = _run_one(
             rollback_argv, cwd=cwd, child_env=_child_env(base_env, cred_values),
             timeout_s=action["timeout_s"])
@@ -350,7 +430,7 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
                                "status": "timed_out" if timed_out else "rollback_failed",
                                "exit": exit_code})
             any_failed = True
-    return {"records": rb_records, "failed": any_failed}
+    return {"records": rb_records, "failed": any_failed, "toolchain": rb_toolchain}
 
 
 def _approval_ref(approval_ctx):

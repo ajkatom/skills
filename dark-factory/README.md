@@ -7,8 +7,9 @@ those scenarios against what the builder wrote, and only a behavior-ID +
 fixed-taxonomy failure signal crosses back to the builder — never the
 scenario content itself — until the build converges or the run is
 abandoned. The hidden scenarios can be written by a human or, with the same
-barrier, by an independent **author** agent (a different model than the
-builder) — and those agent-authored scenarios can be class-typed
+barrier, by an independent **author** agent (ideally a different model than
+the builder — enforced as a distinct *adapter identity*, not a
+system-verified different model) — and those agent-authored scenarios can be class-typed
 (happy/boundary/failure), sharpness-proven (each assertion must reject a battery
 of near-miss mutants), and adversarially critiqued by a **second** decorrelated
 model. Scenarios can also be **generative** (`when.property`, M43a): assert an
@@ -71,8 +72,10 @@ python3 scripts/supervisor.py init --control-root /path/to/cr \
 # 2. Run the build/verify loop:
 python3 scripts/supervisor.py run --control-root /path/to/cr
 
-# 3. Inspect the signed result:
-python3 scripts/supervisor.py verify --control-root /path/to/cr
+# 3. Verify a run's sealed result (byte-integrity + bound-artifact identity):
+python3 scripts/supervisor.py verify-manifest --run-dir /path/to/cr/runs/<run-id>
+#    (and, at hardened/enterprise, verify the tamper-evident audit chain:)
+python3 scripts/supervisor.py verify-chain --control-root /path/to/cr
 ```
 
 `init` validates structure (oracle discrimination, behavior coverage, no
@@ -93,7 +96,7 @@ Four tiers, each strictly stronger than the last, chosen per run via
 | `cooperative` | Honor-system — the builder is asked not to look, nothing stops it | Every run is explicitly **unqualified** |
 | `standard` | OS-level read/write-denial sandbox (macOS `sandbox-exec` / Linux `bwrap`), verified by a fail-closed startup denial probe. The **candidate** (built artifact under test) additionally runs under a **default-deny** profile so it can't read the operator's host (`~/.ssh`, cloud creds, other repos) or reach non-allowlisted loopback ports | A converged run is **qualified** — if every sub-state holds (see "Qualification") |
 | `hardened` | Builder runs inside a Docker container that **never has the control root mounted** — denial by construction, not a deny-rule — still probe-verified | Qualified; unlocks the unattended `H4` (lights-off) intervention mode |
-| `enterprise` | `hardened` + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off** (K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship) | Qualified only via the separate custody attestation step |
+| `enterprise` | `hardened` + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off** (K-of-N ed25519 approver attestation bound to the sealed manifest — with `threshold ≥ 2` no single operator can ship; K-of-N proves distinct *keys/signatures*, not distinct human owners) | Qualified only via the separate custody attestation step |
 
 See `references/isolation.md` (standard + default-deny candidate),
 `references/hardened.md` (hardened), and `references/enterprise.md`
@@ -109,7 +112,7 @@ checkpoint and exit; a human resumes) — no live prompting.
 |---|---|---|
 | `H1` Directed | before each rebuild, after each verify, before ship | tight, step-by-step human direction |
 | `H2` Supervised (default) | after each verify, before ship | review progress between attempts |
-| `H3` Guarded-autonomous | only at guard conditions (e.g. budget soft-alert) | runs on its own, stops if something needs a decision |
+| `H3` Guarded-autonomous | only at a hard guard — the budget **admission cap** (it runs *through* a soft alert and pauses when the next call would exceed the cap) | runs on its own, stops only when a real limit blocks it |
 | `H4` Lights-out | never — any human-needed condition is a deterministic fail-closed terminal, never a silent proceed | fully unattended; `hardened`/`enterprise` only |
 
 See `references/modes.md` for the full state-transition table (approval

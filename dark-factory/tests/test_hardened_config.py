@@ -729,6 +729,76 @@ def test_finalize_container_manifest_digest_none_never_blocks(monkeypatch, capsy
 
 
 # ---------------------------------------------------------------------------
+# DF-R4-10: the image digest is resolved ONCE, early, and the DIGEST-PINNED
+# reference is used for EVERY container dispatch/probe — so a mutable tag cannot
+# move between digest-inspection and dispatch and leave the manifest recording an
+# image that isn't what ran. The manifest's resolved digest == what dispatched.
+# ---------------------------------------------------------------------------
+def test_effective_image_resolvable_tag_is_pinned_for_dispatch(monkeypatch):
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "python@sha256:resolved")
+    cfg = _hardened_cfg(image="python:3.12-alpine")
+    eff = supervisor._effective_image(cfg)
+    assert eff == "python@sha256:resolved"           # dispatched ref is pinned
+    assert "@sha256:" in eff
+    # cached: a second call does NOT re-resolve (a moved tag can't change it)
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "python@sha256:MOVED")
+    assert supervisor._effective_image(cfg) == "python@sha256:resolved"
+    # the manifest reports the SAME digest that dispatched
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["resolved_image_digest"] == "python@sha256:resolved"
+    # internal cache keys never leak onto the manifest
+    assert "_effective_image" not in c and "_resolved_image_digest" not in c
+
+
+def test_effective_image_already_pinned_used_verbatim(monkeypatch):
+    # An operator-pinned @sha256: config is dispatched verbatim (never re-resolved
+    # to some other reference).
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: image.split("@", 1)[1])
+    pinned = "python:3.12-alpine@sha256:deadbeef"
+    cfg = _hardened_cfg(image=pinned)
+    assert supervisor._effective_image(cfg) == pinned
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["image_pinned"] is True
+    assert c["resolved_image_digest"] == "sha256:deadbeef"
+
+
+def test_effective_image_unresolvable_falls_back_to_tag(monkeypatch):
+    # Offline / never-pulled: resolve returns None -> dispatch the mutable tag
+    # (fail-open, back-compat) and the manifest is honest (digest null).
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: None)
+    cfg = _hardened_cfg(image="img:tag")
+    assert supervisor._effective_image(cfg) == "img:tag"
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["resolved_image_digest"] is None
+    assert c["image_pinned"] is False
+
+
+def test_resolve_isolation_probes_the_pinned_digest_ref(tmp_path, monkeypatch):
+    # Prove the ACTUAL dispatch site (probe_container in resolve_isolation) is
+    # invoked with the resolved `@sha256:`-pinned reference, not the mutable tag.
+    monkeypatch.setattr(supervisor.df_sandbox, "current_backend", lambda: _FakeOSBackend())
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: True)
+    monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: True)
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "python@sha256:resolved")
+    seen = []
+    monkeypatch.setattr(supervisor.df_container, "probe_container",
+                        lambda image, *a, **k: seen.append(image) or True)
+    cfg = _hardened_cfg(image="python:3.12-alpine")
+    result = supervisor.resolve_isolation(
+        cfg, str(tmp_path / "cr"), str(tmp_path / "ws"), _FakeJournal(), False)
+    assert result[0] == "hardened"
+    assert seen == ["python@sha256:resolved"]  # the PINNED ref, never the tag
+    # and the manifest sealed for this same cfg reports that exact digest
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["resolved_image_digest"] == "python@sha256:resolved"
+
+
+# ---------------------------------------------------------------------------
 # M10-2 review fixes: the adapter's directory is bind-mounted ro into the
 # builder container, so at hardened it must be an absolute existing file whose
 # directory is disjoint from the control root — at CONFIG time (layer 1) and

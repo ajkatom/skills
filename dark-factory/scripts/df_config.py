@@ -2066,6 +2066,12 @@ def load_config(control_root: str) -> dict:
         "author": cfg_author["expected_sha256"] if cfg_author else None,
         "critic": cfg_critic["expected_sha256"] if cfg_critic else None,
     }
+    # DF-R4-09 (M55): the builder's OPTIONAL operator-ASSERTED model_identity (or
+    # None) — sealed into the terminal manifest's `builder_identity` so an auditor
+    # can compare all THREE roles' declared identities (builder/author/critic)
+    # from the manifest alone. Not system-verified (see _validate_model_identity /
+    # DF-R3-04). Absent -> None -> byte-identical manifest to pre-M55.
+    cfg["_builder_model_identity"] = builder_model_identity
     # DF-R4-07: resolved absolute realpaths of the builder adapter's declared
     # support files, ro-mounted alongside the adapter at hardened/enterprise.
     cfg["_support_files"] = support_files_resolved
