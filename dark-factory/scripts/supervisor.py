@@ -102,6 +102,20 @@ PAUSED = 10
 # while this is set, so a crash never causes a silent duplicate dispatch.
 UNKNOWN_OUTCOME = 11
 
+# M49 DF-R3-02: the ship actions ran (SHIPPED) but a REQUIRED off-box audit sink
+# push FAILED — the mandated off-box evidence is missing, so the run sealed the
+# DISTINCT outcome SHIPPED_AUDIT_PENDING (never SHIPPED). A distinct nonzero exit
+# so automation does NOT read this as a clean exit-0 ship; an idempotent
+# audit-only retry (`ship` re-entry) re-anchors off-box and flips it to 0.
+SHIP_AUDIT_PENDING = 12
+
+# M49 DF-R3-03: on re-entry a prior ship_result.json (or the ship journal that
+# feeds `already_done`) could not be AUTHENTICATED against the signed audit chain
+# (missing/mismatched/tampered) while audit.signing is on — a same-user
+# control-root writer may have planted a terminal SHIPPED or edited the journal.
+# Fail-closed refusal (exit 2), NEVER trusting the unauthenticated local state.
+SHIP_STATE_UNAUTHENTICATED = 2
+
 # M36a Task 3: the versioned, phase-aware, hash-chained FSM checkpoint. A 0.2
 # state records `phase` + the head of a per-run transition chain
 # (fsm_chain.jsonl). Pre-M36a states are 0.1 (no phase, no chain) and resume
@@ -6594,57 +6608,235 @@ def _resolve_ship_action_creds(action):
 
 def _anchor_ship_record(cfg, control_root, run_dir, run_id, record_text, kind,
                         push_offbox=True):
-    """Anchor a ship-phase sidecar (the ship record or the release attestation)
-    into the tamper-evident per-control-root hash chain, and push it off-box if
-    an audit sink is configured — mirroring attach_custody. `kind` is 'ship' or
-    'release'; the chain key is uniquified so repeated ship attempts (pending →
-    attach → ship) each anchor without colliding. Best-effort on the audit key
-    (ship actions may have ALREADY run — never crash after the fact); a required
-    off-box sink failure is surfaced loudly on stderr.
+    """Anchor a ship-phase record (the ship record, a per-action completion token,
+    or the release attestation) into the tamper-evident per-control-root hash chain,
+    and push it off-box if a REQUIRED/optional audit sink is configured — mirroring
+    attach_custody. `kind` is 'ship' / 'ship-action' / 'release'; the chain key is
+    uniquified so repeated ship attempts (pending → attach → ship, plus the M49
+    audit-only retry) each anchor without colliding. Best-effort on the audit key
+    and the local chain append (ship actions may have ALREADY run — never crash
+    after the fact); a required off-box sink failure is SURFACED (M49 DF-R3-02)
+    instead of swallowed, so `_seal_ship_result` can seal SHIPPED_AUDIT_PENDING.
 
-    `push_offbox=False` (M44 RA-02): the caller ALREADY performed the required
-    off-box push fail-closed (attach_release), so this only anchors the local
-    chain and does NOT push again (a second push to the same append-only key
-    would 409). The 'ship' record path keeps the default best-effort push."""
+    Returns a status string (M49 DF-R3-02):
+      "skip"           no sink configured / push suppressed — nothing pushed
+      "ok"             pushed; a receipt BOUND to record_text (body_sha256) was
+                       written to <run_dir>/<kind>_sink_receipt.json
+      "optional_fail"  push failed, sink NOT required — proceed, warn
+      "required_fail"  push failed AND the sink is required — the caller must NOT
+                       report a clean ship (a production action's mandated off-box
+                       evidence never left the box)
+
+    `push_offbox=False` (M44 RA-02 / M49 per-action commit): the caller either
+    ALREADY performed the required off-box push fail-closed (attach_release) or is
+    anchoring a per-action completion token into the local signed chain only, so
+    this anchors the local chain and does NOT push (a second push to the same
+    append-only key would 409); it returns "skip"."""
+    signing = bool(cfg.get("_audit", {}).get("signing"))
     audit_key = None
-    if cfg.get("_audit", {}).get("signing"):
+    if signing:
         try:
             audit_key = df_audit.load_or_create_key(cfg["_audit"]["key_path"])
         except df_audit.AuditKeyError as e:
             sys.stderr.write(f"dark-factory: WARNING — could not load audit key to anchor the "
                              f"{kind} record ({e}); the local sidecar stands unanchored.\n")
-            return
     chain_path = os.path.join(control_root, "audit-chain.jsonl")
     chain_key = f"{run_id}.{kind}.{uuid.uuid4().hex[:8]}"
-    try:
-        df_audit_chain.append_entry(chain_path, chain_key, sha256_str(record_text), _now(),
-                                    audit_key)
-    except (df_audit_chain.ChainError, OSError) as e:
-        sys.stderr.write(f"dark-factory: WARNING — could not anchor the {kind} record into the "
-                         f"audit chain ({e}).\n")
-    if not push_offbox:
-        return
-    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
-    if sink.get("kind", "none") != "none":
+    # CRITICAL (M49 re-audit fix): NEVER append an UNSIGNED entry to a SIGNED
+    # chain. If signing is on but the key could not be loaded, appending with
+    # audit_key=None would make verify_chain fail the ENTIRE control-root chain
+    # (breaking custody/qualification verify too), not just this record. Skip the
+    # local anchor and surface the failure honestly — a signed run whose key is
+    # gone fails re-entry authentication anyway (fail-closed).
+    if not (signing and audit_key is None):
         try:
-            receipt = df_audit_sink.push(sink, chain_key, record_text.encode("utf-8"))
-        except df_audit_sink.SinkError as e:
-            if sink.get("required"):
-                sys.stderr.write(f"dark-factory: WARNING — the REQUIRED audit sink push of the "
-                                 f"{kind} record FAILED ({e}); record it off-box manually.\n")
+            df_audit_chain.append_entry(chain_path, chain_key, sha256_str(record_text), _now(),
+                                        audit_key)
+        except (df_audit_chain.ChainError, OSError) as e:
+            sys.stderr.write(f"dark-factory: WARNING — could not anchor the {kind} record into "
+                             f"the audit chain ({e}).\n")
+    if not push_offbox:
+        return "skip"
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none", "required": False})
+    if sink.get("kind", "none") == "none":
+        return "skip"
+    try:
+        receipt = df_audit_sink.push(sink, chain_key, record_text.encode("utf-8"))
+    except df_audit_sink.SinkError as e:
+        if sink.get("required"):
+            sys.stderr.write(f"dark-factory: WARNING — the REQUIRED audit sink push of the "
+                             f"{kind} record FAILED ({e}); record it off-box manually.\n")
+            return "required_fail"
+        sys.stderr.write(f"dark-factory: audit sink push warning ({kind}, not required): {e}\n")
+        return "optional_fail"
+    # Bind the persisted receipt to the EXACT record bytes that were pushed (M44
+    # _sink_receipt_bound checks body_sha256), so the ship-verify path can prove
+    # the receipt is for THIS sealed ship record, not a stale one.
+    receipt = dict(receipt, body_sha256=sha256_str(record_text), sink_key=chain_key)
+    atomic_write(os.path.join(run_dir, f"{kind}_sink_receipt.json"), canonical_json(receipt))
+    return "ok"
+
+
+def _ship_toolchain_identity(actions):
+    """M49 DF-R3-06: record WHAT ran per action for the audit trail — the resolved
+    executable identity of each action's `run[0]`. Best-effort and HONEST: a
+    PATH-resolved (or absolute) regular readable file gets a sha256; anything not
+    resolvable/hashable is recorded as such (never a false claim). This does NOT
+    make the external tool immutable — it stays operator-controlled; this records
+    its identity at ship time, nothing more (see references/ship.md)."""
+    out = []
+    for action in actions:
+        argv = action.get("run") or []
+        argv0 = argv[0] if argv else None
+        entry = {"action": action.get("name"), "argv0": argv0,
+                 "resolved_path": None, "sha256": None, "note": None}
+        if not argv0:
+            entry["note"] = "action has no run argv"
+            out.append(entry)
+            continue
+        resolved = shutil.which(argv0)
+        if resolved is None and os.path.isfile(argv0):
+            resolved = os.path.abspath(argv0)
+        if resolved is None:
+            entry["note"] = "argv0 not resolvable to a file on PATH (operator-controlled)"
+            out.append(entry)
+            continue
+        entry["resolved_path"] = resolved
+        try:
+            if os.path.isfile(resolved) and os.access(resolved, os.R_OK):
+                entry["sha256"] = sha256_file(resolved)
             else:
-                sys.stderr.write(f"dark-factory: audit sink push warning ({kind}, not "
-                                 f"required): {e}\n")
-        else:
-            atomic_write(os.path.join(run_dir, f"{kind}_sink_receipt.json"),
-                         canonical_json(receipt))
+                entry["note"] = "resolved path is not a regular readable file"
+        except OSError as e:
+            entry["note"] = f"unhashable ({e})"
+        out.append(entry)
+    return out
+
+
+def _ship_action_commit_payload(run_id, action, idk):
+    """The canonical bytes whose sha256 is a completed ship action's chain-anchored
+    completion token (M49 DF-R3-03). Binds the run, the action name, and its
+    idempotency_key, so the token is reconstructible from the journal's
+    SHIP_ACTION_RESULT `ok` event on re-entry yet unforgeable without the audit
+    key (the signature over the chain entry is the real gate)."""
+    return canonical_json({"kind": "ship-action-ok", "run_id": run_id,
+                           "action": action, "idempotency_key": idk})
+
+
+def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
+    """Return a `commit(action_name, idempotency_key)` hook passed into
+    df_ship.run_actions. As EACH action succeeds — BEFORE its SHIP_ACTION_RESULT
+    is journaled — this anchors that action's completion token into the signed
+    chain (chain-only, never off-box). So every `already_done` entry recovered on
+    re-entry is INDIVIDUALLY chain-backed: a legitimate crash-before-seal recovery
+    still authenticates (each completed action has its own signed entry), while a
+    planted/edited SHIP_ACTION_RESULT `ok` line has NO matching signed entry.
+
+    This is why per-action anchoring (not one last-digest at seal) is required: a
+    single last-digest cannot distinguish 'no anchor because a legit crash happened
+    before the first seal' from 'anchor missing because tampered' — both look
+    anchor-less. A per-action signed entry makes the two distinguishable."""
+    def _commit(action_name, idk):
+        payload = _ship_action_commit_payload(run_id, action_name, idk)
+        _anchor_ship_record(cfg, control_root, run_dir, run_id, payload, "ship-action",
+                            push_offbox=False)
+    return _commit
+
+
+def _ship_completed_action_facts(run_dir):
+    """(action, idempotency_key) for every SHIP_ACTION_RESULT with status 'ok'
+    recovered from the ship journal — the exact set `already_done` skips, paired
+    with the idempotency_key each completion token binds (M49 DF-R3-03)."""
+    facts = []
+    for e in _ship_journal_events(run_dir):
+        d = e.get("data", {})
+        if e.get("state") == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
+            if d.get("action") is not None:
+                facts.append((d.get("action"), d.get("idempotency_key")))
+    return facts
+
+
+def _authenticate_ship_chain(cfg, control_root, run_id, target_sha, kind):
+    """M49 DF-R3-03 core (ship record): verify the signed audit chain and confirm
+    ANY signature-valid chain entry for this run's `kind` ('ship') anchors
+    `target_sha`. A planted/altered ship_result.json has no such entry. Fail-closed
+    on ANY chain read/verify error or a missing key (never a silent proceed).
+    Returns (ok, reason)."""
+    audit = cfg.get("_audit", {})
+    try:
+        key = df_audit.load_key(audit["key_path"])
+    except df_audit.AuditKeyError as e:
+        return (False, f"the audit signing key required to authenticate the sealed ship "
+                f"{kind} state could not be loaded ({e}); refusing (fail-closed)")
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    ok, why = df_audit_chain.verify_chain(chain_path, key)
+    if not ok:
+        return (False, f"the signed audit chain failed verification ({why}); refusing to trust "
+                f"the local ship {kind} state (fail-closed)")
+    try:
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError as e:
+        return (False, f"the audit chain is unreadable ({e}); refusing (fail-closed)")
+    prefix = f"{run_id}.{kind}."
+    for e in entries:
+        if str(e.get("invocation", "")).startswith(prefix) and e.get("manifest_sha256") == target_sha:
+            return (True, f"ship {kind} authenticated against the signed audit chain")
+    return (False, f"no signature-valid audit-chain entry anchors this ship {kind}'s digest "
+            "(a planted or altered local ship state)")
+
+
+def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
+    """M49 DF-R3-03: before SKIPPING real actions on the strength of the ship
+    journal's recovered `already_done`, authenticate each completed action against
+    its own per-action signed chain entry (see _make_ship_action_committer).
+
+    A legitimate crash-before-seal recovery authenticates (every completed action
+    was anchored as it committed, before its RESULT was journaled); a planted or
+    edited SHIP_ACTION_RESULT `ok` line for an action that never ran has no
+    matching signed token → REFUSED. Fail-closed on any key/chain error. Returns
+    (ok, reason)."""
+    facts = _ship_completed_action_facts(run_dir)
+    if not facts:
+        return (True, "no completed ship actions to authenticate")
+    audit = cfg.get("_audit", {})
+    try:
+        key = df_audit.load_key(audit["key_path"])
+    except df_audit.AuditKeyError as e:
+        return (False, f"the audit signing key required to authenticate completed ship actions "
+                f"could not be loaded ({e}); refusing (fail-closed)")
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    ok, why = df_audit_chain.verify_chain(chain_path, key)
+    if not ok:
+        return (False, f"the signed audit chain failed verification ({why}); refusing to trust "
+                "the recovered already-completed ship actions (fail-closed)")
+    try:
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError as e:
+        return (False, f"the audit chain is unreadable ({e}); refusing (fail-closed)")
+    prefix = f"{run_id}.ship-action."
+    anchored = {e.get("manifest_sha256") for e in entries
+                if str(e.get("invocation", "")).startswith(prefix)}
+    for action, idk in facts:
+        token = sha256_str(_ship_action_commit_payload(run_id, action, idk))
+        if token not in anchored:
+            return (False, f"completed ship action {action!r} is not individually anchored in "
+                    "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`)")
+    return (True, "all completed ship actions authenticated against the signed audit chain")
 
 
 def _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
-                      artifact_object_id, redactor):
-    """Write the SEPARATE, immutable ship record (ship_result.json) + anchor it,
-    and journal the terminal ship event. NEVER rewrites the manifest (qualified
-    stays qualified). Returns the record dict."""
+                      artifact_object_id, redactor, *, ship_actions=None,
+                      push_offbox=True):
+    """Write the SEPARATE, immutable ship record (ship_result.json), journal the
+    terminal ship event, anchor the record into the signed chain, and push it
+    off-box. NEVER rewrites the manifest (qualified stays qualified). Returns
+    `(record, anchor_status)` — the M49 DF-R3-02 off-box status so the caller can
+    escalate a SHIPPED result to SHIPPED_AUDIT_PENDING when a REQUIRED sink push
+    failed. `push_offbox=False` anchors + writes locally without re-pushing (used
+    by the SHIPPED_AUDIT_PENDING re-seal, whose push already failed).
+
+    (The journal that feeds `already_done` is authenticated per-action, not by a
+    seal-time journal digest — see _make_ship_action_committer.)"""
     record = {
         "ship_version": "1",
         "outcome": result["outcome"],
@@ -6656,14 +6848,56 @@ def _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
         "ship_workspace_object_id": artifact_object_id,
         "ts": _now(),
     }
+    if ship_actions is not None:
+        record["toolchain"] = _ship_toolchain_identity(ship_actions)
     text = _redacted_write(os.path.join(run_dir, SHIP_RESULT_FILE), record, redactor)
     ship_journal.write(result["outcome"],
                        actions=[a.get("name") for a in result.get("actions", [])],
                        rollback_failed=bool(result.get("rollback_failed")),
                        pending_action=result.get("pending_action"),
                        failed_action=result.get("failed_action"))
-    _anchor_ship_record(cfg, control_root, run_dir, run_id, text, "ship")
-    return record
+    anchor_status = _anchor_ship_record(cfg, control_root, run_dir, run_id, text, "ship",
+                                        push_offbox=push_offbox)
+    return record, anchor_status
+
+
+def _ship_audit_retry(cfg, control_root, run_dir, run_id, ship_journal, prior_text,
+                      redactor):
+    """M49 DF-R3-02 idempotent audit-only retry. The prior seal is
+    SHIPPED_AUDIT_PENDING (the real-world actions ALREADY ran) but the REQUIRED
+    off-box audit sink push failed. Re-run ONLY the off-box anchoring for the
+    EXISTING sealed record — NEVER the actions. On success flip the sealed record
+    to SHIPPED (exit 0); still failing → stay SHIPPED_AUDIT_PENDING (exit 12).
+
+    Push-FIRST (not write-first): the SHIPPED bytes are pushed off-box before the
+    on-disk record is flipped, so a still-failing sink never leaves a SHIPPED
+    record without its bound receipt."""
+    try:
+        prior = json.loads(prior_text)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"dark-factory: ship refused — prior ship record is unreadable ({e}).\n")
+        return 2
+    shipped = dict(prior)
+    shipped["outcome"] = df_ship.SHIPPED
+    shipped["ts"] = _now()
+    shipped_obj = redactor.redact_obj(shipped) if redactor is not None else shipped
+    shipped_text = canonical_json(shipped_obj)
+    # Push the EXISTING sealed record off-box (+ chain-anchor + bound receipt).
+    status = _anchor_ship_record(cfg, control_root, run_dir, run_id, shipped_text, "ship")
+    if status == "required_fail":
+        ship_journal.write("SHIP_AUDIT_RETRY_PENDING",
+                           note="required off-box audit sink still unreachable")
+        sys.stderr.write(
+            "dark-factory: SHIP still AUDIT-PENDING — the REQUIRED off-box audit sink is still "
+            "unreachable. The actions remain DONE and are NOT re-run; retry `ship` once the sink "
+            "is reachable.\n")
+        return SHIP_AUDIT_PENDING
+    # Off-box attested now → flip the sealed record to SHIPPED (never re-run actions).
+    atomic_write(os.path.join(run_dir, SHIP_RESULT_FILE), shipped_text)
+    ship_journal.write(df_ship.SHIPPED, note="audit-only retry: off-box evidence anchored")
+    print("dark-factory: SHIPPED — off-box audit evidence anchored on retry (the actions were "
+          "already done; not re-run).")
+    return 0
 
 
 def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"):
@@ -6683,19 +6917,55 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
         return 2
 
     ship_journal = Journal(os.path.join(run_dir, SHIP_JOURNAL_FILE), redactor=redactor)
+    signing_on = bool(cfg.get("_audit", {}).get("signing"))
 
     # Idempotent terminal: a completed ship never re-ships. SHIP_APPROVAL_PENDING
     # is NOT terminal (an attach + re-`ship` resumes it), so it falls through.
     result_path = os.path.join(run_dir, SHIP_RESULT_FILE)
+    prior, prior_text = None, None
     if os.path.exists(result_path):
         try:
-            prior = json.load(open(result_path, encoding="utf-8"))
+            with open(result_path, encoding="utf-8") as f:
+                prior_text = f.read()
+            prior = json.loads(prior_text)
         except (OSError, json.JSONDecodeError):
-            prior = None
-        if isinstance(prior, dict) and prior.get("outcome") in (df_ship.SHIPPED, df_ship.SHIP_FAILED):
-            print(f"dark-factory: ship already terminal ({prior['outcome']}); "
-                  f"see {result_path}. Not re-shipping.")
-            return 0 if prior["outcome"] == df_ship.SHIPPED else 3
+            prior, prior_text = None, None
+    if isinstance(prior, dict) and prior.get("outcome") in (
+            df_ship.SHIPPED, df_ship.SHIP_FAILED, df_ship.SHIPPED_AUDIT_PENDING):
+        prior_outcome = prior["outcome"]
+        # DF-R3-03: NEVER trust a planted/altered terminal ship_result on re-entry.
+        # When signing is on, the sealed result MUST be anchored in the signed
+        # chain (a control-root-write attacker who plants a SHIPPED result — to
+        # suppress a real ship — cannot forge a signature-valid chain entry).
+        if signing_on:
+            ok_a, why_a = _authenticate_ship_chain(
+                cfg, control_root, run_id, sha256_str(prior_text), "ship")
+            if not ok_a:
+                sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the prior ship "
+                                 f"result could not be authenticated: {why_a}\n")
+                return SHIP_STATE_UNAUTHENTICATED
+        if prior_outcome == df_ship.SHIP_FAILED:
+            print(f"dark-factory: ship already terminal (SHIP_FAILED); see {result_path}. "
+                  "Not re-shipping.")
+            return 3
+        # SHIPPED / SHIPPED_AUDIT_PENDING: fully attested only if the REQUIRED
+        # off-box evidence is present + bound (DF-R3-02). SHIPPED_AUDIT_PENDING is
+        # by definition not-yet-attested; a SHIPPED whose required receipt is
+        # absent/unbound is treated the same (fail-closed — never a silent
+        # fully-shipped) and triggers the idempotent audit-only retry.
+        needs_audit_retry = (prior_outcome == df_ship.SHIPPED_AUDIT_PENDING)
+        if prior_outcome == df_ship.SHIPPED and _sink_required(cfg):
+            ok_r, _why_r = _sink_receipt_bound(run_dir, "ship_sink_receipt.json", prior_text)
+            if not ok_r:
+                needs_audit_retry = True
+        if not needs_audit_retry:
+            print(f"dark-factory: ship already terminal (SHIPPED); see {result_path}. "
+                  "Not re-shipping.")
+            return 0
+        # DF-R3-02 idempotent audit-only retry: re-anchor the off-box evidence for
+        # the EXISTING sealed record; the actions are DONE and are NEVER re-run.
+        return _ship_audit_retry(cfg, control_root, run_dir, run_id, ship_journal,
+                                 prior_text, redactor)
 
     # Crash-safety (invariant #4): an INTENT with no RESULT is UNKNOWN. Refuse
     # (exit 11) under plain `continue`; `reconcile` consents to a possible
@@ -6718,7 +6988,7 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                       "failed_action": unresolved.get("action"), "rollbacks": [],
                       "rollback_failed": False}
             _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
-                              artifact_object_id, redactor)
+                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
             print("dark-factory: SHIP ABORTED at an unresolved action (sealed SHIP_FAILED).")
             return 3
         # reconcile: clear the dangling intent by recording an explicit unknown
@@ -6734,6 +7004,27 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
 
     already_done = _ship_completed_actions(run_dir)
 
+    # DF-R3-03: before SKIPPING real actions on the strength of the ship journal's
+    # recovered `already_done`, authenticate EACH completed action against its own
+    # per-action signed chain entry (anchored as the action committed, before its
+    # RESULT was journaled — see _make_ship_action_committer). A same-user
+    # control-root writer who plants a fake SHIP_ACTION_RESULT `ok` (to skip a real
+    # action) has no matching signed token → refused. Per-action anchoring (vs one
+    # seal-time journal digest) is what lets an HONEST crash-before-seal recovery
+    # still authenticate — every action that actually ran was individually
+    # anchored, whereas a last-digest-at-seal scheme cannot tell a legit
+    # crash-before-first-seal (no anchor yet) from a tampered journal (both look
+    # anchor-less), and so would brick crash recovery. Reconcile's own journal
+    # lines (status `reconciled_unknown`, not `ok`) do not enter `already_done`, so
+    # this stays correct after the reconcile writes above.
+    if signing_on and already_done:
+        ok_j, why_j = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
+        if not ok_j:
+            sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the ship journal that "
+                             f"records already-completed actions could not be authenticated: "
+                             f"{why_j}\n")
+            return SHIP_STATE_UNAUTHENTICATED
+
     # The live approval view (invariant #3): the SEALED policy from config + the
     # attached attestation (or none). covers() RE-VERIFIES every call.
     approval_ctx = df_release.ApprovalContext(
@@ -6742,66 +7033,97 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
         threshold=ship_cfg["approval"]["threshold"],
         run_id=run_id, artifact_object_id=artifact_object_id)
 
-    # Materialize a FRESH workspace from the SEALED bytes (invariant #2).
+    # Materialize a FRESH workspace from the SEALED bytes (invariant #2). DF-R3-06:
+    # a try/finally guarantees this fresh copy of the sealed artifact is REMOVED on
+    # EVERY exit path (success, fail, approval-pending, exception) — it used to leak
+    # a full copy of the sealed bytes into temp on every ship.
     ship_ws = tempfile.mkdtemp(prefix="df-ship-ws-")
     try:
-        df_ship.materialize_ship_workspace(_object_store_root(control_root),
-                                           artifact_object_id, ship_ws)
-    except df_ship.ShipError as e:
-        ship_journal.write("SHIP_MATERIALIZE_FAILED", artifact_object_id=artifact_object_id,
-                           detail=str(e))
-        result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
-                  "failed_action": None, "rollbacks": [], "rollback_failed": False}
-        _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
-                          artifact_object_id, redactor)
-        sys.stderr.write(f"dark-factory: ship failed — {e}\n")
+        try:
+            df_ship.materialize_ship_workspace(_object_store_root(control_root),
+                                               artifact_object_id, ship_ws)
+        except df_ship.ShipError as e:
+            ship_journal.write("SHIP_MATERIALIZE_FAILED", artifact_object_id=artifact_object_id,
+                               detail=str(e))
+            result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
+                      "failed_action": None, "rollbacks": [], "rollback_failed": False}
+            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
+            sys.stderr.write(f"dark-factory: ship failed — {e}\n")
+            return 3
+
+        ship_journal.write("SHIP_STARTED", artifact_object_id=artifact_object_id,
+                           action_count=len(ship_cfg["actions"]),
+                           already_done=sorted(already_done))
+        base_secret_values = list(creds.values()) if creds else []
+        # DF-R3-03: under signing, anchor each action's completion into the signed
+        # chain AS it commits (before its RESULT is journaled), so `already_done`
+        # is individually chain-backed on re-entry (crash-recovery authenticates;
+        # a planted RESULT does not). No committer when signing is off (nothing to
+        # authenticate against — the residual is documented, detection-grade).
+        commit_action = (_make_ship_action_committer(cfg, control_root, run_dir, run_id)
+                         if signing_on else None)
+        result = df_ship.run_actions(
+            ship_cfg["actions"], ship_ws,
+            approval_ctx=approval_ctx, journal=ship_journal, run_id=run_id,
+            base_env=os.environ.copy(), base_secret_values=base_secret_values,
+            resolve_action_creds=_resolve_ship_action_creds,
+            already_done=already_done, commit_action=commit_action,
+            log_dir=os.path.join(run_dir, "ship_logs"),
+            now_fn=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+        record, anchor_status = _seal_ship_result(
+            cfg, control_root, run_dir, run_id, ship_journal, result,
+            artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
+
+        if result["outcome"] == df_ship.SHIPPED and anchor_status == "required_fail":
+            # DF-R3-02: the real-world actions RAN, but the REQUIRED off-box audit
+            # sink push FAILED — the mandated evidence is missing. Seal a DISTINCT
+            # outcome (never re-run the actions) + a distinct exit so automation
+            # does NOT read exit 0. Re-`ship` runs the idempotent audit-only retry.
+            pending = dict(result, outcome=df_ship.SHIPPED_AUDIT_PENDING)
+            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, pending,
+                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"],
+                              push_offbox=False)
+            sys.stderr.write(
+                f"dark-factory: SHIPPED_AUDIT_PENDING — {len(result['actions'])} action(s) ran "
+                f"on the sealed artifact {artifact_object_id[:16]}…, but the REQUIRED off-box "
+                f"audit sink push FAILED, so the mandated off-box evidence is not yet anchored. "
+                f"The actions are DONE and are NEVER re-run. Re-run `ship` once the sink is "
+                f"reachable to anchor the evidence and finalize SHIPPED. Record: {result_path}\n")
+            return SHIP_AUDIT_PENDING
+        if result["outcome"] == df_ship.SHIPPED:
+            print(f"dark-factory: SHIPPED — {len(result['actions'])} action(s) ran on the sealed "
+                  f"artifact {artifact_object_id[:16]}…. Record: {result_path}")
+            return 0
+        if result["outcome"] == df_ship.SHIP_APPROVAL_PENDING:
+            pol = ship_cfg["approval"]
+            manifest_path = os.path.join(run_dir, "manifest.json")
+            print(
+                f"dark-factory: SHIP APPROVAL PENDING — the irreversible action "
+                f"{result['pending_action']!r} needs a signed K-of-N release approval "
+                f"({pol['threshold']} of {len(pol['approvers'])}). The run STAYS qualified; no "
+                f"irreversible action ran. To authorize:\n"
+                f"  supervisor.py df-release sign --manifest {manifest_path} "
+                f"--actions {result['pending_action']} --expires <ISO8601Z> --key-file <privkey>\n"
+                f"collect the {{claim,signatures}} into "
+                f"{os.path.join(control_root, RELEASE_APPROVAL_FILE)} (merge signatures for K>1), "
+                f"then:\n"
+                f"  supervisor.py df-release attach {control_root} --run-dir {run_dir}\n"
+                f"  supervisor.py ship {control_root} --run-dir {run_dir}")
+            return 3
+        # SHIP_FAILED
+        if record.get("rollback_failed"):
+            sys.stderr.write(
+                "dark-factory: SHIP FAILED and a ROLLBACK ITSELF FAILED — infrastructure may be "
+                f"in an inconsistent state. Inspect {os.path.join(run_dir, 'ship_logs')} and the "
+                "ship journal, then intervene MANUALLY.\n")
+        print(f"dark-factory: SHIP FAILED at action {result.get('failed_action')!r} "
+              f"(rollback ran in reverse). The run stays qualified. Record: {result_path}")
         return 3
-
-    ship_journal.write("SHIP_STARTED", artifact_object_id=artifact_object_id,
-                       action_count=len(ship_cfg["actions"]),
-                       already_done=sorted(already_done))
-    base_secret_values = list(creds.values()) if creds else []
-    result = df_ship.run_actions(
-        ship_cfg["actions"], ship_ws,
-        approval_ctx=approval_ctx, journal=ship_journal, run_id=run_id,
-        base_env=os.environ.copy(), base_secret_values=base_secret_values,
-        resolve_action_creds=_resolve_ship_action_creds,
-        already_done=already_done,
-        log_dir=os.path.join(run_dir, "ship_logs"),
-        now_fn=lambda: datetime.datetime.now(datetime.timezone.utc))
-
-    record = _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
-                               artifact_object_id, redactor)
-
-    if result["outcome"] == df_ship.SHIPPED:
-        print(f"dark-factory: SHIPPED — {len(result['actions'])} action(s) ran on the sealed "
-              f"artifact {artifact_object_id[:16]}…. Record: {result_path}")
-        return 0
-    if result["outcome"] == df_ship.SHIP_APPROVAL_PENDING:
-        pol = ship_cfg["approval"]
-        manifest_path = os.path.join(run_dir, "manifest.json")
-        print(
-            f"dark-factory: SHIP APPROVAL PENDING — the irreversible action "
-            f"{result['pending_action']!r} needs a signed K-of-N release approval "
-            f"({pol['threshold']} of {len(pol['approvers'])}). The run STAYS qualified; no "
-            f"irreversible action ran. To authorize:\n"
-            f"  supervisor.py df-release sign --manifest {manifest_path} "
-            f"--actions {result['pending_action']} --expires <ISO8601Z> --key-file <privkey>\n"
-            f"collect the {{claim,signatures}} into "
-            f"{os.path.join(control_root, RELEASE_APPROVAL_FILE)} (merge signatures for K>1), "
-            f"then:\n"
-            f"  supervisor.py df-release attach {control_root} --run-dir {run_dir}\n"
-            f"  supervisor.py ship {control_root} --run-dir {run_dir}")
-        return 3
-    # SHIP_FAILED
-    if record.get("rollback_failed"):
-        sys.stderr.write(
-            "dark-factory: SHIP FAILED and a ROLLBACK ITSELF FAILED — infrastructure may be in "
-            f"an inconsistent state. Inspect {os.path.join(run_dir, 'ship_logs')} and the ship "
-            "journal, then intervene MANUALLY.\n")
-    print(f"dark-factory: SHIP FAILED at action {result.get('failed_action')!r} "
-          f"(rollback ran in reverse). The run stays qualified. Record: {result_path}")
-    return 3
+    finally:
+        # DF-R3-06: never leak the materialized sealed-artifact copy, on ANY path.
+        shutil.rmtree(ship_ws, ignore_errors=True)
 
 
 def ship_cmd(control_root, run_dir, decision="continue"):

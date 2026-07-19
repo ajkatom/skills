@@ -47,6 +47,12 @@ class ShipError(RuntimeError):
 SHIPPED = "SHIPPED"
 SHIP_FAILED = "SHIP_FAILED"
 SHIP_APPROVAL_PENDING = "SHIP_APPROVAL_PENDING"
+# M49 DF-R3-02: the real-world actions DID run (SHIPPED), but a REQUIRED off-box
+# audit sink push FAILED, so the mandated off-box evidence is not yet anchored.
+# A DISTINCT sealed outcome (never SHIPPED) so automation cannot read exit 0 with
+# the required attestation missing. The actions are done and are NEVER re-run;
+# an idempotent audit-only retry re-anchors off-box and flips this to SHIPPED.
+SHIPPED_AUDIT_PENDING = "SHIPPED_AUDIT_PENDING"
 
 
 def idempotency_key(run_id, action_name, index):
@@ -142,7 +148,7 @@ def _child_env(base_env, cred_values):
 
 def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                 base_env, base_secret_values, resolve_action_creds,
-                already_done=None, log_dir=None, now_fn=None):
+                already_done=None, log_dir=None, now_fn=None, commit_action=None):
     """Run the ship actions in order. Returns a ShipResult dict:
 
         {"outcome": SHIPPED|SHIP_FAILED|SHIP_APPROVAL_PENDING,
@@ -167,6 +173,14 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         the ship journal) — skipped here, but still placed on the rollback stack
         (an already-succeeded prior action is rolled back in reverse on a later
         failure, invariant #5).
+      - `commit_action(action_name, idempotency_key)` (M49 DF-R3-03), if given, is
+        called for each SUCCEEDED action BEFORE its SHIP_ACTION_RESULT is journaled,
+        so the caller can anchor that action's completion into the signed audit
+        chain. Ordering is deliberate: anchor-before-journal guarantees every
+        `already_done` entry recovered on re-entry is individually chain-backed
+        (a crash between anchor and the RESULT write leaves an unresolved INTENT —
+        handled by the exit-11 reconcile path — never an un-anchored `already_done`
+        entry). It is best-effort (must not raise); a real-world action has run.
     """
     now_fn = now_fn or _utcnow
     already = set(already_done or ())
@@ -252,6 +266,11 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
 
         success = (exit_code == 0) and not timed_out
         status = "ok" if success else ("timed_out" if timed_out else "failed")
+        # M49 DF-R3-03: anchor this action's completion into the signed chain
+        # BEFORE its RESULT is journaled, so every `already_done` entry recovered
+        # on re-entry is individually chain-backed (best-effort; never raises).
+        if success and commit_action is not None:
+            commit_action(name, idk)
         journal.write("SHIP_ACTION_RESULT", action=name, index=index, idempotency_key=idk,
                       exit=exit_code, timed_out=timed_out, status=status,
                       duration_s=round(dur, 3))
