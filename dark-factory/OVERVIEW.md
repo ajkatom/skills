@@ -71,9 +71,9 @@ the loop," and there are four of them:
    attempt is graded, and again before anything is finalized.
 2. **Supervised (H2, the default)** — you review after each attempt and once
    more before it finalizes, but retries run on their own in between.
-3. **Guarded (H3)** — it runs by itself and only stops to ask you when
-   something genuinely needs a decision (like approaching your spending
-   limit).
+3. **Guarded (H3)** — it runs by itself and only stops at a hard limit: it
+   keeps going through a budget *warning* and pauses only when the next step
+   would exceed your spending **cap**.
 4. **Lights-out (H4)** — fully unattended, no human ever needed. Crucially, if
    a situation comes up that *would* need a human, it stops with a clear
    failure rather than quietly guessing and proceeding — and this mode is
@@ -103,16 +103,23 @@ Some are always on, some optional:
   **mandatory** — a build that trips a gate can't be marked "qualified." If
   you decide to accept a specific finding anyway, you don't get to just turn
   the gate off: an authorized person has to **sign a waiver** for that exact
-  finding, and the waiver expires. It also runs in its own locked-down
-  environment so scanning can't be used as a way to read the hidden tests.
+  finding, and the waiver expires. (Honest scope: the built-in scanners run
+  in-process and any *external* gate command you configure is an ordinary host
+  subprocess — the gates are not themselves sandboxed from the host, so treat a
+  configured external scanner as trusted.)
 - A **budget** so a run can't spend more than you've allowed, with warnings
-  before it happens. Raising the ceiling mid-run to get past a spending halt
-  also requires a **signed authorization**, not a quiet edit.
+  before it happens. If — and only if — you configure a `resume_overrides`
+  approver policy, raising the ceiling mid-run then requires a **signed
+  authorization**; without that policy, the ceiling is just a config value an
+  operator can edit.
 - One clear **verdict**: a run is "qualified" only if *everything* held — the
   builder really was walled off, the candidate couldn't read your host, **the
   built app's own network was confined** (an app left free to reach anywhere is
-  *not* qualified), the record is signed against the exact sealed artifact, and
-  the security gates passed (or were properly waived). If any one of those falls
+  *not* qualified), the security gates passed (or were properly waived), and
+  the record is bound to the exact sealed artifact (and cryptographically
+  **signed** at `hardened`/`enterprise`, where signing is mandatory; a
+  `standard` run can qualify with signing off — it's bound and tamper-evident
+  by hash, not HMAC-signed). If any one of those falls
   short, it says exactly which one, instead of a vague "mostly OK." That verdict
   is also **honest about its own ceiling**: the single-user control record is
   detection-grade (it catches tampering, it doesn't out-privilege a same-user
@@ -146,9 +153,10 @@ just so you know which one to open.
 
 - **`authoring.md`** — the guided interview for writing your spec and hidden
   test scenarios, and how to turn them into a ready-to-run project folder.
-  You can also have an **independent agent** (a different model than the
-  builder) write the hidden scenarios for you, with the same barrier — see its
-  "Agent-authored scenarios" section.
+  You can also have an **independent agent** (ideally a different model than
+  the builder — the system enforces a distinct *adapter identity*, not a
+  verified different model) write the hidden scenarios for you, with the same
+  barrier — see its "Agent-authored scenarios" section.
 - **`scenario-adequacy.md`** — how agent-authored scenarios are made
   THOROUGH: class-typed coverage (happy/boundary/failure), a sharpness battery
   (each assertion must reject a battery of near-miss mutants — it mutates the
@@ -164,7 +172,9 @@ just so you know which one to open.
   to catch lost updates / crashes-under-parallelism (ONE STRIKE = fail; a PASS
   is probabilistic detection, not a race-freedom proof).
 - **`role-adapters.md`** — how dark-factory talks to whichever AI model is
-  doing the building or verifying, including the two API-only adapters that
+  doing the building (or, optionally, authoring/critiquing the hidden
+  scenarios) — verification is NOT a model, it's the deterministic oracle —
+  including the two API-only adapters that
   need no command-line tool installed.
 - **`builder-confinement.md`** — how the builder's AI tool is stripped down
   so it can't use side-channels (other AI helper tools, web browsing) to

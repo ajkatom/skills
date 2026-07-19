@@ -386,6 +386,33 @@ def test_resolve_isolation_enterprise_both_ok(tmp_path, monkeypatch):
     assert not j.entries
 
 
+def test_resolve_isolation_enterprise_probes_use_pinned_digest_ref(tmp_path, monkeypatch):
+    # DF-R4-10: at enterprise, BOTH the container probe AND the seccomp probe must
+    # receive the resolved `@sha256:`-pinned reference, not the mutable tag — the
+    # digest is resolved ONCE and threaded to every dispatch site.
+    _patch_enterprise_probes(monkeypatch)
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "python@sha256:ent-resolved")
+    pc_seen, sc_seen = [], []
+    monkeypatch.setattr(supervisor.df_container, "probe_container",
+                        lambda image, *a, **k: pc_seen.append(image) or True)
+    monkeypatch.setattr(supervisor.df_container, "probe_seccomp",
+                        lambda image, *a, **k: sc_seen.append(image) or True)
+    cfg = {
+        "assurance": "enterprise",
+        "_container": {"image": "python:3.12-alpine", "network": "none",
+                       "memory": "2g", "pids": 256},
+        "_enterprise": {"seccomp": df_container.DEFAULT_SECCOMP_PATH},
+    }
+    result = supervisor.resolve_isolation(
+        cfg, str(tmp_path / "cr"), str(tmp_path / "ws"), _FakeJournal(), False)
+    assert result[0] == "enterprise"
+    assert pc_seen == ["python@sha256:ent-resolved"]
+    assert sc_seen == ["python@sha256:ent-resolved"]
+    c = supervisor._finalize_container_manifest(cfg, "enterprise")
+    assert c["resolved_image_digest"] == "python@sha256:ent-resolved"
+
+
 def test_resolve_isolation_enterprise_bad_seccomp_path_downgrades_to_hardened(tmp_path, monkeypatch):
     _patch_enterprise_probes(monkeypatch)
     j = _FakeJournal()

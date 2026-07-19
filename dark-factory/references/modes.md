@@ -16,10 +16,14 @@ return exit **10 (PAUSED)**; a human later `resume`s.
 | **H3** | `guarded` | run | run | **PAUSE** | any qualifying |
 | **H4** | `lights_out` | run | run | **TERMINAL `BUDGET_HALTED`** (exit 3) | **hardened/enterprise only** |
 
-- **H2 is the default** and reproduces legacy `checkpoint:"pause"` (autonomy 4)
-  byte-for-byte: it pauses only after a non-converged verify.
-- **H3** reproduces legacy `checkpoint:"auto"`: it runs the loop straight
-  through but still PAUSEs on a budget guard so a human can raise the cap.
+- **H2 is the default** and maps from legacy `checkpoint:"pause"` (autonomy 4).
+  It pauses after a non-converged verify AND before ship. (It is NOT
+  byte-for-byte identical to the pre-M36b legacy `pause`: M36b added the
+  deliberate before-ship approval pause — see the state table above.)
+- **H3** maps from legacy `checkpoint:"auto"`: it runs the loop straight
+  through — including *through* a budget soft-alert — and PAUSEs only at the
+  hard budget **admission cap** (when the next builder call's estimated spend
+  would exceed `budget.max_usd`), so a human can raise the cap.
 - **H1 directed** adds a *before-build* gate: after each checkpoint the human
   explicitly approves (or edits `spec.md`, or aborts) before the next builder
   call is spent. This is the only mode that gates rebuilds.

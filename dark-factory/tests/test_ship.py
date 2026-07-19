@@ -20,7 +20,7 @@ import df_release
 import df_seal
 import df_ship
 import supervisor
-from df_common import canonical_json
+from df_common import canonical_json, sha256_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STUB = os.path.join(HERE, "fixtures", "ship_stub.py")
@@ -168,6 +168,108 @@ def test_missing_cred_fails_closed(tmp_path, monkeypatch):
     assert res["outcome"] == df_ship.SHIP_FAILED
     assert not (tmp_path / "m").exists()  # never ran
     assert "SHIP_CRED_FAILED" in j.states()
+
+
+# --------------------------------------------------------------------------
+# DF-R4-08: the toolchain identity is captured PRE-exec (hash-before-spawn),
+# resolved against the ACTION's cwd, and covers rollback executables too.
+# --------------------------------------------------------------------------
+def _run_one_action(action, ws):
+    j = FakeJournal()
+    res = df_ship.run_actions(
+        [action], str(ws),
+        approval_ctx=df_release.ApprovalContext(attestation=None, approvers=[], threshold=0,
+                                                run_id="r", artifact_object_id="o"),
+        journal=j, run_id="r", base_env=os.environ.copy(), base_secret_values=[],
+        resolve_action_creds=_no_creds, now_fn=_now)
+    return res, j
+
+
+def test_toolchain_hash_is_pre_exec_bytes_for_self_modifying_tool(tmp_path):
+    # A deploy tool that rewrites its OWN bytes after running: the recorded sha256
+    # must be the bytes that STARTED the action (pre-exec), never the mutated image.
+    ws = tmp_path / "ws"; ws.mkdir()
+    tool = tmp_path / "self_mod_deploy"
+    tool.write_text(
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "with open(sys.argv[0], 'a') as f:\n"
+        "    f.write('# mutated after running\\n')\n",
+        encoding="utf-8")
+    os.chmod(str(tool), 0o755)
+    pre_sha = sha256_file(str(tool))
+
+    action = {"name": "deploy", "run": [str(tool)], "reversible": True, "rollback": None,
+              "timeout_s": 30, "cwd": None, "creds": {"env": []}}
+    res, j = _run_one_action(action, ws)
+
+    assert res["outcome"] == df_ship.SHIPPED
+    # the tool DID rewrite itself (post-exec bytes differ from pre-exec)
+    assert sha256_file(str(tool)) != pre_sha
+    # …yet the recorded identity is the PRE-exec bytes
+    tc = res["toolchain"]
+    assert len(tc) == 1 and tc[0]["action"] == "deploy"
+    assert tc[0]["sha256"] == pre_sha
+    assert tc[0]["resolved_path"] == os.path.realpath(str(tool))
+    # and the INTENT journal carried the same pre-exec identity (bound before spawn)
+    intent = [e for e in j.events if e["state"] == "SHIP_ACTION_INTENT"][0]
+    assert intent["data"]["toolchain"]["sha256"] == pre_sha
+
+
+def test_toolchain_relative_argv0_resolves_against_ship_workspace(tmp_path):
+    # A relative argv0 (with a path separator) must resolve against the ACTION's
+    # cwd (the ship workspace), the way the OS execs it — NOT the supervisor cwd
+    # (which is what the pre-M55 seal-time shutil.which() used).
+    ws = tmp_path / "ws"; ws.mkdir()
+    tool = ws / "deploy_here"
+    marker = tmp_path / "ran_marker"
+    tool.write_text(
+        "#!" + sys.executable + "\n"
+        "open(" + repr(str(marker)) + ", 'w').close()\n",
+        encoding="utf-8")
+    os.chmod(str(tool), 0o755)
+    pre_sha = sha256_file(str(tool))
+
+    action = {"name": "deploy", "run": ["./deploy_here"], "reversible": True, "rollback": None,
+              "timeout_s": 30, "cwd": None, "creds": {"env": []}}
+    res, _j = _run_one_action(action, ws)
+
+    assert res["outcome"] == df_ship.SHIPPED and marker.exists()  # it actually ran
+    tc = res["toolchain"]
+    assert tc[0]["argv0"] == "./deploy_here"
+    # resolved under the ship workspace, not the supervisor cwd
+    assert tc[0]["resolved_path"] == os.path.realpath(str(tool))
+    assert tc[0]["resolved_path"].startswith(os.path.realpath(str(ws)) + os.sep)
+    assert tc[0]["sha256"] == pre_sha
+
+
+def test_rollback_executable_identity_is_recorded(tmp_path):
+    # A rollback tool is as security-relevant as the forward action: on a failure
+    # unwind, each rollback executable's PRE-exec identity is recorded too.
+    m_a = tmp_path / "m_a"
+    ws = tmp_path / "ws"; ws.mkdir()
+    res, _j = _run_one_action_multi(
+        [_touch("a", m_a, rollback_marker=True), _fail("b")], ws)
+    assert res["outcome"] == df_ship.SHIP_FAILED
+    rbtc = res["rollback_toolchain"]
+    # "a" succeeded with a rollback, so its rollback ran and was identified
+    names = [e["action"] for e in rbtc]
+    assert "a" in names
+    entry = [e for e in rbtc if e["action"] == "a"][0]
+    assert entry["argv0"] == sys.executable
+    assert entry["resolved_path"] and isinstance(entry["sha256"], str)
+    assert len(entry["sha256"]) == 64
+
+
+def _run_one_action_multi(actions, ws):
+    j = FakeJournal()
+    res = df_ship.run_actions(
+        actions, str(ws),
+        approval_ctx=df_release.ApprovalContext(attestation=None, approvers=[], threshold=0,
+                                                run_id="r", artifact_object_id="o"),
+        journal=j, run_id="r", base_env=os.environ.copy(), base_secret_values=[],
+        resolve_action_creds=_no_creds, now_fn=_now)
+    return res, j
 
 
 # --------------------------------------------------------------------------

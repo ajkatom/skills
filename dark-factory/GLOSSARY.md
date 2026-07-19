@@ -114,7 +114,7 @@ This glossary consolidates the security terminology used by Dark Factory. It inc
 - **Nonce** — A unique value used once to prevent the same signed approval from being replayed.
 - **Replay attack** — Reusing a previously valid signed message to authorize a new or repeated operation.
 - **K-of-N approval** — At least K distinct authorized signers out of N must approve the same claim.
-- **Split custody** — No single person holds enough authority to qualify or release an enterprise artifact.
+- **Split custody** — Qualifying an enterprise artifact requires K-of-N distinct approver signatures over the sealed manifest. With `threshold ≥ 2` no single operator can ship; a `threshold` of 1 is permitted (and then a single approver suffices). K-of-N proves distinct KEYS/SIGNATURES, not distinct human owners — separation of duties depends on the operator keeping the private keys with genuinely separate people.
 - **Separation of duties** — Assigning building, verification, approval, and release authority to distinct roles to reduce unilateral mistakes or abuse.
 
 ## Integrity, evidence, and auditing
@@ -195,7 +195,7 @@ This glossary consolidates the security terminology used by Dark Factory. It inc
 ## Shipping and operational safety
 
 - **Shipping boundary** — The point where a qualified artifact would be merged, deployed, migrated, or otherwise affect a real system.
-- **Reversible action** — An operation with a defined and credible rollback.
+- **Reversible action** — A ship action the OPERATOR declares reversible (by supplying a `rollback` argv). It is an operator ASSERTION, not verified: `reversible` is a required per-action flag and `rollback` is optional, so the runner trusts the declaration. The signed-release cover-list is the real authority for what runs unattended.
 - **Irreversible action** — An operation that cannot reliably be undone; it requires stronger assurance and signed release approval.
 - **Interlock** — A policy condition preventing a high-risk action until required controls are satisfied.
 - **Release attestation** — K-of-N signed authorization bound to a specific run, artifact, and set of shipping actions.
