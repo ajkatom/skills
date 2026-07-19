@@ -218,9 +218,10 @@ def test_required_unsupported_refuses_fail_closed_no_build(tmp_path, monkeypatch
 
     def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
                     exec_prefix=None, env_extra=None, env_full=None, confine=False):
+        # M52 (DF-R4-02): with the pre-dispatch gate this must NEVER be called
+        # for a required+unsupported builder — recording any call proves a
+        # dispatch leaked past the gate.
         calls.append(confine)
-        assert confine is True
-        # A real gemini adapter fails closed WITHOUT writing anything.
         return {"adapter_protocol": "0.1", "status": "error",
                 "detail": "confinement unsupported for gemini"}, None
 
@@ -228,7 +229,10 @@ def test_required_unsupported_refuses_fail_closed_no_build(tmp_path, monkeypatch
 
     rc = supervisor.run(str(cr), None)
     assert rc == 2
-    assert calls == [True]  # exactly one attempt — no unconfined retry, ever
+    # M52: `gemini` at a non-shipped path is identity-UNSUPPORTED; required
+    # confinement now refuses BEFORE dispatch, so the builder is never invoked
+    # (stronger than the old post-dispatch self-report refusal).
+    assert calls == []
 
     run_id, m = _read_manifest(cr)
     assert m["outcome"] == "CONFINEMENT_REFUSED"

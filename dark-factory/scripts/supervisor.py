@@ -4973,6 +4973,62 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 return anchor_exit or 2
             journal.write("EGRESS_PROBE_PASSED", policy_digest=policy_digest)
 
+        # --- DF-R4-02 (M52): PRE-DISPATCH identity-aware confinement gate. ----
+        # The post-dispatch refusal below (M14, in the build loop) only fires
+        # when the ADAPTER self-reports status:"error" + "confinement
+        # unsupported". An arbitrary executable named `api_anthropic` (a
+        # STRUCTURAL profile) that IGNORES the confine arg and returns success
+        # would otherwise run the builder UNCONFINED while `required:true` — the
+        # security control is fail-OPEN at dispatch. M50 made
+        # df_confine.profile_for identity-aware (a structural api_* claim is
+        # bound to the shipped-adapter realpath OR a pinned content digest,
+        # never the bare basename) and recorded an impostor as
+        # probe:"unsupported" in the manifest, but never used that as a GATE.
+        # This IS that gate: computed ONCE here (the builder adapter identity is
+        # constant across every iteration), BEFORE any invoke_adapter builder
+        # spawn, on the fresh-run AND the resume path (both reach the build loop
+        # only through this function, and both re-run this preflight). A
+        # `required`-confinement adapter whose identity-aware profile is NOT
+        # supported is REFUSED here — the builder is never spawned at all —
+        # rather than trusted to self-report. The existing post-dispatch
+        # self-report refusal is KEPT (defense in depth for a supported adapter
+        # that dynamically reports unsupported at runtime); this gate is
+        # ADDITIVE and fires first. Back-compat: a live-probed CLI (claude —
+        # profile_for ignores adapter_path for non-structural profiles) and a
+        # shipped api_anthropic at its trusted path (or a digest-pinned copy)
+        # stay `supported` and dispatch normally; a disabled/absent confine
+        # (confine_state["enabled"] False) or a not-required confine skips this
+        # entirely (a not-required impostor still runs unconfined, with the
+        # manifest honestly recording probe:"unsupported" via M50 — unchanged).
+        if confine_state["enabled"] and cfg["_confine"]["required"]:
+            _resolved_adapter_path = os.path.realpath(os.path.expanduser(adapter))
+            _confine_profile = df_confine.profile_for(
+                cli, _resolved_adapter_path, cfg["_adapter_digests"]["builder"])
+            if not _confine_profile.get("supported"):
+                _reason = _confine_profile.get(
+                    "reason", f"no confinement profile for {cli}")
+                journal.write("CONFINEMENT_UNSUPPORTED", iteration=start_iter,
+                              detail=_reason)
+                mf = dict(mb_clean, outcome="CONFINEMENT_REFUSED", iterations=start_iter,
+                          qualified=False,
+                          final_exam={"ran": False, "passed": None, "count": 0},
+                          regressions=sorted(regressed),
+                          budget=_budget_manifest_field(cfg["_budget"], builder_calls,
+                                                        estimated_usd),
+                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                      builder_input_tokens,
+                                                      builder_output_tokens))
+                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir,
+                                            mf["invocation"], digest, audit_key, journal)
+                _clear_state()
+                _kb_writeback(cfg, journal, mf, [])
+                sys.stderr.write(
+                    "dark-factory: confinement REQUIRED but the builder adapter's "
+                    f"identity-aware profile is UNSUPPORTED ({_reason}) — refusing "
+                    "BEFORE dispatch (fail-closed); the builder was never spawned.\n")
+                return anchor_exit or 2
+
         # M36b Part C: an AWAIT_SHIP resume seals the ALREADY-frozen artifact
         # here and returns BEFORE the build for-loop — the loop is the only
         # place a builder is dispatched, so this reentry provably makes zero

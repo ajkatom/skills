@@ -354,6 +354,23 @@ def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=Tru
     monkeypatch.setattr(
         supervisor.df_container, "probe_enterprise_egress",
         lambda *a, **k: (egress_ok, {"stub": True, "egress_ok": egress_ok}))
+    # M52 (DF-R4-02): the pre-dispatch confinement gate refuses an identity-
+    # UNSUPPORTED builder under required confinement (which enterprise forces).
+    # These integration runs use `sys.executable` as a STUB builder (they
+    # monkeypatch invoke_adapter and can't run a real model), so — exactly like
+    # docker_available/probe_seccomp above — model a confinement-SUPPORTED
+    # builder: the posture a real enterprise run MUST have (it can only use a
+    # supported adapter). Resolve the shipped api_anthropic's REAL profile so
+    # the shape is authentic; the gate itself is tested for real in
+    # test_m52_confine_gate.py / test_confine_config.py.
+    _shipped_api = os.path.join(
+        os.path.dirname(os.path.abspath(supervisor.df_confine.__file__)),
+        "adapters", "api_anthropic")
+    _real_profile_for = supervisor.df_confine.profile_for
+    monkeypatch.setattr(
+        supervisor.df_confine, "profile_for",
+        lambda cli, adapter_path=None, expected_sha256=None:
+            _real_profile_for("api_anthropic", _shipped_api))
 
 
 def test_resolve_isolation_enterprise_both_ok(tmp_path, monkeypatch):

@@ -236,7 +236,8 @@ def is_supported(cli: str, adapter_path=None, expected_sha256=None) -> bool:
     return bool(profile_for(cli, adapter_path, expected_sha256).get("supported"))
 
 
-def confinement_flags(cli: str, prompt: str) -> list:
+def confinement_flags(cli: str, prompt: str, adapter_path=None,
+                      expected_sha256=None) -> list:
     """Return the FULL confined argv (minus cwd) for `cli`, or raise
     ConfineError if there is no conforming profile. The exact flag names are
     validated by the live probe (probe_confinement / Task 3); if a flag is
@@ -245,8 +246,16 @@ def confinement_flags(cli: str, prompt: str) -> list:
     A `structural` profile (api_anthropic — see PROFILES) has no CLI argv
     concept at all (its adapter is invoked via protocol-0.1 JSON on stdin,
     never a prompt baked into argv), so there are no flags to add: this
-    returns `[]` rather than raising or looking up a nonexistent `flags_fn`."""
-    profile = profile_for(cli)
+    returns `[]` rather than raising or looking up a nonexistent `flags_fn`.
+
+    DF-R4-02 (M52): `adapter_path` + `expected_sha256` are threaded into
+    `profile_for` so a STRUCTURAL profile's support is resolved against the
+    trusted adapter IDENTITY (M50), consistent with `_confine_manifest_field`
+    and the supervisor's pre-dispatch gate. Back-compat: the default
+    (`adapter_path=None`) resolves the profile by basename exactly as pre-M52,
+    so every existing caller (the shipped agentic adapters, which pass their
+    own hardcoded `cli`) is byte-identical."""
+    profile = profile_for(cli, adapter_path, expected_sha256)
     if not profile.get("supported"):
         reason = profile.get("reason", "no confinement profile")
         raise ConfineError(f"confinement unsupported for {cli}: {reason}")
@@ -340,7 +349,8 @@ def _proc_diag(label, proc):
 
 
 def probe_confinement(cli: str, workdir: str, *, timeout_s: int = 120,
-                       runner=subprocess.run):
+                       runner=subprocess.run, adapter_path=None,
+                       expected_sha256=None):
     """LIVE, observable-side-effect proof that confinement actually blocks a
     denied tool — not just that a flag was passed.
 
@@ -384,9 +394,14 @@ def probe_confinement(cli: str, workdir: str, *, timeout_s: int = 120,
     that is a genuine pass without an observable side-effect check — every
     other profile still requires the full live proof below.
     """
-    if not is_supported(cli):
+    # DF-R4-02 (M52): resolve support against the trusted adapter IDENTITY
+    # (M50) when the caller supplies it, so a probe of a renamed/relocated
+    # structural adapter fail-closes exactly like the manifest field and the
+    # supervisor's pre-dispatch gate. adapter_path=None -> basename resolution,
+    # byte-identical to every pre-M52 caller.
+    if not is_supported(cli, adapter_path, expected_sha256):
         return False, f"confinement unsupported for {cli}"
-    profile = profile_for(cli)
+    profile = profile_for(cli, adapter_path, expected_sha256)
     if profile.get("structural"):
         return True, (
             "structural: no in-band agentic tool/MCP surface exists for "
@@ -396,8 +411,10 @@ def probe_confinement(cli: str, workdir: str, *, timeout_s: int = 120,
             "see references/builder-confinement.md"
         )
     try:
-        allowed_argv = confinement_flags(cli, _ALLOWED_PROBE_PROMPT)
-        denied_argv = confinement_flags(cli, _denied_probe_prompt(cli))
+        allowed_argv = confinement_flags(cli, _ALLOWED_PROBE_PROMPT,
+                                          adapter_path, expected_sha256)
+        denied_argv = confinement_flags(cli, _denied_probe_prompt(cli),
+                                        adapter_path, expected_sha256)
     except ConfineError as e:
         return False, str(e)
 
