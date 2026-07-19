@@ -200,6 +200,23 @@ def _validate_fsm_chain(run_dir, expected_head):
     return True, "ok"
 
 
+def _chain_scenario_set_sha256(run_dir):
+    """RA-05: return the run-start scenario-set hash SEALED into the FSM chain's
+    genesis (seq 0) entry, or None if the chain is empty/absent (a legacy 0.1
+    run). Every chain entry binds `bound_ids.scenario_set_sha256` (M36a), and
+    the first entry is written at run start from `_scenario_set_hash(scenarios_dir)`
+    — so the genesis value IS the run-start bundle. This is only trusted AFTER
+    `_validate_fsm_chain` has passed (the chain's integrity is proven, so the
+    bound hash is tamper-evident), which is why resume calls it exactly there."""
+    try:
+        lines = _fsm_chain_lines(run_dir)
+    except json.JSONDecodeError:
+        return None
+    if not lines:
+        return None
+    return lines[0].get("bound_ids", {}).get("scenario_set_sha256")
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -308,6 +325,14 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             # already approved). Additive; a 0.1 state defaults them on load.
             "phase": phase,
             "fsm_chain_head": chain_head,
+            # RA-05/M45: seal the run-start scenario-set hash into state.json
+            # too (additive). The FSM chain's genesis entry is the AUTHORITATIVE
+            # sealed value on a 0.2 resume, but persisting it here is belt-and-
+            # suspenders: a run that somehow lacks a chain (or a future no-chain
+            # path) still carries the sealed hash so resume can enforce bundle
+            # immutability. A pre-M45 0.1 state.json has neither this field nor
+            # a chain -> resume journals SCENARIO_BUNDLE_UNSEALED_LEGACY.
+            "scenario_set_sha256": scenario_set_sha256,
             "build_approved_through": build_approved_through,
             # M36b Part C: the post-convergence data an AWAIT_SHIP pause needs to
             # SEAL on resume WITHOUT rebuilding — the frozen artifact object_id +
@@ -349,6 +374,11 @@ def load_state(run_dir):
     state.setdefault("state_version", "0.1")
     state.setdefault("phase", None)
     state.setdefault("fsm_chain_head", None)
+    # RA-05/M45: additive. A pre-M45 state.json (0.1 legacy OR a 0.2 state
+    # written before this field existed) defaults to None -> the sealed hash
+    # comes from the FSM chain genesis when available, else the run is treated
+    # as unsealed-legacy (journaled, proceeds) rather than false-refused.
+    state.setdefault("scenario_set_sha256", None)
     state.setdefault("build_approved_through", 0)
     # M36b Part C: only an AWAIT_SHIP pause records this; every other state has
     # None (they resume by rebuilding, not sealing).
@@ -363,6 +393,37 @@ def _snapshot_sha256_from_journal(run_dir):
             e = json.loads(line)
             if e.get("state") == "SNAPSHOT":
                 return e.get("data", {}).get("snapshot_sha256")
+    return None
+
+
+def _init_scenario_set_sha256_from_journal(run_dir):
+    """RA-05/M45 (R1): the run-start scenario-set hash as recorded in the
+    journal's INIT event (supervisor.run writes it at run start). This is a
+    THIRD independent run-start record — alongside the FSM chain genesis and
+    the state.json field — so the SCENARIO_BUNDLE_UNSEALED_LEGACY (unenforced)
+    fallback is only reached when a run-start hash exists in NONE of the three.
+    A same-user actor who downgrades state.json to 0.1, deletes fsm_chain.jsonl,
+    and strips the state.json field must ALSO strip/rewrite the journal INIT
+    record to force the unenforced path. HONEST SCOPE: journal.jsonl is plain,
+    UNAUTHENTICATED JSONL (no per-entry hash chain) and resume does not
+    integrity-check it — so this third record raises the AVAILABILITY bar for
+    legacy compat, not the adversarial bar (a determined same-user actor can
+    forge/strip it, the same detection-grade residual the FSM chain already
+    carries). It is a defence-in-depth breadcrumb, not a cryptographic anchor.
+    A missing/unreadable INIT record -> None ("no fallback available"), never a
+    silent pass."""
+    path = os.path.join(run_dir, "journal.jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                e = json.loads(line)
+                if e.get("state") == "INIT":
+                    return e.get("data", {}).get("scenario_set_sha256")
+    except (OSError, json.JSONDecodeError):
+        return None
     return None
 
 
@@ -4278,6 +4339,35 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               f"{detail}. Run: {run_dir}")
         return anchor_exit or 3
 
+    def _scenario_drift_abort(iteration, sealed_hash, live_hash):
+        # M45 RA-05 (fresh-run in-process window): the run-start scenario
+        # bundle was sealed at run start (manifest_base["scenario_set_sha256"]
+        # + the FSM-chain genesis). Resume already refuses a bundle that drifted
+        # across a pause; this seals the SAME-PROCESS window the auditor's RA-05
+        # names ("acceptance criteria can change during a run") — an operator (or
+        # a process) that edits the live scenarios dir between the run-start gate
+        # and the sealed final exam must NEVER have the exam grade the artifact
+        # against altered criteria. Fail-closed, barrier-safe (only 12-char hash
+        # prefixes ever surface — never scenario bytes).
+        journal.write("SCENARIO_BUNDLE_DRIFT", iteration=iteration,
+                      sealed=sealed_hash[:12], live=live_hash[:12])
+        mf = dict(mb_clean, outcome="SCENARIO_BUNDLE_DRIFT", iterations=iteration, qualified=False,
+                  final_exam={"ran": False, "passed": None, "count": 0},
+                  regressions=sorted(regressed), artifact=None,
+                  budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                              builder_input_tokens, builder_output_tokens))
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, [])
+        sys.stderr.write(
+            f"dark-factory: SCENARIO BUNDLE DRIFT — the acceptance scenarios changed "
+            f"mid-run (run-start {sealed_hash[:12]} != live {live_hash[:12]}); refusing to "
+            f"grade the sealed final exam against altered criteria. Run: {run_dir}\n")
+        return anchor_exit or 2
+
     def _finalize_converged(i, object_id, artifact_field, fe, gate_target, allow_pause):
         """M36b Part C: the post-final-exam SEAL tail, shared by the straight-
         through convergence AND the AWAIT_SHIP seal-reentry resume.
@@ -5264,6 +5354,18 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # pure churn (kill+relaunch+readiness-wait) with no variant to
                 # serve, so we reuse dev-verify's already-running twins --
                 # byte-identical to the pre-M12 final-exam path (zero restart).
+                # M45 RA-05 (fresh-run in-process): the sealed final exam below
+                # re-reads the LIVE `scenarios_dir` from the control root. Re-hash
+                # it NOW and refuse if it drifted from the run-start seal — closing
+                # the same-process edit window (resume already covers the across-
+                # pause window). Fail-closed; discards the validation roots first.
+                _sealed_bundle = manifest_base.get("scenario_set_sha256")
+                _live_bundle = _scenario_set_hash(scenarios_dir)
+                if _sealed_bundle is not None and _live_bundle != _sealed_bundle:
+                    _discard_validation_root(r_gates)
+                    _discard_validation_root(r_exam)
+                    return _scenario_drift_abort(i, _sealed_bundle, _live_bundle)
+
                 final_env_extra = verify_env_extra
                 # M44 RA-01: the throwaway sealed-object copies (R_gates/R_exam)
                 # are discarded no matter which terminal this block reaches.
@@ -5560,6 +5662,60 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
 
         spec_text = open(os.path.join(control_root, "spec.md"), encoding="utf-8").read()
         scenarios_dir = os.path.join(control_root, "scenarios")
+
+        # RA-05/M45: SEAL enforcement. The hidden acceptance scenarios live in
+        # the LIVE control root; without this, a resume re-hashes them and uses
+        # the value as-is, so an operator could EDIT the criteria between pause
+        # and resume and qualify the builder against a different scenario set
+        # than the run started with. Enforce immutability, fail-closed.
+        #
+        # The sealed run-start hash is looked up from THREE independent
+        # run-start records, in order (R1): (1) the FSM chain's genesis entry
+        # (authoritative + tamper-evident: the chain was integrity-validated
+        # just above); (2) the additive state.json field (covers a no-chain
+        # state); (3) the journal's INIT event (a THIRD record, so the
+        # unenforced legacy path below is only reachable when NONE of the three
+        # carries a run-start hash). `_scenario_set_hash(scenarios_dir)` here is
+        # computed IDENTICALLY to run start (same control_root/scenarios dir,
+        # same function, and the run-start seal predates the generated-scenarios
+        # dir so neither side hashes gen_dir) — an UNCHANGED bundle always
+        # matches and resumes byte-compatibly; only a genuine edit diverges.
+        sealed_hash = None
+        if state.get("state_version") == STATE_VERSION:
+            sealed_hash = _chain_scenario_set_sha256(run_dir)
+        if sealed_hash is None:
+            sealed_hash = state.get("scenario_set_sha256")
+        if sealed_hash is None:
+            sealed_hash = _init_scenario_set_sha256_from_journal(run_dir)
+        if sealed_hash is None:
+            # No run-start hash in the chain genesis, the state.json field, OR
+            # the journal INIT event, so there is nothing to enforce against.
+            # Reachable for a genuinely pre-seal (pre-M45) run, OR if a same-
+            # user actor stripped EVERY run-start hash record (downgraded
+            # state.json to 0.1, deleted fsm_chain.jsonl and the state field,
+            # and stripped the unauthenticated journal INIT record). Journal it
+            # (auditable, not silent) and proceed — we cannot enforce an
+            # immutability that was never established. The residual is the same
+            # same-user, detection-grade scope as the FSM chain itself (a
+            # process that can rewrite all three records could equally rewrite
+            # a chain + its recorded head together).
+            journal.write("SCENARIO_BUNDLE_UNSEALED_LEGACY",
+                          state_version=state.get("state_version"))
+        else:
+            current_hash = _scenario_set_hash(scenarios_dir)
+            if current_hash != sealed_hash:
+                journal.write("SCENARIO_BUNDLE_CHANGED",
+                              sealed=sealed_hash, current=current_hash)
+                sys.stderr.write(
+                    "dark-factory: SCENARIO_BUNDLE_CHANGED — the acceptance "
+                    "scenario set changed since this run started "
+                    f"(sealed {sealed_hash[:12]}…, live {current_hash[:12]}…); "
+                    "refusing to resume (fail-closed). The hidden acceptance "
+                    "criteria are sealed at run start and must not be edited "
+                    "across a pause.\n")
+                return 2
+            journal.write("SCENARIO_BUNDLE_VERIFIED", sealed=sealed_hash)
+
         adapter = cfg["roles"]["builder"]["adapter"]
         timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)
         cli = os.path.basename(adapter)

@@ -17,12 +17,20 @@ off-box sink, required builder confinement):
 `enterprise` is **fail-closed**: `df_config` refuses to load an enterprise config
 that is missing or weakens any required guarantee (custody block,
 `credential_proxy.enabled: true`, `audit.sink.required: true`,
-`builder_confinement.required: true`, `audit.signing`), and `resolve_isolation`
+`builder_confinement.enabled: true` **and** `builder_confinement.required: true`,
+`audit.signing`), and `resolve_isolation`
 refuses at run start if the Docker/OS-sandbox/seccomp probes don't pass (with an
 `--allow-downgrade` path that steps down enterprise → hardened → standard →
 cooperative, each journaled). The seccomp probe (M22 Task 1) is one of these
 gates: a profile that parses fine but doesn't actually deny what it claims to
 fails the resolve just like a down Docker daemon does.
+
+Confinement must be **enabled**, not merely **required** (RA-04): the runtime
+confine flag is `builder_confinement.enabled`, so a `{enabled: false, required:
+true}` block would claim mandatory confinement while running the builder
+UNCONFINED. Two layers refuse it: at **any** tier, `required: true` with
+`enabled: false` is incoherent (`ConfigError` in the `builder_confinement`
+block); and the enterprise gate additionally requires `enabled: true` by name.
 
 ## `init --answers` scaffolding (DF-04)
 
