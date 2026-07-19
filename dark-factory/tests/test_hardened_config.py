@@ -295,6 +295,10 @@ def _patch_hardened_probes(monkeypatch, os_ok, dk_ok):
     monkeypatch.setattr(supervisor.df_sandbox, "probe_denial", lambda *a, **k: os_ok)
     monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: dk_ok)
     monkeypatch.setattr(supervisor.df_container, "probe_container", lambda *a, **k: dk_ok)
+    # M51: the manifest-seal path best-effort resolves the image digest via real
+    # docker; stub it deterministically so the suite never shells out to docker.
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "sha256:stub-digest-for-" + image)
 
 
 def test_resolve_isolation_hardened_both_ok(tmp_path, monkeypatch):
@@ -425,8 +429,16 @@ def test_builder_wiring_docker_prefix_no_control_root_mount(tmp_path, monkeypatc
     assert m["qualification"]["substates"]["barrier"] is True  # the tier IS probe-proven
     assert m["sandbox_backend"] == df_container.BACKEND_NAME
     assert m["denial_probe_passed"] is True
-    assert m["container"] == {"image": df_container.DEFAULT_IMAGE, "network": "none",
-                              "memory": "2g", "pids": 256, "dep_cache_dir": None}
+    # M51: container manifest now carries the reproducibility advisory fields
+    # (image_pinned + resolved_image_digest, stubbed by _patch_hardened_probes)
+    # alongside the original config fields. DEFAULT_IMAGE is a mutable tag →
+    # image_pinned False.
+    assert m["container"] == {
+        "image": df_container.DEFAULT_IMAGE, "network": "none",
+        "memory": "2g", "pids": 256, "dep_cache_dir": None,
+        "image_pinned": False,
+        "resolved_image_digest": "sha256:stub-digest-for-" + df_container.DEFAULT_IMAGE,
+    }
 
 
 def test_builder_wiring_twin_env_skipped_at_hardened(tmp_path, monkeypatch):
@@ -663,6 +675,57 @@ def test_container_none_on_resume_abort_manifest(tmp_path):
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
     assert m["outcome"] == "ABORTED_BY_HUMAN"
     assert m["container"] is None
+
+
+# ---------------------------------------------------------------------------
+# M51/DF-R3-08: `_finalize_container_manifest` reproducibility advisory fields.
+# FAIL-OPEN — an unpinned tag WARNS (stderr) but never blocks; the digest is
+# best-effort (None never blocks). Both are recorded honestly on the manifest.
+# ---------------------------------------------------------------------------
+
+def test_finalize_container_manifest_none_outside_container_tier():
+    cfg = {"_container": {"image": "img", "network": "none"}}
+    assert supervisor._finalize_container_manifest(cfg, "standard") is None
+    assert supervisor._finalize_container_manifest(cfg, "cooperative") is None
+
+
+def test_finalize_container_manifest_unpinned_tag_warns_and_records(monkeypatch, capsys):
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "python@sha256:resolved")
+    cfg = {"_container": {"image": "python:3.12-alpine", "network": "none",
+                          "memory": "2g", "pids": 256, "dep_cache_dir": None}}
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["image_pinned"] is False
+    assert c["resolved_image_digest"] == "python@sha256:resolved"
+    # original config fields preserved
+    assert c["image"] == "python:3.12-alpine" and c["network"] == "none"
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "unpinned tag" in err and "@sha256:" in err
+
+
+def test_finalize_container_manifest_pinned_image_no_warning(monkeypatch, capsys):
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: image.split("@", 1)[1])
+    pinned = "python:3.12-alpine@sha256:deadbeef"
+    cfg = {"_container": {"image": pinned, "network": "none",
+                          "memory": "2g", "pids": 256, "dep_cache_dir": None}}
+    c = supervisor._finalize_container_manifest(cfg, "enterprise")
+    assert c["image_pinned"] is True
+    assert c["resolved_image_digest"] == "sha256:deadbeef"
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_finalize_container_manifest_digest_none_never_blocks(monkeypatch, capsys):
+    # docker unreachable → resolve_image_digest returns None; the field is None
+    # and the run is NOT blocked (fail-open). Unpinned tag still warns.
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: None)
+    cfg = {"_container": {"image": "img:tag", "network": "none",
+                          "memory": "2g", "pids": 256, "dep_cache_dir": None}}
+    c = supervisor._finalize_container_manifest(cfg, "hardened")
+    assert c["resolved_image_digest"] is None
+    assert c["image_pinned"] is False
+    assert "WARNING" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

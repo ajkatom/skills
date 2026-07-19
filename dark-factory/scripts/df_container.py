@@ -52,6 +52,47 @@ def docker_available(runner=subprocess.run) -> bool:
     return proc.returncode == 0
 
 
+def resolve_image_digest(image, runner=subprocess.run):
+    """Best-effort: return the content digest Docker ACTUALLY resolved `image`
+    to, so a run's manifest can record EXACTLY which image bytes ran even when
+    `image` is a mutable tag (DEFAULT_IMAGE is one). Runs `docker image inspect
+    --format '{{index .RepoDigests 0}}' <image>` (the registry-pull digest,
+    e.g. 'python@sha256:...'); when the image has no RepoDigest (a locally
+    built image never pushed/pulled — the template errors "index out of range"
+    and docker exits nonzero), falls back to `.Id` (the local content id).
+
+    FAIL-OPEN by contract (M51/DF-R3-08 reproducibility is an ADVISORY, not a
+    security gate): returns None on ANY failure — missing `docker` binary,
+    daemon down, unknown image, timeout, empty/whitespace output — and NEVER
+    raises. A missing digest must never block or fail a run; the manifest just
+    records None for `resolved_image_digest`. This is the deliberate OPPOSITE
+    polarity to probe_container/probe_seccomp above, which are fail-CLOSED."""
+    if not isinstance(image, str) or not image or image.startswith("-"):
+        return None
+    # First format is the registry digest (reproducible across hosts); second
+    # is the local image id (fallback for a never-pulled/never-pushed image).
+    for fmt in ("{{index .RepoDigests 0}}", "{{.Id}}"):
+        try:
+            proc = runner(
+                ["docker", "image", "inspect", "--format", fmt, image],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            # Missing binary, OSError, timeout: no retry will help — fail open.
+            return None
+        if proc.returncode == 0:
+            out = (proc.stdout or "").strip()
+            # A '<no value>' render (or empty) means the field was absent; fall
+            # through to the next format rather than record a junk digest.
+            if out and out != "<no value>":
+                return out
+        # rc != 0 here is EITHER an unknown image OR (for the first format) an
+        # empty RepoDigests slice making `index ... 0` out-of-range — the exit
+        # code alone can't tell them apart, so fall through and try `.Id`; if
+        # THAT also fails the image is genuinely unresolvable and we return None.
+    return None
+
+
 def _resolve_mount_path(path, label):
     # Require an absolute input path outright: realpath() would silently resolve a
     # relative path against the process cwd (ambiguous/dangerous for a security-

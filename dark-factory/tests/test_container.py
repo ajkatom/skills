@@ -172,6 +172,93 @@ def test_docker_available_false_when_which_is_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_image_digest (M51/DF-R3-08) — FAIL-OPEN, injected fake runner.
+# Opposite polarity to probe_container: any error → None, never raises/blocks.
+# ---------------------------------------------------------------------------
+
+class _FakeInspectProcess:
+    def __init__(self, returncode, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_resolve_image_digest_returns_repo_digest_on_rc0():
+    calls = []
+
+    def runner(argv, **k):
+        calls.append(argv)
+        return _FakeInspectProcess(0, "python@sha256:abc123\n")
+
+    got = df_container.resolve_image_digest("python:3.12-alpine", runner=runner)
+    assert got == "python@sha256:abc123"
+    # first (and only) call uses the RepoDigests format
+    assert calls[0][:4] == ["docker", "image", "inspect", "--format"]
+    assert calls[0][4] == "{{index .RepoDigests 0}}"
+    assert calls[0][-1] == "python:3.12-alpine"
+    assert len(calls) == 1  # RepoDigest hit → no .Id fallback
+
+
+def test_resolve_image_digest_falls_back_to_id_when_repodigests_empty():
+    # A locally-built, never-pushed image: the RepoDigests template errors
+    # ("index out of range") → docker exits nonzero; the .Id fallback succeeds.
+    seq = [_FakeInspectProcess(1, ""), _FakeInspectProcess(0, "sha256:localid\n")]
+
+    def runner(argv, **k):
+        return seq.pop(0)
+
+    got = df_container.resolve_image_digest("localimg", runner=runner)
+    assert got == "sha256:localid"
+
+
+def test_resolve_image_digest_none_when_both_formats_fail():
+    # An unknown image: both inspects exit nonzero → None (fail-open).
+    def runner(argv, **k):
+        return _FakeInspectProcess(1, "")
+
+    assert df_container.resolve_image_digest("nope:tag", runner=runner) is None
+
+
+def test_resolve_image_digest_none_when_runner_raises():
+    def runner(argv, **k):
+        raise FileNotFoundError("docker not installed")
+
+    assert df_container.resolve_image_digest("img", runner=runner) is None
+
+
+def test_resolve_image_digest_none_on_timeout():
+    def runner(argv, **k):
+        raise subprocess.TimeoutExpired(cmd="docker image inspect", timeout=10)
+
+    assert df_container.resolve_image_digest("img", runner=runner) is None
+
+
+def test_resolve_image_digest_none_on_empty_and_no_value_output():
+    # rc0 but empty / '<no value>' render → treated as no digest, falls through
+    # to .Id; if that's ALSO empty → None.
+    def runner(argv, **k):
+        fmt = argv[4]
+        if fmt == "{{index .RepoDigests 0}}":
+            return _FakeInspectProcess(0, "<no value>\n")
+        return _FakeInspectProcess(0, "   \n")
+
+    assert df_container.resolve_image_digest("img", runner=runner) is None
+
+
+def test_resolve_image_digest_none_on_invalid_image_no_runner_call():
+    called = {"n": 0}
+
+    def runner(argv, **k):
+        called["n"] += 1
+        return _FakeInspectProcess(0, "x")
+
+    # empty / flag-like image is rejected before ever invoking docker
+    assert df_container.resolve_image_digest("", runner=runner) is None
+    assert df_container.resolve_image_digest("-rm", runner=runner) is None
+    assert df_container.resolve_image_digest(None, runner=runner) is None
+    assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
 # probe_container — fail-closed matrix, injected fake runner
 # ---------------------------------------------------------------------------
 

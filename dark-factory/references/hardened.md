@@ -179,6 +179,22 @@ run leaves an auditable, reproducible record of exactly which image bytes
 built the artifact; a tag-pinned run's manifest is honest about the tag it
 asked for, not about which bytes that tag resolved to at run time.
 
+**M51 (DF-R3-08): resolved digest recorded either way + an unpinned-tag
+warning.** So a *tag*-based run's manifest is no longer silent about which
+bytes ran, every container-tier manifest now also records
+`container.resolved_image_digest` — the digest Docker actually resolved the
+image to, read once after the container probe passes via
+`df_container.resolve_image_digest` (`docker image inspect`'s RepoDigest, or
+the local `.Id` fallback). It is FAIL-OPEN: if Docker can't answer (daemon
+down, image never pulled) the field is `null` and the run is never
+blocked — reproducibility is an advisory here, not a security gate.
+Alongside it, `container.image_pinned` is an honest boolean (does the
+effective image carry an `@sha256:` digest?), and an unpinned tag at
+hardened/enterprise emits a one-line stderr WARNING recommending a digest pin
+(advisory only — the run continues, since a tag is legitimate in dev and
+forcing a pin would break users). See `references/audit.md`'s "`container`
+manifest field" and `references/reproducibility.md`.
+
 ## `api_anthropic`: real-model-in-container without a custom image (M24)
 
 The "Image requirements for real builders" section above is the gap M24
