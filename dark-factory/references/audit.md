@@ -297,6 +297,33 @@ process that can rewrite both `fsm_chain.jsonl` and `state.json`'s head together
 (exactly the detection-grade scope of the manifest sha256 sidecar; a
 signed/off-box anchor is the hardened+ story — see "Honest limits" above).
 
+### Sealed scenario bundle (RA-05)
+
+The hidden acceptance scenarios live in the **live** control root, so without a
+seal a resume would re-hash them and use whatever is there — an operator could
+edit the criteria between pause and resume and qualify the builder against a
+**different** scenario set than the run started with. The run-start scenario set
+hash (`_scenario_set_hash(control_root/scenarios)`) is bound into the FSM chain's
+**genesis** entry (`bound_ids.scenario_set_sha256`), additionally persisted into
+`state.json` (`scenario_set_sha256`), and recorded a third time in the journal's
+`INIT` event. On resume, **after** the chain passes integrity validation, the
+live scenarios dir is re-hashed and compared to the sealed value, looked up from
+those three run-start records in order: chain genesis → `state.json` field →
+journal `INIT`. A mismatch → `SCENARIO_BUNDLE_CHANGED` on stderr + exit 2
+(fail-closed), journaled `SCENARIO_BUNDLE_CHANGED`; an unchanged bundle journals
+`SCENARIO_BUNDLE_VERIFIED` and resumes normally (the hash inputs are identical at
+run-start and resume — same dir, same function, and the generated-scenarios dir
+participates in neither — so a same-bundle resume never false-positives). Only
+when **none** of the three records carries a run-start hash is there nothing
+sealed to enforce: resume journals `SCENARIO_BUNDLE_UNSEALED_LEGACY` and proceeds
+(an immutability that was never established cannot be enforced). That path is
+reachable for a genuinely pre-seal (pre-M45) run **or** if a same-user actor
+strips every run-start hash record (downgrades `state.json` to `0.1`, deletes
+`fsm_chain.jsonl` + the `state.json` field, and strips/rewrites the hash-linked
+journal `INIT`) — the residual is the same same-user, detection-grade scope as
+the FSM chain itself (a process that can rewrite all three records could equally
+rewrite a chain and its recorded head together), not "only pre-M45 runs."
+
 ## Resume overrides, spec-fork lineage, before-ship pause (M36b)
 
 **Signed resume overrides** (`df_override`). Raising a BUDGET-PAUSE'd run's

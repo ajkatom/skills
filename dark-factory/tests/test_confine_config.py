@@ -65,6 +65,18 @@ def test_builder_confinement_disabled_required_default_false(tmp_path):
     assert cfg["_confine"] == {"enabled": False, "required": False, "profile": "standard"}
 
 
+def test_builder_confinement_required_true_enabled_false_incoherent_rejected(tmp_path):
+    # RA-04 coherence (ANY tier): explicitly requiring confinement while
+    # disabling it is a contradiction the runtime cannot honor (confine=enabled
+    # would be False, so the builder runs UNCONFINED despite "required"). Refuse
+    # at load, fail-closed. Because `required` defaults to `enabled`, only this
+    # EXPLICIT {enabled:false, required:true} trips it.
+    cr = tmp_path / "control"
+    write_config(cr, builder_confinement={"enabled": False, "required": True})
+    with pytest.raises(df_config.ConfigError, match="incoherent"):
+        df_config.load_config(str(cr))
+
+
 def test_builder_confinement_not_a_dict_rejected(tmp_path):
     cr = tmp_path / "control"
     write_config(cr, builder_confinement="yes")

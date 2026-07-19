@@ -1570,6 +1570,21 @@ def load_config(control_root: str) -> dict:
     if not isinstance(bc_required, bool):
         raise ConfigError("builder_confinement.required must be a bool")
 
+    # RA-04 coherence (ANY tier): `required: true` with `enabled: false` is
+    # a contradiction -- you cannot REQUIRE a mechanism you have turned OFF.
+    # Because `required` defaults to `enabled` (above), this only bites an
+    # EXPLICIT {enabled:false, required:true}, exactly the audited case: an
+    # enterprise (or any) config that CLAIMS mandatory confinement while the
+    # runtime path (confine=enabled) is disabled, so the builder runs
+    # unconfined despite the "required" flag. Refuse at LOAD, fail-closed,
+    # before the enterprise gate below even runs.
+    if bc_required and not bc_enabled:
+        raise ConfigError(
+            "builder_confinement.required: true is incoherent with "
+            "enabled: false — you cannot require confinement that is "
+            "disabled; set enabled: true (or drop required)"
+        )
+
     bc_profile = bc_raw.get("profile", "standard")
     if bc_profile != "standard":
         raise ConfigError(
@@ -1763,6 +1778,19 @@ def load_config(control_root: str) -> dict:
                 "enterprise requires `builder_confinement.required: true` "
                 "(spec 7.4) — confinement.enabled without required, or "
                 "confinement absent, is a weakened enterprise config"
+            )
+        # RA-04 belt-and-suspenders: `required: true` alone is not enough —
+        # the RUNTIME confine flag is `enabled`, and confine=enabled is what
+        # actually sandboxes the builder. The coherence check above already
+        # forbids required-without-enabled, so this is redundant TODAY, but
+        # it names `enabled` explicitly at the enterprise gate so a future
+        # refactor of the default/coherence logic cannot silently let an
+        # enterprise run through with confinement OFF.
+        if not bc_enabled:
+            raise ConfigError(
+                "enterprise requires `builder_confinement.enabled: true` "
+                "(spec 7.4) — confinement that is 'required' but not "
+                "'enabled' does not actually confine the builder at runtime"
             )
         if not audit_signing:
             raise ConfigError(

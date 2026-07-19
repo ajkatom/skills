@@ -151,6 +151,34 @@ def test_enterprise_requires_builder_confinement_present(tmp_path):
         df_config.load_config(str(cr))
 
 
+def test_enterprise_confinement_required_true_but_enabled_false_rejected(tmp_path):
+    # RA-04 (the audited High): {enabled:false, required:true} previously PASSED
+    # enterprise validation (the gate only checked `required`) while runtime
+    # confinement was OFF — an enterprise run that CLAIMS mandatory confinement
+    # yet runs the builder unconfined. Now rejected: the ANY-tier coherence
+    # check fires first (required-without-enabled is incoherent), and the
+    # enterprise gate additionally names `enabled` explicitly. Either way,
+    # fail-closed at load.
+    cr = tmp_path / "control"
+    overrides = _base_enterprise(builder_confinement={"enabled": False, "required": True})
+    write_config(cr, **overrides)
+    with pytest.raises(df_config.ConfigError, match="confinement"):
+        df_config.load_config(str(cr))
+
+
+def test_enterprise_confinement_enabled_true_required_true_still_valid(tmp_path):
+    # Superset guard: the canonical enterprise confinement block
+    # {enabled:true, required:true} still validates unchanged.
+    cr = tmp_path / "control"
+    approvers = sorted(_approver()[1] for _ in range(3))
+    overrides = _base_enterprise(
+        approvers=approvers, threshold=2,
+        builder_confinement={"enabled": True, "required": True})
+    write_config(cr, **overrides)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["_confine"] == {"enabled": True, "required": True, "profile": "standard"}
+
+
 def test_enterprise_requires_signed_audit(tmp_path):
     cr = tmp_path / "control"
     overrides = _base_enterprise(audit={
