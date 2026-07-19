@@ -335,6 +335,10 @@ def _patch_enterprise_probes(monkeypatch, os_ok=True, dk_ok=True, seccomp_ok=Tru
                         lambda *a, **k: (True, {"mode": "default_deny", "residuals": []}))
     monkeypatch.setattr(supervisor.df_container, "docker_available", lambda: dk_ok)
     monkeypatch.setattr(supervisor.df_container, "probe_container", lambda *a, **k: dk_ok)
+    # M51: the manifest-seal path best-effort resolves the image digest via real
+    # docker; stub it deterministically so these tests never shell out to docker.
+    monkeypatch.setattr(supervisor.df_container, "resolve_image_digest",
+                        lambda image, **k: "sha256:stub-digest-for-" + image)
     # M22 Task 1: the enterprise resolve now ALSO live-probes the seccomp
     # profile (df_container.probe_seccomp) before accepting enterprise —
     # patched here (like docker_available/probe_container above) so these

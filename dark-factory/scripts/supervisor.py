@@ -77,6 +77,44 @@ _QUALIFYING_TIERS = ("standard", "hardened", "enterprise")
 # docker argv instead of using the OS-sandbox exec_prefix).
 _CONTAINER_TIERS = ("hardened", "enterprise")
 
+
+def _finalize_container_manifest(cfg, eff_tier):
+    """Build the manifest `container` field (None outside a container tier),
+    enriched with the M51/DF-R3-08 reproducibility ADVISORY fields:
+
+      - `image_pinned` (bool): does the effective image carry an `@sha256:`
+        content digest (reproducible) vs. a mutable tag? Recorded honestly.
+      - `resolved_image_digest` (str|None): the digest Docker ACTUALLY used,
+        resolved ONCE here (the container probe in resolve_isolation has already
+        passed, so docker is up) — best-effort, None on any error. So even a
+        tag-based run's manifest says which image bytes ran.
+
+    When the image is an unpinned tag at hardened/enterprise, emits a ONE-LINE
+    stderr WARNING recommending a digest pin. This is FAIL-OPEN: a tag is
+    legitimate in dev, so it is an advisory, NOT a ConfigError — the run
+    continues either way (contrast the fail-CLOSED isolation probes). Called at
+    both the fresh-run and resume manifest-seal sites so they can't drift."""
+    if eff_tier not in _CONTAINER_TIERS:
+        return None
+    c = dict(cfg["_container"])
+    image = c["image"]
+    # A digest pin is an `@sha256:` reference; anything else is a mutable tag
+    # whose bytes can change under you as upstream republishes it.
+    pinned = "@sha256:" in image
+    c["image_pinned"] = pinned
+    if not pinned:
+        sys.stderr.write(
+            f"dark-factory: WARNING container image {image!r} is an unpinned tag; "
+            "pin a digest (hardened.image: ...@sha256:...) for a reproducible "
+            "build environment (advisory only — the run continues, and the "
+            "manifest records the resolved digest either way).\n"
+        )
+    # Best-effort, fail-open: resolve_image_digest returns None on any error and
+    # never raises, so a missing digest / unreachable docker cannot block a run.
+    c["resolved_image_digest"] = df_container.resolve_image_digest(image)
+    return c
+
+
 BUILDER_RULES = """## Builder rules
 - You are the BUILDER in a dark-factory run. Implement the specification below
   in the current working directory.
@@ -4315,7 +4353,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     manifest_base["qualified"] = eff_tier in _QUALIFYING_TIERS
     manifest_base["sandbox_backend"] = backend_name
     manifest_base["denial_probe_passed"] = probe_passed
-    manifest_base["container"] = dict(cfg["_container"]) if eff_tier in _CONTAINER_TIERS else None
+    manifest_base["container"] = _finalize_container_manifest(cfg, eff_tier)
     manifest_base["_effective_tier"] = eff_tier   # internal; stripped before finalize
     # cooperative banner only when the EFFECTIVE tier is cooperative:
     if eff_tier not in _QUALIFYING_TIERS:
@@ -6287,7 +6325,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         manifest_base["qualified"] = eff_tier in _QUALIFYING_TIERS
         manifest_base["sandbox_backend"] = backend_name
         manifest_base["denial_probe_passed"] = probe_passed
-        manifest_base["container"] = dict(cfg["_container"]) if eff_tier in _CONTAINER_TIERS else None
+        manifest_base["container"] = _finalize_container_manifest(cfg, eff_tier)
         manifest_base["_effective_tier"] = eff_tier
         if eff_tier not in _QUALIFYING_TIERS:
             sys.stderr.write("dark-factory: COOPERATIVE MODE — unqualified: no probe-proven "

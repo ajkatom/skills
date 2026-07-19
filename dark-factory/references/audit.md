@@ -122,6 +122,33 @@ actually ran under:
   fold into the overall `qualified` boolean** — M29b computes and seals it
   but does not re-derive top-level `qualified` from it.
 
+## `container` manifest field (hardened/enterprise; M51 repro fields)
+
+On a container-tier run (hardened/enterprise) the manifest's `container`
+object records the effective builder-container settings; it is explicitly
+`null` on every non-container tier (cooperative/standard) and on pre-probe
+aborts, so the field is always present, never merely absent.
+
+```json
+{"image": "python:3.12-alpine", "network": "none", "memory": "2g",
+ "pids": 256, "dep_cache_dir": null,
+ "image_pinned": false, "resolved_image_digest": "python@sha256:…"}
+```
+
+- `image` / `network` / `memory` / `pids` / `dep_cache_dir` — the effective
+  container config (from the `hardened` block via `cfg["_container"]`).
+- `image_pinned` (M51/DF-R3-08) — honest boolean: does `image` carry an
+  `@sha256:` content digest (`true`, reproducible) or is it a mutable tag
+  (`false`)? An unpinned tag at hardened/enterprise also emits a one-line
+  stderr WARNING recommending a pin — advisory only, the run is NOT blocked.
+- `resolved_image_digest` (M51/DF-R3-08) — the digest Docker ACTUALLY
+  resolved `image` to, read once after the container probe passes
+  (`df_container.resolve_image_digest`: `docker image inspect`'s RepoDigest,
+  or the local `.Id` fallback). So even a *tag*-based run records which image
+  bytes ran. FAIL-OPEN: `null` if Docker can't answer (daemon down, image
+  never pulled) — reproducibility is an advisory, never a gate, so a missing
+  digest never blocks or fails a run. See `references/reproducibility.md`.
+
 ## Artifact binding (DF-01)
 
 Before DF-01/M28a, `verify-manifest` only ever checked the manifest's OWN bytes (`manifest.json`, `manifest.sha256`, `journal.jsonl`, and the optional signature) — it said nothing about whether the *built artifact* (the workspace a converged run produced) still matched what the manifest claimed to have shipped. A converged workspace could be silently mutated after the run finished and `verify-manifest` would still print `OK`. DF-01 (audit Critical) closes that gap: seal the artifact **before** the final exam runs, bind its identity into the signed manifest, and make every later verify/custody check re-derive that identity from the live object store rather than trust a mutable workspace path.

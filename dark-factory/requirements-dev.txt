@@ -1,0 +1,11 @@
+# dark-factory DEV/TEST dependency lock (M51 / DF-R3-08 reproducibility).
+#
+# The skill's RUNTIME is stdlib-only; this locks the DEV/TEST environment only
+# (cryptography is used only at the enterprise tier for ed25519). Neither is
+# needed to run cooperative/standard/hardened tiers — see
+# references/reproducibility.md. cryptography is ALSO pinned as a range for the
+# enterprise runtime in requirements-enterprise.txt; this file additionally
+# locks it to the EXACT version used to develop and test the skill so the test
+# environment is reproducible.
+pytest==9.1.1
+cryptography==49.0.0
