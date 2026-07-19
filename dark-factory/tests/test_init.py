@@ -1,5 +1,6 @@
 import copy
 import json
+import sys
 
 import pytest
 
@@ -212,6 +213,110 @@ def test_build_config_missing_builder_adapter_is_init_error(tmp_path):
     answers = _kv_answers(tmp_path, builder_adapter="")
     with pytest.raises(df_init.InitError, match="builder_adapter"):
         df_init.build_config(answers)
+
+
+# --- DF-R3-01: options pass-through + unknown-key rejection -------------------
+#
+# Regression guard for the init on-ramp gap: `build_config` used to forward only
+# security_gates/twins/knowledge_base (+ budget) from answers.options, silently
+# DROPPING candidate_network and ship. A standard+ control root scaffolded
+# through the canonical `init` therefore defaulted candidate_network to
+# "unrestricted" (df_config's default) -> sealed CANDIDATE_EGRESS_OPEN -> could
+# never qualify, and lost any ship block -> the post-seal phase was unreachable.
+# These tests assert the front door now forwards both keys AND fails closed on
+# unknowns, and that the end-to-end init->load produces a qualification-capable,
+# ship-reachable config.
+
+
+def _load_cfg(tmp_path, cfg):
+    """Write a built cfg to a fresh control root and load it through the REAL
+    validator (df_config.load_config), exactly as validate_scaffold would."""
+    cr = tmp_path / "control"
+    cr.mkdir()
+    (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    return df_config.load_config(str(cr))
+
+
+def test_build_config_forwards_candidate_network_and_load_config_accepts(tmp_path):
+    answers = _kv_answers(
+        tmp_path, assurance="standard",
+        options={"candidate_network": "deny"})
+    cfg = df_init.build_config(answers)
+    assert cfg["candidate_network"] == "deny"          # forwarded, not dropped
+    loaded = _load_cfg(tmp_path, cfg)
+    assert loaded["candidate_network"] == "deny"       # single validator accepts
+
+
+def test_build_config_forwards_ship_and_load_config_exposes__ship(tmp_path):
+    ship = {"actions": [
+        {"name": "smoke", "run": ["/bin/true"], "reversible": True,
+         "timeout_s": 30},
+    ]}
+    answers = _kv_answers(tmp_path, options={"ship": ship})
+    cfg = df_init.build_config(answers)
+    assert cfg["ship"] == ship                          # forwarded, not dropped
+    loaded = _load_cfg(tmp_path, cfg)
+    assert loaded["_ship"] is not None                  # ship phase reachable
+    assert loaded["_ship"]["actions"][0]["name"] == "smoke"
+
+
+def test_build_config_unknown_options_key_is_init_error(tmp_path):
+    answers = _kv_answers(tmp_path, options={"bogus": {"x": 1}})
+    with pytest.raises(df_init.InitError, match="bogus"):
+        df_init.build_config(answers)
+
+
+def test_build_config_typo_of_candidate_network_is_rejected_not_dropped(tmp_path):
+    # The exact class of bug silent-drop hid: a near-miss key vanishing silently.
+    answers = _kv_answers(
+        tmp_path, assurance="standard",
+        options={"candidate_networks": "deny"})       # note the trailing 's'
+    with pytest.raises(df_init.InitError, match="candidate_networks"):
+        df_init.build_config(answers)
+
+
+def test_build_config_options_non_dict_is_init_error(tmp_path):
+    # The pre-existing shape guard must still fire (and before the unknown-key
+    # scan, which assumes a dict).
+    answers = _kv_answers(tmp_path, options=["not", "a", "dict"])
+    with pytest.raises(df_init.InitError, match="answers.options must be an object"):
+        df_init.build_config(answers)
+
+
+def test_onramp_standard_candidate_network_deny_is_qualification_capable(tmp_path):
+    # END-TO-END on-ramp (a): a standard/H3 control root built through init with
+    # candidate_network:"deny" seals a config whose candidate_egress sub-state is
+    # PASSABLE (not forced-open). Asserted against the real qualification helper
+    # supervisor._candidate_egress_qualified, closing the "front door works" gap.
+    import supervisor
+    answers = _kv_answers(
+        tmp_path, assurance="standard", intervention_mode="H3",
+        options={"candidate_network": "deny"})
+    cfg = df_init.build_config(answers)
+    loaded = _load_cfg(tmp_path, cfg)
+    assert loaded["candidate_network"] != "unrestricted"
+    assert supervisor._candidate_egress_qualified(loaded["candidate_network"]) is True
+
+
+def test_onramp_hardened_h4_with_ship_loads_and_is_ship_reachable(tmp_path):
+    # END-TO-END on-ramp (b): a hardened/H4 (lights-out) answers doc carrying a
+    # minimal reversible ship action loads and exposes cfg["_ship"] -> the ship
+    # phase is reachable from init at the fully-unattended tier.
+    ship = {"actions": [
+        {"name": "publish-artifact", "run": ["/bin/true"], "reversible": True,
+         "timeout_s": 60},
+    ]}
+    answers = _kv_answers(
+        tmp_path, assurance="hardened", intervention_mode="H4",
+        builder_adapter=sys.executable,  # hardened requires an absolute existing adapter
+        options={"candidate_network": "deny", "ship": ship})
+    cfg = df_init.build_config(answers)
+    loaded = _load_cfg(tmp_path, cfg)
+    assert loaded["_ship"] is not None
+    assert loaded["_ship"]["actions"][0]["name"] == "publish-artifact"
+    # and candidate egress still confined at the strongest unattended tier
+    import supervisor
+    assert supervisor._candidate_egress_qualified(loaded["candidate_network"]) is True
 
 
 # --- build_behaviors ---------------------------------------------------------

@@ -1,6 +1,6 @@
 ---
 name: dark-factory
-description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified), `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified), `hardened` (builder runs in a Docker container with the control root never mounted — denial by construction, probe-verified — and unlocks fully unattended L5/autonomy-5 runs), and `enterprise` (hardened + kernel-locked egress + seccomp + K-of-N split-custody sign-off — the strongest tier). Per-iteration human checkpoints (pause/resume) at autonomy 4.
+description: Use when the user wants to build a task/feature "dark-factory style" — the human writes a spec, an isolated builder agent implements it WITHOUT ever seeing the hidden acceptance scenarios, a verifier runs those scenarios, and only behavior-ID + failure-taxonomy feedback crosses back until convergence. Triggers on "dark factory", "dark-factory", "hidden tests", "holdout scenarios", "build without seeing the tests", or requests to prevent an AI builder from teaching to the test. Tiers: `cooperative` (honor-system, unqualified), `standard` (OS read-denial sandbox — macOS/Linux — probe-verified and qualified), `hardened` (builder runs in a Docker container with the control root never mounted — denial by construction, probe-verified — and unlocks the fully-unattended H4 lights-out intervention mode), and `enterprise` (hardened + kernel-locked egress + seccomp + K-of-N split-custody sign-off — the strongest tier). The human-intervention axis is a single `intervention_mode` (M36a) with four modes — H1 directed, H2 supervised (default), H3 guarded, H4 lights-out (hardened/enterprise only); the legacy `autonomy`/`checkpoint` fields still map onto these via `df-migrate-config`.
 ---
 
 # dark-factory
@@ -8,15 +8,18 @@ description: Use when the user wants to build a task/feature "dark-factory style
 Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 → isolated builder (spec-only) → verifier → deterministic ID feedback → loop →
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
-(Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock **L5** (`autonomy: 5`, fully unattended/lights-off — spec §2.2).
+(Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — no single operator can ship; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock the fully-unattended **H4 `lights_out`** intervention mode (legacy `autonomy: 5` — spec §2.2).
 
 **Two independent axes, not one.** Assurance tier (isolation strength:
-cooperative/standard/hardened/enterprise) and autonomy/intervention mode
-(**L4** — per-iteration human checkpoint, pause/resume; **L5** — fully
-unattended lights-off) are separate config choices. A tier does not imply
-an autonomy mode: every tier defaults to L4, and only `hardened`/`enterprise`
-may additionally opt into L5 (see below). There are four tiers and two
-autonomy modes — not "four levels" of anything single-dimensional.
+cooperative/standard/hardened/enterprise) and the human-intervention mode
+(`intervention_mode`, M36a: **H1** directed / **H2** supervised / **H3**
+guarded / **H4** lights-out) are separate config choices. A tier does not
+imply an intervention mode: every tier defaults to **H2** (supervised), and
+only `hardened`/`enterprise` may select **H4** (lights-out, see below). There
+are four tiers and four intervention modes — not "four levels" of anything
+single-dimensional. (The legacy `autonomy`/`checkpoint` pair still works and
+maps onto these modes — see `references/modes.md` and `df-migrate-config` —
+but `intervention_mode` is the primary model.)
 
 **Intervention mode (M36a).** The autonomy axis is now expressed as a single
 `intervention_mode` naming *which transitions pause* — pick ONE (default **H2**):
@@ -69,10 +72,13 @@ root to fail confusingly later.
 - **Honest scope:** `init` validates STRUCTURE — it cannot judge whether
   your scenarios truly capture what you meant by the spec (that's still
   your call — review the generated `scenarios/*.json` before trusting
-  them), it does not auto-generate scenarios from spec text, and it never
-  runs a build (it prints the `run` command instead). See
-  `references/authoring.md` for the full interview and scenario-writing
-  guidance.
+  them). `init` **itself** never auto-generates scenarios from spec text —
+  it scaffolds only the scenarios you supply in `answers` — and it never runs
+  a build (it prints the `run` command instead). (The SEPARATE
+  `author-scenarios` step CAN generate the hidden scenarios with an agent — a
+  different-model author, optionally plus an independent critic — see the next
+  bullet and `references/authoring.md`.) See `references/authoring.md` for the
+  full interview and scenario-writing guidance.
 - **Offer agent-authored scenarios (M40).** If the user doesn't want to hand-
   write the hidden scenarios, an **agent** can — with the same barrier. The
   human still owns `spec.md` + `behaviors.json`; the agent (a **different
@@ -249,7 +255,8 @@ unchanged below.
      `"2g"`) and `hardened.pids` (default `256`). `hardened` also forces
      `audit.signing: true` by default (an explicit `false` is rejected) and requires
      `roles.builder.adapter` to be an absolute path to an existing file outside the
-     control root (its directory is bind-mounted read-only into the container). See
+     control root (RA-07/M46: the resolved adapter FILE — not its directory — is
+     bind-mounted read-only into the container). See
      `references/hardened.md` for the full model — what it adds over `standard`, the TCB
      growth (the Docker daemon), image/credential/network honesty, and the deferred list
      (credential broker, egress allowlists, off-box audit).
@@ -266,11 +273,15 @@ unchanged below.
        fails closed (pip/npm's own offline behavior). npm CLI is needed on the
        operator's host at provisioning time only. See `references/hardened.md`
        ("Pinned dependency cache").
-   - **L5 (`autonomy: 5`, lights-off).** Requires `assurance: "hardened"` — any other
-     tier with `autonomy: 5` is rejected at config load. At hardened + L5, `checkpoint`
-     defaults to `auto`: the loop runs unattended to convergence/cap/failure in one CLI
-     call, with no per-iteration pause (a budget cap can still pause — that's a separate,
-     financial safety rail, see `references/budget.md`).
+   - **H4 `lights_out` (fully unattended; legacy `autonomy: 5`).** Requires
+     `assurance: "hardened"` (or `enterprise`) — H4/`autonomy: 5` at any other tier is
+     rejected at config load. Under H4 the loop runs unattended to
+     convergence/cap/failure in one CLI call with no per-iteration pause, and any
+     human-needed condition (e.g. a budget cap) becomes a fail-closed TERMINAL
+     (`BUDGET_HALTED`, exit 3) rather than a pause. (Legacy compatibility: the pair
+     `autonomy: 5` + `checkpoint: auto` maps to H4 — same lights-out semantics,
+     including the `BUDGET_HALTED` terminal — via `df_modes.legacy_mode` /
+     `df-migrate-config`. See `references/modes.md`.)
    - **Budget (optional).** Set `budget.billing`: `"subscription"` (default — no dollar
      metering possible, so it's alert-only) or `"api"` (enforces a dollar cap via an
      estimate). For `"api"`, also set `budget.max_usd` and `budget.per_call_usd`
@@ -355,8 +366,11 @@ unchanged below.
    2 = config/build/abort error (**including a pre-build gate failure** — coverage gap
    or inert scenario; `GATE_FAILED`, no build ever ran, see
    `references/coverage-gates.md`) ·
-   **10 = paused** — either at a checkpoint (autonomy 4 / `checkpoint: pause`) or at a
-   **budget cap** (`journal` has `BUDGET_PAUSE`; fires even at `checkpoint: auto`).
+   **10 = paused** — either at an intervention checkpoint (a mode that pauses: H1
+   directed, H2 supervised, or H3 guarded — legacy `checkpoint: pause`/autonomy 4) or
+   at a **budget cap** (`journal` has `BUDGET_PAUSE`; fires under H1–H3 even in the
+   run-through H3/`checkpoint: auto` mode). Under **H4 lights-out** the loop never
+   returns paused — a budget cap is the `BUDGET_HALTED` terminal (exit 3) instead.
 6. **At a checkpoint (exit 10).** Show the user `runs/<id>/checkpoint_iter_N.md` (per-behavior
    pass/fail — no scenario text). Then, on their decision, run:
    - **continue** → `supervisor.py resume --control-root <cr> --decision continue`
@@ -469,7 +483,7 @@ holdout scenarios in a session that will also drive the builder.
 - `references/audit.md` — manifest signing, the hash chain (`verify-chain`), off-box sink (`http-append`/`s3-objectlock`), the honest trust-domain limits of each, the single-SM `qualification` field + codes, the phase-aware hash-chained FSM checkpoint (M5a, M13, M36a), and the ship-phase sidecars/outcomes (M41)
 - `references/ship.md` — the governed post-seal ship phase (M41): the `ship` action schema + validation, the reversibility gate, the `df-release` signed-approval workflow for irreversible actions, crash-safety (reserve-before + `SHIP_UNKNOWN_OUTCOME`), rollback-in-reverse, the honest "real creds + network, gated by qualification+signature not sandboxing" scope, and the incident-response/prod-secret exclusions; worked configs in `examples/ship-merge-pr/` and `examples/ship-deploy-staging/`
 - `references/isolation.md` — the `standard` tier: OS read-denial sandbox, backends, probe discipline; candidate network authority (`candidate_network`: unrestricted/deny/loopback, candidate-only, live-probed) (§7.4, M27); candidate process + env containment — minimal allowlisted env (host secrets/agents/proxies scrubbed) + full process-group reap, at every tier (DF-02, M29a); default-deny candidate host isolation — `candidate_host_read`, port-pinned loopback, closed keychain/DNS Mach channels, the per-run confinement probe, and the manifest `host_isolation` field (DF-02, M29b macOS + M29c Linux bwrap mount+PID namespace; Linux `loopback`/twins deferred to M29c-2)
-- `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, L5, TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
+- `references/hardened.md` — the `hardened` tier: container barrier (denial by construction), hardening flags, the H4 lights-out mode (legacy L5), TCB growth, image/credential/network honesty, the pinned read-only dependency cache for pip/npm installs (§7.3, M26), deferred scope (M10)
 - `references/reproducibility.md` — what's reproducible/verifiable today (stdlib-only tiers, pinned `cryptography` range, content-addressed artifact binding, config/spec/scenario hashes, digest-pinnable images) vs. the honest owner/infra TODO (LICENSE, CI, hash-locked installs, default digest pinning, release SBOM/provenance)
 - `references/prevention-grade-roadmap.md` — why dark-factory's assurance is DETECTION-grade (catches tampering/misbehavior/accidents after the fact) rather than PREVENTION-grade against a hostile same-OS-user process, and the concrete off-host infrastructure a future project would need to close that gap
 - `references/orchestrator-lockdown.md` — enforcing a skill/tool allowlist on the ORCHESTRATOR session (spec §3B): why the skill can't self-sandbox, the harness-layer recipe (session allow/deny, strict MCP, a PreToolUse hook, OS containment), and how to probe it holds

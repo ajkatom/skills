@@ -25,7 +25,11 @@ The `answers` contract (single source of truth for `init`):
                          "timeout_s": int?}, ...]}, ...
       ],
       "options": {"security_gates": {...}?, "twins": {...}?,
-                  "budget": {...}?, "knowledge_base": {...}?},
+                  "budget": {...}?, "knowledge_base": {...}?,
+                  "candidate_network": str?, "ship": {...}?},
+      # ^ options is a CLOSED set: any other key raises InitError (fail-closed
+      #   on typos). Each key is forwarded raw to df_config.load_config, which
+      #   remains the single validator of its shape.
       "force": bool?,
     }
 """
@@ -482,9 +486,37 @@ def build_config(answers: dict) -> dict:
         raise InitError("answers.options must be an object")
     if "budget" in options:
         cfg["budget"] = {"billing": "subscription", **options["budget"]}
-    for key in ("security_gates", "twins", "knowledge_base"):
+    # DF-R3-01: forward EVERY optional engine key the config validator knows
+    # about. `candidate_network` and `ship` were previously dropped here, so a
+    # standard+ control root scaffolded through the canonical `init` on-ramp
+    # silently defaulted `candidate_network` to "unrestricted" (df_config's
+    # default) -> sealed CANDIDATE_EGRESS_OPEN -> could never qualify, and lost
+    # any `ship` block -> the post-seal ship phase was unreachable from `init`.
+    # Pure pass-through: df_config.load_config stays the SINGLE validator of
+    # each key's shape (mode enum, tier gate, twin-conflict for
+    # candidate_network; action reversibility/path-hygiene for ship) exactly as
+    # security_gates/twins are forwarded raw today -- init MUST NOT reimplement
+    # or partially re-validate that shape here (double-validation drift risk).
+    for key in ("security_gates", "twins", "knowledge_base",
+                "candidate_network", "ship"):
         if key in options:
             cfg[key] = options[key]
+    # DF-R3-01: fail CLOSED on unknown `options` keys. Silent-drop is precisely
+    # what hid the candidate_network/ship gap above: a typo (`candidate_network`)
+    # or an option this init predates would vanish without a trace and the
+    # operator would ship a subtly-wrong control root. Reject any leftover key,
+    # naming both the offender(s) and the allowed set so the fix is obvious.
+    _allowed_options = {
+        "budget", "security_gates", "twins", "knowledge_base",
+        "candidate_network", "ship",
+    }
+    unknown = sorted(set(options) - _allowed_options)
+    if unknown:
+        raise InitError(
+            "answers.options has unknown key(s): "
+            f"{', '.join(unknown)}; allowed keys are "
+            f"{', '.join(sorted(_allowed_options))}"
+        )
 
     if assurance == "enterprise":
         missing = _missing_enterprise_inputs(answers)
