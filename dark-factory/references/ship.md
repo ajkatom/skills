@@ -60,6 +60,16 @@ If ANY action is `reversible: false`:
   (mirrors the M33a waiver / M36b resume-override rules). An explicit
   `audit.signing: false` is a hard rejection.
 
+> **`reversible: true` is an operator-asserted, UNVERIFIED classification.** The
+> system CANNOT verify that an action is actually reversible — it trusts the
+> boolean you write. A production-impacting action mis-classified `reversible:
+> true` bypasses the signed-release-approval gate entirely (M49 DF-R3-06). The
+> real authority for what may run unattended is therefore the **signed release
+> approval's covered action set** (`action_names` in the claim), not the
+> `reversible` flag: treat the approval cover-list as the allow-list of what runs,
+> and classify conservatively. dark-factory records but does NOT pin the external
+> toolchain (see the audit-trail note under invariant #7).
+
 ## Hard safety invariants
 
 1. **Ship only a qualified artifact.** The ship phase runs ONLY when the run is
@@ -91,6 +101,41 @@ If ANY action is `reversible: false`:
    subprocess env (resolved host-side, at action time, by `df_creds`); captured
    stdout/stderr are routed through the run's Redactor before hitting disk. A
    value never enters config, the journal, the manifest, or a captured log.
+7. **Off-box audit integrity, fail-closed (M49).** When `audit.sink.required` is
+   set, a SHIPPED ship whose REQUIRED off-box sink push FAILS does NOT report a
+   clean exit-0: it seals the DISTINCT outcome **`SHIPPED_AUDIT_PENDING`** and
+   returns the distinct exit **12** (`SHIP_AUDIT_PENDING`) — the real-world
+   actions ARE done (they are NEVER re-run), but the mandated off-box evidence is
+   not yet anchored, so automation must not read success. Re-running `ship`
+   performs an **idempotent audit-only retry**: it re-anchors ONLY the off-box
+   evidence for the existing sealed record (never the actions) and, on success,
+   writes a bound `ship_sink_receipt.json` and finalizes `SHIPPED`/exit 0. A
+   SHIPPED record under a required sink with no bound receipt is likewise treated
+   as not-yet-fully-shipped, never a silent success. **Re-entry authenticates
+   local state (DF-R3-03):** when signing is on, a prior `ship_result.json` is
+   trusted on re-entry ONLY if a signature-valid audit-chain entry anchors its
+   digest, and each already-completed action recovered from the ship journal
+   (`already_done`) is trusted ONLY if its own **per-action completion token** is
+   individually anchored in the signed chain. That token is anchored as the action
+   commits — BEFORE its `SHIP_ACTION_RESULT` is journaled — so an honest
+   crash-before-seal recovery (and the `--decision reconcile` path) still
+   authenticates every action that really ran, while a planted/edited
+   `SHIP_ACTION_RESULT ok` (to skip a real action) or a planted terminal result is
+   **refused** (exit 2, `SHIP_STATE_UNAUTHENTICATED`). Per-action anchoring is
+   deliberate: a single seal-time journal digest could not tell a legitimate
+   crash-before-first-seal (no anchor yet) from a tampered journal (both look
+   anchor-less), and would brick crash recovery. Fail-closed on any chain
+   read/verify error (and a signed run NEVER appends an unsigned chain entry when
+   its key is unavailable — that would break the whole control-root chain). When
+   signing is OFF this authentication is detection-grade best-effort only — but
+   irreversible / production actions already REQUIRE hardened/enterprise + a signed
+   release approval, so the high-stakes path is always on the authenticated branch.
+   **Toolchain identity (DF-R3-06):** each action's resolved `run[0]` identity
+   (`argv0`, resolved path, and a sha256 when it is a regular readable file) is
+   recorded in the ship record for the audit trail. This does NOT pin or seal the
+   external tool — it stays operator-controlled — it only records WHAT ran. The
+   fresh workspace materialized from the sealed bytes is removed on every exit
+   path (no sealed-artifact copy is left in temp).
 
 `qualified` is **NOT re-opened by shipping.** The immutable `manifest.json` is
 never rewritten; the ship outcome lives in a SEPARATE `ship_result.json`
@@ -131,9 +176,17 @@ or a config/manifest that has drifted, flips the action back to gated.
   M36b before-ship human pause in H1/H2).
 - **As a deliberate step:** `supervisor.py ship <control_root> --run-dir <run_dir>`
   runs/resumes the ship phase against a qualified run (the ONLY path for
-  enterprise, and the resume path after `SHIP_APPROVAL_PENDING` or
-  `SHIP_UNKNOWN_OUTCOME`). `--decision reconcile|abort` handles the unknown-outcome
-  path.
+  enterprise, and the resume path after `SHIP_APPROVAL_PENDING`,
+  `SHIP_UNKNOWN_OUTCOME`, or `SHIPPED_AUDIT_PENDING`). `--decision reconcile|abort`
+  handles the unknown-outcome path; a plain re-`ship` on a `SHIPPED_AUDIT_PENDING`
+  run runs the idempotent audit-only retry (invariant #7 — actions are never
+  re-run).
+
+Ship exit codes: `0` SHIPPED · `3` SHIP_FAILED / SHIP_APPROVAL_PENDING · `11`
+SHIP_UNKNOWN_OUTCOME (needs `--decision reconcile`) · `12` SHIP_AUDIT_PENDING
+(SHIPPED but the required off-box evidence is not yet anchored — retry) · `2`
+fail-closed refusal (including `SHIP_STATE_UNAUTHENTICATED`, a planted/tampered
+local ship state under a signed run).
 
 ## Honest scope — NOT sandboxed
 
@@ -150,12 +203,23 @@ trail**, NOT confinement.
 - **Provisioning/rotating production SECRET VALUES** — broker-name references
   only (`creds.env`); a value never lives in config/logs/manifest.
 - A DSL for deploy topologies — actions are plain operator argv.
+- **Reversibility verification and toolchain pinning** — `reversible` is an
+  operator assertion the system trusts but cannot check, and the external tool
+  (`run[0]`) is identity-recorded (invariant #7) but NOT pinned or made immutable.
+  The signed-release-approval cover-list is the authority for what runs unattended.
 
 ## Residual (detection-grade, not prevention-grade)
 
 A same-user actor with control-root write AND a signer private key can mint and
 attach a release, and could in principle edit `config.json`'s `ship.approval`.
 Forcing a non-empty policy to ride a SIGNED audit manifest HMAC-pins the sealed
-config; the nonce ledger + distinct-signer counting bound WHO and HOW-OFTEN.
+config; the nonce ledger + distinct-signer counting bound WHO and HOW-OFTEN. The
+M49 re-entry authentication (invariant #7) closes the *unauthenticated* local
+ship-state trust: under a signed run a planted `ship_result.json` or a post-seal
+journal edit is detected against the signed chain and refused. It rests on the
+SAME root of trust as the rest of the design — the audit HMAC key (held outside
+`workspace_root`); a same-user actor who also holds THAT key remains in the
+documented same-user residual (they could forge chain entries too), and when
+signing is OFF the local-state authentication is detection-grade best-effort only.
 This is the same same-user residual documented for custody/waiver/override — see
 `references/prevention-grade-roadmap.md`.
