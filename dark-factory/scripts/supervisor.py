@@ -947,16 +947,26 @@ def _notify_budget(cfg, journal, redactor, invocation, trigger, estimated_usd,
         journal.write("NOTIFY_FAILED", event=trigger, reason=reason)
 
 
-def _confine_manifest_field(confine_cfg, cli):
+def _confine_manifest_field(confine_cfg, cli, adapter_path=None, expected_sha256=None):
     """builder_confinement manifest field (M14) for the CURRENT confine
     state. `confine_cfg["enabled"]` reflects whether confinement is
     ACTUALLY being applied to the builder for this manifest -- it can
     differ from the configured value after a `required: false`
     CONFINEMENT_WARN fallback flips it to False mid-run (never claim a
     profile's properties were applied when they weren't). `mcp_disabled`/
-    `tool_allowlist` come from `df_confine.profile_for(cli)` only when
+    `tool_allowlist` come from `df_confine.profile_for(cli, ...)` only when
     enabled; `probe` is `"unverified"` when enabled (M17 wires a real
     startup probe) or `"n/a"` when not.
+
+    DF-R3-05 (M50): `adapter_path` + `expected_sha256` (the builder adapter's
+    resolved path + its optional M47 `adapter_sha256`) are threaded into
+    `profile_for` so the STRUCTURAL api_* profiles' `supported: True` is bound
+    to a trusted adapter IDENTITY, not the bare basename. If confinement is
+    enabled but the resolved profile is an UNSUPPORTED structural one (an
+    impostor renamed `api_anthropic`, or a relocated copy with no digest pin),
+    the field HONESTLY records that the no-tool-surface claim was NOT granted
+    (`mcp_disabled: False`, empty `tool_allowlist`, `probe: "unsupported"`) —
+    never a false structural claim earned by name alone.
     """
     if not confine_cfg["enabled"]:
         return {
@@ -966,7 +976,17 @@ def _confine_manifest_field(confine_cfg, cli):
             "tool_allowlist": [],
             "probe": "n/a",
         }
-    profile = df_confine.profile_for(cli)
+    profile = df_confine.profile_for(cli, adapter_path, expected_sha256)
+    if profile.get("structural") and not profile.get("supported"):
+        # DF-R3-05 fail-closed: a structural profile whose adapter identity did
+        # not match the shipped adapter (nor a pinned digest). Claim nothing.
+        return {
+            "enabled": True,
+            "profile": confine_cfg["profile"],
+            "mcp_disabled": False,
+            "tool_allowlist": [],
+            "probe": "unsupported",
+        }
     return {
         "enabled": True,
         "profile": confine_cfg["profile"],
@@ -3954,8 +3974,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # config-load time (cfg["_confine"] + the adapter's cli basename),
         # no "unknown" placeholder needed; a required+unsupported refusal or
         # a not-required WARN fallback overrides it later via mb_clean once
-        # the builder is actually invoked (_run_loop).
-        "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
+        # the builder is actually invoked (_run_loop). DF-R3-05: pass the
+        # resolved builder adapter path + its optional pinned digest so a
+        # structural api_* claim is bound to the shipped-adapter identity.
+        "builder_confinement": _confine_manifest_field(
+            cfg["_confine"], cli, adapter, cfg["_adapter_digests"]["builder"]),
         # Additive (M17 Task 3): seeded None here — like `credentials`/`mode`/
         # `builder_confinement` — so EVERY terminal manifest carries
         # custody/proxy/enterprise_egress, including every pre-build abort
@@ -3992,30 +4015,35 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # provenance.
         "lineage": fork_seed if fork_seed else None,
         # Additive (M40): if the hidden scenarios were written by an AGENT
-        # author (roles.author configured), record WHICH independent model and
-        # whether the different-model guarantee was waived -- so an audit shows
-        # the scenarios were agent-written, by which adapter, and (fail-open on
-        # snooping only under an explicit ack) the same_model_ack. None for a
-        # human-authored control root (no roles.author) -- byte-identical to
-        # pre-M40 on every terminal manifest, including the pre-build aborts.
-        # Config-known, so seeded here alongside credentials/mode/custody.
+        # author (roles.author configured), record WHICH independent adapter and
+        # whether the distinct-adapter-identity guarantee was waived -- so an
+        # audit shows the scenarios were agent-written, by which adapter, and
+        # (fail-open on snooping only under an explicit ack) the same_model_ack.
+        # None for a human-authored control root (no roles.author) -- byte-
+        # identical to pre-M40 on every terminal manifest, including pre-build
+        # aborts. Config-known, so seeded here alongside credentials/mode/custody.
+        # DF-R3-04 (M50): `model_identity` (or None) is the operator-ASSERTED,
+        # NOT system-verified model string, sealed VERBATIM for an auditor.
         "authored_by": (
             {"adapter": cfg["_author"]["adapter"],
              "adapter_sha256": (sha256_file(cfg["_author"]["adapter"])
                                 if os.path.exists(cfg["_author"]["adapter"]) else None),
-             "same_model_ack": cfg["_author"]["same_model_ack"]}
+             "same_model_ack": cfg["_author"]["same_model_ack"],
+             "model_identity": cfg["_author"]["model_identity"]}
             if cfg.get("_author") else None
         ),
         # Additive (M42): the decorrelated CRITIC role (or None), sealed exactly
-        # like authored_by -- which independent model reviewed the authored
-        # scenarios and whether the two model-distinctness inequalities were
-        # waived. None for a control root with no roles.critic (byte-identical
-        # to pre-M42 on every terminal manifest).
+        # like authored_by -- which independent adapter reviewed the authored
+        # scenarios and whether the two distinct-adapter-identity inequalities
+        # were waived. None for a control root with no roles.critic (byte-
+        # identical to pre-M42 on every terminal manifest). DF-R3-04 (M50):
+        # `model_identity` is operator-ASSERTED, not system-verified.
         "critic": (
             {"adapter": cfg["_critic"]["adapter"],
              "adapter_sha256": (sha256_file(cfg["_critic"]["adapter"])
                                 if os.path.exists(cfg["_critic"]["adapter"]) else None),
-             "same_model_ack": cfg["_critic"]["same_model_ack"]}
+             "same_model_ack": cfg["_critic"]["same_model_ack"],
+             "model_identity": cfg["_critic"]["model_identity"]}
             if cfg.get("_critic") else None
         ),
     }
@@ -5346,7 +5374,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # unsupported CLI — the result is deterministic).
                     journal.write("CONFINEMENT_WARN", iteration=i, detail=resp.get("detail", ""))
                     confine_state["enabled"] = False
-                    mb_clean["builder_confinement"] = _confine_manifest_field(confine_state, cli)
+                    mb_clean["builder_confinement"] = _confine_manifest_field(
+                        confine_state, cli, adapter, cfg["_adapter_digests"]["builder"])
                     resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
                                                **_invoke_kwargs)
 
@@ -5983,7 +6012,9 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
             # being re-probed on every resume rather than trusted across a
             # pause. Deterministic (same adapter => same unsupported result),
             # so this just re-derives the same WARN, never silently skips it.
-            "builder_confinement": _confine_manifest_field(cfg["_confine"], cli),
+            # DF-R3-05: same identity binding as the fresh-run path.
+            "builder_confinement": _confine_manifest_field(
+                cfg["_confine"], cli, adapter, cfg["_adapter_digests"]["builder"]),
             # Additive (M17 Task 3), same "fresh + resume" threading as
             # `credentials`/`builder_confinement`: None here, overridden only
             # by _run_loop's CONVERGED branch when the effective tier is
@@ -6004,15 +6035,18 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                 {"adapter": cfg["_author"]["adapter"],
                  "adapter_sha256": (sha256_file(cfg["_author"]["adapter"])
                                     if os.path.exists(cfg["_author"]["adapter"]) else None),
-                 "same_model_ack": cfg["_author"]["same_model_ack"]}
+                 "same_model_ack": cfg["_author"]["same_model_ack"],
+                 "model_identity": cfg["_author"]["model_identity"]}
                 if cfg.get("_author") else None
             ),
             # Additive (M42): same fresh+resume threading as authored_by.
+            # DF-R3-04 (M50): model_identity sealed on resume too.
             "critic": (
                 {"adapter": cfg["_critic"]["adapter"],
                  "adapter_sha256": (sha256_file(cfg["_critic"]["adapter"])
                                     if os.path.exists(cfg["_critic"]["adapter"]) else None),
-                 "same_model_ack": cfg["_critic"]["same_model_ack"]}
+                 "same_model_ack": cfg["_critic"]["same_model_ack"],
+                 "model_identity": cfg["_critic"]["model_identity"]}
                 if cfg.get("_critic") else None
             ),
         }

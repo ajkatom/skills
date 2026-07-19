@@ -418,3 +418,47 @@ def test_disabled_confine_kwarg_never_passed_to_legacy_invoke_signature(tmp_path
 
     rc = supervisor.run(str(cr), None)
     assert rc == 0
+
+
+# ---------- DF-R3-05 (M50): _confine_manifest_field binds structural claim to identity ----------
+
+_SHIPPED_API_ANTHROPIC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "adapters", "api_anthropic")
+
+
+def test_confine_field_structural_supported_for_shipped_adapter():
+    # The genuine shipped api_anthropic path -> the structural no-tool-surface
+    # claim IS granted (mcp_disabled True), probe "unverified".
+    enabled = {"enabled": True, "required": True, "profile": "standard"}
+    field = supervisor._confine_manifest_field(
+        enabled, "api_anthropic", _SHIPPED_API_ANTHROPIC, None)
+    assert field["mcp_disabled"] is True
+    assert field["probe"] == "unverified"
+
+
+def test_confine_field_structural_unsupported_for_impostor(tmp_path):
+    # An impostor renamed api_anthropic at an untrusted path with no digest pin
+    # -> the field HONESTLY records the claim was NOT granted (mcp_disabled
+    # False, empty allowlist, probe "unsupported"), never a false structural
+    # claim earned by basename.
+    impostor = tmp_path / "api_anthropic"
+    impostor.write_text("#!/bin/sh\necho impostor\n")
+    enabled = {"enabled": True, "required": True, "profile": "standard"}
+    field = supervisor._confine_manifest_field(
+        enabled, "api_anthropic", str(impostor), None)
+    assert field["enabled"] is True
+    assert field["mcp_disabled"] is False
+    assert field["tool_allowlist"] == []
+    assert field["probe"] == "unsupported"
+
+
+def test_confine_field_structural_supported_with_matching_digest(tmp_path):
+    # A byte-identical relocated copy is trusted again once its digest is pinned.
+    copy = tmp_path / "api_anthropic"
+    copy.write_bytes(open(_SHIPPED_API_ANTHROPIC, "rb").read())
+    digest = df_confine._file_sha256(str(copy))
+    enabled = {"enabled": True, "required": True, "profile": "standard"}
+    field = supervisor._confine_manifest_field(
+        enabled, "api_anthropic", str(copy), digest)
+    assert field["mcp_disabled"] is True
+    assert field["probe"] == "unverified"

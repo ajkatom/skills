@@ -362,3 +362,85 @@ def test_api_openai_probe_confinement_structural_pass_without_spawning():
         "api_openai", "/nonexistent/workdir", runner=fake_runner)
     assert ok is True
     assert "structural" in reason.lower()
+
+
+# ---------- DF-R3-05 (M50): structural profile bound to a TRUSTED adapter identity ----------
+#
+# The structural `supported: True` claim for api_anthropic/api_openai is a
+# property of THIS skill's shipped adapter CODE, not of any executable that
+# merely shares the basename. profile_for now binds it to a trusted identity
+# (the shipped adapter's realpath, OR a pinned content digest) when the caller
+# supplies the resolved adapter path. Back-compat: no adapter_path -> unchanged.
+
+SHIPPED_API_ANTHROPIC = os.path.join(HERE, "..", "scripts", "adapters", "api_anthropic")
+SHIPPED_API_OPENAI = os.path.join(HERE, "..", "scripts", "adapters", "api_openai")
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@pytest.mark.parametrize("cli,shipped", [
+    ("api_anthropic", SHIPPED_API_ANTHROPIC),
+    ("api_openai", SHIPPED_API_OPENAI),
+])
+def test_structural_supported_for_shipped_adapter_path(cli, shipped):
+    # The genuine shipped adapter path (even via a non-normalized ../ form)
+    # realpath-resolves to the trusted identity -> supported, structural claim
+    # granted.
+    profile = df_confine.profile_for(cli, shipped)
+    assert profile["supported"] is True
+    assert profile["structural"] is True
+    assert df_confine.is_supported(cli, shipped) is True
+
+
+@pytest.mark.parametrize("cli", ["api_anthropic", "api_openai"])
+def test_structural_unsupported_for_impostor_copy_no_digest(cli, tmp_path):
+    # An unrelated executable (or a relocated copy) merely NAMED api_anthropic,
+    # at a path that is neither the shipped adapter nor a digest-pinned match ->
+    # fail-closed UNSUPPORTED, never granted the no-tool-surface claim.
+    impostor = tmp_path / cli
+    impostor.write_text("#!/bin/sh\necho not the real adapter\n")
+    profile = df_confine.profile_for(cli, str(impostor))
+    assert profile["supported"] is False
+    assert profile.get("structural") is True  # it IS a structural profile, just untrusted
+    assert "shipped adapter identity" in profile["reason"]
+    assert df_confine.is_supported(cli, str(impostor)) is False
+
+
+@pytest.mark.parametrize("cli,shipped", [
+    ("api_anthropic", SHIPPED_API_ANTHROPIC),
+    ("api_openai", SHIPPED_API_OPENAI),
+])
+def test_structural_supported_for_digest_pinned_relocated_copy(cli, shipped, tmp_path):
+    # A byte-identical relocated copy at a non-shipped path is accepted ONLY
+    # when its content digest is pinned (expected_sha256) -- the honest way to
+    # relocate the adapter and keep the structural claim.
+    copy = tmp_path / cli
+    copy.write_bytes(open(shipped, "rb").read())
+    digest = _sha256_file(str(copy))
+    assert df_confine.is_supported(cli, str(copy)) is False  # no pin -> refused
+    assert df_confine.is_supported(cli, str(copy), digest) is True  # pinned -> supported
+    # A WRONG pin is still refused (fail-closed).
+    assert df_confine.is_supported(cli, str(copy), "0" * 64) is False
+
+
+@pytest.mark.parametrize("cli", ["api_anthropic", "api_openai"])
+def test_structural_back_compat_no_adapter_path_unchanged(cli):
+    # Byte-identical to pre-M50: no adapter_path supplied -> the exact PROFILES
+    # object, supported True.
+    assert df_confine.profile_for(cli) is df_confine.PROFILES[cli]
+    assert df_confine.is_supported(cli) is True
+
+
+def test_non_structural_profile_ignores_adapter_path(tmp_path):
+    # claude's support is probe-based, not identity-based: an arbitrary
+    # adapter_path must NOT downgrade it (the identity binding is structural-
+    # only).
+    assert df_confine.profile_for("claude", str(tmp_path / "whatever")) is df_confine.PROFILES["claude"]
+    assert df_confine.is_supported("claude", "/some/other/path") is True

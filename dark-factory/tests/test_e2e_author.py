@@ -218,3 +218,26 @@ def test_author_scenarios_refuses_existing_scenarios(tmp_path):
     a2 = _cli("author-scenarios", "--control-root", str(cr))
     assert a2.returncode == 2
     assert "already has" in a2.stderr
+
+
+def test_author_model_identity_sealed_verbatim_into_manifest(tmp_path):
+    # DF-R3-04 (M50): an operator-ASSERTED roles.author.model_identity is sealed
+    # VERBATIM into the terminal manifest's authored_by. init doesn't surface
+    # this optional field, so we patch config.json directly (author-scenarios +
+    # run both re-load config fresh) before authoring.
+    cr, p = _init(tmp_path, FAKE_AUTHOR)
+    assert p.returncode == 0, p.stderr
+
+    cfg_path = cr / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["roles"]["author"]["model_identity"] = "openai/gpt-5-codex"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    a = _cli("author-scenarios", "--control-root", str(cr))
+    assert a.returncode == 0, a.stderr
+    r = _cli("run", "--control-root", str(cr))
+    assert r.returncode == 0, r.stderr
+
+    manifest = json.loads((_run_dir(cr) / "manifest.json").read_text())
+    # Verbatim, operator-asserted (not verified) identity on the sealed manifest.
+    assert manifest["authored_by"]["model_identity"] == "openai/gpt-5-codex"

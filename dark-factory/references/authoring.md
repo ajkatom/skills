@@ -273,21 +273,35 @@ agent writes only `scenarios/*.json` (HOW to test each behavior). An agent that
 invented the spec, the behaviors, AND the tests would just grade itself, so
 this is deliberately **scenarios-only**.
 
-**The different-model requirement.** The author must resolve to a **different
-adapter path than the builder**, enforced fail-closed at config load:
-`realpath(roles.author.adapter) != realpath(roles.builder.adapter)` or the run
-refuses (symlink/relative/absolute all resolved on both sides). For the
-**fixed-model CLI adapters** (`claude`/`codex`/`gemini`) a distinct path IS a
-distinct model. For the **env-parameterized API adapters**
+**The distinct-adapter-identity requirement.** The author must resolve to a
+**different adapter path than the builder**, enforced fail-closed at config
+load: `realpath(roles.author.adapter) != realpath(roles.builder.adapter)` or the
+run refuses (symlink/relative/absolute all resolved on both sides). This gate is
+a distinct **resolved path**, NOT a proven different *model*. For the
+**fixed-model CLI adapters** (`claude`/`codex`/`gemini`) a distinct path is (in
+practice) a distinct model. For the **env-parameterized API adapters**
 (`api_anthropic`/`api_openai`) the path check alone does NOT guarantee distinct
 models: two different adapter files (or the same file used for both roles) can
 be pointed at the *same* backing model via `DF_API_MODEL` / the base-URL env —
-the realpath check cannot see that, so **the operator is responsible for not
-aiming the author and builder at the same model** when using the API adapters.
-The same adapter file for both roles is refused outright unless you set
-`roles.author.allow_same_model_ack: true` (which records the weaker guarantee
-in the manifest's `authored_by.same_model_ack`). Rationale: an agent grading
-its own model's build is not an independent check.
+the realpath check cannot see that. The same adapter file for both roles is
+refused outright unless you set `roles.author.allow_same_model_ack: true` (which
+records the weaker guarantee in the manifest's `authored_by.same_model_ack`).
+Rationale: an agent grading its own model's build is not an independent check.
+
+To get a stronger guarantee than "distinct path":
+
+- **Content-level (verified).** Pin `adapter_sha256` on **both** roles. Identical
+  bytes = the same adapter = the same model, so two roles pinning the SAME
+  digest is a `ConfigError` (M50, DF-R3-04) — unless that pair's
+  `allow_same_model_ack`. This is the way to *prove* distinct adapter content
+  even when two copies live at different paths.
+- **Operator-asserted (not verified).** Set `roles.author.model_identity` /
+  `roles.builder.model_identity` (free-form strings, e.g.
+  `"anthropic/claude-opus-4"` vs `"openai/gpt-5-codex"`). Two must-differ roles
+  asserting the SAME value → `ConfigError`. Sealed verbatim into
+  `authored_by.model_identity` for an auditor. This is an **operator assertion**,
+  never system-verified — dark-factory cannot prove which model a black-box API
+  key actually reaches.
 
 **The workflow — init → author-scenarios → review → run:**
 

@@ -205,6 +205,27 @@ def _validate_adapter_sha256(role_raw, role_label):
     return expected.lower()
 
 
+def _validate_model_identity(role_raw, role_label):
+    """DF-R3-04 (M50): an OPTIONAL free-form `model_identity` string a role may
+    carry (e.g. "anthropic/claude-opus-4"). It is sealed VERBATIM into the
+    manifest role field and, when two roles that MUST differ both assert the
+    SAME value, refused as a same-model config (see the cross-role check in
+    load_config). This identity is operator-ASSERTED, NOT system-verified —
+    dark-factory cannot prove which model a black-box API key actually reaches,
+    so the manifest/docs label it asserted rather than a verified guarantee.
+    Absent -> None -> byte-identical to pre-M50 (no assertion, no check)."""
+    if "model_identity" not in role_raw:
+        return None
+    val = role_raw["model_identity"]
+    # Non-empty string only; kept VERBATIM (not stripped) for the seal so the
+    # manifest records exactly what the operator asserted.
+    if not isinstance(val, str) or not val.strip():
+        raise ConfigError(
+            f"roles.{role_label}.model_identity must be a non-empty string "
+            "(an operator-asserted model identity, e.g. 'anthropic/claude-opus-4')")
+    return val
+
+
 def _allowlist_entry_host(entry):
     """Read the HOST component back out of one credential_proxy.allowlist
     entry, using df_proxy's own canonical-origin parser (parse_allowlist_entry)
@@ -295,6 +316,7 @@ def load_config(control_root: str) -> dict:
                 "be mounted into the builder container)"
             )
     builder_expected_sha256 = _validate_adapter_sha256(builder, "builder")
+    builder_model_identity = _validate_model_identity(builder, "builder")
 
     # M40: optional `roles.author` -- an AGENT (a different model than the
     # builder) writes the hidden scenarios instead of a human, with the SAME
@@ -303,7 +325,15 @@ def load_config(control_root: str) -> dict:
     # mounted into any container (authoring is a discarded pre-run step, never
     # concurrent with the builder), but it gets the SAME path hygiene as the
     # builder at hardened+ so a bare command name can't silently resolve against
-    # CWD. The load-bearing gate is DIFFERENT-MODEL enforcement, fail-closed.
+    # CWD. The load-bearing gate is DISTINCT-ADAPTER-IDENTITY enforcement,
+    # fail-closed: realpath(author) != realpath(builder) (path identity), plus —
+    # when both roles pin `adapter_sha256` — a content-digest inequality (the
+    # only way to prove distinct CONTENT, hence distinct model; two identical
+    # wrapper copies at different paths pass the realpath check but collide on
+    # digest). "Different MODEL" is NOT provable for the env-parameterized api_*
+    # adapters (a black-box API key can reach any model), so an operator may
+    # additionally ASSERT `model_identity` — surfaced, never verified. See
+    # DF-R3-04 and the cross-role checks below.
     author_raw = roles.get("author")
     if author_raw is not None:
         if not isinstance(author_raw, dict):
@@ -330,14 +360,18 @@ def load_config(control_root: str) -> dict:
         allow_same_model_ack = author_raw.get("allow_same_model_ack", False)
         if not isinstance(allow_same_model_ack, bool):
             raise ConfigError("roles.author.allow_same_model_ack must be a bool")
-        # Different-model enforcement (owner's strongest-anti-snooping choice),
-        # fail-closed: realpath(author.adapter) must differ from
-        # realpath(builder.adapter). For the shipped adapters a distinct path
-        # ⇒ a distinct model; the SAME adapter (even with a different
-        # DF_API_MODEL) is a same-model case -> refuse UNLESS
-        # allow_same_model_ack explicitly records the weaker guarantee, which
-        # is then sealed into the manifest's `authored_by.same_model_ack` for
-        # an auditor to see.
+        # Distinct-adapter-IDENTITY enforcement (owner's strongest-anti-snooping
+        # choice), fail-closed: realpath(author.adapter) must differ from
+        # realpath(builder.adapter). This is a distinct RESOLVED PATH, NOT a
+        # proven "different model": two wrapper copies, or two api_* adapters
+        # aimed at the same backing model, resolve to different paths yet reach
+        # the same model. A distinct path stops the trivial same-adapter case;
+        # pin `adapter_sha256` on both roles for a real content-level guarantee
+        # (checked below), and/or assert `model_identity`. The SAME adapter file
+        # (even with a different DF_API_MODEL) is refused UNLESS
+        # allow_same_model_ack explicitly records the weaker guarantee, which is
+        # then sealed into the manifest's `authored_by.same_model_ack` for an
+        # auditor to see.
         if (os.path.realpath(os.path.expanduser(author_adapter))
                 == os.path.realpath(os.path.expanduser(adapter))):
             if not allow_same_model_ack:
@@ -353,22 +387,27 @@ def load_config(control_root: str) -> dict:
             "timeout_s": author_timeout,
             "same_model_ack": allow_same_model_ack,
             "expected_sha256": _validate_adapter_sha256(author_raw, "author"),
+            "model_identity": _validate_model_identity(author_raw, "author"),
         }
     else:
         cfg_author = None
 
     # M42 Task 4/5: optional `roles.critic` -- a SECOND, independent
-    # (different-model) agent that adversarially reviews the AUTHORED scenarios
+    # (decorrelated) agent that adversarially reviews the AUTHORED scenarios
     # before they seal. Absent -> cfg["_critic"] = None (byte-identical to pre-
     # M42; no critic loop). Same path hygiene as author at hardened+. The
-    # load-bearing gate is TWO fail-closed model-distinctness inequalities:
+    # load-bearing gate is TWO fail-closed distinct-adapter-IDENTITY
+    # inequalities on RESOLVED PATHS (a distinct path, NOT a proven different
+    # model — see the author block + DF-R3-04):
     #   realpath(critic) != realpath(builder)  -- COLLUSION (a critic must not
     #       bless scenarios its own model will build against), AND
     #   realpath(critic) != realpath(author)   -- DECORRELATION (the whole
     #       point is a second, independent mind).
     # A single `allow_same_model_ack` waives BOTH (recording the weaker
     # guarantee in the manifest's critic.same_model_ack), mirroring M40's
-    # author check exactly.
+    # author check exactly. Pin `adapter_sha256` on the roles for a content-
+    # level guarantee (cross-role digest check below) and/or assert
+    # `model_identity` (operator-asserted, not verified).
     critic_raw = roles.get("critic")
     if critic_raw is not None:
         if not isinstance(critic_raw, dict):
@@ -423,9 +462,61 @@ def load_config(control_root: str) -> dict:
             "timeout_s": critic_timeout,
             "same_model_ack": critic_ack,
             "expected_sha256": _validate_adapter_sha256(critic_raw, "critic"),
+            "model_identity": _validate_model_identity(critic_raw, "critic"),
         }
     else:
         cfg_critic = None
+
+    # DF-R3-04 (M50): the realpath inequalities above only stop the SAME adapter
+    # FILE being reused across roles; two DISTINCT wrapper copies (or two api_*
+    # adapters aimed at one model) resolve to different paths yet reach the same
+    # model. Two ADDITIVE cross-role checks close that honestly:
+    #
+    #   (1) CONTENT digest: when both roles pin the OPTIONAL M47 `adapter_sha256`,
+    #       an IDENTICAL digest is proof of byte-identical adapter CONTENT = the
+    #       same model — a real content-level collision the path check cannot
+    #       see. Refuse it (this is the way to GET a content-level distinctness
+    #       guarantee: pin the digest on every role).
+    #   (2) ASSERTED identity: when both roles set `model_identity` (operator-
+    #       ASSERTED, never system-verified) to the SAME value, the operator has
+    #       declared two roles reach the same model — refuse.
+    #
+    # Each check is waived by the SAME `allow_same_model_ack` that waives the
+    # realpath inequality for that pair (a role whose ack accepts same-model
+    # must not then be tripped by the finer-grained same-model evidence). Absent
+    # digests/identities (the default) -> nothing to compare -> byte-identical
+    # to pre-M50.
+    def _same_model_conflict(role_label, a_dig, a_id, b_label, b_dig, b_id, ack):
+        if ack:
+            return
+        if a_dig and b_dig and a_dig == b_dig:
+            raise ConfigError(
+                f"roles.{role_label}.adapter_sha256 is IDENTICAL to "
+                f"roles.{b_label}.adapter_sha256 (identical adapter content = the "
+                f"same model — not an independent check); pin distinct adapters or "
+                f"set roles.{role_label}.allow_same_model_ack: true")
+        if a_id is not None and b_id is not None and a_id == b_id:
+            raise ConfigError(
+                f"roles.{role_label}.model_identity is IDENTICAL to "
+                f"roles.{b_label}.model_identity ({a_id!r}); the operator has "
+                f"asserted these roles reach the SAME model (not an independent "
+                f"check) — assert distinct identities or set "
+                f"roles.{role_label}.allow_same_model_ack: true")
+
+    if cfg_author is not None:
+        _same_model_conflict(
+            "author", cfg_author["expected_sha256"], cfg_author["model_identity"],
+            "builder", builder_expected_sha256, builder_model_identity,
+            cfg_author["same_model_ack"])
+    if cfg_critic is not None:
+        _same_model_conflict(
+            "critic", cfg_critic["expected_sha256"], cfg_critic["model_identity"],
+            "builder", builder_expected_sha256, builder_model_identity,
+            cfg_critic["same_model_ack"])
+        _same_model_conflict(
+            "critic", cfg_critic["expected_sha256"], cfg_critic["model_identity"],
+            "author", cfg_author["expected_sha256"], cfg_author["model_identity"],
+            cfg_critic["same_model_ack"])
 
     # M42 Task 1/5: the scenario-adequacy policy (class-typed coverage + the
     # critic loop toggle) -> cfg["_adequacy"]. DEFAULTS are back-compat-first:

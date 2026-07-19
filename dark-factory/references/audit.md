@@ -477,10 +477,17 @@ reconcile|abort`, never a blind re-run).
 
 When the hidden scenarios were written by an **agent** author (a `roles.author`
 block, see `references/authoring.md`), every terminal manifest carries
-`authored_by = {adapter, adapter_sha256, same_model_ack}` — the independent
-author adapter's path + content hash, and whether the different-model guarantee
-was explicitly waived (`same_model_ack: true` means the author was allowed to
-be the SAME model as the builder, a weaker guarantee an auditor should notice).
+`authored_by = {adapter, adapter_sha256, same_model_ack, model_identity}` — the
+independent author adapter's path + content hash, and whether the
+distinct-adapter-identity guarantee was explicitly waived (`same_model_ack:
+true` means the author was allowed to be the SAME adapter/model as the builder,
+a weaker guarantee an auditor should notice). The enforced gate is a distinct
+resolved PATH, not a proven different *model*; `model_identity` (M50, DF-R3-04)
+is the operator-**ASSERTED** model string (or `null`), sealed **verbatim** —
+auditor-visible, NEVER system-verified (dark-factory cannot prove which model a
+black-box API key reaches). A content-level distinctness is provable only by
+pinning `adapter_sha256` on every role (identical digest → refused at config
+load).
 For a human-authored control root (no `roles.author`) the field is `null` —
 byte-identical to pre-M40 on every terminal, including the pre-build aborts.
 `authored_by` records only WHO wrote the scenarios, never their content; the
@@ -506,9 +513,11 @@ Every terminal that ran the M7 pre-build gate seals `adequacy` — the auditable
   `review` (read back from `authored.jsonl`'s `CRITIC_REVIEW`) is `{rounds,
   blocking_resolved, advisories}` or `null` if the critic hasn't run.
 
-A top-level `critic = {adapter, adapter_sha256, same_model_ack}` mirrors
-`authored_by` — WHICH independent model reviewed the scenarios and whether the
-two model-distinctness inequalities were waived. `null` with no `roles.critic`.
+A top-level `critic = {adapter, adapter_sha256, same_model_ack, model_identity}`
+mirrors `authored_by` — WHICH independent adapter reviewed the scenarios, the
+operator-asserted `model_identity` (or `null`), and whether the two
+distinct-adapter-identity inequalities were waived. `null` with no
+`roles.critic`.
 
 None of these records carry any scenario `then` content — mutant KINDS
 ("stdout_equals:empty") and class NAMES are category labels, barrier-safe. The

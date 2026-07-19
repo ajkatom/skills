@@ -165,3 +165,60 @@ def test_three_distinct_models_load(tmp_path):
         "critic": {"adapter": "/bin/ls"}}))
     assert cfg["_critic"]["adapter"] == "/bin/ls"
     assert cfg["_critic"]["same_model_ack"] is False
+
+
+# ---------- DF-R3-04 (M50): critic content-digest + asserted model_identity ----------
+
+_DA = "a" * 64
+_DB = "b" * 64
+_DC = "c" * 64
+
+
+def test_critic_same_digest_as_builder_refused(tmp_path):
+    with pytest.raises(df_config.ConfigError, match="IDENTICAL to roles.builder.adapter_sha256"):
+        df_config.load_config(_cfg(tmp_path, {
+            "builder": {"adapter": "/bin/echo", "adapter_sha256": _DA},
+            "author": {"adapter": "/bin/cat", "adapter_sha256": _DB},
+            "critic": {"adapter": "/bin/ls", "adapter_sha256": _DA}}))
+
+
+def test_critic_same_digest_as_author_refused(tmp_path):
+    with pytest.raises(df_config.ConfigError, match="IDENTICAL to roles.author.adapter_sha256"):
+        df_config.load_config(_cfg(tmp_path, {
+            "builder": {"adapter": "/bin/echo", "adapter_sha256": _DA},
+            "author": {"adapter": "/bin/cat", "adapter_sha256": _DB},
+            "critic": {"adapter": "/bin/ls", "adapter_sha256": _DB}}))
+
+
+def test_critic_same_digest_waived_by_ack(tmp_path):
+    cfg = df_config.load_config(_cfg(tmp_path, {
+        "builder": {"adapter": "/bin/echo", "adapter_sha256": _DA},
+        "author": {"adapter": "/bin/cat", "adapter_sha256": _DB},
+        "critic": {"adapter": "/bin/ls", "adapter_sha256": _DA,
+                   "allow_same_model_ack": True}}))
+    assert cfg["_critic"]["same_model_ack"] is True
+
+
+def test_critic_distinct_digests_load(tmp_path):
+    cfg = df_config.load_config(_cfg(tmp_path, {
+        "builder": {"adapter": "/bin/echo", "adapter_sha256": _DA},
+        "author": {"adapter": "/bin/cat", "adapter_sha256": _DB},
+        "critic": {"adapter": "/bin/ls", "adapter_sha256": _DC}}))
+    assert cfg["_critic"]["expected_sha256"] == _DC
+
+
+def test_critic_same_model_identity_as_author_refused(tmp_path):
+    with pytest.raises(df_config.ConfigError, match="model_identity is IDENTICAL"):
+        df_config.load_config(_cfg(tmp_path, {
+            "builder": {"adapter": "/bin/echo"},
+            "author": {"adapter": "/bin/cat", "model_identity": "gemini/2.5-pro"},
+            "critic": {"adapter": "/bin/ls", "model_identity": "gemini/2.5-pro"}}))
+
+
+def test_critic_distinct_model_identities_sealed(tmp_path):
+    cfg = df_config.load_config(_cfg(tmp_path, {
+        "builder": {"adapter": "/bin/echo", "model_identity": "anthropic/claude"},
+        "author": {"adapter": "/bin/cat", "model_identity": "openai/gpt-5"},
+        "critic": {"adapter": "/bin/ls", "model_identity": "gemini/2.5-pro"}}))
+    assert cfg["_critic"]["model_identity"] == "gemini/2.5-pro"
+    assert cfg["_author"]["model_identity"] == "openai/gpt-5"
