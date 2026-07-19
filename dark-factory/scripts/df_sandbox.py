@@ -124,6 +124,13 @@ RESIDUAL_DNS_OPEN = "dns_mach_ipc_open"
 RESIDUAL_METADATA = "file_metadata_outside_home"
 RESIDUAL_NET_UNRESTRICTED = "network_unrestricted_open"
 RESIDUAL_SYSTEM_DATA_OPEN = "system_data_file_open"
+# M47 RA-08(b): a HOST backend (macOS sandbox-exec; the standard-tier host path)
+# has no PID namespace, so a candidate child that deliberately setsid()s /
+# double-forks into its own session escapes the best-effort killpg reap. This is
+# named honestly as a host-isolation residual but is SOFT (does not disqualify):
+# a namespace backend (Linux --unshare-pid, hardened/enterprise container) closes
+# it by construction. See references/isolation.md, "Process containment".
+RESIDUAL_PROCESS_GROUP_ESCAPE = "process_group_escape"
 
 # Real sensitive files/dirs that live INSIDE the profile's broad system-read
 # allows but are operator secrets, not runtime code — the leaves the
@@ -264,6 +271,12 @@ class _MacOSBackend:
     # (and any test double that doesn't set this) falls back to the legacy
     # candidate wrapper and reports mode="legacy_allow_host_read" honestly.
     supports_default_deny = True
+
+    # M47 RA-08(b): sandbox-exec is a HOST backend -- no PID namespace. A
+    # candidate child that setsid()s / double-forks escapes the killpg reap;
+    # the manifest labels this "process_group_besteffort" and carries the
+    # RESIDUAL_PROCESS_GROUP_ESCAPE residual (soft) for an honest audit.
+    provides_pid_namespace = False
 
     def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
                               allowed_loopback_ports=None, scratch_dirs=()):
@@ -538,6 +551,12 @@ class _LinuxBackend:
     # construction, and `probe_candidate_confinement` live-proves it per run
     # before any scenario relies on it.
     supports_default_deny = True
+
+    # M47 RA-08(b): the candidate namespace is built with --unshare-pid, so it
+    # is a REAL PID namespace: every candidate descendant (setsid / double-fork
+    # included) is contained and reaped by construction on teardown. The
+    # manifest labels this "namespace" -- no process_group_escape residual.
+    provides_pid_namespace = True
 
     def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
                               allowed_loopback_ports=None, scratch_dirs=()):

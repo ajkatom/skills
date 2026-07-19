@@ -17,7 +17,7 @@ import sys
 import pytest
 
 import df_sandbox
-from test_supervisor import setup_control
+from test_supervisor import external_reachable, needs_network, setup_control
 from test_supervisor_twins import GREETER, _no_twin_orphans
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -219,15 +219,23 @@ def test_honest_builder_converges_with_fresh_seed_per_pass(tmp_path):
 # (c) evidence channel is write-protected (standard tier)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
+@needs_network
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="M47: a QUALIFIED twin run needs candidate_network=loopback "
+                           "(macOS sandbox-exec path)")
 def test_evidence_channel_write_denied_at_standard_tier(tmp_path):
     b = df_sandbox.current_backend()
     if not (b and b.available()):
         pytest.skip("no OS sandbox primitive")
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
 
     cr = _twin_evidence_control(tmp_path, FAKE_TWIN_BUILDER)
     cfg = json.loads((cr / "config.json").read_text())
     cfg["assurance"] = "standard"
+    # M47 RA-08(a): confine candidate egress to QUALIFY; 'loopback' keeps twins
+    # reachable ('deny' would make them unreachable).
+    cfg["candidate_network"] = "loopback"
     (cr / "config.json").write_text(json.dumps(cfg))
 
     proc = subprocess.run(

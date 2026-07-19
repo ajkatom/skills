@@ -36,6 +36,7 @@ import re
 import df_config
 import df_custody
 import df_gates
+import df_modes
 import run_scenarios
 
 
@@ -365,17 +366,44 @@ def build_config(answers: dict) -> dict:
             f"supported: {sorted(tiers)}"
         )
 
-    autonomy = answers.get("autonomy", 4)
-    if autonomy not in (4, 5):
-        raise InitError("autonomy must be 4 or 5")
-    if autonomy == 5 and assurance not in ("hardened", "enterprise"):
-        raise InitError(
-            "autonomy 5 (lights-off) requires assurance: hardened or enterprise"
-        )
+    # M47 condition #10: the H1..H4 intervention modes (M36a) are now selectable
+    # AT INIT -- H1 (directed: approve before every rebuild AND before ship) no
+    # longer needs a hand-edit. `answers.intervention_mode` accepts H1..H4 or the
+    # human aliases (directed/supervised/guarded/lights_out). It is MUTUALLY
+    # EXCLUSIVE with the legacy autonomy/checkpoint pair (mirrors df_config's own
+    # dual-field rejection): setting both is an operator error a machine can't
+    # disambiguate. When intervention_mode is set the scaffold writes ONLY that
+    # key (so df_config's dual-field guard is satisfied); the legacy fields keep
+    # working unchanged when intervention_mode is absent.
+    intervention_mode = answers.get("intervention_mode")
+    if intervention_mode is not None:
+        if "autonomy" in answers or "checkpoint" in answers:
+            raise InitError(
+                "intervention_mode cannot be combined with legacy "
+                "autonomy/checkpoint (specify one scheme)")
+        try:
+            canonical_mode = df_modes.canonical_mode(intervention_mode)
+        except df_modes.ModeError as e:
+            raise InitError(str(e))
+        if df_modes.requires_hardened(canonical_mode) and assurance not in (
+                "hardened", "enterprise"):
+            raise InitError(
+                "intervention_mode H4 (lights-out) requires assurance: hardened "
+                "or enterprise")
+        mode_cfg = {"intervention_mode": canonical_mode}
+    else:
+        autonomy = answers.get("autonomy", 4)
+        if autonomy not in (4, 5):
+            raise InitError("autonomy must be 4 or 5")
+        if autonomy == 5 and assurance not in ("hardened", "enterprise"):
+            raise InitError(
+                "autonomy 5 (lights-off) requires assurance: hardened or enterprise"
+            )
 
-    checkpoint = answers.get("checkpoint", "auto")
-    if checkpoint not in ("pause", "auto"):
-        raise InitError("checkpoint must be 'pause' or 'auto'")
+        checkpoint = answers.get("checkpoint", "auto")
+        if checkpoint not in ("pause", "auto"):
+            raise InitError("checkpoint must be 'pause' or 'auto'")
+        mode_cfg = {"autonomy": autonomy, "checkpoint": checkpoint}
 
     max_iterations = answers.get("max_iterations", 8)
     if (
@@ -392,8 +420,7 @@ def build_config(answers: dict) -> dict:
     cfg = {
         "config_version": "0.1",
         "feedback": "ids",
-        "autonomy": autonomy,
-        "checkpoint": checkpoint,
+        **mode_cfg,
         "assurance": assurance,
         "max_iterations": max_iterations,
         "workspace_root": workspace_root,

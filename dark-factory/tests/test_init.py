@@ -137,6 +137,58 @@ def test_build_config_autonomy_5_with_hardened_is_allowed(tmp_path):
     assert cfg["assurance"] == "hardened"
 
 
+# --- M47 condition #10: intervention_mode (H1..H4) selectable at init --------
+
+def test_build_config_intervention_mode_h1_scaffolds_h1(tmp_path):
+    # RED before M47 (no init selector -> H1 required a hand-edit), GREEN after:
+    # answers.intervention_mode="H1" writes H1 into the config and NO legacy
+    # autonomy/checkpoint keys (so df_config's dual-field guard is satisfied),
+    # and the scaffolded config loads with H1's pause-point set.
+    answers = _kv_answers(tmp_path, intervention_mode="H1")
+    cfg = df_init.build_config(answers)
+    assert cfg["intervention_mode"] == "H1"
+    assert "autonomy" not in cfg and "checkpoint" not in cfg
+
+    cr = tmp_path / "control"
+    cr.mkdir()
+    (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    loaded = df_config.load_config(str(cr))
+    assert loaded["intervention_mode"] == "H1"
+
+
+def test_build_config_intervention_mode_human_alias_canonicalizes(tmp_path):
+    cfg = df_init.build_config(_kv_answers(tmp_path, intervention_mode="directed"))
+    assert cfg["intervention_mode"] == "H1"
+
+
+def test_build_config_intervention_mode_plus_legacy_is_init_error(tmp_path):
+    # Mirrors df_config's dual-field rejection: specifying BOTH schemes is a
+    # hard error a machine can't disambiguate.
+    answers = _kv_answers(tmp_path, intervention_mode="H2", autonomy=4)
+    with pytest.raises(df_init.InitError, match="cannot be combined with legacy"):
+        df_init.build_config(answers)
+
+
+def test_build_config_intervention_mode_h4_requires_hardened(tmp_path):
+    with pytest.raises(df_init.InitError, match="H4"):
+        df_init.build_config(_kv_answers(tmp_path, intervention_mode="H4"))
+    cfg = df_init.build_config(
+        _kv_answers(tmp_path, intervention_mode="H4", assurance="hardened"))
+    assert cfg["intervention_mode"] == "H4"
+
+
+def test_build_config_bad_intervention_mode_is_init_error(tmp_path):
+    with pytest.raises(df_init.InitError):
+        df_init.build_config(_kv_answers(tmp_path, intervention_mode="H9"))
+
+
+def test_build_config_legacy_autonomy_checkpoint_still_works(tmp_path):
+    # Back-compat: with no intervention_mode, the legacy fields are unchanged.
+    cfg = df_init.build_config(_kv_answers(tmp_path, autonomy=4, checkpoint="pause"))
+    assert cfg["autonomy"] == 4 and cfg["checkpoint"] == "pause"
+    assert "intervention_mode" not in cfg
+
+
 def test_build_config_workspace_not_disjoint_is_init_error(tmp_path):
     cr = str(tmp_path / "control")
     answers = _kv_answers(tmp_path, control_root=cr, workspace_root=str(tmp_path / "control" / "ws"))

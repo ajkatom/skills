@@ -60,9 +60,25 @@ its network authority narrowed. `cfg["candidate_network"] == "unrestricted"`
 (the default) is a total no-op — `resolve_candidate_prefix` returns
 `exec_prefix` unchanged, byte-identical to pre-M27 behavior.
 
+**Unrestricted candidate egress is DISQUALIFYING at standard+ (M47 RA-08(a)).**
+`unrestricted` remains the config DEFAULT (so no config errors, and cooperative
+— which has no sandbox to enforce anything — is unaffected), but it is no longer
+*non-disqualifying*. A qualifying-tier run (standard/hardened/enterprise) whose
+candidate egress is left wide open ships an artifact that can reach anywhere,
+which no `COMPLETE_QUALIFIED` seal should certify. The single qualification
+state machine (`df_qualify.derive`) now folds a `candidate_egress` sub-state
+into the qualification AND: it is True iff `candidate_network ∈ {deny,
+loopback}`. An `unrestricted` candidate at a qualifying tier therefore seals the
+distinct terminal code `CANDIDATE_EGRESS_OPEN` (qualified = False) — the run
+still CONVERGES (the build succeeded), it just isn't qualified. To qualify a
+standard+ run, set `candidate_network` to `deny` (no egress needed) or
+`loopback` (digital twins on localhost stay reachable). This can only ever
+NEWLY FAIL a run, never newly pass one (the superset invariant).
+
 **Three modes** (`df_sandbox._NETWORK_MODES`):
 - `unrestricted` (default) — no restriction; candidate and builder share the
-  same network authority, exactly as before M27.
+  same network authority, exactly as before M27. At a qualifying tier this now
+  seals `CANDIDATE_EGRESS_OPEN` (unqualified) per RA-08(a) above.
 - `deny` — blocks ALL network I/O for the wrapped candidate, including
   loopback. macOS: `(deny network*)` appended to the sandbox-exec profile.
   Linux: `--unshare-net` (a fresh network namespace with no interfaces
@@ -200,12 +216,34 @@ group if anything is still alive (checked via `os.killpg(pgid, 0)`), polling
 up to 2s more for the group to actually clear. Because the PGID is captured
 once at launch and never re-resolved later via `os.getpgid(proc.pid)`, an
 already-exited direct child (e.g. a shell wrapper) can't cause a
-still-running grandchild in the same group to leak. This closes the
-`setsid`/double-fork escape: a candidate that backgrounds or detaches a child
-process to survive past its own exit is still in the same process group, and
-still gets killed. Applies identically to CLI scenarios (`run_scenario`) and
-HTTP scenarios (`_run_http_scenario`, which additionally reaps the started
-service regardless of whether it ever became ready or answered the request).
+still-running grandchild in the same group to leak. A candidate that merely
+backgrounds or detaches a child WITHIN its process group is still in that
+group and still gets killed. Applies identically to CLI scenarios
+(`run_scenario`) and HTTP scenarios (`_run_http_scenario`, which additionally
+reaps the started service regardless of whether it ever became ready or
+answered the request).
+
+**Honest residual — process-group escape on a HOST backend (M47 RA-08(b)).**
+`killpg` reaps a process *group*. A candidate that deliberately calls
+`setsid()` (or double-forks) creates its OWN new session/process group, which
+is NOT the captured PGID — so on a HOST backend (macOS `sandbox-exec`, and the
+standard-tier host path) that escaped process is not guaranteed to be reaped.
+This is a real, named residual, not a closed hole. It is fully closed only by
+a backend that gives the candidate its own **PID namespace** — Linux
+`--unshare-pid` (M29c netns) or a hardened/enterprise container — where every
+descendant, setsid'd or not, dies with the namespace by construction. The
+manifest records this honestly in the `host_isolation` block:
+
+- `process_containment: "namespace"` — a PID-namespace backend; no escape.
+- `process_containment: "process_group_besteffort"` — a host backend; the
+  reap is best-effort, and the block carries the SOFT residual
+  `process_group_escape` (soft = auditable but NON-disqualifying; it does not
+  flip `host_isolation.qualified`, which gates on host-READ containment).
+
+So a host-backend run is not silently claimed to fully contain a hostile
+candidate's descendants — an auditor sees the exact ceiling in the sealed
+manifest. Detection-grade, not prevention-grade, for this specific vector on a
+host backend; use a hardened/enterprise (or Linux netns) backend to close it.
 
 **Honest scope.** This is the env/IPC + process half of DF-02. The host-READ
 half — a candidate reading the operator's home directory, dotfiles, other

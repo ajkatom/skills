@@ -6,25 +6,32 @@ import pytest
 
 import df_sandbox
 import supervisor
-from test_supervisor import FAKE, STUBBORN, setup_control
+from test_supervisor import FAKE, STUBBORN, setup_control, stub_network_probe
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 READS_PROMPT = os.path.join(HERE, "fixtures", "fake_builder_reads_prompt")
 
 
-def _std(tmp_path, **kw):
+def _std(tmp_path, candidate_network=None, **kw):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto", **kw)
     # rewrite assurance to standard
     p = cr / "config.json"
-    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"
+    # M47 RA-08(a): a qualifying run needs a CONFINED candidate network.
+    if candidate_network is not None:
+        cfg["candidate_network"] = candidate_network
+    p.write_text(json.dumps(cfg))
     return cr
 
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
-def test_standard_run_converges_qualified_when_probe_passes(tmp_path):
+def test_standard_run_converges_qualified_when_probe_passes(tmp_path, monkeypatch):
     if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
         pytest.skip("no OS sandbox primitive")
-    cr = _std(tmp_path)
+    # M47 RA-08(a): confine candidate egress so the run can QUALIFY; stub the
+    # egress-denial probe so this stays hermetic (no external connection).
+    cr = _std(tmp_path, candidate_network="deny")
+    stub_network_probe(monkeypatch)
     assert supervisor.run(str(cr), None) == 0
     run_id = os.listdir(cr / "runs")[0]
     m = json.loads((cr / "runs" / run_id / "manifest.json").read_text())
@@ -69,13 +76,15 @@ def test_cooperative_unaffected(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
-def test_standard_resume_stays_qualified_and_reprobes(tmp_path):
+def test_standard_resume_stays_qualified_and_reprobes(tmp_path, monkeypatch):
     # DEFAULT standard flow: autonomy 4 → pause → resume finalizes. resume MUST
     # re-probe + re-wrap, else the resumed build/verify runs UNSANDBOXED and the
     # qualified claim is a lie. This pins that path.
     if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
         pytest.skip("no OS sandbox primitive")
-    cr = _std(tmp_path)                      # _std sets checkpoint="auto"...
+    # M47 RA-08(a): confine candidate egress to QUALIFY; stub the probe (hermetic).
+    cr = _std(tmp_path, candidate_network="deny")   # _std sets checkpoint="auto"...
+    stub_network_probe(monkeypatch)
     p = cr / "config.json"
     cfg = json.loads(p.read_text()); cfg["checkpoint"] = "pause"; p.write_text(json.dumps(cfg))
     assert supervisor.run(str(cr), None) == 10          # paused at iteration 1
@@ -157,12 +166,15 @@ def test_standard_cap_is_not_qualified(tmp_path):
 # once the supervisor writes the working prompt copy into the workspace.
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
-def test_standard_prompt_reading_adapter_converges_qualified(tmp_path):
+def test_standard_prompt_reading_adapter_converges_qualified(tmp_path, monkeypatch):
     if not (df_sandbox.current_backend() and df_sandbox.current_backend().available()):
         pytest.skip("no OS sandbox primitive")
     cr = setup_control(tmp_path, READS_PROMPT, checkpoint="auto")
     p = cr / "config.json"
-    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"; p.write_text(json.dumps(cfg))
+    cfg = json.loads(p.read_text()); cfg["assurance"] = "standard"
+    # M47 RA-08(a): confine candidate egress to QUALIFY; stub the probe (hermetic).
+    cfg["candidate_network"] = "deny"; p.write_text(json.dumps(cfg))
+    stub_network_probe(monkeypatch)
     rc = supervisor.run(str(cr), None)
     assert rc == 0
     run_id = os.listdir(cr / "runs")[0]

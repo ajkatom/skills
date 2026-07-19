@@ -22,6 +22,7 @@ import time
 import pytest
 
 import df_sandbox
+from test_supervisor import external_reachable, needs_network
 from test_supervisor_twins import FAKE_TWIN_BUILDER, GREETER, _no_twin_orphans, _twin_control
 
 SUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "supervisor.py")
@@ -118,16 +119,25 @@ def test_twin_run_converges_talks_to_real_twin_and_leaves_no_orphans(tmp_path):
     assert _no_twin_orphans()
 
 
-@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs a real sandbox backend")
+@needs_network
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="M47: a QUALIFIED twin run needs candidate_network=loopback "
+                           "(twins are unreachable under 'deny'); loopback is the macOS "
+                           "sandbox-exec path (bwrap has no port-pinned loopback)")
 def test_standard_tier_twin_run_converges_qualified_and_holdout_still_denied(tmp_path):
     b = df_sandbox.current_backend()
     if not (b and b.available()):
         pytest.skip("no OS sandbox primitive")
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
 
     cr = _twin_control(tmp_path, FAKE_TWIN_BUILDER)
     p = cr / "config.json"
     cfg = json.loads(p.read_text())
     cfg["assurance"] = "standard"
+    # M47 RA-08(a): confine candidate egress so the run QUALIFIES. Twins need the
+    # localhost twin reachable, so 'loopback' (not 'deny').
+    cfg["candidate_network"] = "loopback"
     p.write_text(json.dumps(cfg))
 
     proc = subprocess.run(

@@ -402,13 +402,20 @@ def test_resolve_isolation_enterprise_bad_seccomp_no_downgrade_raises(tmp_path, 
 # verify-custody is tamper-evident (a one-byte manifest edit breaks it).
 # ---------------------------------------------------------------------------
 
-def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto", sink_url=None):
+def _enterprise_control(tmp_path, approvers, threshold=2, checkpoint="auto", sink_url=None,
+                        candidate_network=None):
     cr = setup_control(tmp_path, FAKE, checkpoint=checkpoint)
     cfg = json.loads((cr / "config.json").read_text())
     overrides = _base_enterprise(approvers=approvers, threshold=threshold)
     if sink_url is not None:
         overrides["audit"] = {
             "sink": {"kind": "http-append", "url": sink_url, "required": True}}
+    # M47 RA-08(a): a run that qualifies must CONFINE candidate egress. The
+    # enterprise probes are patched (probe_candidate_confinement returns True),
+    # so "deny" here reaches no real network -- it only makes candidate_egress
+    # True so a properly-isolated enterprise run stays qualifiable.
+    if candidate_network is not None:
+        overrides["candidate_network"] = candidate_network
     cfg.update(overrides)
     (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     return cr
@@ -574,7 +581,8 @@ def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
     _priv_c, pub_c = _approver()
     approvers = [pub_a, pub_b, pub_c]
     with _sink_receiver(tmp_path) as (sink_url, _store):
-        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url,
+                                 candidate_network="deny")
         _patch_enterprise_probes(monkeypatch)
         monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
@@ -621,7 +629,8 @@ def test_enterprise_attach_appends_to_audit_chain_and_pushes_off_box(tmp_path, m
     _priv_c, pub_c = _approver()
     approvers = [pub_a, pub_b, pub_c]
     with _sink_receiver(tmp_path) as (sink_url, _store):
-        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url,
+                                 candidate_network="deny")
         _patch_enterprise_probes(monkeypatch)
         monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 

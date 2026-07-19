@@ -502,10 +502,15 @@ def _network_available() -> bool:
         return False
 
 
-NETWORK_LIVE = _network_available()
+# M47 condition #10: only probe (and thus only reach api.osv.dev) when the
+# opt-in DF_ALLOW_NETWORK_TESTS flag is set. A default `pytest` never makes this
+# external connection -- not even at collection time -- so the suite is hermetic;
+# the live OSV probes are still exercised in the opt-in/CI run.
+NETWORK_LIVE = bool(os.environ.get("DF_ALLOW_NETWORK_TESTS")) and _network_available()
 
 
-@pytest.mark.skipif(not NETWORK_LIVE, reason="network unavailable")
+@pytest.mark.skipif(not NETWORK_LIVE,
+                    reason="live external OSV probe; set DF_ALLOW_NETWORK_TESTS=1")
 def test_live_query_osv_api_jinja2_2_4_1_has_vulns():
     pkgs = [{"ecosystem": "PyPI", "name": "jinja2", "version": "2.4.1"}]
     result = query_osv_api(pkgs)

@@ -109,10 +109,17 @@ Some are always on, some optional:
   before it happens. Raising the ceiling mid-run to get past a spending halt
   also requires a **signed authorization**, not a quiet edit.
 - One clear **verdict**: a run is "qualified" only if *everything* held — the
-  builder really was walled off, the candidate couldn't read your host, the
-  record is signed, and the security gates passed (or were properly waived).
-  If any one of those falls short, it says exactly which one, instead of a
-  vague "mostly OK."
+  builder really was walled off, the candidate couldn't read your host, **the
+  built app's own network was confined** (an app left free to reach anywhere is
+  *not* qualified), the record is signed against the exact sealed artifact, and
+  the security gates passed (or were properly waived). If any one of those falls
+  short, it says exactly which one, instead of a vague "mostly OK." That verdict
+  is also **honest about its own ceiling**: the single-user control record is
+  detection-grade (it catches tampering, it doesn't out-privilege a same-user
+  attacker), and a hostile candidate that detaches a background process on a
+  host (non-container) backend is a **named residual**, not a silent claim — use
+  a container/namespace tier to close it. Full account:
+  `references/prevention-grade-roadmap.md`.
 - **Digital twins** — fake stand-ins for real external services (so a build
   that's supposed to talk to a payment processor doesn't actually need one
   during development).

@@ -188,6 +188,23 @@ def _adapter_provider(adapter_path):
     return None
 
 
+def _validate_adapter_sha256(role_raw, role_label):
+    """M47 condition #7: an OPTIONAL `adapter_sha256` on a role pins the EXACT
+    adapter file content (not just its path/basename). Validate the hex SHAPE
+    at load (a 64-char hex sha256); the supervisor computes the file's real
+    sha256 at run start and REFUSES on mismatch (fail-closed). Returns the
+    lowercased expected digest or None. Absent -> None -> today's behavior is
+    byte-identical (no pin, no check)."""
+    if "adapter_sha256" not in role_raw:
+        return None
+    expected = role_raw["adapter_sha256"]
+    if not isinstance(expected, str) or not _HEX64_RE.match(expected):
+        raise ConfigError(
+            f"roles.{role_label}.adapter_sha256 must be a 64-character hex "
+            "sha256 digest (pins the exact adapter file content)")
+    return expected.lower()
+
+
 def _allowlist_entry_host(entry):
     """Read the HOST component back out of one credential_proxy.allowlist
     entry, using df_proxy's own canonical-origin parser (parse_allowlist_entry)
@@ -273,6 +290,7 @@ def load_config(control_root: str) -> dict:
                 "disjoint from the control root (it would be mounted into the "
                 "builder container)"
             )
+    builder_expected_sha256 = _validate_adapter_sha256(builder, "builder")
 
     # M40: optional `roles.author` -- an AGENT (a different model than the
     # builder) writes the hidden scenarios instead of a human, with the SAME
@@ -330,6 +348,7 @@ def load_config(control_root: str) -> dict:
             "adapter": author_adapter,
             "timeout_s": author_timeout,
             "same_model_ack": allow_same_model_ack,
+            "expected_sha256": _validate_adapter_sha256(author_raw, "author"),
         }
     else:
         cfg_author = None
@@ -399,6 +418,7 @@ def load_config(control_root: str) -> dict:
             "adapter": critic_adapter,
             "timeout_s": critic_timeout,
             "same_model_ack": critic_ack,
+            "expected_sha256": _validate_adapter_sha256(critic_raw, "critic"),
         }
     else:
         cfg_critic = None
@@ -1903,4 +1923,14 @@ def load_config(control_root: str) -> dict:
     # required_classes/min_per_class for BOTH human- and agent-authored roots.
     cfg["_critic"] = cfg_critic
     cfg["_adequacy"] = cfg_adequacy
+    # M47 condition #7: expected adapter content digests (or None) per role. The
+    # supervisor computes each configured adapter file's real sha256 at run start
+    # and REFUSES (exit 2, journal ADAPTER_DIGEST_MISMATCH) on mismatch, so an
+    # operator pins the exact bytes rather than trusting a path. All None (the
+    # default) -> no pin -> byte-identical to pre-M47.
+    cfg["_adapter_digests"] = {
+        "builder": builder_expected_sha256,
+        "author": cfg_author["expected_sha256"] if cfg_author else None,
+        "critic": cfg_critic["expected_sha256"] if cfg_critic else None,
+    }
     return cfg

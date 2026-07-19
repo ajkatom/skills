@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 
 import pytest
 
@@ -9,6 +10,55 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE = os.path.join(HERE, "fixtures", "fake_builder")
 STUBBORN = os.path.join(HERE, "fixtures", "fake_builder_stubborn")
 MARKER = "HOLDOUT-MARKER-93e1"
+
+# M47 RA-08(a): a genuinely-qualified standard+ run now requires a CONFINED
+# candidate network (deny/loopback) -- an unrestricted candidate egress is
+# DISQUALIFYING (code CANDIDATE_EGRESS_OPEN). Two shared helpers below let the
+# former COMPLETE_QUALIFIED tests keep asserting a QUALIFIED run without turning
+# the default suite into a network-dependent one:
+#
+#   * IN-PROCESS tests set candidate_network="deny"/"loopback" and call
+#     stub_network_probe(monkeypatch) so the egress-denial baseline probe passes
+#     WITHOUT reaching outside localhost. The probe is NOT weakened -- its real
+#     behavior is covered by test_candidate_network.py / test_e2e_candidate_
+#     network.py's live tests; here we isolate the QUALIFICATION wiring from the
+#     network round-trip so it stays hermetic.
+#   * SUBPROCESS tests (which can't monkeypatch the child) use the `needs_network`
+#     marker + external_reachable(): a real qualified run at deny/loopback DOES
+#     connect outside localhost via the egress probe, so those are honest
+#     external-network tests gated behind DF_ALLOW_NETWORK_TESTS.
+NETWORK_TESTS_ENABLED = bool(os.environ.get("DF_ALLOW_NETWORK_TESTS"))
+needs_network = pytest.mark.skipif(
+    not NETWORK_TESTS_ENABLED,
+    reason="reaches outside localhost to prove candidate-egress denial; "
+           "set DF_ALLOW_NETWORK_TESTS=1 to run")
+
+
+def external_reachable():
+    """Baseline the egress-denial probe itself requires (same host/port). Only
+    called from opt-in `needs_network` tests, so the hermetic default (which
+    skips them) never opens this connection."""
+    try:
+        socket.create_connection(("1.1.1.1", 443), timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
+def stub_network_probe(monkeypatch):
+    """Make the candidate egress-denial probes pass without any network I/O, so
+    an IN-PROCESS qualified-standard run at candidate_network="deny" stays
+    hermetic. Both probes take a REAL external baseline connect at network=="deny"
+    (the honest non-vacuity half): `probe_network_denial` on the allow-host-read
+    path and `probe_candidate_confinement` on the default-deny path. We stub
+    BOTH here -- the sandbox profile itself is still built and enforced; only the
+    external baseline round-trip is substituted. The probes' real behavior is
+    covered by test_candidate_network.py / test_e2e_candidate_network.py's live
+    tests, so this only isolates the QUALIFICATION wiring from the network."""
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_network_denial",
+                        lambda *a, **k: (True, "network probe stubbed (hermetic test)"))
+    monkeypatch.setattr(supervisor.df_sandbox, "probe_candidate_confinement",
+                        lambda *a, **k: (True, {"mode": "default_deny", "residuals": []}))
 
 TOY_SPEC = """# greet CLI
 Create an executable python file `greet.py` in the workspace root.

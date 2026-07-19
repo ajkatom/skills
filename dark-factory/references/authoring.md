@@ -110,6 +110,25 @@ every non-converging iteration, per `references/config-reference.md`). If
 you want per-iteration human review at autonomy 4, set
 `answers.checkpoint: "pause"` explicitly.
 
+**Intervention mode selectable at init (M47 condition #10).** You no longer
+need a hand-edit to get H1: set `answers.intervention_mode` to `H1`/`directed`,
+`H2`/`supervised`, `H3`/`guarded`, or `H4`/`lights_out` (case/hyphen-
+insensitive) and `init` scaffolds it directly. It is mutually exclusive with
+the legacy `answers.autonomy`/`answers.checkpoint` pair — setting both is an
+`InitError` (pick one scheme; the legacy fields still work when
+`intervention_mode` is absent). `H4` (lights-out) requires
+`hardened`/`enterprise`. See `references/modes.md` for the pause-point table.
+
+**Confine the built app's egress to QUALIFY at `standard`+ (M47 RA-08(a)).**
+For a run you want sealed `COMPLETE_QUALIFIED`, set `candidate_network` to
+`"deny"` (the built app needs no network) or `"loopback"` (it must reach
+digital twins on `127.0.0.1`). Leaving it `"unrestricted"` (the default) at
+`standard`+ now seals the distinct `CANDIDATE_EGRESS_OPEN` (qualified `false`):
+the run still converges, but an app free to reach anywhere is not certified.
+`"deny"` cannot be combined with `twins.enabled` or http scenarios (use
+`"loopback"`); `"loopback"` is macOS-only. See `references/config-reference.md`
+and `references/isolation.md`.
+
 ## 3. The must-pass behaviors and their holdout scenarios
 
 For each behavior in `answers.behaviors[]`, write 1-3 `scenarios[]` — a

@@ -33,7 +33,7 @@ import pytest
 
 import df_container
 import df_sandbox
-from test_supervisor import FAKE, MARKER, setup_control
+from test_supervisor import FAKE, MARKER, external_reachable, needs_network, setup_control
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_SNOOP = os.path.join(HERE, "fixtures", "fake_builder_snoop")
@@ -91,10 +91,16 @@ def _plant_canary(cr, token):
 # (a) live hardened convergence + barrier proof
 # ---------------------------------------------------------------------------
 
+@needs_network
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
 def test_live_hardened_convergence_and_barrier(tmp_path):
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
     cr = setup_control(tmp_path, FAKE_SNOOP, checkpoint="auto")
-    _make_hardened(cr, tmp_path)
+    # M47 RA-08(a): confine candidate egress so the hardened run QUALIFIES (the
+    # candidate verify runs under the HOST sandbox, so the deny probe reaches the
+    # host network -> external -> gated behind DF_ALLOW_NETWORK_TESTS).
+    _make_hardened(cr, tmp_path, candidate_network="deny")
 
     canary_token = "DF-E2E-CANARY-" + uuid.uuid4().hex
     _plant_canary(cr, canary_token)
@@ -189,13 +195,17 @@ def test_fake_builder_snoop_finds_scenarios_when_run_uncontained(tmp_path):
 # (b) live L5 lights-off + config-level autonomy-5 gate
 # ---------------------------------------------------------------------------
 
+@needs_network
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
 def test_live_l5_lights_off_no_pause(tmp_path):
     # FAKE (not the snoop fixture): a two-iteration buggy-then-fixed builder,
     # so a real feedback round happens mid-run — proving autonomy 5 doesn't
     # pause even at an iteration boundary that checkpoint:pause would stop at.
+    if not external_reachable():
+        pytest.skip("no external reachability for the candidate egress-denial probe")
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
-    _make_hardened(cr, tmp_path, autonomy=5)
+    # M47 RA-08(a): confine candidate egress so the hardened L5 run QUALIFIES.
+    _make_hardened(cr, tmp_path, autonomy=5, candidate_network="deny")
 
     proc = _run(cr, "run", timeout=240)
     assert proc.returncode == 0, proc.stderr
@@ -289,10 +299,15 @@ def test_refusal_without_docker_then_allow_downgrade(tmp_path):
 
     # Note: manifest["tier"] always echoes the CONFIGURED assurance
     # ("hardened") — same convention as the standard-tier downgrade tests
-    # (test_standard_tier.py) — so the effective tier is read from `qualified`
-    # (and the journal DOWNGRADE entry above), not from manifest["tier"].
+    # (test_standard_tier.py) — so the effective tier is read from the journal
+    # DOWNGRADE entry above, not from manifest["tier"].
+    # M47 RA-08(a): the downgraded run keeps candidate_network unrestricted
+    # (the default), so its candidate egress is OPEN -> a standard landing seals
+    # the distinct CANDIDATE_EGRESS_OPEN (unqualified), and a cooperative landing
+    # is COMPLETE_UNQUALIFIED. Either way the DOWNGRADE is the point here; the
+    # qualified claim is now honestly False without a confined candidate network.
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["qualified"] is (effective == "standard")
+    assert manifest["qualified"] is False
     assert manifest["outcome"] == (
-        "COMPLETE_QUALIFIED" if effective == "standard" else "COMPLETE_UNQUALIFIED"
+        "CANDIDATE_EGRESS_OPEN" if effective == "standard" else "COMPLETE_UNQUALIFIED"
     )

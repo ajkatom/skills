@@ -197,6 +197,9 @@ def test_standard_optout_seals_host_isolation_limited(tmp_path):
     # distinct HOST_ISOLATION_LIMITED (pre-M36a it was COMPLETE_QUALIFIED).
     assert m["outcome"] == "HOST_ISOLATION_LIMITED"
     assert m["qualified"] is False
+    # host_isolation precedes candidate_egress, so HOST_ISOLATION_LIMITED still
+    # wins the code even though candidate_egress is also False here (M47 default
+    # candidate_network is unrestricted).
     assert m["qualification"]["substates"] == {
-        "barrier": True, "host_isolation": False, "control_plane": True,
-        "app_security": True, "waiver_validity": True}
+        "barrier": True, "host_isolation": False, "candidate_egress": False,
+        "control_plane": True, "app_security": True, "waiver_validity": True}

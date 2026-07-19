@@ -75,8 +75,10 @@ def test_ra02_verify_requires_sink_receipt(tmp_path, monkeypatch):
     priv_b, pub_b = _approver()
     _priv_c, pub_c = _approver()
     with _sink_receiver(tmp_path) as (sink_url, _store):
+        # M47 RA-08(a): confine candidate egress so the run is custody-qualifiable
+        # (the enterprise probes are patched, so "deny" reaches no real network).
         cr = _enterprise_control(tmp_path, [pub_a, pub_b, pub_c], threshold=2,
-                                 sink_url=sink_url)
+                                 sink_url=sink_url, candidate_network="deny")
         _patch_enterprise_probes(monkeypatch)
         monkeypatch.setattr(supervisor, "invoke_adapter", _fake_invoke)
 
