@@ -380,8 +380,9 @@ def build_config(answers: dict) -> dict:
     # key (so df_config's dual-field guard is satisfied); the legacy fields keep
     # working unchanged when intervention_mode is absent.
     intervention_mode = answers.get("intervention_mode")
+    has_legacy_mode = "autonomy" in answers or "checkpoint" in answers
     if intervention_mode is not None:
-        if "autonomy" in answers or "checkpoint" in answers:
+        if has_legacy_mode:
             raise InitError(
                 "intervention_mode cannot be combined with legacy "
                 "autonomy/checkpoint (specify one scheme)")
@@ -395,7 +396,19 @@ def build_config(answers: dict) -> dict:
                 "intervention_mode H4 (lights-out) requires assurance: hardened "
                 "or enterprise")
         mode_cfg = {"intervention_mode": canonical_mode}
+    elif not has_legacy_mode:
+        # DF-R4-05 (R4 re-audit): when the operator supplies NEITHER an
+        # intervention_mode NOR any legacy autonomy/checkpoint field, scaffold
+        # the DOCUMENTED default mode **H2** (supervised) — matching
+        # df_config.load_config's own no-fields default and every public doc.
+        # The old fallback wrote checkpoint:"auto", which resolves to H3 and
+        # silently gave the canonical-on-ramp user FEWER human gates (no
+        # after-verify / before-ship pauses) than advertised. A scripted /
+        # unattended scaffold now opts into that explicitly via
+        # intervention_mode: "H3" (or "H4" at hardened+).
+        mode_cfg = {"intervention_mode": "H2"}
     else:
+        # Legacy autonomy/checkpoint EXPLICITLY supplied -> honor verbatim.
         autonomy = answers.get("autonomy", 4)
         if autonomy not in (4, 5):
             raise InitError("autonomy must be 4 or 5")
