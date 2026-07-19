@@ -313,7 +313,7 @@ The dark-factory spec (§5.2) envisions **verifier-only hidden twin variants** c
 - Sandboxed scenario orchestration (the current scenario runner cannot control twins).
 - Per-scenario twin configuration discovery without revealing scenarios to the builder.
 
-These features arrive in `hardened`/`enterprise` tiers (not yet built). M3a deliberately does not include them.
+These verifier-only hidden-variant features are still deferred (the `hardened` and `enterprise` tiers themselves now ship — see their references — but this specific spec §5.2 twin-variant orchestration is not yet built on top of them). M3a deliberately does not include them. (See the M12 update below for the variant-seed capability that HAS since shipped.)
 
 **M12 update:** M12 ships **verifier-only variant seeds** within a single twin
 implementation (see "Observation & Evidence" above) — a genuine step toward

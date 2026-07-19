@@ -25,8 +25,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GREETER = os.path.join(HERE, "fixtures", "twin_greeter")
 
 # hardened validates roles.builder.adapter as an absolute EXISTING file whose
-# directory is disjoint from the control root (its dir is mounted into the
-# container). test_config.write_config's default "/bin/true" does not exist on
+# directory is disjoint from the control root (RA-07/M46: the resolved adapter
+# FILE is mounted into the container, not its dir; the dir-disjointness check
+# still stands). test_config.write_config's default "/bin/true" does not exist on
 # every platform (macOS ships only /usr/bin/true), so hardened tests pin a
 # real file that always exists and lives outside any tmp control root.
 VALID_ADAPTER = sys.executable

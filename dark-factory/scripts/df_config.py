@@ -269,26 +269,30 @@ def load_config(control_root: str) -> dict:
     if not adapter:
         raise ConfigError("roles.builder.adapter is required")
     if tier in ("hardened", "enterprise"):
-        # The adapter's DIRECTORY is bind-mounted ro into the builder container
-        # at both hardened AND enterprise (enterprise's container path IS the
-        # hardened container path, plus the egress lock + seccomp), so it must
-        # be pinned down at config time: a bare command name (e.g. "claude")
-        # would realpath against the process CWD (mounting whatever directory
-        # the operator happens to run from), and an adapter inside the control
-        # root would mount holdout content into the "isolated" builder. Both
-        # are mount-escape paths — reject at load.
+        # RA-07/M46: the resolved adapter FILE (not its directory) is bind-mounted
+        # ro into the builder container at both hardened AND enterprise
+        # (enterprise's container path IS the hardened container path, plus the
+        # egress lock + seccomp). It must still be pinned down at config time: a
+        # bare command name (e.g. "claude") would realpath against the process
+        # CWD (resolving to whatever directory the operator happens to run from),
+        # and an adapter inside the control root would mount holdout content into
+        # the "isolated" builder. Both are mount-escape paths — reject at load.
+        # We keep the DIRECTORY-level disjointness check below (a control-root
+        # sibling adapter is refused) even though only the single file is mounted,
+        # because a control-root-resident adapter path is a barrier breach in
+        # itself regardless of mount granularity.
         adapter_path = os.path.expanduser(adapter)
         if not os.path.isabs(adapter_path) or not os.path.isfile(adapter_path):
             raise ConfigError(
                 f"{tier} requires roles.builder.adapter to be an absolute path "
-                "to an existing file (its directory is mounted into the container)"
+                "to an existing file (the resolved file is mounted into the container)"
             )
         adapter_dir = os.path.dirname(os.path.realpath(adapter_path))
         if not _disjoint(adapter_dir, control_root):
             raise ConfigError(
                 f"{tier} requires the roles.builder.adapter directory to be "
-                "disjoint from the control root (it would be mounted into the "
-                "builder container)"
+                "disjoint from the control root (the resolved adapter file would "
+                "be mounted into the builder container)"
             )
     builder_expected_sha256 = _validate_adapter_sha256(builder, "builder")
 
@@ -1622,10 +1626,13 @@ def load_config(control_root: str) -> dict:
     # module never imports `cryptography` (df_custody.py is the sole,
     # guarded import site) and never checks whether a hex string is a valid
     # *curve point* -- verify_custody rejects a bad key at verify time,
-    # returning False rather than crashing. Enforcing custody as REQUIRED at
-    # assurance: "enterprise" is Task 3 (the enterprise tier doesn't exist
-    # in supported_tiers.json until then); here an absent block at ANY tier,
-    # including a future enterprise, is still None.
+    # returning False rather than crashing. This block validates SHAPE at every
+    # tier; the REQUIRED-at-enterprise gate now lives at the enterprise
+    # composition check below (`if tier == "enterprise": if cfg_custody is None:
+    # raise ...`) — enterprise IS a supported tier (supported_tiers.json), so an
+    # absent custody block at enterprise is a fail-closed ConfigError there. At
+    # every NON-enterprise tier an absent block is still None (byte-identical to
+    # pre-M17).
     custody_raw = raw.get("custody")
     if custody_raw is not None:
         if not isinstance(custody_raw, dict):
@@ -1680,8 +1687,9 @@ def load_config(control_root: str) -> dict:
     # env var the proxy reads host-side at request time, mirroring the
     # M11/M13 inline-secret rejection (credentials.*, audit.sink.*). Absent
     # -> {"enabled": False}, byte-identical to pre-M17 behavior at every
-    # tier (the enterprise tier's REQUIRED credential_proxy.enabled:true
-    # gate is Task 3 -- this module validates only the block's shape).
+    # NON-enterprise tier. This block validates only the proxy's SHAPE; the
+    # enterprise tier's REQUIRED `credential_proxy.enabled: true` gate is
+    # enforced at the enterprise composition check below (that gate has landed).
     proxy_raw = raw.get("credential_proxy", {})
     if not isinstance(proxy_raw, dict):
         raise ConfigError("credential_proxy must be a JSON object")

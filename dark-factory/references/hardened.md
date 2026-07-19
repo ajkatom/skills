@@ -96,7 +96,7 @@ Every builder invocation at `hardened` is wrapped in:
 | `--read-only` | the container's root filesystem is immutable |
 | `--tmpfs /tmp` | the one writable scratch path, backed by `HOME=/tmp` |
 | `-v <workspace>:<workspace>` | the only read-write bind mount |
-| `-v <adapter_dir>:<adapter_dir>:ro` | the only other bind mount, read-only |
+| `-v <adapter_file>:<adapter_file>:ro` | the only other bind mount, read-only (RA-07/M46: the resolved adapter FILE, not its directory) |
 
 Never applied, under any configuration: `--privileged`, the Docker socket
 bind-mounted in, or a shared host PID/IPC namespace. `df_container.build_argv`
@@ -293,7 +293,7 @@ not scale past a handful of packages.
 operator-provisioned, **read-only** local directory of pinned package
 artifacts. When set, the supervisor bind-mounts that directory read-only
 into the builder container (a second `ro_mount`, alongside the adapter
-directory) and sets four non-secret environment variables so pip/npm resolve
+executable file) and sets four non-secret environment variables so pip/npm resolve
 entirely from it:
 
 | Env var | Effect |

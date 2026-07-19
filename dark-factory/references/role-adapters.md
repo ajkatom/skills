@@ -164,7 +164,7 @@ confinement") for why a plain HTTP client needs no such probe.
 
 **Proven live.** `dark-factory/tests/test_e2e_api_container.py` runs this
 adapter, live, INSIDE a real `python:3.12-alpine` Docker container
-(`network: bridge`, the adapter's directory ro-mounted, the workspace
+(`network: bridge`, the resolved adapter FILE ro-mounted — RA-07/M46, not its directory — the workspace
 rw-mounted — the same `df_container.build_argv` shape the hardened tier
 uses for every builder call) against a local stub Messages endpoint reached
 via `host.docker.internal` (the M17 host-service pattern). This is
