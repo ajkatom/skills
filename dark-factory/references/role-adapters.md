@@ -31,13 +31,17 @@ The `role` field tells an adapter which job it is doing this invocation.
   their existing `{"files": {"scenarios.json": "..."}}` return — so there are
   **no adapter code changes** for the author role. The one hard rule
   (config-load, fail-closed): `roles.author.adapter` must resolve to a
-  **different path than `roles.builder.adapter`**, unless
-  `roles.author.allow_same_model_ack: true`. For the fixed-model CLI adapters a
-  distinct path is a distinct model; for the env-parameterized API adapters
+  **different path than `roles.builder.adapter`** (a distinct adapter IDENTITY,
+  not a proven different *model*), unless `roles.author.allow_same_model_ack:
+  true`. For the fixed-model CLI adapters a distinct path is (in practice) a
+  distinct model; for the env-parameterized API adapters
   (`api_anthropic`/`api_openai`) the operator must ensure the two aren't aimed
   at the same backing model (the path check can't see `DF_API_MODEL`/base-URL).
-  See `references/authoring.md` ("Agent-authored scenarios") for the full
-  workflow, the API-adapter caveat, and the honest intent-capture limit.
+  Pin `adapter_sha256` on both roles for a verified content-level distinctness
+  guarantee (identical digest → `ConfigError`, M50), and/or assert
+  `model_identity` (operator-asserted, not system-verified). See
+  `references/authoring.md` ("Agent-authored scenarios") for the full workflow,
+  the API-adapter caveat, and the honest intent-capture limit.
 - **`critic`** (M42) — a SECOND, independent agent that adversarially reviews
   the AUTHORED scenarios for gaps. Also an author-time step (`role="critic"`, a
   fresh scratch workdir), same protocol: it writes exactly one file
@@ -46,7 +50,9 @@ The `role` field tells an adapter which job it is doing this invocation.
   author↔critic revision loop; `advisories` (likely-missing REQUIREMENTS) are
   surfaced to the operator in `scenario_review.md`, NEVER auto-applied. Its
   output is control-plane and NEVER reaches the builder (barrier discipline,
-  tested). TWO fail-closed model-distinctness inequalities on resolved paths:
+  tested). TWO fail-closed distinct-adapter-identity inequalities on resolved
+  paths (a distinct path, not a proven different *model* — pin `adapter_sha256`
+  / assert `model_identity` for stronger guarantees, M50):
   `realpath(critic) != realpath(builder)` (collusion — a critic must not bless
   scenarios its own model will build against) AND `realpath(critic) !=
   realpath(author)` (decorrelation — a model can't decorrelate from itself);

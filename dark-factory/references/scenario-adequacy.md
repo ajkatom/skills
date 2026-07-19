@@ -93,7 +93,7 @@ of per-dimension isolation.
 
 One author model has blind spots, and two correlated minds (an author + a
 builder of the same lineage) tend to miss the SAME unknown-unknowns. The
-optional `roles.critic` is a SECOND, independent (different-model) agent that
+optional `roles.critic` is a SECOND, independent (decorrelated) agent that
 adversarially reviews the AUTHORED scenario set. It sits on the VERIFIER side of
 the barrier, like the author: it may see spec + behaviors + the authored
 scenarios + the oracle format, and it emits a strict JSON verdict:
@@ -111,20 +111,31 @@ until the critic is clean or the bound is hit — **fail-closed** on
 non-convergence (`CRITIC_UNRESOLVED`, nothing installed). A critic that can't run
 or emits an unparseable verdict also fails closed (`CRITIC_ABORTED`).
 
-### Model distinctness (collusion + decorrelation), fail-closed
+### Adapter-identity distinctness (collusion + decorrelation), fail-closed
 
 `df_config` enforces TWO inequalities on resolved (`realpath`) adapter paths:
 
 - `realpath(critic) != realpath(builder)` — **collusion**: a critic must not
   bless scenarios its own model will build against.
-- `realpath(critic) != realpath(author)` — **decorrelation**: the same model
+- `realpath(critic) != realpath(author)` — **decorrelation**: the same adapter
   cannot decorrelate from itself.
 
-A single `roles.critic.allow_same_model_ack: true` waives BOTH and is sealed
-into the manifest's `critic.same_model_ack` for an auditor. The ideal is three
-distinct models (e.g. author=Codex, critic=Gemini, builder=Claude); the config
-enforces the two inequalities, not a specific assignment. A `roles.critic`
-without a `roles.author` is refused (there is nothing agent-authored to review).
+These are **distinct-adapter-identity** checks (a distinct resolved *path*), NOT
+a proven different *model*: two adapter copies, or two `api_*` adapters aimed at
+one backing model, resolve to different paths yet reach the same model (see
+`references/authoring.md`). For a real **content-level** guarantee, pin
+`adapter_sha256` on the roles — two roles pinning the SAME digest is identical
+adapter content = the same model → `ConfigError` (M50). For an
+**operator-asserted** identity, set `model_identity` on the roles (an identical
+value on a must-differ pair → `ConfigError`; asserted, not system-verified).
+
+A single `roles.critic.allow_same_model_ack: true` waives BOTH path inequalities
+(and the critic's cross-role digest / `model_identity` same-model checks) and is
+sealed into the manifest's `critic.same_model_ack` for an auditor. The ideal is
+three distinct models (e.g. author=Codex, critic=Gemini, builder=Claude); the
+config enforces the identity inequalities, not a specific assignment. A
+`roles.critic` without a `roles.author` is refused (there is nothing
+agent-authored to review).
 
 ### Barrier discipline (enforced + tested)
 

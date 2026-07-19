@@ -76,7 +76,9 @@ root to fail confusingly later.
   it scaffolds only the scenarios you supply in `answers` — and it never runs
   a build (it prints the `run` command instead). (The SEPARATE
   `author-scenarios` step CAN generate the hidden scenarios with an agent — a
-  different-model author, optionally plus an independent critic — see the next
+  distinct-adapter author (a different resolved path, not a proven different
+  *model* unless you pin `adapter_sha256` / assert `model_identity`), optionally
+  plus an independent critic — see the next
   bullet and `references/authoring.md`.) See `references/authoring.md` for the
   full interview and scenario-writing guidance.
 - **Offer agent-authored scenarios (M40).** If the user doesn't want to hand-
@@ -102,8 +104,10 @@ root to fail confusingly later.
   assertion must reject a battery of near-miss mutant OBSERVATIONS, not one
   garbage output (honest scope: it mutates the observation, NOT the built code —
   not full code-mutation testing). (3) A **decorrelated critic** — a SECOND,
-  different-model agent (`answers.critic_adapter`, distinct from BOTH builder and
-  author, fail-closed) adversarially reviews the authored set; blocking findings
+  independent agent (`answers.critic_adapter`, a distinct adapter identity from
+  BOTH builder and author, fail-closed; pin `adapter_sha256` / assert
+  `model_identity` for stronger distinctness — M50) adversarially reviews the
+  authored set; blocking findings
   drive a bounded revision loop, and advisories (likely-missing requirements) are
   written to `scenario_review.md` for the operator, NEVER auto-applied. See
   `references/scenario-adequacy.md`.

@@ -178,6 +178,36 @@ holding and the profile must be re-derived, probe-verified like claude's, or
 withdrawn — `structural: True` is a claim about *this* adapter's shape, not
 a blanket exemption from ever needing a probe.
 
+#### The structural claim is bound to the shipped-adapter IDENTITY (M50, DF-R3-05)
+
+The structural argument above is a claim about **this skill's shipped adapter
+code**, not about any executable that merely shares the basename
+`api_anthropic`/`api_openai`. Keying `supported: True` off the basename alone
+would hand the "no agentic tool/MCP surface" claim to an *unrelated* executable
+someone renamed `api_anthropic` — which might be a shell, an agentic CLI, or
+anything at all. So `df_confine.profile_for(cli, adapter_path, expected_sha256)`
+**binds the structural claim to a trusted adapter identity**, fail-closed: for
+the structural profiles, `supported: True` holds only when the resolved
+`adapter_path` EITHER
+
+1. realpath-equals this skill's OWN shipped adapter file
+   (`<skill_dir>/scripts/adapters/<name>`, where `<skill_dir>` is derived from
+   `df_confine.py`'s own on-disk location — the trusted installation path), OR
+2. matches a configured `expected_sha256` — the role's `adapter_sha256` content
+   pin (see `references/config-reference.md`), so a byte-identical **relocated
+   copy** is trusted by content.
+
+Anything else (a renamed impostor, or a relocated copy with no digest pin) gets
+an UNSUPPORTED profile (`supported: False`, a reason naming the path) — it is
+treated as unconfined/unsupported, never granted the claim by name. The
+supervisor threads the resolved builder adapter path + its pinned digest into
+this call, so the `builder_confinement` manifest field honestly records
+`mcp_disabled: false` / `probe: "unsupported"` for an impostor instead of a
+false structural claim. A normally-installed shipped `api_anthropic` (the common
+case) resolves to the trusted path and stays supported — byte-identical to
+before. (`claude`'s support is a live tool-denial *probe*, not adapter identity,
+so it is unaffected by this binding; unknown CLIs remain unsupported.)
+
 ### api_openai — same structural argument as api_anthropic
 
 `df_confine.PROFILES["api_openai"]` is the identical `{"supported": True,

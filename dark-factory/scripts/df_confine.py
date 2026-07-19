@@ -38,7 +38,20 @@ protocol-0.1 adapter invoked over stdin JSON — and `probe_confinement`
 returns a trivial pass without spawning anything, since there is no denied
 tool to probe for). See references/builder-confinement.md ("api_anthropic —
 structural confinement").
+
+DF-R3-05 (M50): the structural `supported: True` claim is a property of THIS
+skill's shipped adapter CODE (a plain HTTP client), NOT of any executable that
+merely shares the basename `api_anthropic`/`api_openai`. `profile_for` therefore
+binds that claim to a TRUSTED adapter IDENTITY when a caller supplies the
+resolved adapter path: the path must realpath-equal this skill's OWN shipped
+adapter file (`<skill_dir>/scripts/adapters/<name>`) OR match a pinned content
+digest (`expected_sha256`, the role's M47 `adapter_sha256`). An unrelated
+executable renamed `api_anthropic` (or a relocated copy with no digest pin)
+gets an UNSUPPORTED profile — fail-closed, the no-tool-surface claim is never
+granted by basename. Back-compat: a caller that passes no `adapter_path`
+(`None`) gets the profile object unchanged, byte-identical to pre-M50.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -116,7 +129,10 @@ PROFILES = {
     # comment above and references/builder-confinement.md). No
     # `tool_allowlist` applies (there are no tools to allow-list) and no
     # `flags_fn` applies (there is no CLI argv to build — see
-    # `confinement_flags`'s structural branch below).
+    # `confinement_flags`'s structural branch below). DF-R3-05: this
+    # `supported: True` is granted only to THIS skill's shipped adapter file
+    # (or a digest-pinned copy) — `profile_for` refuses an impostor that merely
+    # renamed itself `api_anthropic` (see the module docstring + profile_for).
     "api_anthropic": {
         "supported": True,
         "structural": True,
@@ -126,6 +142,9 @@ PROFILES = {
     # Same structural argument as api_anthropic above: api_openai is also a
     # plain stdlib HTTP client (one urllib POST to a fixed, supervisor-
     # configured endpoint) with no agentic tool/MCP/sub-agent surface at all.
+    # DF-R3-05: same identity binding as api_anthropic — the structural claim
+    # is bound to the shipped adapter file (or a digest-pinned copy), never the
+    # bare basename.
     "api_openai": {
         "supported": True,
         "structural": True,
@@ -135,13 +154,86 @@ PROFILES = {
 }
 
 
-def profile_for(cli: str) -> dict:
-    """PROFILES[cli], or a {"supported": False} default for an unknown CLI."""
-    return PROFILES.get(cli, {"supported": False, "reason": f"unknown cli {cli!r}"})
+# DF-R3-05: <skill_dir> is derived from THIS module's own on-disk location
+# (<skill_dir>/scripts/df_confine.py -> its parent scripts/ -> the skill dir),
+# never a caller-supplied guess, so the trusted-installation-path check below is
+# anchored to the real install regardless of the process CWD.
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SKILL_DIR = os.path.dirname(_SCRIPTS_DIR)
 
 
-def is_supported(cli: str) -> bool:
-    return bool(profile_for(cli).get("supported"))
+def _shipped_adapter_path(name: str) -> str:
+    """Absolute path of THIS skill's OWN shipped adapter `name`
+    (`<skill_dir>/scripts/adapters/<name>`) — the trusted identity a structural
+    profile's `supported: True` is bound to (realpath-compared below)."""
+    return os.path.join(_SKILL_DIR, "scripts", "adapters", name)
+
+
+def _file_sha256(path: str):
+    """sha256 hex of `path`'s bytes, or None if it can't be read. Local (no
+    df_common import) so this module stays standalone — the shipped adapters
+    import df_confine and must not drag in the rest of the control plane."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _structural_identity_ok(cli: str, adapter_path: str, expected_sha256) -> bool:
+    """DF-R3-05: is `adapter_path` a TRUSTED identity for structural profile
+    `cli`? True iff EITHER it realpath-equals this skill's OWN shipped adapter
+    file (trusted installation path — the audit explicitly accepts this), OR its
+    content sha256 matches a pinned `expected_sha256` (a digest match certifies a
+    relocated copy is byte-identical to the shipped adapter). Fail-closed:
+    anything else (a renamed impostor, a relocated copy with no digest pin, an
+    unreadable file) is False."""
+    if os.path.realpath(adapter_path) == os.path.realpath(_shipped_adapter_path(cli)):
+        return True
+    if expected_sha256:
+        actual = _file_sha256(adapter_path)
+        if actual is not None and actual.lower() == expected_sha256.lower():
+            return True
+    return False
+
+
+def profile_for(cli: str, adapter_path=None, expected_sha256=None) -> dict:
+    """PROFILES[cli], or a {"supported": False} default for an unknown CLI.
+
+    DF-R3-05: for the STRUCTURAL profiles (api_anthropic/api_openai) the
+    `supported: True` claim is bound to a TRUSTED adapter IDENTITY. When a caller
+    supplies the resolved `adapter_path` (the supervisor does), the claim holds
+    only if that path realpath-equals this skill's OWN shipped adapter file OR
+    matches a pinned `expected_sha256` content digest; otherwise this returns an
+    UNSUPPORTED profile (fail-closed) so a renamed impostor is treated as
+    unconfined/unsupported, never granted the no-tool-surface claim by basename.
+    Non-structural profiles (claude/codex/gemini) ignore `adapter_path` — their
+    support rests on a live tool-denial probe, not on adapter identity. Back-
+    compat: `adapter_path=None` returns the profile object UNCHANGED (identity is
+    the SAME PROFILES dict for a known CLI), byte-identical to every pre-M50
+    caller."""
+    profile = PROFILES.get(cli)
+    if profile is None:
+        return {"supported": False, "reason": f"unknown cli {cli!r}"}
+    if (profile.get("structural") and adapter_path is not None
+            and not _structural_identity_ok(cli, adapter_path, expected_sha256)):
+        return {
+            "supported": False,
+            "structural": True,
+            "reason": (
+                "structural confinement claim requires the shipped adapter "
+                f"identity; {adapter_path} is neither the shipped adapter "
+                f"({_shipped_adapter_path(cli)}) nor a digest-pinned match"
+            ),
+        }
+    return profile
+
+
+def is_supported(cli: str, adapter_path=None, expected_sha256=None) -> bool:
+    return bool(profile_for(cli, adapter_path, expected_sha256).get("supported"))
 
 
 def confinement_flags(cli: str, prompt: str) -> list:
