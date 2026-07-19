@@ -490,6 +490,54 @@ def _unresolved_dispatch_intent(run_dir):
     return None
 
 
+def _resolved_dispatch_result(run_dir, invocation, iteration):
+    """RA-06/M46: return the recorded DISPATCH_RESULT data dict for iteration
+    `iteration`'s dispatch key IFF that dispatch already resolved
+    SUCCESSFULLY (status "ok"), else None.
+
+    This is the RESOLVED counterpart to `_unresolved_dispatch_intent`, and the
+    two are deliberately disjoint. M35 made the intent->result interval
+    crash-safe: an UNRESOLVED intent (crash BETWEEN intent and result) stops
+    resume at UNKNOWN_OUTCOME / reconcile. But a crash landing AFTER
+    DISPATCH_RESULT ok was journaled (the paid builder call COMPLETED and its
+    output was written into the persisted workspace) yet BEFORE the iteration
+    finalized and `next_iter` advanced leaves state.json still at this same
+    iteration `i`. On `resume --decision continue`, `_unresolved_dispatch_intent`
+    returns None (the intent IS resolved), so without this check the loop would
+    re-enter iteration `i` and re-dispatch -- a SECOND PAID model request for
+    work already done. When this returns non-None the caller SKIPS
+    invoke_adapter and instead verifies the already-persisted workspace,
+    journaling a value-free DISPATCH_REPLAYED. The reservation was already
+    committed to durable state at intent time (M35) and reloaded into
+    builder_calls/estimated_usd on resume, so replaying does NOT double-count
+    spend -- the caller must NOT re-commit it.
+
+    Only a SUCCESSFUL result triggers the replay: an errored DISPATCH_RESULT
+    means the dispatch already terminated the run (ABORTED_BUILD_ERROR /
+    CONFINEMENT_REFUSED cleared state.json), so it is never resumed into a
+    re-dispatch in the first place. Absence of any matching result returns None,
+    leaving the M35 unresolved-intent -> reconcile / UNKNOWN_OUTCOME path (and
+    every pre-M35 journal) untouched -- fail-closed by omission.
+    """
+    path = os.path.join(run_dir, "journal.jsonl")
+    if not os.path.exists(path):
+        return None
+    key = _dispatch_idempotency_key(invocation, iteration)
+    resolved = None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            e = json.loads(line)
+            if e.get("state") != "DISPATCH_RESULT":
+                continue
+            data = e.get("data", {})
+            if data.get("idempotency_key") == key and data.get("status") == "ok":
+                resolved = data
+    return resolved
+
+
 def latest_paused_run(control_root):
     runs_dir = os.path.join(control_root, "runs")
     if not os.path.isdir(runs_dir):
@@ -4790,360 +4838,417 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             prompt_file = os.path.join(workspace, "DARK_FACTORY_PROMPT.md")
             atomic_write(prompt_file, prompt)
 
-            # --- Budget admission control (M8): reserve BEFORE the builder call,
-            # regardless of checkpoint mode (even auto/L5) — a cost overrun pauses
-            # here rather than proceeding unattended. billing=="subscription" can't
-            # meter dollars (alert-only, milestone-only); max_calls is exact and
-            # enforced under any billing. api+max_usd without per_call_usd has no
-            # estimate to reserve against, so the $ cap downgrades to alert-only
-            # (still counted, never pauses on $).
-            b = cfg["_budget"]
-            calls_after = builder_calls + 1
-            est_after = estimated_usd + (b["per_call_usd"] or 0.0)
-            dollar_enforced, calls_enforced = _budget_enforced(b)
+            # RA-06/M46: idempotent dispatch replay. Before dispatching
+            # iteration i's PAID builder call, check whether it already
+            # resolved successfully in a prior (crashed) process. A crash
+            # that landed AFTER DISPATCH_RESULT ok was journaled (the call
+            # completed and wrote the workspace) but BEFORE the iteration
+            # finalized and next_iter advanced leaves state.json still at
+            # iteration i; `_unresolved_dispatch_intent` sees the intent
+            # RESOLVED and would let plain `continue` re-enter and re-pay.
+            # _resolved_dispatch_result closes that window: a successful
+            # result means the output is already in the persisted workspace,
+            # so SKIP the whole admission+dispatch block below (no second
+            # paid call, and no re-committing the reservation -- it was
+            # committed at intent time in M35 and reloaded into
+            # builder_calls/estimated_usd, so re-running admission would
+            # double-count) and fall straight through to verifying the
+            # already-persisted workspace with the recorded ok result.
+            replay_result = _resolved_dispatch_result(run_dir, mb_clean["invocation"], i)
+            if replay_result is None:
+                # --- Budget admission control (M8): reserve BEFORE the builder call,
+                # regardless of checkpoint mode (even auto/L5) — a cost overrun pauses
+                # here rather than proceeding unattended. billing=="subscription" can't
+                # meter dollars (alert-only, milestone-only); max_calls is exact and
+                # enforced under any billing. api+max_usd without per_call_usd has no
+                # estimate to reserve against, so the $ cap downgrades to alert-only
+                # (still counted, never pauses on $).
+                b = cfg["_budget"]
+                calls_after = builder_calls + 1
+                est_after = estimated_usd + (b["per_call_usd"] or 0.0)
+                dollar_enforced, calls_enforced = _budget_enforced(b)
 
-            if (b["billing"] == "api" and b["max_usd"] is not None
-                    and b["per_call_usd"] is None and not budget_downgrade_noted):
-                journal.write(
-                    "BUDGET_DOWNGRADE",
-                    reason="max_usd set without per_call_usd; no estimate to reserve "
-                           "against — $ cap downgraded to alert-only",
-                )
-                budget_downgrade_noted = True
+                if (b["billing"] == "api" and b["max_usd"] is not None
+                        and b["per_call_usd"] is None and not budget_downgrade_noted):
+                    journal.write(
+                        "BUDGET_DOWNGRADE",
+                        reason="max_usd set without per_call_usd; no estimate to reserve "
+                               "against — $ cap downgraded to alert-only",
+                    )
+                    budget_downgrade_noted = True
 
-            if not budget_alerted:
-                hit_dollar = dollar_enforced and estimated_usd >= b["alert_at"] * b["max_usd"]
-                hit_calls = calls_enforced and builder_calls >= b["alert_at"] * b["max_calls"]
-                if hit_dollar or hit_calls:
-                    journal.write("BUDGET_ALERT", estimated_usd=estimated_usd,
-                                  builder_calls=builder_calls, cap_usd=b["max_usd"],
-                                  max_calls=b["max_calls"])
+                if not budget_alerted:
+                    hit_dollar = dollar_enforced and estimated_usd >= b["alert_at"] * b["max_usd"]
+                    hit_calls = calls_enforced and builder_calls >= b["alert_at"] * b["max_calls"]
+                    if hit_dollar or hit_calls:
+                        journal.write("BUDGET_ALERT", estimated_usd=estimated_usd,
+                                      builder_calls=builder_calls, cap_usd=b["max_usd"],
+                                      max_calls=b["max_calls"])
+                        sys.stderr.write(
+                            f"dark-factory: BUDGET ALERT — {b['alert_at']:.0%} of budget cap "
+                            f"reached (estimated_usd={estimated_usd}, builder_calls={builder_calls}).\n")
+                        _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
+                                       "BUDGET_ALERT", estimated_usd, builder_calls)
+                        budget_alerted = True
+
+                if (b["billing"] == "subscription" and not dollar_enforced and not calls_enforced
+                        and calls_after % 5 == 0):
+                    journal.write("BUDGET_ALERT", milestone=True, builder_calls=calls_after,
+                                  estimated_usd=est_after)
                     sys.stderr.write(
-                        f"dark-factory: BUDGET ALERT — {b['alert_at']:.0%} of budget cap "
-                        f"reached (estimated_usd={estimated_usd}, builder_calls={builder_calls}).\n")
+                        f"dark-factory: budget milestone — {calls_after} builder calls "
+                        f"(subscription billing; informational only).\n")
+
+                budget_pause = ((calls_enforced and calls_after > b["max_calls"]) or
+                                (dollar_enforced and est_after > b["max_usd"]))
+                if budget_pause and _lights_out:
+                    # M36a H4 (lights-out) fail-closed contract: a budget guard that
+                    # PAUSES in H1/H2/H3 becomes a deterministic TERMINAL under
+                    # lights-out. Never a silent proceed past a human-needed
+                    # decision (raise-the-cap), never an indefinite block. This is
+                    # the ONLY safe meaning of "unattended": the run halts, sealed,
+                    # rather than waiting forever for a human who isn't watching.
+                    journal.write("BUDGET_HALTED", estimated_usd=estimated_usd,
+                                  builder_calls=builder_calls, cap_usd=b["max_usd"],
+                                  max_calls=b["max_calls"], mode=mode)
                     _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
-                                   "BUDGET_ALERT", estimated_usd, builder_calls)
-                    budget_alerted = True
-
-            if (b["billing"] == "subscription" and not dollar_enforced and not calls_enforced
-                    and calls_after % 5 == 0):
-                journal.write("BUDGET_ALERT", milestone=True, builder_calls=calls_after,
-                              estimated_usd=est_after)
-                sys.stderr.write(
-                    f"dark-factory: budget milestone — {calls_after} builder calls "
-                    f"(subscription billing; informational only).\n")
-
-            budget_pause = ((calls_enforced and calls_after > b["max_calls"]) or
-                            (dollar_enforced and est_after > b["max_usd"]))
-            if budget_pause and _lights_out:
-                # M36a H4 (lights-out) fail-closed contract: a budget guard that
-                # PAUSES in H1/H2/H3 becomes a deterministic TERMINAL under
-                # lights-out. Never a silent proceed past a human-needed
-                # decision (raise-the-cap), never an indefinite block. This is
-                # the ONLY safe meaning of "unattended": the run halts, sealed,
-                # rather than waiting forever for a human who isn't watching.
-                journal.write("BUDGET_HALTED", estimated_usd=estimated_usd,
-                              builder_calls=builder_calls, cap_usd=b["max_usd"],
-                              max_calls=b["max_calls"], mode=mode)
-                _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
-                               "BUDGET_HALTED", estimated_usd, builder_calls)
-                mf = dict(mb_clean, outcome="BUDGET_HALTED", iterations=i, qualified=False,
-                          final_exam={"ran": False, "passed": None, "count": 0},
-                          regressions=sorted(regressed),
-                          qualification=_qualification_field(mb_clean, effective),
-                          budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
-                          usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                      builder_input_tokens, builder_output_tokens))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                            digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-                print(f"dark-factory: BUDGET HALTED (lights-out) — budget cap reached "
-                      f"(estimated_usd={estimated_usd}, builder_calls={builder_calls}); "
-                      f"a lights-out run fails closed instead of pausing. Run: {run_dir}")
-                return anchor_exit or 3
-            if budget_pause:
-                journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
-                              builder_calls=builder_calls, cap_usd=b["max_usd"],
-                              max_calls=b["max_calls"])
-                _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
-                               "BUDGET_PAUSE", estimated_usd, builder_calls)
-                save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
-                          dev_status=prev_dev_status, regressions=regressed,
-                          builder_calls=builder_calls, estimated_usd=estimated_usd,
-                          budget_alerted=budget_alerted, reason="budget",
-                          phase=f"AWAIT_BUDGET_{i}", chain_append=True,
-                          scenario_set_sha256=scenario_set_sha256,
-                          build_approved_through=build_approved_through, redactor=redactor,
-                          builder_input_tokens=builder_input_tokens,
-                          builder_output_tokens=builder_output_tokens,
-                          usage_known=usage_known)
-                print(f"dark-factory: PAUSED — budget cap reached (estimated_usd={estimated_usd}, "
-                      f"builder_calls={builder_calls}). Raise budget.max_usd (or max_calls) in "
-                      f"config.json and run: supervisor.py resume --control-root "
-                      f"{cfg.get('_control_root', '<cr>')} --decision continue")
-                return PAUSED
-
-            # Builder isolation: at effective "hardened" the builder runs inside a
-            # Docker container (control root never mounted — barrier by
-            # construction), built fresh per call; the OS-sandbox exec_prefix
-            # returned by resolve_isolation is reserved for the VERIFIER only
-            # (run_all below), unchanged. Builder-side twin env cannot cross the
-            # container boundary in M10 (journaled, not silently dropped) — the
-            # container always gets a clean env regardless of twins, PLUS
-            # (M11) the configured credential allowlist via `-e` container env.
-            builder_env_full = None
-            if effective == "hardened":
-                c = cfg["_container"]
-                adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
-                # Belt-and-suspenders (defense in depth against config drift /
-                # TOCTOU): df_config already rejects a hardened adapter whose
-                # directory overlaps the control root, but this dir is about to
-                # be bind-mounted into the builder container — re-verify at the
-                # moment of use rather than trusting the load-time check.
-                if not _disjoint(adapter_ro_dir, cfg["_control_root"]):
-                    raise df_sandbox.SandboxError(
-                        "hardened: refusing to mount the adapter directory — it "
-                        f"overlaps the control root ({adapter_ro_dir}); the "
-                        "holdout barrier would be breached by construction")
-                # (M11) Credential values enter the container ONLY as `-e` argv
-                # baked into the docker invocation by build_argv — never via the
-                # docker CLIENT process's own env. This is the sole channel any
-                # env reaches the hardened builder; `-e K=V` is visible to local
-                # `ps` (documented residual, see references/credentials.md).
-                # (§7.3 Task 3) hardened.dep_cache_dir, when configured, is a
-                # SECOND ro_mount — a pre-provisioned read-only pip/npm cache
-                # so a hardened builder can pip/npm install pinned deps
-                # without live network access. Same TOCTOU re-check
-                # discipline as the adapter mount above: config-load already
-                # validated the dir exists, but this is the moment it's about
-                # to be bind-mounted into the container.
-                ro_mounts = [adapter_ro_dir]
-                dep_cache_env = None
-                dep_cache_dir = c.get("dep_cache_dir")
-                if dep_cache_dir:
-                    if not _disjoint(dep_cache_dir, cfg["_control_root"]):
-                        raise df_sandbox.SandboxError(
-                            "hardened: refusing to mount dep_cache_dir — it "
-                            f"overlaps the control root ({dep_cache_dir}); the "
-                            "holdout barrier would be breached by construction")
-                    ro_mounts.append(dep_cache_dir)
-                    dep_cache_env = {
-                        "PIP_NO_INDEX": "1",
-                        "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
-                        "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
-                        "npm_config_offline": "true",
-                    }
-                merged_env = dict(creds) if creds else {}
-                if dep_cache_env:
-                    merged_env.update(dep_cache_env)
-                builder_prefix = df_container.build_argv(
-                    c["image"], workspace,
-                    ro_mounts=ro_mounts,
-                    network=c["network"], memory=c["memory"], pids=c["pids"],
-                    env=merged_env if merged_env else None)
-                if build_env_extra:
-                    journal.write("TWIN_ENV_SKIPPED", tier="hardened",
-                                  reason="builder-side twin env not forwarded into "
-                                         "container (M12)")
-                builder_env = creds
-            elif effective == "enterprise":
-                # M17 Task 3: the hardened container path PLUS the egress
-                # lock + seccomp. Same adapter-mount TOCTOU re-check as
-                # hardened above (the enterprise container mounts the
-                # adapter directory too).
-                c = cfg["_container"]
-                adapter_ro_dir = os.path.dirname(os.path.realpath(adapter))
-                if not _disjoint(adapter_ro_dir, cfg["_control_root"]):
-                    raise df_sandbox.SandboxError(
-                        "enterprise: refusing to mount the adapter directory — it "
-                        f"overlaps the control root ({adapter_ro_dir}); the "
-                        "holdout barrier would be breached by construction")
-                # Enterprise passes NO PROVIDER credential env into the
-                # container (the credential_proxy is the SOLE provider-
-                # credential path: the raw provider token is read host-side
-                # by the proxy and injected on the proxy->provider leg,
-                # never baked into the container as a `-e` var — df_config
-                # additionally refuses a config where credential_proxy.
-                # token_env also appears in credentials.allowlist, so the
-                # two channels can't collide). (§7.3 Task 3) dep_cache_dir
-                # carries the SAME ro_mount + env wiring as hardened above —
-                # it is not a credential either.
-                #
-                # M30/DF-03 supervisor-wiring (M32, Part 1): when the
-                # builder IS an API adapter (api_anthropic/api_openai --
-                # enterprise_provider is set above), also thread in
-                # DF_PROXY_DESCRIPTOR: {endpoint, provider, target_base_url,
-                # capability_token} as a plain env var. This is NOT the
-                # provider secret -- it is a LOCAL workload capability token
-                # (proves to the proxy which process may use it) plus
-                # non-secret routing (where the proxy listens, which
-                # provider/base-URL to address). The adapter uses it to
-                # speak PLAINTEXT to the local proxy (see api_anthropic/
-                # api_openai's _parse_proxy_descriptor); the proxy is what
-                # opens the real TLS leg and injects the REAL key, host-side,
-                # exactly as before. CLI builder adapters never read this
-                # var (enterprise_provider is None for them) — unchanged
-                # behavior, no descriptor, same as pre-M32.
-                ro_mounts_ent = [adapter_ro_dir]
-                enterprise_env = {}
-                dep_cache_dir = c.get("dep_cache_dir")
-                if dep_cache_dir:
-                    if not _disjoint(dep_cache_dir, cfg["_control_root"]):
-                        raise df_sandbox.SandboxError(
-                            "enterprise: refusing to mount dep_cache_dir — it "
-                            f"overlaps the control root ({dep_cache_dir}); the "
-                            "holdout barrier would be breached by construction")
-                    ro_mounts_ent.append(dep_cache_dir)
-                    enterprise_env.update({
-                        "PIP_NO_INDEX": "1",
-                        "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
-                        "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
-                        "npm_config_offline": "true",
-                    })
-                if enterprise_provider is not None:
-                    target_base_url = f"https://{_PROXY_PROVIDER_RULES[enterprise_provider]['host']}"
-                    descriptor = {
-                        "endpoint": f"http://{proxy_endpoint}",
-                        "provider": enterprise_provider,
-                        "target_base_url": target_base_url,
-                        "capability_token": enterprise_capability_token,
-                    }
-                    enterprise_env["DF_PROXY_DESCRIPTOR"] = canonical_json(descriptor)
-                    # Descriptor WIRED — never the token value.
-                    journal.write("PROXY_DESCRIPTOR_WIRED", iteration=i,
-                                  provider=enterprise_provider,
-                                  endpoint=descriptor["endpoint"],
-                                  target_base_url=target_base_url)
-                builder_prefix = df_container.build_enterprise_argv(
-                    c["image"], workspace,
-                    ro_mounts=ro_mounts_ent,
-                    proxy_endpoint=proxy_endpoint,
-                    seccomp_profile_path=cfg["_enterprise"]["seccomp"],
-                    entrypoint_path=entrypoint_path,
-                    memory=c["memory"], pids=c["pids"],
-                    env=enterprise_env if enterprise_env else None)
-                if build_env_extra:
-                    journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
-                                  reason="builder-side twin env not forwarded into "
-                                         "container (M12)")
-                builder_env = None
-            else:
-                builder_prefix = exec_prefix
-                if creds:
-                    # Strip credential-shaped launcher vars that aren't
-                    # allowlisted, then merge the resolved creds in — a full
-                    # env REPLACEMENT (env_full), since env_extra's
-                    # dict(os.environ, **env_extra) merge can only add, never
-                    # strip. Twin env (build_env_extra: DF_TWIN_* endpoints)
-                    # is NOT a credential and keeps flowing to non-hardened
-                    # builders exactly as pre-M11 — merged over the scoped
-                    # env so twins+credentials compose instead of silently
-                    # dropping the twin endpoints.
-                    builder_env = None
-                    builder_env_full = df_creds.launcher_scoped_env(
-                        os.environ, cfg["_credentials"]["allowlist"], creds)
-                    builder_env_full.update(build_env_extra or {})
-                else:
-                    builder_env = build_env_extra
-
-            # env_full is only ever passed when actually set (M11 credentials
-            # configured at standard/cooperative): existing invoke_adapter
-            # call sites/tests that predate env_full and don't accept it as a
-            # kwarg keep working unchanged when no credentials are configured.
-            _invoke_kwargs = {"exec_prefix": builder_prefix, "env_extra": builder_env}
-            if builder_env_full is not None:
-                _invoke_kwargs["env_full"] = builder_env_full
-            # confine is only ever passed when actually enabled (M14) — same
-            # back-compat reason as env_full above: existing invoke_adapter
-            # callers/tests that predate `confine` and don't accept it as a
-            # kwarg keep working unchanged when builder_confinement is
-            # absent/disabled.
-            _confined_kwargs = dict(_invoke_kwargs)
-            if confine_state["enabled"]:
-                _confined_kwargs["confine"] = True
-
-            # --- DF-08/M35: crash-safe dispatch. Journal INTENT to dispatch
-            # a paid builder call, and COMMIT the reservation computed above
-            # (calls_after/est_after) to durable state, BOTH before the call
-            # is made -- so if this process is killed anywhere between here
-            # and the matching DISPATCH_RESULT below (including mid-
-            # subprocess, after a real provider request has already gone
-            # out), the spend is never understated and a resume never
-            # silently re-dispatches: `_unresolved_dispatch_intent` (used by
-            # resume()) finds this INTENT with no matching RESULT and stops,
-            # fail-closed, at UNKNOWN_OUTCOME instead of guessing. This
-            # replaces the old post-call `builder_calls = calls_after;
-            # estimated_usd = est_after` commit (moved here, before the
-            # call) -- a normal, non-crashing run ends with the identical
-            # final numbers, just committed earlier.
-            dispatch_key = _dispatch_idempotency_key(mb_clean["invocation"], i)
-            journal.write("DISPATCH_INTENT", iteration=i, idempotency_key=dispatch_key,
-                          reserved_calls=calls_after, reserved_usd=est_after)
-            builder_calls = calls_after
-            estimated_usd = est_after
-            save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
-                      dev_status=prev_dev_status, regressions=regressed,
-                      builder_calls=builder_calls, estimated_usd=estimated_usd,
-                      budget_alerted=budget_alerted, reason="dispatch",
-                      phase=f"DISPATCH_{i}", chain_append=False,
-                      build_approved_through=build_approved_through, redactor=redactor,
-                      builder_input_tokens=builder_input_tokens,
-                      builder_output_tokens=builder_output_tokens,
-                      usage_known=usage_known)
-
-            resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                       **_confined_kwargs)
-
-            if (confine_state["enabled"] and err is None and resp is not None
-                    and resp.get("status") == "error"
-                    and "confinement unsupported" in (resp.get("detail") or "")):
-                if cfg["_confine"]["required"]:
-                    # Fail-closed (M14 Global Constraint): a tier that
-                    # REQUIRES confinement must NEVER run the builder
-                    # unconfined — refuse here, before any unconfined build
-                    # happens (this iteration's builder call already did
-                    # nothing but report the refusal; no artifact written).
-                    journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
-                                 status="error")
-                    journal.write("CONFINEMENT_UNSUPPORTED", iteration=i,
-                                 detail=resp.get("detail", ""))
-                    mf = dict(mb_clean, outcome="CONFINEMENT_REFUSED", iterations=i,
-                             qualified=False,
-                             final_exam={"ran": False, "passed": None, "count": 0},
-                             regressions=sorted(regressed),
-                             budget=_budget_manifest_field(cfg["_budget"], builder_calls,
-                                                           estimated_usd),
-                             usage=_usage_manifest_field(cfg["_budget"], usage_known,
-                                                         builder_input_tokens, builder_output_tokens))
+                                   "BUDGET_HALTED", estimated_usd, builder_calls)
+                    mf = dict(mb_clean, outcome="BUDGET_HALTED", iterations=i, qualified=False,
+                              final_exam={"ran": False, "passed": None, "count": 0},
+                              regressions=sorted(regressed),
+                              qualification=_qualification_field(mb_clean, effective),
+                              budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
+                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                          builder_input_tokens, builder_output_tokens))
                     digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
                     anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
                                                 digest, audit_key, journal)
                     _clear_state()
                     _kb_writeback(cfg, journal, mf, [])
-                    sys.stderr.write(
-                        f"dark-factory: confinement required but unsupported for this "
-                        f"builder adapter at iteration {i} — refusing (fail-closed); "
-                        f"the builder was never run unconfined\n")
-                    return anchor_exit or 2
-                # Not required: warn + fall back to an UNCONFINED call for
-                # the rest of this run (retrying confine=True every
-                # iteration would just keep re-hitting the same
-                # unsupported CLI — the result is deterministic).
-                journal.write("CONFINEMENT_WARN", iteration=i, detail=resp.get("detail", ""))
-                confine_state["enabled"] = False
-                mb_clean["builder_confinement"] = _confine_manifest_field(confine_state, cli)
-                resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
-                                           **_invoke_kwargs)
+                    print(f"dark-factory: BUDGET HALTED (lights-out) — budget cap reached "
+                          f"(estimated_usd={estimated_usd}, builder_calls={builder_calls}); "
+                          f"a lights-out run fails closed instead of pausing. Run: {run_dir}")
+                    return anchor_exit or 3
+                if budget_pause:
+                    journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
+                                  builder_calls=builder_calls, cap_usd=b["max_usd"],
+                                  max_calls=b["max_calls"])
+                    _notify_budget(cfg, journal, redactor, manifest_base["invocation"],
+                                   "BUDGET_PAUSE", estimated_usd, builder_calls)
+                    save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                              dev_status=prev_dev_status, regressions=regressed,
+                              builder_calls=builder_calls, estimated_usd=estimated_usd,
+                              budget_alerted=budget_alerted, reason="budget",
+                              phase=f"AWAIT_BUDGET_{i}", chain_append=True,
+                              scenario_set_sha256=scenario_set_sha256,
+                              build_approved_through=build_approved_through, redactor=redactor,
+                              builder_input_tokens=builder_input_tokens,
+                              builder_output_tokens=builder_output_tokens,
+                              usage_known=usage_known)
+                    print(f"dark-factory: PAUSED — budget cap reached (estimated_usd={estimated_usd}, "
+                          f"builder_calls={builder_calls}). Raise budget.max_usd (or max_calls) in "
+                          f"config.json and run: supervisor.py resume --control-root "
+                          f"{cfg.get('_control_root', '<cr>')} --decision continue")
+                    return PAUSED
 
-            # DF-08/M35: durable marker that iteration i's dispatch RESOLVED
-            # (the adapter call returned -- no crash) -- whichever of the
-            # one or two invoke_adapter attempts above actually produced the
-            # resp/err this iteration lands on. Written unconditionally,
-            # before the ok/error branch, so both outcomes are bracketed.
-            journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
-                          status="error" if err else ("ok" if resp.get("status") == "ok" else "error"))
+                # Builder isolation: at effective "hardened" the builder runs inside a
+                # Docker container (control root never mounted — barrier by
+                # construction), built fresh per call; the OS-sandbox exec_prefix
+                # returned by resolve_isolation is reserved for the VERIFIER only
+                # (run_all below), unchanged. Builder-side twin env cannot cross the
+                # container boundary in M10 (journaled, not silently dropped) — the
+                # container always gets a clean env regardless of twins, PLUS
+                # (M11) the configured credential allowlist via `-e` container env.
+                builder_env_full = None
+                if effective == "hardened":
+                    c = cfg["_container"]
+                    # RA-07/M46: mount the adapter EXECUTABLE FILE, not its parent
+                    # directory. Mounting os.path.dirname(...) ro-exposed EVERY
+                    # sibling of the adapter to the builder — an adapter placed in
+                    # a broad dir (~/bin, a repo root, a dir also holding keys)
+                    # would leak all of it. Docker supports a single-file bind
+                    # mount, and df_container.build_argv binds any path as
+                    # `-v {p}:{p}:ro`, so the in-container adapter path (and the
+                    # invocation) are unchanged — only the exposed surface shrinks
+                    # from the whole directory to the one file. The shipped
+                    # in-container adapters (api_anthropic/api_openai) are
+                    # stdlib-only single files (no sibling import), so a file mount
+                    # is sufficient; a multi-file adapter must declare its extras
+                    # (see references/hardened.md) rather than get its dir mounted.
+                    adapter_ro_file = os.path.realpath(adapter)
+                    # Belt-and-suspenders (defense in depth against config drift /
+                    # TOCTOU): df_config already rejects a hardened adapter whose
+                    # directory overlaps the control root, but this file is about to
+                    # be bind-mounted into the builder container — re-verify at the
+                    # moment of use rather than trusting the load-time check.
+                    if not _disjoint(adapter_ro_file, cfg["_control_root"]):
+                        raise df_sandbox.SandboxError(
+                            "hardened: refusing to mount the adapter executable — it "
+                            f"overlaps the control root ({adapter_ro_file}); the "
+                            "holdout barrier would be breached by construction")
+                    # (M11) Credential values enter the container ONLY as `-e` argv
+                    # baked into the docker invocation by build_argv — never via the
+                    # docker CLIENT process's own env. This is the sole channel any
+                    # env reaches the hardened builder; `-e K=V` is visible to local
+                    # `ps` (documented residual, see references/credentials.md).
+                    # (§7.3 Task 3) hardened.dep_cache_dir, when configured, is a
+                    # SECOND ro_mount — a pre-provisioned read-only pip/npm cache
+                    # so a hardened builder can pip/npm install pinned deps
+                    # without live network access. Same TOCTOU re-check
+                    # discipline as the adapter mount above: config-load already
+                    # validated the dir exists, but this is the moment it's about
+                    # to be bind-mounted into the container.
+                    ro_mounts = [adapter_ro_file]
+                    dep_cache_env = None
+                    dep_cache_dir = c.get("dep_cache_dir")
+                    if dep_cache_dir:
+                        if not _disjoint(dep_cache_dir, cfg["_control_root"]):
+                            raise df_sandbox.SandboxError(
+                                "hardened: refusing to mount dep_cache_dir — it "
+                                f"overlaps the control root ({dep_cache_dir}); the "
+                                "holdout barrier would be breached by construction")
+                        ro_mounts.append(dep_cache_dir)
+                        dep_cache_env = {
+                            "PIP_NO_INDEX": "1",
+                            "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
+                            "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
+                            "npm_config_offline": "true",
+                        }
+                    merged_env = dict(creds) if creds else {}
+                    if dep_cache_env:
+                        merged_env.update(dep_cache_env)
+                    builder_prefix = df_container.build_argv(
+                        c["image"], workspace,
+                        ro_mounts=ro_mounts,
+                        network=c["network"], memory=c["memory"], pids=c["pids"],
+                        env=merged_env if merged_env else None)
+                    if build_env_extra:
+                        journal.write("TWIN_ENV_SKIPPED", tier="hardened",
+                                      reason="builder-side twin env not forwarded into "
+                                             "container (M12)")
+                    builder_env = creds
+                elif effective == "enterprise":
+                    # M17 Task 3: the hardened container path PLUS the egress
+                    # lock + seccomp. RA-07/M46 (same fix as hardened above):
+                    # mount the adapter EXECUTABLE FILE, not its parent directory,
+                    # so an adapter in a broad dir cannot leak its siblings into
+                    # the builder. Same single-file bind + TOCTOU re-check as
+                    # hardened; the shipped in-container API adapters are
+                    # stdlib-only single files, so a file mount suffices.
+                    c = cfg["_container"]
+                    adapter_ro_file = os.path.realpath(adapter)
+                    if not _disjoint(adapter_ro_file, cfg["_control_root"]):
+                        raise df_sandbox.SandboxError(
+                            "enterprise: refusing to mount the adapter executable — it "
+                            f"overlaps the control root ({adapter_ro_file}); the "
+                            "holdout barrier would be breached by construction")
+                    # Enterprise passes NO PROVIDER credential env into the
+                    # container (the credential_proxy is the SOLE provider-
+                    # credential path: the raw provider token is read host-side
+                    # by the proxy and injected on the proxy->provider leg,
+                    # never baked into the container as a `-e` var — df_config
+                    # additionally refuses a config where credential_proxy.
+                    # token_env also appears in credentials.allowlist, so the
+                    # two channels can't collide). (§7.3 Task 3) dep_cache_dir
+                    # carries the SAME ro_mount + env wiring as hardened above —
+                    # it is not a credential either.
+                    #
+                    # M30/DF-03 supervisor-wiring (M32, Part 1): when the
+                    # builder IS an API adapter (api_anthropic/api_openai --
+                    # enterprise_provider is set above), also thread in
+                    # DF_PROXY_DESCRIPTOR: {endpoint, provider, target_base_url,
+                    # capability_token} as a plain env var. This is NOT the
+                    # provider secret -- it is a LOCAL workload capability token
+                    # (proves to the proxy which process may use it) plus
+                    # non-secret routing (where the proxy listens, which
+                    # provider/base-URL to address). The adapter uses it to
+                    # speak PLAINTEXT to the local proxy (see api_anthropic/
+                    # api_openai's _parse_proxy_descriptor); the proxy is what
+                    # opens the real TLS leg and injects the REAL key, host-side,
+                    # exactly as before. CLI builder adapters never read this
+                    # var (enterprise_provider is None for them) — unchanged
+                    # behavior, no descriptor, same as pre-M32.
+                    ro_mounts_ent = [adapter_ro_file]
+                    enterprise_env = {}
+                    dep_cache_dir = c.get("dep_cache_dir")
+                    if dep_cache_dir:
+                        if not _disjoint(dep_cache_dir, cfg["_control_root"]):
+                            raise df_sandbox.SandboxError(
+                                "enterprise: refusing to mount dep_cache_dir — it "
+                                f"overlaps the control root ({dep_cache_dir}); the "
+                                "holdout barrier would be breached by construction")
+                        ro_mounts_ent.append(dep_cache_dir)
+                        enterprise_env.update({
+                            "PIP_NO_INDEX": "1",
+                            "PIP_FIND_LINKS": os.path.join(dep_cache_dir, "pypi"),
+                            "npm_config_cache": os.path.join(dep_cache_dir, "npm-cache"),
+                            "npm_config_offline": "true",
+                        })
+                    if enterprise_provider is not None:
+                        target_base_url = f"https://{_PROXY_PROVIDER_RULES[enterprise_provider]['host']}"
+                        descriptor = {
+                            "endpoint": f"http://{proxy_endpoint}",
+                            "provider": enterprise_provider,
+                            "target_base_url": target_base_url,
+                            "capability_token": enterprise_capability_token,
+                        }
+                        enterprise_env["DF_PROXY_DESCRIPTOR"] = canonical_json(descriptor)
+                        # Descriptor WIRED — never the token value.
+                        journal.write("PROXY_DESCRIPTOR_WIRED", iteration=i,
+                                      provider=enterprise_provider,
+                                      endpoint=descriptor["endpoint"],
+                                      target_base_url=target_base_url)
+                    builder_prefix = df_container.build_enterprise_argv(
+                        c["image"], workspace,
+                        ro_mounts=ro_mounts_ent,
+                        proxy_endpoint=proxy_endpoint,
+                        seccomp_profile_path=cfg["_enterprise"]["seccomp"],
+                        entrypoint_path=entrypoint_path,
+                        memory=c["memory"], pids=c["pids"],
+                        env=enterprise_env if enterprise_env else None)
+                    if build_env_extra:
+                        journal.write("TWIN_ENV_SKIPPED", tier="enterprise",
+                                      reason="builder-side twin env not forwarded into "
+                                             "container (M12)")
+                    builder_env = None
+                else:
+                    builder_prefix = exec_prefix
+                    if creds:
+                        # Strip credential-shaped launcher vars that aren't
+                        # allowlisted, then merge the resolved creds in — a full
+                        # env REPLACEMENT (env_full), since env_extra's
+                        # dict(os.environ, **env_extra) merge can only add, never
+                        # strip. Twin env (build_env_extra: DF_TWIN_* endpoints)
+                        # is NOT a credential and keeps flowing to non-hardened
+                        # builders exactly as pre-M11 — merged over the scoped
+                        # env so twins+credentials compose instead of silently
+                        # dropping the twin endpoints.
+                        builder_env = None
+                        builder_env_full = df_creds.launcher_scoped_env(
+                            os.environ, cfg["_credentials"]["allowlist"], creds)
+                        builder_env_full.update(build_env_extra or {})
+                    else:
+                        builder_env = build_env_extra
+
+                # env_full is only ever passed when actually set (M11 credentials
+                # configured at standard/cooperative): existing invoke_adapter
+                # call sites/tests that predate env_full and don't accept it as a
+                # kwarg keep working unchanged when no credentials are configured.
+                _invoke_kwargs = {"exec_prefix": builder_prefix, "env_extra": builder_env}
+                if builder_env_full is not None:
+                    _invoke_kwargs["env_full"] = builder_env_full
+                # confine is only ever passed when actually enabled (M14) — same
+                # back-compat reason as env_full above: existing invoke_adapter
+                # callers/tests that predate `confine` and don't accept it as a
+                # kwarg keep working unchanged when builder_confinement is
+                # absent/disabled.
+                _confined_kwargs = dict(_invoke_kwargs)
+                if confine_state["enabled"]:
+                    _confined_kwargs["confine"] = True
+
+                # --- DF-08/M35: crash-safe dispatch. Journal INTENT to dispatch
+                # a paid builder call, and COMMIT the reservation computed above
+                # (calls_after/est_after) to durable state, BOTH before the call
+                # is made -- so if this process is killed anywhere between here
+                # and the matching DISPATCH_RESULT below (including mid-
+                # subprocess, after a real provider request has already gone
+                # out), the spend is never understated and a resume never
+                # silently re-dispatches: `_unresolved_dispatch_intent` (used by
+                # resume()) finds this INTENT with no matching RESULT and stops,
+                # fail-closed, at UNKNOWN_OUTCOME instead of guessing. This
+                # replaces the old post-call `builder_calls = calls_after;
+                # estimated_usd = est_after` commit (moved here, before the
+                # call) -- a normal, non-crashing run ends with the identical
+                # final numbers, just committed earlier.
+                dispatch_key = _dispatch_idempotency_key(mb_clean["invocation"], i)
+                journal.write("DISPATCH_INTENT", iteration=i, idempotency_key=dispatch_key,
+                              reserved_calls=calls_after, reserved_usd=est_after)
+                builder_calls = calls_after
+                estimated_usd = est_after
+                save_state(run_dir, next_iter=i, feedback=feedback, workspace=workspace,
+                          dev_status=prev_dev_status, regressions=regressed,
+                          builder_calls=builder_calls, estimated_usd=estimated_usd,
+                          budget_alerted=budget_alerted, reason="dispatch",
+                          phase=f"DISPATCH_{i}", chain_append=False,
+                          build_approved_through=build_approved_through, redactor=redactor,
+                          builder_input_tokens=builder_input_tokens,
+                          builder_output_tokens=builder_output_tokens,
+                          usage_known=usage_known)
+
+                resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
+                                           **_confined_kwargs)
+
+                if (confine_state["enabled"] and err is None and resp is not None
+                        and resp.get("status") == "error"
+                        and "confinement unsupported" in (resp.get("detail") or "")):
+                    if cfg["_confine"]["required"]:
+                        # Fail-closed (M14 Global Constraint): a tier that
+                        # REQUIRES confinement must NEVER run the builder
+                        # unconfined — refuse here, before any unconfined build
+                        # happens (this iteration's builder call already did
+                        # nothing but report the refusal; no artifact written).
+                        journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
+                                     status="error")
+                        journal.write("CONFINEMENT_UNSUPPORTED", iteration=i,
+                                     detail=resp.get("detail", ""))
+                        mf = dict(mb_clean, outcome="CONFINEMENT_REFUSED", iterations=i,
+                                 qualified=False,
+                                 final_exam={"ran": False, "passed": None, "count": 0},
+                                 regressions=sorted(regressed),
+                                 budget=_budget_manifest_field(cfg["_budget"], builder_calls,
+                                                               estimated_usd),
+                                 usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                             builder_input_tokens, builder_output_tokens))
+                        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                    digest, audit_key, journal)
+                        _clear_state()
+                        _kb_writeback(cfg, journal, mf, [])
+                        sys.stderr.write(
+                            f"dark-factory: confinement required but unsupported for this "
+                            f"builder adapter at iteration {i} — refusing (fail-closed); "
+                            f"the builder was never run unconfined\n")
+                        return anchor_exit or 2
+                    # Not required: warn + fall back to an UNCONFINED call for
+                    # the rest of this run (retrying confine=True every
+                    # iteration would just keep re-hitting the same
+                    # unsupported CLI — the result is deterministic).
+                    journal.write("CONFINEMENT_WARN", iteration=i, detail=resp.get("detail", ""))
+                    confine_state["enabled"] = False
+                    mb_clean["builder_confinement"] = _confine_manifest_field(confine_state, cli)
+                    resp, err = invoke_adapter(adapter, "builder", workspace, prompt_file, timeout_s,
+                                               **_invoke_kwargs)
+
+                # DF-08/M35: durable marker that iteration i's dispatch RESOLVED
+                # (the adapter call returned -- no crash) -- whichever of the
+                # one or two invoke_adapter attempts above actually produced the
+                # resp/err this iteration lands on. Written unconditionally,
+                # before the ok/error branch, so both outcomes are bracketed.
+                journal.write("DISPATCH_RESULT", iteration=i, idempotency_key=dispatch_key,
+                              status="error" if err else ("ok" if resp.get("status") == "ok" else "error"))
+            else:
+                # Replay path. On the happy path (no crash) replay_result is
+                # always None, so this branch is inert -- the normal run is
+                # unchanged. Here the builder already ran and wrote the
+                # workspace, which persists across the crash. Fail CLOSED if it
+                # is somehow gone: a resolved-ok result with a missing workspace
+                # is an inconsistent state we must never paper over by verifying
+                # an empty tree (which could spuriously 'converge' on nothing).
+                if not os.path.isdir(workspace):
+                    raise df_sandbox.SandboxError(
+                        f"RA-06 replay: iteration {i} recorded a successful "
+                        f"DISPATCH_RESULT but its workspace is missing "
+                        f"({workspace}) -- refusing to verify an inconsistent "
+                        "state (fail-closed)")
+                journal.write("DISPATCH_REPLAYED", iteration=i,
+                              idempotency_key=_dispatch_idempotency_key(
+                                  mb_clean["invocation"], i))
+                # Reconstruct the minimal ok result the ok-branch below needs.
+                # No usage is replayed (value-free): M25 token accounting for
+                # this already-paid call is a soft, fail-soft estimate, simply
+                # not re-accrued on replay -- the paid-spend budget
+                # (builder_calls/estimated_usd) is what M35 durably preserved.
+                resp, err = {"status": "ok"}, None
 
             if err or resp.get("status") != "ok":
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=err or resp.get("detail", ""))

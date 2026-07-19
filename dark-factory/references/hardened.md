@@ -25,9 +25,21 @@ container, the control root's path simply does not exist. Only two paths are
 ever mounted into the builder container:
 
 - the **workspace**, read-write, at its host realpath;
-- the **adapter's directory**, read-only, at its host realpath (so the
-  adapter-protocol contract — an absolute executable path — still resolves
-  identically inside and outside the container).
+- the **adapter executable FILE**, read-only, at its host realpath (a
+  single-file bind mount, so the adapter-protocol contract — an absolute
+  executable path — still resolves identically inside and outside the
+  container).
+
+  RA-07/M46 narrowed this: earlier releases mounted the adapter's whole
+  *directory* read-only, which exposed **every sibling of the adapter**
+  (an adapter dropped in `~/bin`, a repo root, or a dir that also held keys
+  leaked all of it into the untrusted builder). Now only the one executable
+  file is bound. The shipped in-container adapters (`api_anthropic`,
+  `api_openai`) are stdlib-only single files with no sibling import, so a
+  file mount is sufficient. **A multi-file adapter must declare its extra
+  files explicitly** — it cannot rely on its directory being mounted (there
+  is no directory mount anymore). (`hardened.dep_cache_dir`, when configured,
+  remains a separate, explicitly-declared read-only mount.)
 
 Nothing else. `df_container.build_argv` asserts this structurally: the
 resulting argv contains exactly `1 + len(ro_mounts)` `-v` flags, so a third

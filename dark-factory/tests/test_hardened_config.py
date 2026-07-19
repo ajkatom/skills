@@ -516,9 +516,10 @@ def test_dep_cache_dir_hardened_mounted_and_env_injected(tmp_path, monkeypatch):
 
 
 def test_dep_cache_dir_unset_hardened_ro_mounts_and_env_unchanged(tmp_path, monkeypatch):
-    # Back-compat: a hardened run that never configures dep_cache_dir must
-    # see byte-identical ro_mounts/env to pre-M26 behavior — only the
-    # adapter directory mounted, no pip/npm env vars injected.
+    # A hardened run that never configures dep_cache_dir mounts ONLY the adapter
+    # and injects no pip/npm env vars. RA-07/M46: the single ro_mount is the
+    # adapter EXECUTABLE FILE, never its parent directory (a broad parent dir
+    # would ro-expose sibling secrets to the builder).
     cr = _hardened_control(tmp_path)
     _patch_hardened_probes(monkeypatch, os_ok=True, dk_ok=True)
 
@@ -538,10 +539,15 @@ def test_dep_cache_dir_unset_hardened_ro_mounts_and_env_unchanged(tmp_path, monk
     assert captured, "builder invoke_adapter was never called"
 
     argv = captured[0]
+    adapter_ro_file = os.path.realpath(FAKE)
     adapter_ro_dir = os.path.realpath(os.path.dirname(FAKE))
     v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
     ro_specs = [s for s in v_specs if s.endswith(":ro")]
-    assert ro_specs == [f"{adapter_ro_dir}:{adapter_ro_dir}:ro"]
+    # RA-07: the adapter FILE is the sole ro_mount ...
+    assert ro_specs == [f"{adapter_ro_file}:{adapter_ro_file}:ro"]
+    # ... and its parent DIRECTORY is mounted nowhere (no ro OR rw spec binds
+    # the dir), so a sibling secret next to the adapter is never exposed.
+    assert not any(spec.startswith(f"{adapter_ro_dir}:{adapter_ro_dir}") for spec in v_specs)
 
     e_pairs = {argv[i + 1] for i, x in enumerate(argv) if x == "-e"}
     for forbidden in ("PIP_NO_INDEX=1", "npm_config_offline=true"):

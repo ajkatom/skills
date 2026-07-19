@@ -203,6 +203,125 @@ def test_unresolved_dispatch_intent_helper_detects_gap(tmp_path):
     assert supervisor._unresolved_dispatch_intent(str(run_dir)) is None
 
 
+def test_crash_after_dispatch_result_replays_instead_of_redispatching(tmp_path, monkeypatch):
+    # RA-06/M46: a crash that lands AFTER iteration 1's DISPATCH_RESULT ok was
+    # journaled (the paid builder call COMPLETED and wrote the workspace) but
+    # BEFORE the iteration finalized and next_iter advanced must, on plain
+    # `resume --decision continue`, REPLAY the recorded result (verify the
+    # already-persisted workspace) -- NEVER re-dispatch a second PAID call.
+    # This is the RESOLVED counterpart to the M35 UNRESOLVED->UNKNOWN_OUTCOME
+    # test above (which stays green): resolved auto-skips, unresolved reconciles.
+    cr = setup_control(tmp_path, FAKE, checkpoint="auto")
+    _set_budget(cr, {"billing": "api", "per_call_usd": 2.0, "max_usd": 100.0})
+
+    calls = {"n": 0}
+    real_invoke = supervisor.invoke_adapter
+
+    def counting_invoke(*a, **kw):
+        calls["n"] += 1
+        return real_invoke(*a, **kw)
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", counting_invoke)
+
+    # Crash simulation: raise inside the POST-dispatch verify on the first
+    # builder call only (gated on calls["n"] >= 1 so a pre-build gate can't
+    # trip it; one-shot via `armed`). At that point DISPATCH_RESULT ok is
+    # journaled and the buggy workspace is written, but state.json is still the
+    # DISPATCH_1 save (next_iter == 1), so resume re-enters iteration 1.
+    real_run_all = supervisor.run_all
+    crash = {"armed": True}
+
+    def crashing_run_all(*a, **kw):
+        if crash["armed"] and calls["n"] >= 1:
+            crash["armed"] = False
+            raise RuntimeError("simulated crash post-dispatch-result")
+        return real_run_all(*a, **kw)
+
+    monkeypatch.setattr(supervisor, "run_all", crashing_run_all)
+
+    with pytest.raises(RuntimeError, match="simulated crash post-dispatch-result"):
+        supervisor.run(str(cr), None)
+    assert calls["n"] == 1  # iteration 1 dispatched exactly once
+
+    entries, run_id = read_journal(cr)
+    intents = _dispatch_intents(entries)
+    results = _dispatch_results(entries)
+    assert len(intents) == 1
+    assert len(results) == 1 and results[0]["data"]["status"] == "ok"
+
+    run_dir = cr / "runs" / run_id
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["next_iter"] == 1          # iteration NOT finalized before crash
+    assert state["builder_calls"] == 1      # reserved spend committed at intent time
+    assert state["estimated_usd"] == 2.0
+
+    # Plain `continue`: the RESOLVED dispatch is replayed, not re-dispatched.
+    rc = supervisor.resume(str(cr), "continue")
+    assert rc == 0                          # FAKE converges (iter1 buggy -> iter2 fixed)
+    # THE regression assertion: the builder was NOT paid again for iteration 1.
+    # calls["n"] == 2 means only iteration 2's real call was added; a re-dispatch
+    # bug would make this 3 (re-run iter1 + iter2).
+    assert calls["n"] == 2
+
+    entries2, _ = read_journal(cr)
+    states2 = [e["state"] for e in entries2]
+    replayed = [e for e in entries2 if e["state"] == "DISPATCH_REPLAYED"]
+    assert len(replayed) == 1
+    assert replayed[0]["data"]["iteration"] == 1
+    # The replay matched iteration 1's EXACT dispatch key (recorded result),
+    # not a fresh dispatch.
+    assert replayed[0]["data"]["idempotency_key"] == sha256_str(f"{run_id}:1")
+    # Iteration 1 was never re-dispatched: still exactly one INTENT for it, plus
+    # iteration 2's -- and iteration 1 has no SECOND DISPATCH_RESULT.
+    assert [e["data"]["iteration"] for e in _dispatch_intents(entries2)] == [1, 2]
+    assert [e["data"]["iteration"] for e in _dispatch_results(entries2)] == [1, 2]
+    assert "CONVERGED" in states2
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    # Budget NOT double-counted: iteration 1's reserved call (committed pre-crash,
+    # reloaded on resume, NOT re-committed on replay) + iteration 2's real call
+    # = 2 calls / $4.0. A re-dispatch would show 3 / $6.0.
+    assert manifest["budget"]["builder_calls"] == 2
+    assert manifest["budget"]["estimated_usd"] == 4.0
+    assert not (run_dir / "state.json").exists()  # cleared at terminal
+
+
+def test_resolved_dispatch_result_helper(tmp_path):
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    inv = "INV"
+    key = sha256_str(f"{inv}:1")
+
+    # No journal at all -> None (never a false positive; unresolved path intact).
+    assert supervisor._resolved_dispatch_result(str(run_dir), inv, 1) is None
+
+    lines = [{"ts": "a", "state": "DISPATCH_INTENT",
+              "data": {"iteration": 1, "idempotency_key": key}}]
+    (run_dir / "journal.jsonl").write_text(
+        "\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+    # Intent but NO result -> None (this is precisely the UNKNOWN/reconcile case
+    # that _unresolved_dispatch_intent owns; the two helpers stay disjoint).
+    assert supervisor._resolved_dispatch_result(str(run_dir), inv, 1) is None
+
+    # An ERROR result must NOT trigger replay (an errored dispatch already
+    # terminated its run; it is never resumed into a re-dispatch).
+    lines.append({"ts": "b", "state": "DISPATCH_RESULT",
+                  "data": {"iteration": 1, "idempotency_key": key, "status": "error"}})
+    (run_dir / "journal.jsonl").write_text(
+        "\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+    assert supervisor._resolved_dispatch_result(str(run_dir), inv, 1) is None
+
+    # A SUCCESSFUL result for iteration 1 -> returns its recorded data dict.
+    lines.append({"ts": "c", "state": "DISPATCH_RESULT",
+                  "data": {"iteration": 1, "idempotency_key": key, "status": "ok"}})
+    (run_dir / "journal.jsonl").write_text(
+        "\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+    got = supervisor._resolved_dispatch_result(str(run_dir), inv, 1)
+    assert got is not None and got["status"] == "ok" and got["idempotency_key"] == key
+    # Keys are per-iteration: iteration 2 has no ok result -> None.
+    assert supervisor._resolved_dispatch_result(str(run_dir), inv, 2) is None
+
+
 def test_second_concurrent_run_refused_by_lock(tmp_path):
     cr = setup_control(tmp_path, FAKE, checkpoint="auto")
     lock = supervisor.acquire_lock(str(cr))

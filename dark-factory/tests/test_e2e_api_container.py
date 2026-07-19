@@ -67,16 +67,19 @@ def _prepull_image():
 def _run_adapter_in_container(workdir, prompt_file, container_base_url, timeout_s=60):
     """Build the exact docker argv supervisor._run_loop builds for a real
     hardened builder call (df_container.build_argv: workspace rw-mounted,
-    the adapter's OWN directory ro-mounted, network bridge, the credential
-    env baked in as docker `-e` flags) and invoke the adapter INSIDE it,
-    exactly the way supervisor.invoke_adapter does (`exec_prefix + [adapter]`,
-    protocol-0.1 request JSON piped on stdin). Returns the raw
+    the adapter FILE ro-mounted — RA-07/M46: the executable itself, NOT its
+    parent directory — network bridge, the credential env baked in as docker
+    `-e` flags) and invoke the adapter INSIDE it, exactly the way
+    supervisor.invoke_adapter does (`exec_prefix + [adapter]`, protocol-0.1
+    request JSON piped on stdin). This live run also proves the shipped
+    api_anthropic adapter is SELF-CONTAINED: it completes with only its own
+    file mounted (no sibling module needed). Returns the raw
     subprocess.CompletedProcess so the caller can inspect/grep stdout+stderr
     directly (rather than only the parsed response) for the no-key-leak
     assertion below."""
-    adapter_ro_dir = os.path.dirname(ADAPTER)
+    adapter_ro_file = os.path.realpath(ADAPTER)
     docker_argv = df_container.build_argv(
-        IMAGE, workdir, ro_mounts=[adapter_ro_dir], network="bridge",
+        IMAGE, workdir, ro_mounts=[adapter_ro_file], network="bridge",
         env={"ANTHROPIC_BASE_URL": container_base_url, "ANTHROPIC_API_KEY": TEST_KEY},
     )
     req = {
@@ -214,9 +217,9 @@ def test_api_anthropic_paid_live_in_container(tmp_path):
     if os.environ.get("DF_API_MODEL"):
         env["DF_API_MODEL"] = os.environ["DF_API_MODEL"]
 
-    adapter_ro_dir = os.path.dirname(ADAPTER)
+    adapter_ro_file = os.path.realpath(ADAPTER)  # RA-07: file, not dir
     docker_argv = df_container.build_argv(
-        IMAGE, ws_real, ro_mounts=[adapter_ro_dir], network="bridge", env=env,
+        IMAGE, ws_real, ro_mounts=[adapter_ro_file], network="bridge", env=env,
     )
     req = {
         "adapter_protocol": "0.1", "role": "builder", "workdir": ws_real,

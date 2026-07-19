@@ -59,9 +59,9 @@ def _run_adapter_in_container(workdir, prompt_file, env, timeout_s=60):
     channel any env reaches the hardened builder). Returns the raw
     CompletedProcess so the caller can grep stdout+stderr for the no-key-leak
     assertion."""
-    adapter_ro_dir = os.path.dirname(ADAPTER)
+    adapter_ro_file = os.path.realpath(ADAPTER)  # RA-07: adapter FILE, not dir
     docker_argv = df_container.build_argv(
-        IMAGE, workdir, ro_mounts=[adapter_ro_dir], network="bridge", env=env,
+        IMAGE, workdir, ro_mounts=[adapter_ro_file], network="bridge", env=env,
     )
     req = {
         "adapter_protocol": "0.1",

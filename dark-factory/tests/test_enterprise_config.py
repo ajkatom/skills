@@ -523,6 +523,46 @@ def test_dep_cache_dir_enterprise_mounted_and_env_injected(tmp_path, monkeypatch
         assert m["container"]["dep_cache_dir"] == dep_cache_real
 
 
+def test_enterprise_mounts_adapter_file_not_parent_dir(tmp_path, monkeypatch):
+    # RA-07/M46: the enterprise builder container ro-mounts the adapter
+    # EXECUTABLE FILE, never its parent directory. A broad parent dir would
+    # ro-expose sibling files (keys, other repos) to the untrusted builder.
+    # Same fix + assertion shape as the hardened tier
+    # (test_hardened_config.test_dep_cache_dir_unset_hardened...): the adapter
+    # FILE appears as a `-v file:file:ro` spec and the parent DIR appears in no
+    # `-v` spec at all. The enterprise config's builder adapter is VALID_ADAPTER
+    # (== sys.executable), whose parent `.../bin` holds many other binaries --
+    # exactly the "broad dir next to the adapter" RA-07 is about.
+    approvers = [_approver()[1] for _ in range(3)]
+    with _sink_receiver(tmp_path) as (sink_url, _store):
+        cr = _enterprise_control(tmp_path, approvers, threshold=2, sink_url=sink_url)
+        _patch_enterprise_probes(monkeypatch)
+
+        captured = []
+
+        def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
+                        exec_prefix=None, env_extra=None, env_full=None, confine=False):
+            captured.append(list(exec_prefix) if exec_prefix else [])
+            with open(os.path.join(workdir, "greet.py"), "w", encoding="utf-8") as f:
+                f.write(GREET_PY)
+            return {"adapter_protocol": "0.1", "status": "ok"}, None
+
+        monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
+
+        rc = supervisor.run(str(cr), None)
+        assert rc == 3  # enterprise always seals CUSTODY_PENDING; unrelated here
+        assert captured, "builder invoke_adapter was never called"
+
+        argv = captured[0]
+        adapter_ro_file = os.path.realpath(VALID_ADAPTER)
+        adapter_ro_dir = os.path.realpath(os.path.dirname(VALID_ADAPTER))
+        v_specs = [argv[i + 1] for i, x in enumerate(argv) if x == "-v"]
+        # The adapter FILE is bound read-only ...
+        assert f"{adapter_ro_file}:{adapter_ro_file}:ro" in v_specs, v_specs
+        # ... and its parent DIRECTORY is bound nowhere (ro or rw).
+        assert not any(spec.startswith(f"{adapter_ro_dir}:{adapter_ro_dir}") for spec in v_specs)
+
+
 def test_enterprise_two_phase_attach_and_tamper_evidence(tmp_path, monkeypatch):
     """THE end-to-end contract: real supervisor.run + real ed25519 sigs.
     run -> CUSTODY_PENDING; 1-of-3 attach -> not satisfied (exit 3, no
