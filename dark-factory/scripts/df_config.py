@@ -318,6 +318,40 @@ def load_config(control_root: str) -> dict:
     builder_expected_sha256 = _validate_adapter_sha256(builder, "builder")
     builder_model_identity = _validate_model_identity(builder, "builder")
 
+    # DF-R4-07 (R4 re-audit): a MULTI-FILE builder adapter (the shipped CLI
+    # adapters claude/codex/gemini `import df_confine`, a sibling in scripts/)
+    # needs its support files present in the hardened/enterprise container. M46
+    # mounts ONLY the adapter executable FILE (not its directory), so a sibling
+    # import ImportErrors in-container. `roles.builder.support_files` is the
+    # EXPLICIT allowlist of extra files to ro-mount alongside the adapter — the
+    # audit's preferred "explicit file allowlist with digests + safe mounts"
+    # over a whole-directory mount. Each is mounted at its own host realpath
+    # (df_container mounts `{p}:{p}:ro`), so a shipped CLI adapter that does
+    # `sys.path.insert(dirname(dirname(__file__)))` finds df_confine.py when its
+    # host path is declared here. Same path hygiene as the adapter: absolute,
+    # existing, disjoint from the control root. Absent -> [] (unchanged;
+    # self-contained adapters like api_anthropic need none). Only meaningful at
+    # hardened/enterprise (where the container exists), but validated at every
+    # tier so a typo is caught early.
+    support_files_raw = builder.get("support_files", [])
+    if not isinstance(support_files_raw, list):
+        raise ConfigError("roles.builder.support_files must be a list of absolute file paths")
+    support_files_resolved = []
+    for sf in support_files_raw:
+        if not isinstance(sf, str) or not sf:
+            raise ConfigError("roles.builder.support_files entries must be non-empty strings")
+        sf_path = os.path.expanduser(sf)
+        if not os.path.isabs(sf_path) or not os.path.isfile(sf_path):
+            raise ConfigError(
+                f"roles.builder.support_files entry {sf!r} must be an absolute path "
+                "to an existing file (it is ro-mounted into the builder container)")
+        sf_real = os.path.realpath(sf_path)
+        if not _disjoint(sf_real, control_root):
+            raise ConfigError(
+                f"roles.builder.support_files entry {sf!r} must be disjoint from the "
+                "control root (it would be mounted into the builder container)")
+        support_files_resolved.append(sf_real)
+
     # M40: optional `roles.author` -- an AGENT (a different model than the
     # builder) writes the hidden scenarios instead of a human, with the SAME
     # barrier preserved. Absent -> cfg["_author"] = None and today's behavior is
@@ -2032,4 +2066,7 @@ def load_config(control_root: str) -> dict:
         "author": cfg_author["expected_sha256"] if cfg_author else None,
         "critic": cfg_critic["expected_sha256"] if cfg_critic else None,
     }
+    # DF-R4-07: resolved absolute realpaths of the builder adapter's declared
+    # support files, ro-mounted alongside the adapter at hardened/enterprise.
+    cfg["_support_files"] = support_files_resolved
     return cfg

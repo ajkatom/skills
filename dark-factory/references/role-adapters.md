@@ -97,6 +97,20 @@ adapter has no such dependency, closing the gap `references/hardened.md`
 build inside the container used to require a user-supplied image with the
 CLI baked in; now a stdlib HTTP adapter needs no image customization at all.
 
+**Multi-file adapters in-container — `roles.builder.support_files` (DF-R4-07).**
+At hardened/enterprise the supervisor bind-mounts only the adapter EXECUTABLE
+FILE (not its directory — a security posture so a broad adapter dir can't leak
+siblings into the builder). The shipped CLI adapters (`claude`/`codex`/
+`gemini`) are NOT self-contained: each does `sys.path.insert(...); import
+df_confine` (a sibling in `scripts/`), which is absent from the container and
+ImportErrors. If you run a CLI builder in-container (a custom image with the
+CLI baked in), declare its extra files in `roles.builder.support_files` — a
+list of absolute paths, each validated absolute/existing/**disjoint from the
+control root** and ro-mounted alongside the adapter at its own host realpath
+(so the adapter's `import df_confine` resolves). For the shipped CLI adapters
+that means `support_files: ["<...>/dark-factory/scripts/df_confine.py"]`. The
+self-contained `api_anthropic`/`api_openai` adapters need none (absent ⇒ `[]`).
+
 **Protocol.** Same adapter-protocol 0.1 request/response as every other
 adapter (`workdir`, `prompt_file`, `timeout_s`, `confine`). The model sees
 only the prompt file's content (spec + prior-iteration feedback), exactly

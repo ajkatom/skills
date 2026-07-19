@@ -102,13 +102,19 @@ that requires live infra `init` never provisions or touches. See
 `references/enterprise.md`, "Manual WORM-readback preflight (operator
 step)", before relying on a scaffolded sink for real custody attestations.
 
-**Checkpoint default differs from a hand-written config.json.** `init`
-always writes `checkpoint: "auto"` regardless of autonomy (matching this
-on-ramp's scripting/example use case), whereas a hand-authored
-`config.json` at `autonomy: 4` defaults to `"pause"` (a checkpoint after
-every non-converging iteration, per `references/config-reference.md`). If
-you want per-iteration human review at autonomy 4, set
-`answers.checkpoint: "pause"` explicitly.
+**Default intervention mode is H2 (supervised), matching `load_config`.**
+When `answers` supplies NEITHER `intervention_mode` NOR any legacy
+`autonomy`/`checkpoint` field, `init` scaffolds `intervention_mode: "H2"` —
+the same default `df_config.load_config` uses and every doc names (pauses
+after each non-converged verify and before ship). (Earlier `init` wrote
+`checkpoint: "auto"`, which resolved to **H3** and silently gave the
+canonical on-ramp fewer human gates than advertised — DF-R4-05, fixed.) A
+scripted / unattended scaffold opts into fewer gates EXPLICITLY:
+`answers.intervention_mode: "H3"` (guarded — runs through, pauses only at a
+hard budget guard) or `"H4"` at `hardened`/`enterprise` (lights-out). The
+worked `examples/kv-service/answers.json` sets `H3` for exactly this reason.
+Legacy `answers.autonomy`/`answers.checkpoint`, when supplied explicitly, are
+still honored verbatim.
 
 **Intervention mode selectable at init (M47 condition #10).** You no longer
 need a hand-edit to get H1: set `answers.intervention_mode` to `H1`/`directed`,

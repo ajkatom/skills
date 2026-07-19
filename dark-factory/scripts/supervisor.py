@@ -5067,6 +5067,42 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         # (confine_state["enabled"] False) or a not-required confine skips this
         # entirely (a not-required impostor still runs unconfined, with the
         # manifest honestly recording probe:"unsupported" via M50 — unchanged).
+        # DF-R4-06 (R4 re-audit): H4 (lights-out) is permitted at config load
+        # ONLY for a hardened/enterprise CONFIGURED tier. But resolve_isolation
+        # can DOWNGRADE the EFFECTIVE tier under --allow-downgrade (e.g. docker
+        # unavailable -> standard/cooperative). A lights-out run must never
+        # silently proceed unattended under weaker isolation than the mode
+        # requires: re-check the invariant against the EFFECTIVE tier here,
+        # before any builder spawn, on the fresh-run AND resume path. Changing
+        # the mode is an operator decision, not an implicit side effect of
+        # --allow-downgrade, so this fails CLOSED (a distinct terminal, builder
+        # never invoked) rather than demoting the mode silently.
+        if _lights_out and effective not in ("hardened", "enterprise"):
+            journal.write("H4_TIER_DOWNGRADED", effective=effective,
+                          configured=cfg["assurance"])
+            mf = dict(mb_clean, outcome="MODE_TIER_UNAVAILABLE", iterations=start_iter,
+                      qualified=False,
+                      final_exam={"ran": False, "passed": None, "count": 0},
+                      regressions=sorted(regressed),
+                      budget=_budget_manifest_field(cfg["_budget"], builder_calls,
+                                                    estimated_usd),
+                      usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                  builder_input_tokens,
+                                                  builder_output_tokens))
+            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir,
+                                        mf["invocation"], digest, audit_key, journal)
+            _clear_state()
+            _kb_writeback(cfg, journal, mf, [])
+            sys.stderr.write(
+                f"dark-factory: intervention_mode H4 (lights-out) requires an EFFECTIVE "
+                f"hardened/enterprise tier, but isolation resolved to {effective!r} "
+                f"(configured {cfg['assurance']!r}, downgraded). Refusing to run "
+                f"lights-out under weaker-than-selected isolation — reconfigure the "
+                f"mode or restore the required infrastructure. The builder was never "
+                f"spawned.\n")
+            return anchor_exit or 2
+
         if confine_state["enabled"] and cfg["_confine"]["required"]:
             _resolved_adapter_path = os.path.realpath(os.path.expanduser(adapter))
             _confine_profile = df_confine.profile_for(
@@ -5319,6 +5355,22 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # validated the dir exists, but this is the moment it's about
                     # to be bind-mounted into the container.
                     ro_mounts = [adapter_ro_file]
+                    # DF-R4-07: the builder adapter's declared support files
+                    # (e.g. df_confine.py, which the shipped CLI adapters import)
+                    # ro-mounted alongside the adapter. df_container mounts each
+                    # at its own host realpath, so a shipped CLI adapter's
+                    # `sys.path.insert(dirname(dirname(__file__)))` + `import
+                    # df_confine` resolves in-container. Same fail-closed TOCTOU
+                    # disjointness re-check as the adapter/dep-cache mounts;
+                    # config-load already validated absolute/existing/disjoint,
+                    # but re-check at the moment of mount.
+                    for sf in cfg.get("_support_files", []):
+                        if not _disjoint(sf, cfg["_control_root"]):
+                            raise df_sandbox.SandboxError(
+                                "hardened: refusing to mount builder support file — it "
+                                f"overlaps the control root ({sf}); the holdout barrier "
+                                "would be breached by construction")
+                        ro_mounts.append(sf)
                     dep_cache_env = None
                     dep_cache_dir = c.get("dep_cache_dir")
                     if dep_cache_dir:
@@ -5389,6 +5441,16 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # var (enterprise_provider is None for them) — unchanged
                     # behavior, no descriptor, same as pre-M32.
                     ro_mounts_ent = [adapter_ro_file]
+                    # DF-R4-07: builder adapter support files (e.g. df_confine.py)
+                    # ro-mounted alongside the adapter, same as hardened — a
+                    # multi-file CLI adapter's sibling import resolves in-container.
+                    for sf in cfg.get("_support_files", []):
+                        if not _disjoint(sf, cfg["_control_root"]):
+                            raise df_sandbox.SandboxError(
+                                "enterprise: refusing to mount builder support file — it "
+                                f"overlaps the control root ({sf}); the holdout barrier "
+                                "would be breached by construction")
+                        ro_mounts_ent.append(sf)
                     enterprise_env = {}
                     dep_cache_dir = c.get("dep_cache_dir")
                     if dep_cache_dir:

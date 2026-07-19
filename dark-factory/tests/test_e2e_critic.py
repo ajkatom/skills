@@ -39,6 +39,9 @@ def _answers(tmp_path, author_adapter, critic_adapter):
         "app_name": "greet",
         "spec_text": SPEC,
         "assurance": "cooperative",
+        # M54 (DF-R4-05): init now defaults to H2 (pauses before ship); these
+        # tests exercise unattended author/critic convergence, so pin H3.
+        "intervention_mode": "H3",
         "workspace_root": str(tmp_path / "ws"),
         "control_root": str(tmp_path / "control"),
         "builder_adapter": FAKE_BUILDER,
