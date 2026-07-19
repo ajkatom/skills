@@ -267,10 +267,12 @@ def test_honest_crash_before_seal_recovers_under_signing(tmp_path, monkeypatch):
 
 
 def test_audit_key_load_failure_does_not_poison_the_signed_chain(tmp_path, monkeypatch):
-    """DF-R3 Finding 2: when signing is on but the audit key cannot be loaded,
-    `_anchor_ship_record` must NOT append an UNSIGNED entry (which would make
+    """DF-R3 Finding 2 / DF-R4-03: when signing is on but the audit key cannot be
+    loaded, `_anchor_ship_local` must NOT append an UNSIGNED entry (which would make
     verify_chain fail the ENTIRE control-root chain, breaking custody/qualification
-    verify too). It skips the local anchor and surfaces the failure honestly."""
+    verify too). It returns "anchor_failed" and surfaces the failure honestly. It
+    also uses df_audit.load_key (NEVER load_or_create_key), so a missing key does
+    not mint a replacement key mid-run."""
     import df_audit
     cr = tmp_path / "control"
     marker = tmp_path / "merged"
@@ -286,12 +288,12 @@ def test_audit_key_load_failure_does_not_poison_the_signed_chain(tmp_path, monke
     assert supervisor.df_audit_chain.verify_chain(str(chain), key)[0]
 
     # Force the audit key load to fail, then anchor another ship record: it must
-    # NOT append an unsigned entry into the signed chain.
-    monkeypatch.setattr(df_audit, "load_or_create_key",
+    # NOT append an unsigned entry into the signed chain, and must fail closed.
+    monkeypatch.setattr(df_audit, "load_key",
                         lambda *a, **k: (_ for _ in ()).throw(df_audit.AuditKeyError("boom")))
-    status = supervisor._anchor_ship_record(
-        cfg, str(cr), str(run_dir), rid, "another ship record", "ship", push_offbox=False)
-    assert status == "skip"
+    status = supervisor._anchor_ship_local(
+        cfg, str(cr), rid, "another ship record", "ship")
+    assert status == "anchor_failed"
     # No new (unsigned) entry, and the signed chain still verifies with the real key.
     assert chain.read_text().count("\n") == lines_before
     ok, why = supervisor.df_audit_chain.verify_chain(str(chain), key)
