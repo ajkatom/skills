@@ -1692,9 +1692,11 @@ def _sink_readback(sink: dict, receipt: dict, att_text: str):
       True   — read back and the off-box bytes match (server-authentic)
       False  — read back and the object is ABSENT or its bytes DIFFER (a forged /
                never-pushed / tampered receipt) → the caller REJECTS
-      None   — could not confirm (sink unreachable / kind unsupported); the
-               caller keeps the server_issued requirement but does not reject on
-               an inconclusive readback (best-effort, honest about its limits).
+      None   — could not confirm (sink unreachable / kind unsupported). For a
+               REQUIRED receipt the caller treats anything other than True as
+               not-confirmed and REFUSES (M53/M56: a required sink demands
+               POSITIVE off-box confirmation — inconclusive is not acceptance);
+               an unreachable sink is thus a temporary refusal, retryable.
     This is what makes a purely-local http-append receipt non-forgeable: the
     fabricated object was never PUT, so a GET against the off-box trust domain
     404s."""
@@ -3332,8 +3334,9 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
             f"candidate_host_read 'default_deny': {reason}")
 
     if not getattr(os_backend, "supports_default_deny", False):
-        # Backend without a default-deny profile (Linux bwrap until M29c,
-        # plus any test double): take the EXACT M27 path -- same wrapper,
+        # Backend without a default-deny profile (since M29c both shipped
+        # backends have one, so in practice a test double): take the EXACT
+        # M27 path -- same wrapper,
         # same probes, same journal events (a network-probe failure still
         # surfaces as PROBE_FAILED, not as a confinement failure it isn't)
         # -- and label the result honestly: host reads are OPEN here.

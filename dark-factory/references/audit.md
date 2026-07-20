@@ -94,7 +94,11 @@ actually ran under:
   "Default-deny candidate host isolation"); `"allow_host_read_optout"`
   (explicit `candidate_host_read: "allow_host_read"` config);
   `"allow_host_read_downgrade"` (`--allow-downgrade` after a failed
-  confinement probe); `"legacy_allow_host_read"` (Linux until M29c);
+  confinement probe); `"legacy_allow_host_read"` (a sandbox
+  backend with no default-deny profile — both shipped backends, macOS
+  sandbox-exec and Linux bwrap, HAVE one since M29c, so this label only
+  appears with a non-default legacy backend and honestly records that
+  host reads stayed open);
   `"none"` (cooperative — no candidate sandbox exists).
 - `probed`/`passed` — whether `probe_candidate_confinement` ran and what it
   proved, live, per run (and re-proved on every resume).
