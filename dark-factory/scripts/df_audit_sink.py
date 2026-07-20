@@ -53,6 +53,45 @@ def push(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int = 20) -> dict:
     raise SinkError(f"unknown or unpushable sink kind: {kind!r}")
 
 
+def signed_s3_get(sink_cfg: dict, key: str, *, timeout_s: int = 20):
+    """R5 DF-R5-07: SigV4-signed GET of the object at `{bucket}/{prefix}{key}` from
+    an s3-objectlock sink — the READBACK that makes an S3-backed ship receipt
+    idempotently re-verifiable off-box (a local receipt cannot fabricate the object
+    in the trust domain). Returns `(status, body)`:
+      (200, bytes) — the object exists off-box; caller compares its sha256
+      (404, None)  — the object is ABSENT off-box (a forged/never-pushed receipt)
+      (0,   None)  — inconclusive: sink unreachable, or credentials unavailable
+                     (the caller keeps the positive-confirmation rule, does NOT
+                     reject on an inconclusive readback). Never raises."""
+    if sink_cfg.get("kind") != "s3-objectlock":
+        return (0, None)
+    try:
+        scheme, host = _split_endpoint(sink_cfg["endpoint"])
+        bucket, region = sink_cfg["bucket"], sink_cfg["region"]
+        prefix = sink_cfg.get("prefix", "")
+        access_key = os.environ.get(sink_cfg.get("access_key_env") or _DEFAULT_ACCESS_KEY_ENV)
+        secret_key = os.environ.get(sink_cfg.get("secret_key_env") or _DEFAULT_SECRET_KEY_ENV)
+        if not access_key or not secret_key:
+            return (0, None)  # can't sign a readback → inconclusive, not a rejection
+        object_path = f"{bucket}/{prefix}{key}"
+        canonical_uri = "/" + "/".join(
+            urllib.parse.quote(part, safe="-_.~") for part in object_path.split("/"))
+        amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        headers = _sigv4_headers("GET", host, canonical_uri, b"", access_key=access_key,
+                                 secret_key=secret_key, region=region, service="s3",
+                                 amz_date=amz_date)
+        url = f"{scheme}://{host}{canonical_uri}"
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if 200 <= resp.status < 300:
+                return (200, resp.read())
+            return (0, None)
+    except urllib.error.HTTPError as e:
+        return (404, None) if e.code == 404 else (0, None)
+    except (urllib.error.URLError, TimeoutError, OSError, KeyError):
+        return (0, None)
+
+
 def _push_http_append(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int) -> dict:
     url = sink_cfg["url"].rstrip("/") + f"/audit/{urllib.parse.quote(key, safe='')}"
     req = urllib.request.Request(url, data=body, method="PUT")
