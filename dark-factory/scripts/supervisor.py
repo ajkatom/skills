@@ -257,6 +257,17 @@ UNKNOWN_OUTCOME = 11
 # audit-only retry (`ship` re-entry) re-anchors off-box and flips it to 0.
 SHIP_AUDIT_PENDING = 12
 
+# R5 DF-R5-02: a ship action's per-action evidence could not be signed (a
+# transient audit-key/signer failure) — either its completion token after the
+# real-world action RAN (that action is DONE and is NEVER re-run), or its intent
+# token BEFORE the spawn (nothing ran; the retry re-runs it). The run sealed the
+# DISTINCT, RECOVERABLE outcome SHIP_EVIDENCE_PENDING (never SHIPPED, never an
+# unbacked journal `ok`). A distinct nonzero exit; `ship` re-entry runs the
+# AUTHENTICATED evidence-only repair (re-sign from intent-token-bound facts) and
+# then continues the remaining actions normally. Same code as SHIP_AUDIT_PENDING
+# family: 13.
+SHIP_EVIDENCE_PENDING_EXIT = 13
+
 # M49 DF-R3-03: on re-entry a prior ship_result.json (or the ship journal that
 # feeds `already_done`) could not be AUTHENTICATED against the signed audit chain
 # (missing/mismatched/tampered) while audit.signing is on — a same-user
@@ -7249,6 +7260,23 @@ def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
                            "approval_ref": approval_ref})
 
 
+def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
+                                reversible=None, approval_ref=None):
+    """R5 DF-R5-02: the canonical bytes of a ship action's PRE-SPAWN intent token —
+    the SAME evidence fields as the completion token, under a DISTINCT kind so the
+    two can never collide. Signed BEFORE the action spawns, it is what makes the
+    evidence-pending recovery authenticated: when the completion token later fails
+    to sign (signer outage AFTER the real-world action ran), the retry may re-sign
+    the completion from the journaled facts ONLY because those exact facts were
+    already chain-bound while the signer was up. A same-user writer who plants an
+    intent + evidence_pending journal pair for an action that never ran cannot
+    produce the matching SIGNED intent token, so the retry refuses it."""
+    return canonical_json({"kind": "ship-action-intent", "run_id": run_id,
+                           "action": action, "idempotency_key": idk,
+                           "toolchain": toolchain, "reversible": reversible,
+                           "approval_ref": approval_ref})
+
+
 def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
     """Return a `commit(action_name, idempotency_key)` hook passed into
     df_ship.run_actions. As EACH action succeeds — BEFORE its SHIP_ACTION_RESULT
@@ -7262,10 +7290,17 @@ def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
     single last-digest cannot distinguish 'no anchor because a legit crash happened
     before the first seal' from 'anchor missing because tampered' — both look
     anchor-less. A per-action signed entry makes the two distinguishable."""
-    def _commit(action_name, idk, toolchain=None, reversible=None, approval_ref=None):
-        payload = _ship_action_commit_payload(run_id, action_name, idk, toolchain,
-                                              reversible, approval_ref)
-        # Local signed anchor only (per-action tokens never go off-box).
+    def _commit(action_name, idk, toolchain=None, reversible=None, approval_ref=None,
+                phase="done"):
+        # R5 DF-R5-02: phase "intent" signs the PRE-SPAWN intent token (distinct
+        # payload kind); the default "done" signs the completion token exactly as
+        # before. Both are chain-only, never off-box.
+        if phase == "intent":
+            payload = _ship_action_intent_payload(run_id, action_name, idk, toolchain,
+                                                  reversible, approval_ref)
+        else:
+            payload = _ship_action_commit_payload(run_id, action_name, idk, toolchain,
+                                                  reversible, approval_ref)
         # DF-R5-01/R5-02: return the anchor status so run_actions can make an
         # anchor FAILURE a first-class result (do NOT journal `ok` for an action
         # whose completion token could not be signed — that would brick re-entry).
@@ -7370,6 +7405,254 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
                     "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`, or a "
                     "tampered toolchain / reversibility / approval_ref)")
     return (True, "all completed ship actions authenticated against the signed audit chain")
+
+
+def _terminal_anchor_pending_sha(run_dir):
+    """R5 DF-R5-02: the record_sha256 of the LATEST journaled
+    SHIP_TERMINAL_ANCHOR_PENDING (a terminal ship record sealed while the signer
+    was down), or None. The marker alone authorizes NOTHING — re-anchoring also
+    requires _failed_ship_record_bound to hold."""
+    sha = None
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_TERMINAL_ANCHOR_PENDING":
+            sha = e.get("data", {}).get("record_sha256")
+    return sha
+
+
+def _failed_ship_record_bound(cfg, control_root, run_dir, run_id, prior,
+                              artifact_object_id=None):
+    """R5 DF-R5-02: bind an UNANCHORED SHIP_FAILED record to the run's signed +
+    journaled evidence before it may be re-anchored (the signer-outage terminal
+    recovery). The record file AND the pending marker are same-user writable, so
+    neither is trusted alone; what must hold:
+
+      * every claimed `ok` action authenticates against its own signed
+        per-action completion token, and the claimed ok-SET equals the
+        token-set EXACTLY (a laundered/edited action list is refused);
+      * the claimed failed_action has a journaled SHIP_ACTION_INTENT and a
+        journaled NON-ok SHIP_ACTION_RESULT (failed/timed_out) whose exit
+        matches the record — and has NO ok-token (it really failed);
+      * rollback records are carried journal-honestly (they are not signed;
+        the terminal is FAILED either way — documented detection-grade
+        residual, they never gate a skip or a SHIPPED).
+
+    Returns (ok, reason)."""
+    if prior.get("outcome") != df_ship.SHIP_FAILED:
+        return (False, "terminal-anchor recovery only applies to SHIP_FAILED records")
+    # Opus-review V-A4 hardening: the record's artifact id must be the
+    # AUTHENTICATED one from the sealed manifest (_ship_eligible), so re-anchoring
+    # can't sign a forged oid into the chain. Remaining unbound terminal metadata
+    # (rollbacks/ts/durations) is inert + detection-grade by design: the outcome
+    # stays SHIP_FAILED and can never launder to SHIPPED.
+    if (artifact_object_id is not None
+            and prior.get("ship_workspace_object_id") != artifact_object_id):
+        return (False, "the record's ship_workspace_object_id does not match the sealed "
+                "manifest's artifact_object_id (a forged artifact id)")
+    facts = _ship_completed_action_facts(run_dir)
+    if facts:
+        ok_j, why_j = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
+        if not ok_j:
+            return (False, why_j)
+    anchored_ok = {f["name"] for f in facts}
+    claimed_ok = {a.get("name") for a in (prior.get("actions") or [])
+                  if isinstance(a, dict) and a.get("status") == "ok"}
+    if claimed_ok != anchored_ok:
+        return (False, "the SHIP_FAILED record's claimed ok actions "
+                f"{sorted(x for x in claimed_ok if x is not None)} do not match the signed "
+                f"per-action evidence {sorted(anchored_ok)}")
+    failed = prior.get("failed_action")
+    # Opus-review HIGH: a record naming NO failed action binds nothing checkable
+    # beyond the ok-set — an EMPTY one (the materialize-failure/reconcile-abort
+    # shape, and equally a pure forgery) binds NOTHING at all, and a failed:None
+    # record whose ok-set covers every token would sign away a SHIPPABLE run as
+    # FAILED. Neither is distinguishable from a plant via the writable journal,
+    # so re-anchoring would be a signing oracle + ship suppression. Fail-closed:
+    # recovery requires a NAMED failed action with journal-bound failure
+    # evidence. (The only legit victims — a materialize-failure or abort sealed
+    # during a signer outage — ran NOTHING new; they stay the pre-M56b exit-2
+    # refusal, recoverable by removing the unauthenticated record and
+    # re-shipping.)
+    if failed is None:
+        return (False, "the record names no failed action, so it binds no failure "
+                "evidence — indistinguishable from a forgery (fail-closed; if this was a "
+                "genuine materialize-failure/abort sealed during a signer outage, nothing "
+                "ran: remove the unauthenticated record and re-ship)")
+    if failed is not None:
+        if failed in anchored_ok:
+            return (False, f"the record claims {failed!r} failed but a signed ok-token "
+                    "exists for it")
+        intents, results = {}, {}
+        for e in _ship_journal_events(run_dir):
+            d = e.get("data", {})
+            if e.get("state") == "SHIP_ACTION_INTENT" and d.get("action") == failed:
+                intents[d.get("idempotency_key")] = d
+            elif e.get("state") == "SHIP_ACTION_RESULT" and d.get("action") == failed:
+                results[d.get("idempotency_key")] = d
+        failed_results = [r for k, r in results.items()
+                          if k in intents and r.get("status") in ("failed", "timed_out")]
+        if not failed_results:
+            return (False, f"the record claims {failed!r} failed but the journal has no "
+                    "matching intent + failed/timed_out result for it")
+        rec_failed = [a for a in (prior.get("actions") or [])
+                      if isinstance(a, dict) and a.get("name") == failed
+                      and a.get("status") in ("failed", "timed_out")]
+        if not rec_failed or all(r.get("exit") != rec_failed[0].get("exit")
+                                 for r in failed_results):
+            return (False, f"the record's failure evidence for {failed!r} does not match "
+                    "the journaled result")
+    return (True, "SHIP_FAILED record bound to the signed + journaled evidence")
+
+
+def _ship_evidence_pending_entries(run_dir):
+    """R5 DF-R5-02: the journal's UNREPAIRED evidence-pending completions — for each
+    idempotency_key whose LATEST SHIP_ACTION_RESULT has status 'evidence_pending'
+    (no later 'ok' appended by a completed repair), the pair (intent_data,
+    result_data). Journal-driven on purpose: the recovery NEVER reads the same-user-
+    writable ship_result.json blob (DF-R5-01 discipline)."""
+    intents, latest = {}, {}
+    for e in _ship_journal_events(run_dir):
+        d = e.get("data", {})
+        idk = d.get("idempotency_key")
+        if idk is None:
+            continue
+        if e.get("state") == "SHIP_ACTION_INTENT":
+            intents[idk] = d
+        elif e.get("state") == "SHIP_ACTION_RESULT":
+            latest[idk] = d
+    return [(intents.get(idk), r) for idk, r in latest.items()
+            if r.get("status") == "evidence_pending"]
+
+
+def _repair_ship_evidence(cfg, control_root, run_dir, run_id, ship_journal,
+                          decision="continue"):
+    """R5 DF-R5-02: the AUTHENTICATED evidence-only repair, run on every ship
+    re-entry BEFORE `already_done` is derived (idempotent no-op when nothing is
+    pending). For each unrepaired evidence-pending completion:
+
+      1. AUTHENTICATE: the signed chain must verify AND contain the action's
+         SIGNED INTENT token over exactly the journaled facts (action/idk/
+         toolchain/reversible/approval_ref). The intent was signed BEFORE the
+         spawn, while the signer was up — a planted intent + evidence_pending
+         journal pair has no matching signed token → fail-closed refusal, never
+         a token minted for an action that cannot be proven to have been
+         legitimately dispatched.
+      2. RE-SIGN: anchor the completion token over those SAME intent-bound facts
+         (the action is chain-authenticated-ok by construction: only a
+         SUCCEEDED action ever journals evidence_pending). If the signer is
+         still down → still pending, retry again later (never a brick).
+      3. RECORD: append the normal SHIP_ACTION_RESULT `ok` (so `already_done`
+         skips the action and _authenticate_ship_actions finds its token) plus
+         an explicit SHIP_EVIDENCE_RESIGNED naming the outage window — the
+         journal facts sat unauthenticated between the outage and this repair;
+         binding-by-intent-token narrows that to the completion CLAIM only,
+         and the resign event keeps the window visible to an auditor
+         (detection-grade, like the rest of the same-user threat model).
+
+    CONSENT (the confused-deputy guard): the SUCCESS claim itself — "this
+    dispatched action exited 0" — sat in the same-user-writable journal during
+    the signer outage and CANNOT be authenticated after the fact (the intent
+    token proves WHAT was dispatched with WHICH facts, not that it succeeded; a
+    journal writer could flip a real `failed` line to `evidence_pending` and let
+    the operator's key-holding retry mint the ok-token FOR them). So the repair
+    only runs under an EXPLICIT `--decision repair-evidence` — the operator is
+    told exactly which action's success claim is being trusted and is expected
+    to verify its real-world state first — mirroring the existing
+    `--decision reconcile` consent for unknown outcomes. A plain `continue`
+    re-entry reports and exits SHIP_EVIDENCE_PENDING, repairing nothing.
+
+    The real-world action is NEVER re-run here. Returns (status, detail):
+      "clean"    nothing was pending
+      "consent"  pending exists but the operator has not consented
+                 (caller exits SHIP_EVIDENCE_PENDING with instructions)
+      "repaired" every pending completion re-signed
+      "pending"  signer still unavailable (caller exits SHIP_EVIDENCE_PENDING)
+      "refused"  authentication failed (caller exits fail-closed 2)."""
+    pending = _ship_evidence_pending_entries(run_dir)
+    if not pending:
+        return ("clean", "")
+    # KEY-FREE consistency checks FIRST — before the consent prompt, so the
+    # prompt can never be misdirected (opus-review MEDIUM: the result line's
+    # `action` is attacker-writable while the mint re-signs the INTENT's facts;
+    # a renamed result line would make a diligent operator verify the WRONG
+    # action's real-world state). The result line must agree with its intent on
+    # the action name AND the idempotency_key must recompute from those exact
+    # (run_id, action, index) facts — the same binding the intent token signs.
+    all_results = {}
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_ACTION_RESULT":
+            d = e.get("data", {})
+            all_results.setdefault(d.get("idempotency_key"), []).append(d)
+    for intent, result in pending:
+        name = result.get("action")
+        idk = result.get("idempotency_key")
+        if intent is None:
+            return ("refused", f"evidence-pending ship action {name!r} has no journaled "
+                    "SHIP_ACTION_INTENT (a planted result line)")
+        if intent.get("action") != name or intent.get("action") is None:
+            return ("refused", f"evidence-pending result names action {name!r} but its "
+                    f"intent (same idempotency_key) names {intent.get('action')!r} — a "
+                    "tampered journal")
+        if idk != df_ship.idempotency_key(run_id, intent.get("action"),
+                                          intent.get("index")):
+            return ("refused", f"evidence-pending ship action {name!r} has an "
+                    "idempotency_key that does not recompute from its own "
+                    "run/action/index facts — a tampered journal")
+        # Defense in depth: an evidence_pending line only ever follows a SUCCESS
+        # in run_actions; ANY failed/timed_out result for the same
+        # idempotency_key (an attacker APPENDING evidence_pending after a real
+        # failure) refuses.
+        if any(r.get("status") in ("failed", "timed_out") for r in all_results.get(idk, [])):
+            return ("refused", f"evidence-pending ship action {name!r} also has a journaled "
+                    "failed/timed_out result — a success claim cannot coexist with a failure "
+                    "(tampered journal)")
+    if decision != "repair-evidence":
+        # Consent prompt names come from the INTENT (now proven consistent with
+        # the result line + idk above), never the raw result line.
+        names = sorted({i.get("action") for i, _r in pending if i and i.get("action")})
+        return ("consent", f"action(s) {names} completed but their evidence is unsigned")
+    audit = cfg.get("_audit", {})
+    try:
+        key = df_audit.load_key(audit["key_path"])
+    except df_audit.AuditKeyError as e:
+        return ("pending", f"the audit signing key is still unavailable ({e}); the "
+                "evidence-pending ship action(s) remain unrepaired")
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    ok, why = df_audit_chain.verify_chain(chain_path, key)
+    if not ok:
+        return ("refused", f"the signed audit chain failed verification ({why})")
+    try:
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError as e:
+        return ("refused", f"the audit chain is unreadable ({e})")
+    prefix = f"{run_id}.ship-action."
+    anchored = {e.get("manifest_sha256") for e in entries
+                if str(e.get("invocation", "")).startswith(prefix)}
+    for intent, result in pending:
+        name = intent.get("action")
+        idk = result.get("idempotency_key")
+        intent_token = sha256_str(_ship_action_intent_payload(
+            run_id, intent.get("action"), idk, intent.get("toolchain"),
+            intent.get("reversible"), intent.get("approval_ref")))
+        if intent_token not in anchored:
+            return ("refused", f"evidence-pending ship action {name!r} has no SIGNED intent "
+                    "token in the audit chain — its journaled facts cannot be authenticated "
+                    "(a planted intent/evidence_pending pair, or a tampered intent)")
+        done_payload = _ship_action_commit_payload(
+            run_id, intent.get("action"), idk, intent.get("toolchain"),
+            intent.get("reversible"), intent.get("approval_ref"))
+        if _anchor_ship_local(cfg, control_root, run_id, done_payload,
+                              "ship-action") != "anchored":
+            return ("pending", f"the completion token for ship action {name!r} still could "
+                    "not be signed; the evidence stays pending (retry later)")
+        ship_journal.write("SHIP_ACTION_RESULT", action=intent.get("action"),
+                           index=intent.get("index"), idempotency_key=idk,
+                           exit=result.get("exit"), timed_out=False, status="ok",
+                           duration_s=result.get("duration_s"))
+        ship_journal.write("SHIP_EVIDENCE_RESIGNED", action=intent.get("action"),
+                           idempotency_key=idk,
+                           note="completion token re-signed on retry from the SIGNED "
+                                "intent-token-bound facts; the real-world action was NOT re-run")
+    return ("repaired", "")
 
 
 def _pending_ship_authenticated(cfg, control_root, run_dir, run_id, prior, prior_text,
@@ -7522,6 +7805,17 @@ def _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
     atomic_write(result_path, text)
     _journal_ship_seal(ship_journal, result)
     local_anchor_status = _anchor_ship_local(cfg, control_root, run_id, text, "ship")
+    # R5 DF-R5-02: a TERMINAL record sealed while the signer is down would
+    # otherwise brick re-entry forever (the record can never authenticate against
+    # the chain). Journal the anchor failure as a first-class marker binding THIS
+    # record's exact bytes; re-entry may then re-anchor the record — but ONLY
+    # after re-verifying its evidence fields against the signed per-action
+    # facts (_failed_ship_record_bound), so a planted terminal + planted marker
+    # is still refused, never laundered into the signed chain.
+    if (bool(cfg.get("_audit", {}).get("signing"))
+            and local_anchor_status != "anchored"):
+        ship_journal.write("SHIP_TERMINAL_ANCHOR_PENDING", outcome=result["outcome"],
+                           record_sha256=sha256_str(text))
     sink_status = _push_ship_offbox(cfg, run_dir, run_id, text, "ship") if push_offbox else "skip"
     return record, sink_status, local_anchor_status
 
@@ -7684,6 +7978,37 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
             else:
                 ok_a, why_a = _authenticate_ship_chain(
                     cfg, control_root, run_id, sha256_str(prior_text), "ship")
+            if (not ok_a and prior_outcome == df_ship.SHIP_FAILED
+                    and _terminal_anchor_pending_sha(run_dir) == sha256_str(prior_text)):
+                # R5 DF-R5-02 terminal recovery: this SHIP_FAILED was sealed while
+                # the signer was down (first-class journaled marker binding these
+                # exact bytes). Re-anchor it — but ONLY after re-verifying the
+                # record against the signed per-action + journaled evidence, so a
+                # planted terminal + planted marker is still refused, never
+                # laundered into the signed chain.
+                ok_b, why_b = _failed_ship_record_bound(cfg, control_root, run_dir,
+                                                        run_id, prior,
+                                                        artifact_object_id=artifact_object_id)
+                if not ok_b:
+                    sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the "
+                                     f"unanchored SHIP_FAILED record could not be bound to "
+                                     f"the run's evidence: {why_b}\n")
+                    return SHIP_STATE_UNAUTHENTICATED
+                if _anchor_ship_local(cfg, control_root, run_id, prior_text,
+                                      "ship") != "anchored":
+                    sys.stderr.write(
+                        "dark-factory: SHIP_EVIDENCE_PENDING — the SHIP_FAILED terminal "
+                        "record is evidence-bound but its signed anchor STILL could not be "
+                        "committed (audit key/signer unavailable). Re-run `ship` once the "
+                        "signer is available.\n")
+                    return SHIP_EVIDENCE_PENDING_EXIT
+                ship_journal.write("SHIP_TERMINAL_ANCHOR_RESOLVED",
+                                   outcome=prior_outcome,
+                                   record_sha256=sha256_str(prior_text))
+                print(f"dark-factory: ship already terminal (SHIP_FAILED); its pending "
+                      f"signed anchor was committed on retry (evidence-bound, no action "
+                      f"re-ran); see {result_path}. Not re-shipping.")
+                return 3
             if not ok_a:
                 sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the prior ship "
                                  f"result could not be authenticated: {why_a}\n")
@@ -7749,6 +8074,34 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                            note="operator accepted possible duplicate; re-running")
         print(f"dark-factory: reconciling unresolved ship action "
               f"{unresolved.get('action')!r} — re-running (possible duplicate).")
+
+    # R5 DF-R5-02: the AUTHENTICATED evidence-only repair runs BEFORE already_done
+    # is derived, so a succeeded-but-unanchored action (journal status
+    # `evidence_pending`, never `ok`) is re-signed from its intent-token-bound
+    # facts and THEN skipped as done — the real-world action is never re-run and
+    # never re-bricked. No-op when nothing is pending.
+    repair_status, repair_detail = _repair_ship_evidence(
+        cfg, control_root, run_dir, run_id, ship_journal, decision=decision)
+    if repair_status == "refused":
+        sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the evidence-pending "
+                         f"ship state could not be authenticated: {repair_detail}\n")
+        return SHIP_STATE_UNAUTHENTICATED
+    if repair_status == "consent":
+        sys.stderr.write(
+            f"dark-factory: SHIP_EVIDENCE_PENDING — {repair_detail} (a signer outage after the "
+            "action ran). The success claim sat in the WRITABLE journal during the outage and "
+            "cannot be authenticated after the fact — VERIFY the action's real-world state, "
+            "then consent with `ship --decision repair-evidence` to re-sign its evidence from "
+            "the signed intent facts and continue. Nothing was repaired or re-run.\n")
+        return SHIP_EVIDENCE_PENDING_EXIT
+    if repair_status == "pending":
+        sys.stderr.write(f"dark-factory: SHIP_EVIDENCE_PENDING — {repair_detail}. The completed "
+                         "action(s) are DONE and are NEVER re-run; re-run `ship --decision "
+                         "repair-evidence` once the audit key/signer is available.\n")
+        return SHIP_EVIDENCE_PENDING_EXIT
+    if repair_status == "repaired":
+        print("dark-factory: ship evidence repaired — the pending completion token(s) were "
+              "re-signed from the intent-authenticated facts (no action re-ran); continuing.")
 
     already_done = _ship_completed_actions(run_dir)
 
@@ -7824,6 +8177,29 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
             cfg, control_root, run_dir, run_id, ship_journal, result,
             artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
 
+        if result["outcome"] == df_ship.SHIP_EVIDENCE_PENDING:
+            # R5 DF-R5-02: a per-action token could not be signed. The loop already
+            # STOPPED (no later action ran). Seal the RECOVERABLE pending record —
+            # its own anchor will typically ALSO fail (same signer); that is fine:
+            # re-entry is journal+chain-driven and never trusts this blob.
+            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
+            ran = result.get("evidence_pending_action")
+            halted = result.get("pending_action")
+            gap = (f"action {ran!r} RAN but its completion token could not be signed"
+                   if ran is not None else
+                   f"action {halted!r} did NOT run (its intent token could not be signed "
+                   "before the spawn)")
+            fix = ("verify the action's real-world state, then re-run `ship --decision "
+                   "repair-evidence` once the signer is available (the retry re-signs its "
+                   "evidence from the SIGNED intent facts and continues)"
+                   if ran is not None else
+                   "re-run `ship` once the signer is available (the action re-runs normally)")
+            sys.stderr.write(
+                f"dark-factory: SHIP_EVIDENCE_PENDING — {gap} (a transient audit-key/signer "
+                f"failure). No further action ran. Completed actions are DONE and are NEVER "
+                f"re-run. To recover: {fix}.\n")
+            return SHIP_EVIDENCE_PENDING_EXIT
         if result["outcome"] == df_ship.SHIPPED:
             # DF-R4-04/03: a SHIPPED is FINAL only when the REQUIRED off-box evidence
             # landed server-authentic AND (under signing) the local signed anchor
@@ -8401,10 +8777,14 @@ def main():
     p_ship.add_argument("control_root")
     p_ship.add_argument("--run-dir", required=True,
                         help="the qualified run_dir to ship (under <control_root>/runs)")
-    p_ship.add_argument("--decision", choices=["continue", "reconcile", "abort"],
+    p_ship.add_argument("--decision",
+                        choices=["continue", "reconcile", "abort", "repair-evidence"],
                         default="continue",
                         help="continue (default) · reconcile (accept a possible duplicate after "
-                             "SHIP_UNKNOWN_OUTCOME) · abort (seal SHIP_FAILED at an unresolved action)")
+                             "SHIP_UNKNOWN_OUTCOME) · abort (seal SHIP_FAILED at an unresolved "
+                             "action) · repair-evidence (after SHIP_EVIDENCE_PENDING: consent to "
+                             "re-sign a completed action's evidence from its signed intent facts "
+                             "— verify the action's real-world state first)")
 
     # `df-release` — M41: the signed release-approval operator CLI (mirror of
     # df-custody/df-waiver), gating IRREVERSIBLE ship actions. keygen -> sign
