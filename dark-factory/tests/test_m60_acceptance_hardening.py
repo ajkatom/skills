@@ -237,17 +237,20 @@ def test_evidence_bundle_assembles_from_a_completed_run(tmp_path, monkeypatch):
 
     bundle, err = df_evidence_bundle.assemble(str(cr), str(run_dir))
     assert err is None
+    assert bundle["bundle_version"] == "2"
     assert bundle["requested_tier"] == "standard"
     assert bundle["effective_tier"] == "standard"
     assert bundle["config_sha256"]
-    assert bundle["manifest_sha256"]
+    # M64 v2: the manifest section is VERIFIED, and its sha256 is the raw bytes.
+    assert bundle["manifest"]["manifest_sha256"]
     # DF-R5-03 support-file identity flows into the bundle.
     assert bundle["builder_identity"]["support_files"][0]["sha256"] == \
         hashlib.sha256(b"VALUE = 1\n").hexdigest()
     # sections present even when empty (a partial exercise still reports).
     assert "audit_chain" in bundle and "custody" in bundle
     # This run did not ship, so the reentry section honestly says so.
-    assert bundle["reentry"]["ship_journal_present"] is False
+    assert bundle["reentry"]["available"] is True
+    assert bundle["reentry"]["applied_actions"] == []
 
 
 def test_evidence_bundle_scrubs_secret_bearing_keys():
@@ -283,7 +286,7 @@ def test_bundle_manifest_sha256_is_the_raw_on_disk_digest_even_non_ascii(tmp_pat
     bundle, err = df_evidence_bundle.assemble(str(cr), str(run_dir))
     assert err is None
     raw = (run_dir / "manifest.json").read_bytes()
-    assert bundle["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert bundle["manifest"]["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
 
 
 def test_bundle_non_object_manifest_is_a_clean_error_not_a_crash(tmp_path):
