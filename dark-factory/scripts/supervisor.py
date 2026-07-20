@@ -31,6 +31,7 @@ import df_container
 import df_creds
 import df_critic
 import df_custody
+import df_evidence_bundle
 import df_gates
 import df_init
 import df_kb
@@ -1738,7 +1739,12 @@ def _sink_readback(sink: dict, receipt: dict, att_text: str):
         sink_key = receipt.get("sink_key")
         if not sink_key:
             return None
-        status, body = df_audit_sink.signed_s3_get(sink, str(sink_key))
+        # M60 (R5 arbitration M56.6): read the EXACT recorded version, so a
+        # versioned bucket's readback verifies the precise pushed bytes, not a
+        # later version at the same key. Absent version_id (pre-M60 receipt) →
+        # latest, as before.
+        status, body = df_audit_sink.signed_s3_get(
+            sink, str(sink_key), version_id=str(receipt.get("version_id") or ""))
         if status == 200 and body is not None:
             return hashlib.sha256(body).hexdigest() == receipt.get("body_sha256")
         if status == 404:
@@ -4107,6 +4113,36 @@ def _variant_seed_extra(twin_defs):
     return None
 
 
+def _builder_identity_field(cfg):
+    """The sealed `builder_identity` manifest field (or None). Carries the
+    operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
+    (DF-R5-03 class) — the DIGEST of every builder support file.
+
+    A support file (e.g. df_confine.py, which the shipped CLI adapters import and
+    EXECUTE in-container) contributes to the adapter's actual behavior, so an
+    adapter's structural 'no agentic tool surface' guarantee is only as strong as
+    those bytes. Sealing `{path, sha256}` for each into the terminal manifest makes
+    the exact mounted support bytes auditable and bound to the run — a substituted
+    support file changes the manifest. (Content pinning/refusal is a separate,
+    optional control; this is the always-on evidence seal the arbitration requires:
+    'every support file contributing to adapter behavior must be digest-bound and
+    sealed'.) None when there is neither a model_identity nor any support file, so
+    a control root with neither is byte-identical to pre-M60."""
+    support = [
+        {"path": sf, "sha256": (sha256_file(sf) if os.path.exists(sf) else None)}
+        for sf in (cfg.get("_support_files") or [])
+    ]
+    model_identity = cfg.get("_builder_model_identity")
+    if not support and not model_identity:
+        return None
+    field = {}
+    if model_identity:
+        field["model_identity"] = model_identity
+    if support:
+        field["support_files"] = support
+    return field
+
+
 def _enforce_adapter_digests(cfg, journal):
     """M47 condition #7: if a role pinned `adapter_sha256`, the adapter FILE's
     actual content sha256 must match at run start, else REFUSE (fail-closed).
@@ -4325,10 +4361,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # verified (a black-box API key can reach any model — same caveat as
         # authored_by/critic model_identity). Absent -> None -> byte-identical
         # manifest to pre-M55.
-        "builder_identity": (
-            {"model_identity": cfg["_builder_model_identity"]}
-            if cfg.get("_builder_model_identity") else None
-        ),
+        "builder_identity": _builder_identity_field(cfg),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -6464,12 +6497,10 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                  "model_identity": cfg["_critic"]["model_identity"]}
                 if cfg.get("_critic") else None
             ),
-            # DF-R4-09 (M55): same fresh+resume threading as authored_by/critic —
-            # the builder's operator-ASSERTED model_identity, sealed on resume too.
-            "builder_identity": (
-                {"model_identity": cfg["_builder_model_identity"]}
-                if cfg.get("_builder_model_identity") else None
-            ),
+            # DF-R4-09 (M55) + M60 (R5 arbitration): same fresh+resume threading —
+            # the builder's model_identity AND every support-file digest, sealed
+            # on resume too.
+            "builder_identity": _builder_identity_field(cfg),
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -8643,6 +8674,18 @@ def main():
     p_vc.add_argument("--key-path", default=None,
                       help="path to the audit signing key; required to verify a "
                            "signed (any entry carrying 'sig') chain")
+    p_eb = sub.add_parser(
+        "evidence-bundle",
+        help="assemble the production-validation evidence bundle from a completed "
+             "run (read-only; see references/live-validation.md)")
+    p_eb.add_argument("control_root")
+    p_eb.add_argument("--run-dir", required=True,
+                      help="the completed run_dir to report on (under <control_root>/runs)")
+    p_eb.add_argument("--out", default=None,
+                      help="write the JSON bundle here (default: stdout)")
+    p_eb.add_argument("--key-path", default=None,
+                      help="path to the audit key; supply it to record a real signed-chain "
+                           "verification result in the bundle (else it records UNVERIFIED)")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort", "reconcile"],
@@ -8861,6 +8904,25 @@ def main():
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 sys.exit(2)
         sys.exit(0 if verify_chain_cmd(args.control_root, key=vkey) else 1)
+    elif args.cmd == "evidence-bundle":
+        ekey = None
+        if args.key_path:
+            try:
+                ekey = df_audit.load_key(args.key_path)
+            except df_audit.AuditKeyError as e:
+                sys.stderr.write(f"dark-factory: audit key error: {e}\n")
+                sys.exit(2)
+        bundle, err = df_evidence_bundle.assemble(args.control_root, args.run_dir, key=ekey)
+        if err is not None:
+            sys.stderr.write(f"dark-factory: {err}\n")
+            sys.exit(2)
+        text = json.dumps(bundle, indent=2, sort_keys=True)
+        if args.out:
+            atomic_write(args.out, text + "\n")
+            print(f"dark-factory: evidence bundle written to {args.out}")
+        else:
+            print(text)
+        sys.exit(0)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade,
                         override_file=args.override_file))

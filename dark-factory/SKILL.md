@@ -504,3 +504,4 @@ holdout scenarios in a session that will also drive the builder.
 - `references/scenario-format.md` — oracle IR v0
 - `references/coverage-gates.md` — behaviors.json schema + the fail-closed pre-build coverage/mutation gates (M7)
 - `references/role-adapters.md` — adapter protocol
+- `references/live-validation.md` — the operator runbook for a live hardened-H4 / enterprise exercise on disposable staging + the `evidence-bundle` command that assembles the production-GO evidence bundle (Codex R5 arbitration)

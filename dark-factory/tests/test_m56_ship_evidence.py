@@ -96,6 +96,64 @@ def test_forged_pending_fields_never_reach_signed_shipped(tmp_path, monkeypatch)
     assert ok_c, why
 
 
+def test_every_field_of_the_pending_record_is_reconstructed_not_trusted(tmp_path, monkeypatch):
+    # M60 (R5 arbitration M56.7): mutate EVERY field of the writable pending
+    # record, not only the three in the R5 repro. Because the final SHIPPED is
+    # RECONSTRUCTED from authenticated facts (never dict(prior)), no forged field
+    # — evidence or cosmetic — survives into the signed bytes.
+    cr, run_dir, cfg, rid, real_oid, counter = _make_unanchored_pending(tmp_path, monkeypatch)
+    rec = json.loads((run_dir / "ship_result.json").read_text())
+    # Forge every field EXCEPT the two that DEFINE the record's authenticated
+    # identity — outcome (the re-entry path) and each action's status:"ok" (the
+    # M53 laundering guard binds the claimed ok-SET to the signed tokens, so
+    # flipping it is a SEPARATE, already-refused attack; see the laundering
+    # tests). Everything else — evidence and cosmetic — is mutated to a poison
+    # sentinel; NONE may survive into the reconstructed signed bytes.
+    rec["ship_version"] = "666"
+    rec["ship_workspace_object_id"] = "f" * 64
+    rec["pending_action"] = "POISON-PENDING"
+    rec["failed_action"] = "POISON-FAILED"
+    rec["rollbacks"] = [{"name": "POISON-ROLLBACK", "status": "rolled_back"}]
+    rec["rollback_failed"] = True
+    rec["ts"] = "1999-01-01T00:00:00Z"
+    rec["toolchain"] = [{"action": "x", "argv0": "/evil", "resolved_path": "/evil",
+                         "sha256": "e" * 64}]
+    rec["rollback_toolchain"] = [{"action": "x", "argv0": "/evil-rb"}]
+    rec["EXTRA_INJECTED_KEY"] = "POISON-EXTRA"
+    for a in rec.get("actions", []):
+        a["exit"] = 999
+        a["reversible"] = False
+        a["approval_ref"] = "POISON-APPROVAL"
+        a["duration_s"] = 123456
+        a["INJECTED"] = "POISON-ACTION-KEY"
+    (run_dir / "ship_result.json").write_text(json.dumps(rec), encoding="utf-8")
+
+    rc = supervisor.ship_cmd(str(cr), str(run_dir))
+    assert rc == 0, "the legitimately-completed ship still finalizes"
+    assert counter.read_text() == "x", "the action is NEVER re-run"
+
+    final = json.loads((run_dir / "ship_result.json").read_text())
+    assert final["outcome"] == df_ship.SHIPPED
+    assert final["ship_workspace_object_id"] == real_oid
+    assert final["pending_action"] is None
+    assert final["failed_action"] is None
+    assert final["rollbacks"] == [] and final["rollback_failed"] is False
+    for a in final["actions"]:
+        assert a["status"] == "ok" and a["exit"] == 0
+        assert a["reversible"] is True and a["approval_ref"] != "POISON-APPROVAL"
+        assert "INJECTED" not in a
+    dumped = json.dumps(final)
+    for poison in ("POISON-PENDING", "POISON-FAILED", "POISON-ROLLBACK",
+                   "POISON-APPROVAL", "POISON-EXTRA", "POISON-ACTION-KEY",
+                   "/evil", "e" * 64, "1999-01-01"):
+        assert poison not in dumped, f"forged field {poison!r} leaked into signed bytes"
+    # The reconstructed bytes authenticate against the signed chain.
+    ok_c, why = supervisor._authenticate_ship_chain(
+        cfg, str(cr), rid, supervisor.sha256_str((run_dir / "ship_result.json").read_text()),
+        "ship")
+    assert ok_c, why
+
+
 def test_tampered_toolchain_breaks_per_action_authentication(tmp_path, monkeypatch):
     # Independently: editing the recovered toolchain so the per-action token can't be
     # recomputed must FAIL authentication (not silently accept a forged tool).
