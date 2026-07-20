@@ -183,10 +183,23 @@ or a config/manifest that has drifted, flips the action back to gated.
   re-run).
 
 Ship exit codes: `0` SHIPPED · `3` SHIP_FAILED / SHIP_APPROVAL_PENDING · `11`
-SHIP_UNKNOWN_OUTCOME (needs `--decision reconcile`) · `12` SHIP_AUDIT_PENDING
-(SHIPPED but the required off-box evidence is not yet anchored — retry) · `2`
-fail-closed refusal (including `SHIP_STATE_UNAUTHENTICATED`, a planted/tampered
-local ship state under a signed run).
+SHIP_UNKNOWN_OUTCOME (a crash left a forward action's — or, DF-R6-02, a
+rollback's — effect unknown; needs `--decision reconcile` or `abort`, never a
+blind re-run) · `12` SHIP_AUDIT_PENDING (SHIPPED but the required off-box
+evidence is not yet anchored — plain re-`ship` re-anchors) · `13`
+**SHIP_EVIDENCE_PENDING** (R5 DF-R5-02 / M56b: a per-action completion token
+could not be SIGNED — the action already RAN and is NEVER re-run; re-run `ship
+--decision repair-evidence`, after verifying the action's real-world state, once
+the audit signer is available to re-sign the evidence from the signed
+pre-spawn intent facts and continue) · `2` fail-closed refusal (including
+`SHIP_STATE_UNAUTHENTICATED`, a planted/tampered local ship state under a signed
+run).
+
+**Enterprise before-ship gate.** At non-enterprise tiers H1/H2 PAUSE before the
+ship (`AWAIT_SHIP`). At **enterprise**, a converged run instead seals the
+`CUSTODY_PENDING` terminal (exit 3): shipping is unreachable until a K-of-N
+split-custody attestation is attached (`df-custody attach`), so the human gate
+there is the custody sign-off, not a pause.
 
 ## Honest scope — NOT sandboxed
 

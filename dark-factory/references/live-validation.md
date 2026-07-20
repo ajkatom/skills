@@ -43,7 +43,7 @@ storage keeps you at **"mechanism tested,"** never "production-validated."
 1. Scaffold a hardened control root with `intervention_mode: "H4"`,
    `hardened.image` digest-pinned, `hardened.network` as your builder needs,
    and any `roles.builder.support_files` your adapter imports.
-2. `supervisor.py run <cr> --project-src <sample>` on the real host. H4 must run
+2. `supervisor.py run --control-root <cr> --project-src <sample>` on the real host. H4 must run
    to a terminal with **no** pause. Confirm the manifest seals
    `requested_tier: "hardened"`, `effective_tier: "hardened"` (no silent
    downgrade), `denial_probe_passed: true`, and a `container.resolved_image_digest`
@@ -59,7 +59,7 @@ storage keeps you at **"mechanism tested,"** never "production-validated."
    `custody.threshold ≥ 2` with N distinct approver keys, a **required**
    `audit.sink` of `kind: "s3-objectlock"` pointing at the remote WORM bucket,
    and the credential proxy allowlist for your test provider.
-2. `supervisor.py run <cr> --project-src <sample>`. It seals `CUSTODY_PENDING`
+2. `supervisor.py run --control-root <cr> --project-src <sample>`. It seals `CUSTODY_PENDING`
    (exit 3) — qualification requires the K-of-N attestation.
 3. Each approver: `supervisor.py df-custody sign …` over the exact sealed
    manifest; collect signatures; `supervisor.py df-custody attach <cr> --run-dir <run>`.
