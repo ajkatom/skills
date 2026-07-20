@@ -357,6 +357,32 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         journal.write("SHIP_ACTION_INTENT", action=name, index=index, idempotency_key=idk,
                       reversible=reversible, approval_ref=approval_ref, toolchain=tc_entry)
 
+        # R5 DF-R5-02: sign the INTENT token BEFORE the spawn. This is what makes
+        # the evidence-pending recovery AUTHENTICATED: a completion token that
+        # later fails to sign can be re-signed on retry from journal facts ONLY
+        # because those exact facts were already bound into a SIGNED intent token
+        # while the signer was up — a planted intent/evidence_pending journal line
+        # has no signed intent token and is refused. If the signer is ALREADY down
+        # here, NOTHING has run yet: journal an explicit not-run resolution (so
+        # the reserve-before scan doesn't read it as a crash-unknown) and stop
+        # with the RECOVERABLE SHIP_EVIDENCE_PENDING — the retry re-runs this
+        # action from scratch.
+        if commit_action is not None:
+            intent_committed = commit_action(name, idk, tc_entry, reversible,
+                                             approval_ref, phase="intent")
+            if intent_committed != "anchored":
+                journal.write("SHIP_ACTION_RESULT", action=name, index=index,
+                              idempotency_key=idk, exit=None, timed_out=False,
+                              status="not_run_evidence_halt", duration_s=None)
+                records.append({"name": name, "reversible": reversible,
+                                "status": "not_run_evidence_halt", "exit": None,
+                                "approval_ref": approval_ref, "duration_s": None})
+                return {"outcome": SHIP_EVIDENCE_PENDING, "actions": records,
+                        "pending_action": name, "failed_action": None,
+                        "evidence_pending_action": None,
+                        "rollbacks": [], "rollback_failed": False,
+                        "toolchain": toolchain, "rollback_toolchain": []}
+
         exit_code, timed_out, out, err, dur = _run_one(
             action["run"], cwd=cwd, child_env=_child_env(base_env, cred_values),
             timeout_s=action["timeout_s"])
@@ -369,10 +395,29 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # journaled, so every `already_done` entry recovered on re-entry is
         # individually chain-backed AND its toolchain is authenticated (a forged
         # toolchain in the writable pending record cannot reconstruct a matching
-        # signed token). Best-effort anchor; a failed anchor surfaces on re-entry
-        # via _authenticate_ship_actions.
+        # signed token).
+        # R5 DF-R5-02: the hook's status is FIRST-CLASS. A succeeded action whose
+        # completion token could not be signed is journaled `evidence_pending` —
+        # NEVER `ok` (an unbacked ok would permanently brick re-entry) — the loop
+        # STOPS (the evidence chain must not fall further behind reality), and the
+        # caller seals the RECOVERABLE SHIP_EVIDENCE_PENDING. The action itself
+        # RAN and is NEVER re-run; the retry re-signs its token from the
+        # intent-authenticated facts and continues.
+        committed = "anchored"
         if success and commit_action is not None:
-            commit_action(name, idk, tc_entry, reversible, approval_ref)
+            committed = commit_action(name, idk, tc_entry, reversible, approval_ref)
+        if success and committed != "anchored":
+            journal.write("SHIP_ACTION_RESULT", action=name, index=index,
+                          idempotency_key=idk, exit=exit_code, timed_out=timed_out,
+                          status="evidence_pending", duration_s=round(dur, 3))
+            records.append({"name": name, "reversible": reversible,
+                            "status": "evidence_pending", "exit": exit_code,
+                            "approval_ref": approval_ref, "duration_s": round(dur, 3)})
+            return {"outcome": SHIP_EVIDENCE_PENDING, "actions": records,
+                    "pending_action": None, "failed_action": None,
+                    "evidence_pending_action": name,
+                    "rollbacks": [], "rollback_failed": False,
+                    "toolchain": toolchain, "rollback_toolchain": []}
         journal.write("SHIP_ACTION_RESULT", action=name, index=index, idempotency_key=idk,
                       exit=exit_code, timed_out=timed_out, status=status,
                       duration_s=round(dur, 3))
