@@ -182,7 +182,7 @@ dark-factory/
     run_scenarios.py, id_feedback.py, snapshot_source.py  # the oracle
   references/              # one topic-focused doc per subsystem (~20 files)
   examples/kv-service/       # a complete, copyable worked example
-  tests/                       # ~1490 tests, `pytest dark-factory/tests`
+  tests/                       # ~2046 tests, `pytest dark-factory/tests`
 ```
 
 ## Run lifecycle beyond a single run

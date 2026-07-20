@@ -23,10 +23,10 @@ but `intervention_mode` is the primary model.)
 
 **Intervention mode (M36a).** The autonomy axis is now expressed as a single
 `intervention_mode` naming *which transitions pause* — pick ONE (default **H2**):
-- **H1 `directed`** — pause before every rebuild AND after every verify (most hands-on).
-- **H2 `supervised`** — pause after every non-converged verify (== legacy `checkpoint:"pause"`; the default).
-- **H3 `guarded`** — run straight through, pause only on a budget cap (== legacy `checkpoint:"auto"`).
-- **H4 `lights_out`** — never pause; any human-needed condition (e.g. a budget cap) is a fail-closed TERMINAL (`BUDGET_HALTED`). Hardened/enterprise only (== legacy `autonomy:5`).
+- **H1 `directed`** — pause before every rebuild, after every non-converged verify, at the budget guard, AND before the ship (most hands-on).
+- **H2 `supervised`** — pause after every non-converged verify, at the budget guard, AND before the ship (the default; extends legacy `checkpoint:"pause"` with the M36b before-ship gate).
+- **H3 `guarded`** — run straight through, pause only at the budget guard (== legacy `checkpoint:"auto"`).
+- **H4 `lights_out`** — never pause; any human-needed condition (e.g. a budget cap) is a fail-closed TERMINAL (`BUDGET_HALTED`). Hardened/enterprise only (== legacy `autonomy:5`). At **enterprise**, the before-ship gate is instead the `CUSTODY_PENDING` terminal (H1/H2's before-ship *pause* applies at non-enterprise tiers; enterprise always seals `CUSTODY_PENDING` and requires a K-of-N attestation before shipping).
 
 `intervention_mode` and the legacy `autonomy`/`checkpoint` pair are mutually
 exclusive (specifying both is a config error). Convert an old config with
@@ -413,9 +413,15 @@ unchanged below.
     (an irreversible action awaits sign-off): have K approvers `df-release sign`
     a claim bound to the run+artifact, collect into `<control_root>/release-approval.json`,
     `df-release attach`, then `ship <control_root> --run-dir <run_dir>`. On
-    `SHIP_UNKNOWN_OUTCOME` (exit 11, a crash left an action's effect unknown):
-    inspect the target, then `ship --decision reconcile` (accept a possible
-    duplicate) or `--decision abort`. Enterprise ships ONLY after `df-custody attach`.
+    `SHIP_UNKNOWN_OUTCOME` (exit 11, a crash left a forward action's — or a
+    rollback's — effect unknown): inspect the target, then `ship --decision
+    reconcile` (accept a possible duplicate) or `--decision abort`. On
+    `SHIP_AUDIT_PENDING` (exit 12, SHIPPED but required off-box evidence not yet
+    anchored): plain re-`ship` re-anchors. On `SHIP_EVIDENCE_PENDING` (exit 13, a
+    completed action's signed evidence could not be committed — the action RAN and
+    is NEVER re-run): verify its real-world state, then `ship --decision
+    repair-evidence` once the signer is available. Enterprise ships ONLY after
+    `df-custody attach` (it seals `CUSTODY_PENDING`, not a before-ship pause).
 7. **Report.** Outcome, iterations, per-behavior status from `journal.jsonl`, the workspace
    path, and `verify-manifest --run-dir <run_dir>`. `verify-manifest` (DF-01/M28a) now also
    re-verifies the manifest's bound artifact object against the content-addressed store at
@@ -448,7 +454,7 @@ unchanged below.
   use the `credentials` config block (env-file/keychain, allowlisted, gitignore
   enforced, artifact-scrubbed — see `references/credentials.md`), never a bare
   env var baked into the adapter script or config.
-- A **cooperative** run is always UNQUALIFIED — say so. A **standard** or **hardened** run is qualified ONLY when its startup probe(s) passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`); never call a cooperative, downgraded, aborted, or capped run a qualified ship-candidate — report the manifest's actual `qualified` value. Note: `manifest.tier` always echoes the *configured* assurance; since M57 the manifest also seals `requested_tier` and `effective_tier`, so a downgrade is explicit in the sealed evidence (every downstream decision — qualification, custody, release, ship — consumes the EFFECTIVE tier), with the journal's `DOWNGRADE` entry carrying the reason.
+- A **cooperative** run (or any run whose EFFECTIVE tier is cooperative) is always UNQUALIFIED — say so. A run qualifies ONLY when its EFFECTIVE tier is standard/hardened/enterprise AND its startup probe(s) passed (manifest `qualified: true` / outcome `COMPLETE_QUALIFIED`, or `CUSTODY_PENDING`→attested at enterprise). A **permitted downgrade to an effective standard or hardened tier still qualifies** — it is judged on its `effective_tier`, not the configured one; only a downgrade whose effective tier is cooperative, or an aborted/capped run, is never a qualified ship-candidate. Report the manifest's actual `qualified` value. Note: `manifest.tier` echoes the *configured* assurance; since M57 the manifest also seals `requested_tier` and `effective_tier`, so a downgrade is explicit in the sealed evidence (every downstream decision — qualification, custody, release, ship — consumes the EFFECTIVE tier), with the journal's `DOWNGRADE` entry carrying the reason.
 - Signed audit is opt-in at `cooperative`/`standard` (`audit.signing: true` in config) but **mandatory** at `hardened` (an explicit `audit.signing: false` is a `ConfigError`). Verify with `verify-manifest --key-path <path>`. A signed manifest with no key prints UNVERIFIED and exits non-zero (fail-closed) — never treat it as OK.
 - Every run also chains its manifest into `<control_root>/audit-chain.jsonl` (always-on, M13); check it with `verify-chain <control_root> [--key-path <path>]`, which fails closed the same way — a chain carrying a signed entry, checked without `--key-path`, is UNVERIFIED, not OK. An optional `audit.sink` ships each entry off-box; see `references/audit.md` for what it does and does not prove.
 - `hardened` is fail-closed on **both** halves: a working Docker daemon + passing container probe, AND a working OS sandbox for the verifier. Either missing refuses (exit 2) unless `--allow-downgrade` is passed. See `references/hardened.md`.
@@ -505,3 +511,4 @@ holdout scenarios in a session that will also drive the builder.
 - `references/coverage-gates.md` — behaviors.json schema + the fail-closed pre-build coverage/mutation gates (M7)
 - `references/role-adapters.md` — adapter protocol
 - `references/live-validation.md` — the operator runbook for a live hardened-H4 / enterprise exercise on disposable staging + the `evidence-bundle` command that assembles the production-GO evidence bundle (Codex R5 arbitration)
+- `references/support-matrix.md` — the precise supported application × host OS × assurance-tier matrix, including the Linux loopback/twins limitation for HTTP/twin-backed apps at standard+ (Codex R6 DF-R6-12)
