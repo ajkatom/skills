@@ -7,8 +7,12 @@ hardened-H4 / enterprise exercise whose evidence is independently verifiable.
 This module reads a finished control root + run dir and emits ONE JSON bundle
 with exactly the fields the arbitration enumerates, pulled from the SEALED
 artifacts (manifest, ship result, custody attestation, sink receipts, audit
-chain) — never re-derived or re-run. It is a read-only reporter: it makes no
-network calls and mutates nothing.
+chain) — never re-derived or re-run. It MUTATES nothing. DF-R7-07: it is
+read-only but NOT offline — verifying a required off-box sink receipt performs a
+read-only HTTP GET (http-append) or a signed S3 GET (s3-objectlock) against the
+remote sink, so bundle assembly needs network reachability and, for S3, usable
+read credentials (DF_AUDIT_S3_ACCESS_KEY / DF_AUDIT_S3_SECRET_KEY). It never
+writes to the sink and makes no OTHER network calls.
 
 The bundle NEVER contains a credential value — it reports credential/env NAMES
 and allowlists only (the same barrier the manifest itself keeps). A defensive
@@ -69,15 +73,32 @@ def _read_json(path):
 def _source_commit(control_root):
     """The exact git commit of the SKILL source (this repo), or None. Best
     effort — a bundle from a non-git checkout just records None."""
-    here = os.path.dirname(os.path.abspath(__file__))
+    return _live_source_identity(control_root).get("commit")
+
+
+def _live_source_identity(control_root):
+    """DF-R7-04: the SAME commit + tree/content digest the supervisor's
+    _source_identity_field seals, recomputed at bundle-assembly time so the
+    bundle can compare the assembly-time source to the sealed one. Reuses the
+    supervisor's own function so the digest formula can never drift between the
+    two."""
     try:
-        out = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
-                             capture_output=True, text=True, timeout=10)
-        if out.returncode == 0:
-            return out.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
+        import supervisor
+        return supervisor._source_identity_field()
+    except Exception:
+        return {"commit": None, "tree_digest": None, "clean": None}
+
+
+def _source_matches(sealed_src, live_src):
+    """True iff the assembly-time source matches the sealed identity — on the
+    full tree/content digest when the manifest sealed one (DF-R7-04), else on the
+    commit (a pre-M67 manifest). None sealed commit → never a match."""
+    if sealed_src.get("commit") is None:
+        return False
+    st = sealed_src.get("tree_digest")
+    if st is not None:
+        return st == live_src.get("tree_digest")
+    return sealed_src.get("commit") == live_src.get("commit")
 
 
 def _verify_chain_output(control_root, key):
@@ -159,9 +180,9 @@ def _verified_release(control_root, run_dir, key):
     except OSError:
         pass
     anchored = None
+    run_id = _run_id_of(run_dir)
     if att_bytes is not None:
         try:
-            run_id = _run_id_of(run_dir)
             ok_c, _why = supervisor._authenticate_ship_chain(
                 _cfg_of(control_root), control_root, run_id,
                 df_common.sha256_str(att_bytes), "release")
@@ -169,8 +190,32 @@ def _verified_release(control_root, run_dir, key):
         except Exception as e:
             anchored = f"ERROR: {e.__class__.__name__}: {e}"
     claim = att.get("claim") or {}
+    # DF-R7-03: CRYPTOGRAPHICALLY verify the release — the K-of-N signatures over
+    # the sealed approver policy/threshold, bound to THIS run+artifact, in scope,
+    # unexpired — via df_release.verify_release, not merely chain membership.
+    sig_verified = None
+    sig_reason = None
+    try:
+        import df_release
+        import datetime
+        cfg = _cfg_of(control_root)
+        ship = cfg.get("_ship") or {}
+        approval = ship.get("approval") or {}
+        manifest, _ = _read_json(os.path.join(run_dir, "manifest.json"))
+        artifact_object_id = ((manifest or {}).get("artifact") or {}).get("object_id")
+        signatures = att.get("signatures") or []
+        ok_s, sig_reason, _count, _nonce = df_release.verify_release(
+            claim=claim, signatures=signatures,
+            approvers=approval.get("approvers") or [],
+            threshold=approval.get("threshold"),
+            run_id=run_id, artifact_object_id=artifact_object_id,
+            now=datetime.datetime.now(datetime.timezone.utc), used_nonces=set())
+        sig_verified = bool(ok_s)
+    except Exception as e:
+        sig_verified = f"ERROR: {e.__class__.__name__}: {e}"
     return {"present": True, "chain_anchored": anchored,
-            "verified": anchored is True,
+            "signatures_verified": sig_verified, "signature_reason": sig_reason,
+            "verified": (anchored is True and sig_verified is True),
             "action_names": claim.get("action_names"),
             "expires_at": claim.get("expires_at"),
             "approvers_satisfied": att.get("approvers_satisfied")}
@@ -209,13 +254,29 @@ def _verified_receipt(control_root, run_dir, basename):
                 att_text = f.read()
         except OSError:
             att_text = None
+    # DF-R7-03: BIND the receipt to the exact current record bytes BEFORE the
+    # positive readback — a receipt whose body_sha256 does not match the record
+    # it accompanies proves nothing about THIS run's evidence.
+    bound = None
+    if record_name:
+        try:
+            ok_b, _why = supervisor._sink_receipt_bound(
+                run_dir, basename, att_text or "", require_server_issued=True,
+                sink=_cfg_of(control_root).get("_audit", {}).get("sink"))
+            bound = bool(ok_b)
+        except Exception as e:
+            bound = f"ERROR: {e.__class__.__name__}: {e}"
+    facts["bound"] = bound
     try:
         cfg = _cfg_of(control_root)
         sink = cfg.get("_audit", {}).get("sink", {"kind": "none"})
         facts["readback"] = supervisor._sink_readback(sink, receipt, att_text or "")
     except Exception as e:
         facts["readback"] = f"ERROR: {e.__class__.__name__}: {e}"
-    facts["verified"] = facts.get("readback") is True
+    # Verified only when the receipt is bound to the current bytes AND positively
+    # read back off-box.
+    facts["verified"] = (facts.get("readback") is True
+                         and (bound is True or record_name is None))
     return facts
 
 
@@ -230,14 +291,40 @@ def _attempt_aware_reentry(control_root, run_dir):
         return {"available": False, "reason": f"{e.__class__.__name__}: {e}"}
     unresolved = (st.get("unresolved_forward") or st.get("unresolved_rollback")
                   or bool(st.get("unknown_effect")))
+    # DF-R7-03: proof of no-duplicate re-entry requires that a ship actually
+    # RAN AND completed (a final SHIPPED ship_result) — an UNSHIPPED run has no
+    # re-entry to attest and must NOT read as "no duplicates".
+    ship_result, _ = _read_json(os.path.join(run_dir, "ship_result.json"))
+    shipped = (ship_result or {}).get("outcome") == "SHIPPED"
+    started = sum(1 for e in _ship_journal_events_safe(run_dir)
+                  if e.get("state") == "SHIP_STARTED")
     return {"available": True,
             "applied_actions": sorted((st.get("applied") or {}).keys()),
             "unknown_effect": sorted(st.get("unknown_effect") or []),
             "has_unresolved": bool(unresolved),
-            "no_duplicate_or_unknown_actions": not unresolved}
+            "shipped": shipped,
+            "ship_started_count": started,
+            # a real idempotent-re-entry proof: a SHIPPED terminal, no unresolved
+            # or unknown action, and (when observed) more than one SHIP_STARTED
+            # with no duplicated applied effect.
+            "no_duplicate_or_unknown_actions": (shipped and not unresolved)}
 
 
-def assemble(control_root, run_dir, key=None, require_production=False):
+def _ship_journal_events_safe(run_dir):
+    path = os.path.join(run_dir, "ship_journal.jsonl")
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+def assemble(control_root, run_dir, key=None, require_production=False, profile=None):
     """Return (bundle_dict, error). error is a string only when the run is
     unreadable (no manifest). With require_production=True the bundle also carries
     a `production_ready` verdict that fails closed on ANY missing/unverified
@@ -256,7 +343,7 @@ def assemble(control_root, run_dir, key=None, require_production=False):
     # mismatch (a checkout moved after the run) is visible, and the SEALED value is
     # authoritative.
     sealed_src = manifest.get("source_identity") or {}
-    live_commit = _source_commit(control_root)
+    live_src = _live_source_identity(control_root)
     manifest_v = _verified_manifest(control_root, run_dir, key)
 
     bundle = {
@@ -265,10 +352,15 @@ def assemble(control_root, run_dir, key=None, require_production=False):
         "run_dir": os.path.abspath(run_dir),
         "source": {
             "sealed_commit": sealed_src.get("commit"),
+            "sealed_clean": sealed_src.get("clean"),   # DF-R7-04 tri-state
             "sealed_dirty": sealed_src.get("dirty"),
-            "assembly_time_commit": live_commit,
-            "matches_sealed": (sealed_src.get("commit") is not None
-                               and sealed_src.get("commit") == live_commit),
+            "sealed_tree_digest": sealed_src.get("tree_digest"),
+            "assembly_time_commit": live_src.get("commit"),
+            "assembly_time_tree_digest": live_src.get("tree_digest"),
+            # DF-R7-04: match on the full tree/content digest (not just the
+            # commit — two trees can share one commit), falling back to commit
+            # for a pre-M67 manifest with no sealed tree_digest.
+            "matches_sealed": _source_matches(sealed_src, live_src),
         },
         "config_sha256": manifest.get("config_sha256"),
         "spec_sha256": manifest.get("spec_sha256"),
@@ -315,29 +407,77 @@ def assemble(control_root, run_dir, key=None, require_production=False):
     }
 
     if require_production:
-        # Production evidence fails CLOSED on any unmet requirement — a partial or
-        # mock exercise can never masquerade as a production-GO bundle.
-        unmet = []
-        if not manifest_v.get("manifest_verified"):
-            unmet.append("manifest not verified (HMAC/artifact/chain-membership)")
-        if bundle["source"]["sealed_commit"] is None:
-            unmet.append("no sealed source commit")
-        if bundle["source"]["sealed_dirty"]:
-            unmet.append("source tree was DIRTY at run start")
-        if bundle["audit_chain"].get("verified") is not True:
-            unmet.append("signed audit chain not verified")
-        if bundle["effective_tier"] not in ("standard", "hardened", "enterprise"):
-            unmet.append(f"effective tier {bundle['effective_tier']!r} is not qualifiable")
-        if bundle["qualified"] is not True and bundle["effective_tier"] != "enterprise":
-            unmet.append("run is not qualified")
-        if bundle["effective_tier"] == "enterprise" and bundle["custody"].get("verified") is not True:
-            unmet.append("enterprise custody not cryptographically verified")
-        if bundle["ship_result"]["present"] and bundle["release"]["present"] \
-                and bundle["release"].get("verified") is not True:
-            unmet.append("release attestation not verified")
-        if bundle["reentry"].get("no_duplicate_or_unknown_actions") is not True:
-            unmet.append("re-entry shows an unresolved/unknown ship action")
-        bundle["production_ready"] = not unmet
-        bundle["production_unmet"] = unmet
+        bundle["production_profile"] = profile
+        bundle["production_ready"], bundle["production_unmet"] = _production_verdict(
+            bundle, manifest_v, manifest, profile)
 
     return _scrub(bundle), None
+
+
+def _production_verdict(bundle, manifest_v, manifest, profile):
+    """DF-R7-03: fail CLOSED unless EVERY fact a named production profile requires
+    is present, non-null, bound, and cryptographically verified. A partial/mock
+    exercise, an unshipped run, or an unrecognized/absent profile can never read
+    as production-GO. Returns (ready: bool, unmet: [str])."""
+    unmet = []
+    if profile not in ("hardened-h4", "enterprise"):
+        return (False, [f"no recognized production profile (got {profile!r}; "
+                        "use --profile hardened-h4 | enterprise)"])
+
+    src = bundle["source"]
+    container = manifest.get("container") or {}
+
+    # --- facts EVERY production profile requires ---
+    if not manifest_v.get("manifest_verified"):
+        unmet.append("manifest not verified (HMAC + artifact + chain membership)")
+    if src["sealed_commit"] is None:
+        unmet.append("no sealed source commit")
+    if src.get("sealed_clean") is not True:      # DF-R7-04: clean must be EXPLICIT True
+        unmet.append("source tree not explicitly clean at run start")
+    if not src.get("matches_sealed"):
+        unmet.append("assembly-time source does not match the sealed source identity")
+    if bundle["audit_chain"].get("verified") is not True:
+        unmet.append("signed audit chain not verified")
+    if bundle["ship_result"]["outcome"] != "SHIPPED":
+        unmet.append("no final SHIPPED ship_result")
+    if bundle["reentry"].get("no_duplicate_or_unknown_actions") is not True:
+        unmet.append("no authenticated idempotent re-entry proof (unshipped or unresolved)")
+    # DF-R7-03 (opus F2): an irreversible action's release must verify under EVERY
+    # profile, not only enterprise. `reversible is True` counts an action as
+    # reversible — a missing/None label is treated as irreversible (fail-closed).
+    irreversible = any(a.get("reversible") is not True
+                       for a in bundle["ship_result"].get("actions", []))
+    if irreversible and bundle["release"].get("verified") is not True:
+        unmet.append("an irreversible (or unlabeled) action shipped but the release "
+                     "attestation is not cryptographically verified")
+
+    if profile == "hardened-h4":
+        if bundle["effective_tier"] != "hardened":
+            unmet.append(f"effective tier is {bundle['effective_tier']!r}, not hardened")
+        if bundle["qualified"] is not True:
+            unmet.append("run is not qualified")
+        if (manifest.get("intervention_mode") not in ("H4", "lights_out")):
+            unmet.append("run was not H4 (lights-out)")
+        if not container.get("resolved_image_digest"):
+            unmet.append("no resolved/digest-pinned image identity")
+        if bundle["denial_probe_passed"] is not True:
+            unmet.append("denial/confinement probe did not pass")
+
+    elif profile == "enterprise":
+        if bundle["effective_tier"] != "enterprise":
+            unmet.append(f"effective tier is {bundle['effective_tier']!r}, not enterprise")
+        if bundle["custody"].get("verified") is not True:
+            unmet.append("enterprise custody not cryptographically verified")
+        if not container.get("resolved_image_digest"):
+            unmet.append("no resolved/digest-pinned image identity")
+        egress = bundle.get("enterprise_egress") or {}
+        if not (egress.get("probed") and egress.get("passed")):
+            unmet.append("enterprise egress probe did not pass")
+        # a required S3 Object-Lock sink, server-issued + bound + read back:
+        rcpt = bundle["ship_sink_receipt"]
+        if not (rcpt.get("present") and rcpt.get("kind") == "s3-objectlock"
+                and rcpt.get("server_issued") and rcpt.get("version_id")
+                and rcpt.get("verified") is True):
+            unmet.append("required s3-objectlock ship receipt not server-issued/bound/read-back")
+
+    return (not unmet, unmet)
