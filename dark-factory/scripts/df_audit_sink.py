@@ -53,13 +53,18 @@ def push(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int = 20) -> dict:
     raise SinkError(f"unknown or unpushable sink kind: {kind!r}")
 
 
-def signed_s3_get(sink_cfg: dict, key: str, *, timeout_s: int = 20):
-    """R5 DF-R5-07: SigV4-signed GET of the object at `{bucket}/{prefix}{key}` from
-    an s3-objectlock sink — the READBACK that makes an S3-backed ship receipt
-    idempotently re-verifiable off-box (a local receipt cannot fabricate the object
-    in the trust domain). Returns `(status, body)`:
-      (200, bytes) — the object exists off-box; caller compares its sha256
-      (404, None)  — the object is ABSENT off-box (a forged/never-pushed receipt)
+def signed_s3_get(sink_cfg: dict, key: str, *, version_id: str = "", timeout_s: int = 20):
+    """R5 DF-R5-07 + M60 (R5 arbitration): SigV4-signed GET of the object at
+    `{bucket}/{prefix}{key}` from an s3-objectlock sink — the READBACK that makes an
+    S3-backed ship receipt idempotently re-verifiable off-box (a local receipt
+    cannot fabricate the object in the trust domain). When `version_id` is given,
+    reads THAT EXACT version (`?versionId=`) rather than whatever the key currently
+    resolves to — so on a versioned/object-lock bucket the readback verifies the
+    precise bytes the push recorded, never a later version at the same key. The
+    caller compares the returned BYTES' sha256 (ETag is never treated as a content
+    hash — it is not one for multipart uploads). Returns `(status, body)`:
+      (200, bytes) — the (exact-version) object exists off-box; caller compares sha256
+      (404, None)  — the object/version is ABSENT off-box (a forged/never-pushed receipt)
       (0,   None)  — inconclusive: sink unreachable, or credentials unavailable
                      (the caller keeps the positive-confirmation rule, does NOT
                      reject on an inconclusive readback). Never raises."""
@@ -76,11 +81,14 @@ def signed_s3_get(sink_cfg: dict, key: str, *, timeout_s: int = 20):
         object_path = f"{bucket}/{prefix}{key}"
         canonical_uri = "/" + "/".join(
             urllib.parse.quote(part, safe="-_.~") for part in object_path.split("/"))
+        # SigV4 requires the query string in the signed canonical request. S3
+        # versionId is a single param, already URL-safe (no encoding needed).
+        canonical_qs = f"versionId={urllib.parse.quote(version_id, safe='')}" if version_id else ""
         amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         headers = _sigv4_headers("GET", host, canonical_uri, b"", access_key=access_key,
                                  secret_key=secret_key, region=region, service="s3",
-                                 amz_date=amz_date)
-        url = f"{scheme}://{host}{canonical_uri}"
+                                 amz_date=amz_date, canonical_querystring=canonical_qs)
+        url = f"{scheme}://{host}{canonical_uri}" + (f"?{canonical_qs}" if canonical_qs else "")
         req = urllib.request.Request(url, method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             if 200 <= resp.status < 300:

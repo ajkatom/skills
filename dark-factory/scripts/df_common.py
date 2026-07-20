@@ -14,11 +14,18 @@ def sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def sha256_file(path: str) -> str:
+def sha256_file(path: str):
+    """sha256 of a file's bytes, or None when the path is unreadable / not a
+    regular file (M60 opus review 1c: a support file whose realpath is swapped
+    to a directory between config-load and manifest-seal must seal an honest
+    null, never crash the run with an uncaught IsADirectoryError)."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
     return h.hexdigest()
 
 
