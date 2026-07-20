@@ -6942,36 +6942,105 @@ def _ship_journal_events(run_dir):
     return out
 
 
-def _unresolved_ship_action(run_dir):
-    """The M35 reserve-before check, for ship actions. Returns the data dict of
-    the LATEST SHIP_ACTION_INTENT that has NO matching SHIP_ACTION_RESULT (same
-    idempotency_key) — meaning a prior process crashed after journaling+fsyncing
-    the intent but before the action's outcome resolved (its real-world effect
-    is UNKNOWN) — else None. Never a blind re-run of a deploy."""
-    latest_intent = None
-    resolved = set()
+def _resolution_key(data):
+    """DF-R6-01: the token that binds a SHIP_ACTION_RESULT to the specific
+    SHIP_ACTION_INTENT it resolves. The `attempt_id` (fresh per dispatch) when
+    present; else the stable idempotency_key (a pre-M61 legacy journal, whose
+    single-attempt semantics the key still matches correctly)."""
+    aid = data.get("attempt_id")
+    return aid if aid is not None else ("idk:" + str(data.get("idempotency_key")))
+
+
+def _ship_action_recovery_state(run_dir):
+    """DF-R6-01/02: the ONE ordered-pass recovery view of the ship journal.
+
+    Walks events in order and returns a dict:
+      - `applied`: {action -> latest-ok-result-data} for actions whose most
+        recent forward `ok` result was NOT subsequently rolled back (the set a
+        re-ship SKIPS — the currently-APPLIED effects);
+      - `unresolved_forward`: the data of the latest SHIP_ACTION_INTENT whose
+        attempt has NO matching SHIP_ACTION_RESULT (a crash left its real-world
+        effect UNKNOWN), else None;
+      - `unresolved_rollback`: the data of the latest SHIP_ROLLBACK_INTENT whose
+        attempt has NO matching SHIP_ROLLED_BACK/SHIP_ROLLBACK_FAILED, else None.
+
+    Matching is by attempt (see _resolution_key), so a reconciled RETRY — which
+    reuses the stable idempotency_key — is a DISTINCT attempt: an old
+    `reconciled_unknown` result can never resolve the retry's fresh intent, and a
+    second crash re-surfaces the unknown outcome instead of silently re-firing."""
+    forward_intents = {}       # attempt-key -> intent data (latest per key)
+    forward_resolved = set()   # attempt-keys with a result
+    latest_forward_intent = None
+    rollback_intents = {}      # attempt-key -> rollback intent data
+    rollback_resolved = set()
+    latest_rollback_intent = None
+    applied = {}               # action -> latest ok result data (not yet rolled back)
+    unknown_effect = set()     # actions whose rollback FAILED (real state unknown)
     for e in _ship_journal_events(run_dir):
-        data = e.get("data", {})
+        d = e.get("data", {})
         state = e.get("state")
         if state == "SHIP_ACTION_INTENT":
-            latest_intent = data
+            forward_intents[_resolution_key(d)] = d
+            latest_forward_intent = d
         elif state == "SHIP_ACTION_RESULT":
-            resolved.add(data.get("idempotency_key"))
-    if latest_intent is not None and latest_intent.get("idempotency_key") not in resolved:
-        return latest_intent
-    return None
+            forward_resolved.add(_resolution_key(d))
+            if d.get("status") == "ok" and d.get("action") is not None:
+                applied[d["action"]] = d
+                # A fresh successful re-run resolves a prior unknown state.
+                unknown_effect.discard(d["action"])
+        elif state == "SHIP_ROLLBACK_INTENT":
+            rollback_intents[_resolution_key(d)] = d
+            latest_rollback_intent = d
+        elif state == "SHIP_ROLLED_BACK":
+            rollback_resolved.add(_resolution_key(d))
+            # A SUCCESSFUL rollback PROVES the effect is gone: drop it from
+            # `applied` so the action re-runs before any SHIPPED (DF-R6-02).
+            if d.get("action") is not None:
+                applied.pop(d["action"], None)
+                unknown_effect.discard(d["action"])
+        elif state == "SHIP_ROLLBACK_FAILED":
+            rollback_resolved.add(_resolution_key(d))
+            # A FAILED rollback proves NOTHING about the real-world state: the
+            # undo may have partially applied, or not at all (the effect may
+            # still be fully present). Neither silently skipping (omission) nor
+            # silently re-running (DUPLICATE of a possibly-still-applied,
+            # possibly-non-idempotent action) is safe — so the action enters an
+            # explicit UNKNOWN-effect set that forces an operator decision
+            # (SHIP_UNKNOWN_OUTCOME) instead of either guess.
+            if d.get("action") is not None:
+                applied.pop(d["action"], None)
+                unknown_effect.add(d["action"])
+    unresolved_forward = (
+        latest_forward_intent
+        if (latest_forward_intent is not None
+            and _resolution_key(latest_forward_intent) not in forward_resolved)
+        else None)
+    unresolved_rollback = (
+        latest_rollback_intent
+        if (latest_rollback_intent is not None
+            and _resolution_key(latest_rollback_intent) not in rollback_resolved)
+        else None)
+    return {"applied": applied,
+            "unknown_effect": unknown_effect,
+            "unresolved_forward": unresolved_forward,
+            "unresolved_rollback": unresolved_rollback}
+
+
+def _unresolved_ship_action(run_dir):
+    """The M35 reserve-before check, for ship actions (DF-R6-01/02): the data
+    dict of the latest unresolved FORWARD or ROLLBACK intent — a prior process
+    crashed after journaling+fsyncing the intent but before its outcome resolved
+    (real-world effect UNKNOWN) — else None. Never a blind re-run of a deploy."""
+    st = _ship_action_recovery_state(run_dir)
+    return st["unresolved_forward"] or st["unresolved_rollback"]
 
 
 def _ship_completed_actions(run_dir):
-    """Names of actions with a recorded SHIP_ACTION_RESULT status 'ok' (a prior
-    ship attempt succeeded on them) — recovered so a re-ship SKIPS them, never
-    re-runs a succeeded action."""
-    done = set()
-    for e in _ship_journal_events(run_dir):
-        if e.get("state") == "SHIP_ACTION_RESULT" and e.get("data", {}).get("status") == "ok":
-            done.add(e["data"].get("action"))
-    done.discard(None)
-    return done
+    """Names of actions currently APPLIED (a prior attempt succeeded and was NOT
+    later rolled back) — recovered so a re-ship SKIPS them, never re-runs a
+    succeeded action, but ALSO never skips one whose effect was undone
+    (DF-R6-02)."""
+    return set(_ship_action_recovery_state(run_dir)["applied"].keys())
 
 
 def _load_release_attestation(run_dir, cfg=None):
@@ -7363,22 +7432,29 @@ def _ship_completed_action_facts(run_dir):
     control-root writer who edits the toolchain cannot make the recomputed token
     match, so a forged toolchain is refused and never reconstructed into a signed
     final SHIPPED record."""
-    intents = {}
+    # DF-R6-02: derive facts from the ordered-pass APPLIED set, so the
+    # authenticated set == the skip set (`_ship_completed_actions`) exactly — a
+    # rolled-back action is neither skipped nor authenticated-as-done. The
+    # toolchain/reversible/approval_ref come from the intent of the SAME attempt
+    # that produced the applied `ok` (matched by attempt_id, falling back to the
+    # last intent for the idk on a legacy journal).
+    applied = _ship_action_recovery_state(run_dir)["applied"]
+    intents_by_key = {}
+    intents_by_idk = {}
     for e in _ship_journal_events(run_dir):
         d = e.get("data", {})
-        if e.get("state") == "SHIP_ACTION_INTENT" and d.get("idempotency_key") is not None:
-            intents[d.get("idempotency_key")] = d
+        if e.get("state") == "SHIP_ACTION_INTENT":
+            intents_by_key[_resolution_key(d)] = d
+            if d.get("idempotency_key") is not None:
+                intents_by_idk[d.get("idempotency_key")] = d
     facts = []
-    for e in _ship_journal_events(run_dir):
-        d = e.get("data", {})
-        if e.get("state") == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
-            if d.get("action") is not None:
-                idk = d.get("idempotency_key")
-                intent = intents.get(idk) or {}
-                facts.append({"name": d.get("action"), "idk": idk,
-                              "toolchain": intent.get("toolchain"),
-                              "reversible": intent.get("reversible"),
-                              "approval_ref": intent.get("approval_ref")})
+    for name, result in applied.items():
+        intent = intents_by_key.get(_resolution_key(result)) \
+            or intents_by_idk.get(result.get("idempotency_key")) or {}
+        facts.append({"name": name, "idk": result.get("idempotency_key"),
+                      "toolchain": intent.get("toolchain"),
+                      "reversible": intent.get("reversible"),
+                      "approval_ref": intent.get("approval_ref")})
     return facts
 
 
@@ -8087,21 +8163,65 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
 
     # Crash-safety (invariant #4): an INTENT with no RESULT is UNKNOWN. Refuse
     # (exit 11) under plain `continue`; `reconcile` consents to a possible
-    # duplicate; `abort` seals SHIP_FAILED.
-    unresolved = _unresolved_ship_action(run_dir)
+    # duplicate; `abort` seals SHIP_FAILED. DF-R6-02: a dangling ROLLBACK intent
+    # is ALSO an unknown outcome (the undo may or may not have applied).
+    _rec = _ship_action_recovery_state(run_dir)
+    unresolved_fwd = _rec["unresolved_forward"]
+    unresolved_rb = _rec["unresolved_rollback"]
+    unknown_effect = sorted(_rec["unknown_effect"])
+    unresolved = unresolved_fwd or unresolved_rb
+    # DF-R6-02: an action whose ROLLBACK FAILED has an UNKNOWN real-world state —
+    # the undo may have partly applied or not at all. Skipping it risks omitting a
+    # required effect; re-running it risks DUPLICATING a possibly-still-applied,
+    # possibly-non-idempotent production action. Neither guess is acceptable, so
+    # this is an explicit unknown outcome requiring an operator decision — the
+    # same gate a dangling intent gets.
+    if unresolved is None and unknown_effect:
+        if decision == "continue":
+            ship_journal.write("SHIP_UNKNOWN_OUTCOME", actions=unknown_effect,
+                               kind="failed_rollback")
+            sys.stderr.write(
+                f"dark-factory: ship action(s) {unknown_effect} had a FAILED rollback — the undo "
+                "did not complete, so their real-world state is UNKNOWN (possibly still applied, "
+                "possibly partial). Refusing to skip (would omit a required effect) or re-run "
+                "(would duplicate a possibly-applied action). Inspect the target, then `ship "
+                "--decision reconcile` (re-runs, accepting a possible duplicate) or `--decision "
+                "abort` (seals SHIP_FAILED).\n")
+            return UNKNOWN_OUTCOME
+        if decision == "abort":
+            ship_journal.write("SHIP_RECONCILE_ABORT", actions=unknown_effect,
+                               kind="failed_rollback")
+            result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
+                      "failed_action": unknown_effect[0], "rollbacks": [],
+                      "rollback_failed": True}
+            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
+                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
+            print("dark-factory: SHIP ABORTED at a failed-rollback unknown state "
+                  "(sealed SHIP_FAILED).")
+            return 3
+        # reconcile: the operator inspected and consents to re-running the
+        # unknown-state action(s) (accepting a possible duplicate). They are
+        # already OUT of `applied`, so the normal loop re-runs them.
+        ship_journal.write("SHIP_RECONCILED", actions=unknown_effect, kind="failed_rollback",
+                           note="operator accepted possible duplicate; re-running")
+        print(f"dark-factory: reconciling failed-rollback unknown state for "
+              f"{unknown_effect} — re-running (possible duplicate).")
     if unresolved is not None:
+        kind = "action" if unresolved_fwd is not None else "rollback"
         if decision == "continue":
             ship_journal.write("SHIP_UNKNOWN_OUTCOME", action=unresolved.get("action"),
-                               idempotency_key=unresolved.get("idempotency_key"))
+                               idempotency_key=unresolved.get("idempotency_key"),
+                               attempt_id=unresolved.get("attempt_id"), kind=kind)
             sys.stderr.write(
-                f"dark-factory: ship action {unresolved.get('action')!r} was reserved but did "
+                f"dark-factory: ship {kind} {unresolved.get('action')!r} was reserved but did "
                 "not resolve before a crash — its real-world effect is UNKNOWN. Refusing to "
                 "re-run a possibly-applied action. Inspect the target, then `ship --decision "
                 "reconcile` (re-runs, accepting a possible duplicate) or `--decision abort` "
                 "(seals SHIP_FAILED).\n")
             return UNKNOWN_OUTCOME
         if decision == "abort":
-            ship_journal.write("SHIP_RECONCILE_ABORT", action=unresolved.get("action"))
+            ship_journal.write("SHIP_RECONCILE_ABORT", action=unresolved.get("action"),
+                               kind=kind)
             result = {"outcome": df_ship.SHIP_FAILED, "actions": [], "pending_action": None,
                       "failed_action": unresolved.get("action"), "rollbacks": [],
                       "rollback_failed": False}
@@ -8109,15 +8229,29 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                               artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
             print("dark-factory: SHIP ABORTED at an unresolved action (sealed SHIP_FAILED).")
             return 3
-        # reconcile: clear the dangling intent by recording an explicit unknown
-        # RESULT (so the re-scan is satisfied and the action re-runs — it is NOT
-        # in `already_done`), operator consenting to a possible duplicate.
-        ship_journal.write("SHIP_ACTION_RESULT", action=unresolved.get("action"),
-                           idempotency_key=unresolved.get("idempotency_key"),
-                           status="reconciled_unknown", exit=None, timed_out=False)
-        ship_journal.write("SHIP_RECONCILED", action=unresolved.get("action"),
+        # reconcile: resolve the dangling intent so the re-scan is satisfied, then
+        # re-run from a clean applied set (operator consents to a possible
+        # duplicate). The result CARRIES the dangling intent's attempt_id, so it
+        # resolves EXACTLY that attempt and can NEVER resolve a future retry's
+        # fresh attempt (DF-R6-01).
+        if unresolved_fwd is not None:
+            # A dangling FORWARD action: record an explicit unknown forward RESULT
+            # (status != ok, so it does not enter `already_done`; the action
+            # re-runs).
+            ship_journal.write("SHIP_ACTION_RESULT", action=unresolved.get("action"),
+                               idempotency_key=unresolved.get("idempotency_key"),
+                               attempt_id=unresolved.get("attempt_id"),
+                               status="reconciled_unknown", exit=None, timed_out=False)
+        else:
+            # A dangling ROLLBACK: resolve it as an operator-consented unknown
+            # failure AND drop the action from `applied` (its effect is now
+            # unknown, so it must re-run before any SHIPPED).
+            ship_journal.write("SHIP_ROLLBACK_FAILED", action=unresolved.get("action"),
+                               attempt_id=unresolved.get("attempt_id"),
+                               detail="operator-reconciled unknown rollback outcome")
+        ship_journal.write("SHIP_RECONCILED", action=unresolved.get("action"), kind=kind,
                            note="operator accepted possible duplicate; re-running")
-        print(f"dark-factory: reconciling unresolved ship action "
+        print(f"dark-factory: reconciling unresolved ship {kind} "
               f"{unresolved.get('action')!r} — re-running (possible duplicate).")
 
     # R5 DF-R5-02: the AUTHENTICATED evidence-only repair runs BEFORE already_done
@@ -8224,11 +8358,14 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
 
         if result["outcome"] == df_ship.SHIP_EVIDENCE_PENDING:
             # R5 DF-R5-02: a per-action token could not be signed. The loop already
-            # STOPPED (no later action ran). Seal the RECOVERABLE pending record —
-            # its own anchor will typically ALSO fail (same signer); that is fine:
-            # re-entry is journal+chain-driven and never trusts this blob.
-            _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
-                              artifact_object_id, redactor, ship_actions=ship_cfg["actions"])
+            # STOPPED (no later action ran). The RECOVERABLE pending record was
+            # ALREADY sealed by the unconditional _seal_ship_result above — its own
+            # anchor will typically fail too (same signer); that is fine: re-entry
+            # is journal+chain-driven and never trusts this blob.
+            # DF-R6-09: do NOT seal a second time. The duplicate seal wrote two
+            # terminal records, two journal events, two chain anchors and two
+            # off-box versions for ONE event, leaving a needlessly contradictory
+            # WORM history.
             ran = result.get("evidence_pending_action")
             halted = result.get("pending_action")
             gap = (f"action {ran!r} RAN but its completion token could not be signed"

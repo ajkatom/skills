@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 
 import df_common
 import df_creds
@@ -351,11 +352,20 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         toolchain.append(tc_entry)
 
         idk = idempotency_key(run_id, name, index)
+        # DF-R6-01: a FRESH attempt id per dispatch. The idempotency_key is stable
+        # for (run_id, action, index) — intentionally, for external targets that
+        # honor one — so a reconciled RETRY reuses the same key, and matching a
+        # result to an intent by KEY let an OLD `reconciled_unknown` result resolve
+        # a NEW intent (a second crash then silently re-fired the action). A
+        # result now resolves the intent that shares its attempt_id, so a retry's
+        # intent stays unresolved until ITS OWN result lands.
+        attempt_id = uuid.uuid4().hex
         # RESERVE-BEFORE (invariant #4): journal the intent (fsync'd) BEFORE the
         # subprocess is spawned. On a crash between here and the RESULT, resume
         # sees an unresolved intent and refuses (SHIP_UNKNOWN_OUTCOME).
         journal.write("SHIP_ACTION_INTENT", action=name, index=index, idempotency_key=idk,
-                      reversible=reversible, approval_ref=approval_ref, toolchain=tc_entry)
+                      attempt_id=attempt_id, reversible=reversible,
+                      approval_ref=approval_ref, toolchain=tc_entry)
 
         # R5 DF-R5-02: sign the INTENT token BEFORE the spawn. This is what makes
         # the evidence-pending recovery AUTHENTICATED: a completion token that
@@ -372,8 +382,9 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                                              approval_ref, phase="intent")
             if intent_committed != "anchored":
                 journal.write("SHIP_ACTION_RESULT", action=name, index=index,
-                              idempotency_key=idk, exit=None, timed_out=False,
-                              status="not_run_evidence_halt", duration_s=None)
+                              idempotency_key=idk, attempt_id=attempt_id, exit=None,
+                              timed_out=False, status="not_run_evidence_halt",
+                              duration_s=None)
                 records.append({"name": name, "reversible": reversible,
                                 "status": "not_run_evidence_halt", "exit": None,
                                 "approval_ref": approval_ref, "duration_s": None})
@@ -408,8 +419,9 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
             committed = commit_action(name, idk, tc_entry, reversible, approval_ref)
         if success and committed != "anchored":
             journal.write("SHIP_ACTION_RESULT", action=name, index=index,
-                          idempotency_key=idk, exit=exit_code, timed_out=timed_out,
-                          status="evidence_pending", duration_s=round(dur, 3))
+                          idempotency_key=idk, attempt_id=attempt_id, exit=exit_code,
+                          timed_out=timed_out, status="evidence_pending",
+                          duration_s=round(dur, 3))
             records.append({"name": name, "reversible": reversible,
                             "status": "evidence_pending", "exit": exit_code,
                             "approval_ref": approval_ref, "duration_s": round(dur, 3)})
@@ -419,8 +431,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                     "rollbacks": [], "rollback_failed": False,
                     "toolchain": toolchain, "rollback_toolchain": []}
         journal.write("SHIP_ACTION_RESULT", action=name, index=index, idempotency_key=idk,
-                      exit=exit_code, timed_out=timed_out, status=status,
-                      duration_s=round(dur, 3))
+                      attempt_id=attempt_id, exit=exit_code, timed_out=timed_out,
+                      status=status, duration_s=round(dur, 3))
         records.append({"name": name, "reversible": reversible, "status": status,
                         "exit": exit_code, "approval_ref": approval_ref,
                         "duration_s": round(dur, 3)})
@@ -488,20 +500,27 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
         rb_tc_entry = toolchain_identity(name, rollback_argv[0] if rollback_argv else None, cwd,
                                          child_env=_child_env(base_env, cred_values))
         rb_toolchain.append(rb_tc_entry)
-        journal.write("SHIP_ROLLBACK_INTENT", action=name, toolchain=rb_tc_entry)
+        # DF-R6-02: a fresh attempt id for THIS rollback dispatch (reserve-before,
+        # like the forward action) so a crash between the intent and its result is
+        # detectable as an UNRESOLVED rollback (unknown real-world effect), not
+        # silently treated as done or re-run.
+        rb_attempt_id = uuid.uuid4().hex
+        journal.write("SHIP_ROLLBACK_INTENT", action=name, attempt_id=rb_attempt_id,
+                      toolchain=rb_tc_entry)
         exit_code, timed_out, out, err, dur = _run_one(
             rollback_argv, cwd=cwd, child_env=_child_env(base_env, cred_values),
             timeout_s=action["timeout_s"])
         _write_logs(log_dir, name, ".rollback", out, err, redactor)
         if exit_code == 0 and not timed_out:
-            journal.write("SHIP_ROLLED_BACK", action=name, duration_s=round(dur, 3))
+            journal.write("SHIP_ROLLED_BACK", action=name, attempt_id=rb_attempt_id,
+                          duration_s=round(dur, 3))
             rb_records.append({"name": name, "status": "rolled_back", "exit": 0})
         else:
             # LOUD, never swallowed: the operator must intervene — a rollback
             # that could not undo its action leaves real infrastructure in an
             # unknown state.
-            journal.write("SHIP_ROLLBACK_FAILED", action=name, exit=exit_code,
-                          timed_out=timed_out, duration_s=round(dur, 3))
+            journal.write("SHIP_ROLLBACK_FAILED", action=name, attempt_id=rb_attempt_id,
+                          exit=exit_code, timed_out=timed_out, duration_s=round(dur, 3))
             rb_records.append({"name": name,
                                "status": "timed_out" if timed_out else "rollback_failed",
                                "exit": exit_code})
