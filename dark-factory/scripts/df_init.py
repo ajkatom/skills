@@ -417,8 +417,15 @@ def build_config(answers: dict) -> dict:
                 "autonomy 5 (lights-off) requires assurance: hardened or enterprise"
             )
 
-        checkpoint = answers.get("checkpoint", "auto")
-        if checkpoint not in ("pause", "auto"):
+        # DF-R5-06: an OMITTED checkpoint defaults exactly as df_config's
+        # runtime default ("pause" for autonomy 4 -> H2, "auto" only for 5),
+        # so a partial-legacy `answers` scaffolds the SAME mode the runtime
+        # would resolve for the same partial config — init previously wrote
+        # "auto" (H3), silently dropping the documented H2 human gates.
+        checkpoint = answers.get("checkpoint")
+        if checkpoint is None:
+            checkpoint = "pause" if autonomy == 4 else "auto"
+        elif checkpoint not in ("pause", "auto"):
             raise InitError("checkpoint must be 'pause' or 'auto'")
         mode_cfg = {"autonomy": autonomy, "checkpoint": checkpoint}
 
@@ -434,6 +441,38 @@ def build_config(answers: dict) -> dict:
     if not builder_adapter:
         raise InitError("answers.builder_adapter is required")
 
+    # DF-R5-06: a fully-shaped `answers.roles.builder` carries the OPTIONAL
+    # builder fields the runtime schema already validates (timeout_s,
+    # adapter_sha256, model_identity, support_files) — same shaped/flat duality
+    # as author/critic below, with df_config staying the one validator. The
+    # flat `answers.builder_adapter` stays required either way; a shaped block
+    # naming a DIFFERENT adapter is refused (ambiguity, never silently picked).
+    shaped_builder = (answers.get("roles") or {}).get("builder")
+    if shaped_builder is not None and not isinstance(shaped_builder, dict):
+        raise InitError("answers.roles.builder must be an object")
+    # Fail CLOSED on unknown shaped-builder keys (same DF-R3-01 discipline as
+    # `options` below): df_config reads only the known builder keys and never
+    # rejects extras, so a typo like `adaptersha256` would be forwarded and
+    # silently DROPPED — the operator believes the adapter is content-pinned
+    # while it runs unauthenticated. Reject, naming offender(s) + allowed set.
+    _allowed_builder_keys = {
+        "adapter", "timeout_s", "adapter_sha256", "model_identity",
+        "support_files",
+    }
+    unknown_builder = sorted(set(shaped_builder or {}) - _allowed_builder_keys)
+    if unknown_builder:
+        raise InitError(
+            "answers.roles.builder has unknown key(s): "
+            f"{', '.join(unknown_builder)}; allowed keys are "
+            f"{', '.join(sorted(_allowed_builder_keys))}"
+        )
+    builder_role = dict(shaped_builder) if shaped_builder else {}
+    if builder_role.get("adapter", builder_adapter) != builder_adapter:
+        raise InitError(
+            "answers.roles.builder.adapter conflicts with answers.builder_adapter "
+            "(supply one adapter path, not two different ones)")
+    builder_role["adapter"] = builder_adapter
+
     cfg = {
         "config_version": "0.1",
         "feedback": "ids",
@@ -441,7 +480,7 @@ def build_config(answers: dict) -> dict:
         "assurance": assurance,
         "max_iterations": max_iterations,
         "workspace_root": workspace_root,
-        "roles": {"builder": {"adapter": builder_adapter}},
+        "roles": {"builder": builder_role},
         "budget": {"billing": "subscription"},
     }
 
@@ -510,8 +549,14 @@ def build_config(answers: dict) -> dict:
     # candidate_network; action reversibility/path-hygiene for ship) exactly as
     # security_gates/twins are forwarded raw today -- init MUST NOT reimplement
     # or partially re-validate that shape here (double-validation drift risk).
+    # DF-R5-06: `hardened`, `credentials` and `brownfield` join the raw
+    # pass-through set so the canonical init on-ramp can express a normal live
+    # hardened builder (network/image/dep-cache/limits + brokered provider
+    # credentials) and a brownfield root WITHOUT a post-init hand edit.
+    # df_config.load_config remains the single validator of every block.
     for key in ("security_gates", "twins", "knowledge_base",
-                "candidate_network", "ship"):
+                "candidate_network", "ship", "hardened", "credentials",
+                "brownfield"):
         if key in options:
             cfg[key] = options[key]
     # DF-R3-01: fail CLOSED on unknown `options` keys. Silent-drop is precisely
@@ -521,7 +566,7 @@ def build_config(answers: dict) -> dict:
     # naming both the offender(s) and the allowed set so the fix is obvious.
     _allowed_options = {
         "budget", "security_gates", "twins", "knowledge_base",
-        "candidate_network", "ship",
+        "candidate_network", "ship", "hardened", "credentials", "brownfield",
     }
     unknown = sorted(set(options) - _allowed_options)
     if unknown:
@@ -775,10 +820,11 @@ def validate_scaffold(control_root: str) -> tuple:
     any validator failure is captured into the report and ok=False."""
     control_root = os.path.abspath(control_root)
     report = {"config_ok": False, "inert": [], "coverage": {}, "spec_leak": [],
-              "scenarios_pending": False}
+              "scenarios_pending": False, "network_incompatible": [],
+              "adequacy_under_covered": []}
 
     try:
-        df_config.load_config(control_root)
+        cfg = df_config.load_config(control_root)
         report["config_ok"] = True
     except df_config.ConfigError as e:
         report["config_error"] = str(e)
@@ -816,6 +862,24 @@ def validate_scaffold(control_root: str) -> tuple:
 
     report["coverage"] = df_gates.check_coverage(behaviors, scenarios)
 
+    # DF-R5-05: the SAME pure cross-file compatibility rule `run`'s pre-build
+    # gate enforces (candidate_network "deny" makes an http/property-http
+    # scenario's loopback server unreachable) — run here too, via the ONE shared
+    # function, so init never blesses a root that run then rejects GATE_FAILED.
+    report["network_incompatible"] = (
+        run_scenarios.deny_network_incompatible_ids(scenarios)
+        if cfg["candidate_network"] == "deny" else []
+    )
+
+    # DF-R5-05 (general class, opus review): `run` also gates on scenario-class
+    # ADEQUACY (df_gates.check_adequacy against cfg["_adequacy"], the M42
+    # policy) before any build — the same pure behaviors+scenarios+config rule
+    # family as the network check above, so validate_scaffold must enforce it
+    # too or a root with a stricter scenario_adequacy block (hand-edited or
+    # agent-author default) is blessed here and ADEQUACY_GATE_FAILED there.
+    adq = df_gates.check_adequacy(behaviors, scenarios, cfg["_adequacy"])
+    report["adequacy_under_covered"] = adq["under_covered"]
+
     spec_path = os.path.join(control_root, "spec.md")
     spec_text = ""
     if os.path.exists(spec_path):
@@ -830,5 +894,7 @@ def validate_scaffold(control_root: str) -> tuple:
         and not coverage.get("uncovered_dev")
         and not coverage.get("orphan_scenarios")
         and not report["spec_leak"]
+        and not report["network_incompatible"]
+        and not report["adequacy_under_covered"]
     )
     return ok, report

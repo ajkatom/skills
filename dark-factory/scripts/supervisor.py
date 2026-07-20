@@ -56,7 +56,12 @@ from df_config import (
     load_config,
 )
 from id_feedback import project_feedback
-from run_scenarios import OracleError, load_scenarios, run_all
+from run_scenarios import (
+    OracleError,
+    deny_network_incompatible_ids,
+    load_scenarios,
+    run_all,
+)
 import snapshot_source
 from snapshot_source import SnapshotError, snapshot
 
@@ -162,6 +167,62 @@ def _effective_image(cfg):
         c["_effective_image"] = digest if digest else image
     c["_resolved_image_digest"] = digest
     return c["_effective_image"]
+
+
+def _image_resolved_from_journal(run_dir):
+    """DF-R5-09: the FIRST journaled IMAGE_RESOLVED event of this run, or None.
+    Scans forward and returns the first (the pin), mirroring
+    _snapshot_sha256_from_journal's tolerance model: the journal is this run's
+    append-only record; a torn/absent file just means no pin yet."""
+    path = os.path.join(run_dir, "journal.jsonl")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("state") == "IMAGE_RESOLVED":
+                return e.get("data", {})
+    return None
+
+
+def _pin_effective_image(cfg, run_dir, journal):
+    """DF-R5-09: ONE logical run = ONE container image identity, across process
+    resume. `_effective_image` caches the resolved digest only on the in-memory
+    cfg, so a pause/crash/restart reloaded config.json and re-resolved a mutable
+    tag — earlier iterations could build under digest A, the resume under digest
+    B, and the manifest sealed only B. Called at `_run_loop` entry (fresh run
+    AND every resume enter there):
+
+      - a prior IMAGE_RESOLVED journal event -> pre-seed the in-memory cache
+        from it VERBATIM (no re-resolution; every dispatch/probe this segment
+        uses the run's original pinned reference);
+      - no prior event (fresh run, or a pre-M58 paused run) -> resolve once via
+        _effective_image and journal IMAGE_RESOLVED so every LATER segment
+        reuses it.
+
+    No-op for tiers without a container. Same-user tampering of the journal is
+    detection-grade like the rest of the run evidence (see references/audit.md)."""
+    cc = cfg.get("_container")
+    if not cc:
+        return
+    prior = _image_resolved_from_journal(run_dir)
+    if prior and prior.get("effective_image"):
+        # The pin WINS over a config.json image edited across a pause — one
+        # logical run, one image (an operator who wants different bytes starts
+        # a new run) — but the override is journaled, never silent.
+        if prior.get("config_image") is not None and cc["image"] != prior["config_image"]:
+            journal.write("IMAGE_PIN_KEPT", pinned=prior["effective_image"],
+                          original_config_image=prior["config_image"],
+                          edited_config_image=cc["image"])
+        cc["_effective_image"] = prior["effective_image"]
+        cc["_resolved_image_digest"] = prior.get("resolved_image_digest")
+        return
+    eff = _effective_image(cfg)
+    journal.write("IMAGE_RESOLVED", effective_image=eff, config_image=cc["image"],
+                  resolved_image_digest=cc.get("_resolved_image_digest"))
 
 
 BUILDER_RULES = """## Builder rules
@@ -2886,10 +2947,14 @@ def _verify_enterprise_egress(cfg, pcfg, proxy_endpoint):
     # run-to-run even under an identical policy and defeat drift detection).
     # An operator can diff this digest across two runs to see whether the
     # egress policy actually changed.
+    # DF-R5-09/R5-11: fingerprint the EFFECTIVE (digest-pinned) image — the one
+    # probes and dispatch actually use — not the configured string, so a moved
+    # mutable tag shows up as policy drift instead of hiding behind a stable
+    # config value.
     policy_digest = sha256_str(canonical_json({
         "allowlist": sorted(pcfg["allowlist"]),
         "header": pcfg["header"],
-        "image": cfg["_container"]["image"],
+        "image": _effective_image(cfg),
         "seccomp_profile": cfg["_enterprise"]["seccomp"],
     }))
     stub_httpd = None
@@ -3382,6 +3447,19 @@ def _init_report_lines(report: dict) -> list:
         lines.append(
             f"  spec_leak: scenario(s) {ids} have a `then` value appearing verbatim in "
             "spec.md (the builder-visible spec would leak the holdout answer)"
+        )
+    if report.get("network_incompatible"):
+        lines.append(
+            f"  candidate_network 'deny' vs http scenario(s) {report['network_incompatible']}: "
+            "an http/property-http scenario polls the candidate over 127.0.0.1, which "
+            "'deny' blocks — use candidate_network 'loopback' or drop the http steps "
+            "(run's pre-build gate enforces the SAME rule)"
+        )
+    if report.get("adequacy_under_covered"):
+        lines.append(
+            f"  scenario-class adequacy: {report['adequacy_under_covered']} — behavior(s) "
+            "missing a required scenario class under this root's scenario_adequacy "
+            "policy (run's pre-build gate enforces the SAME rule)"
         )
     if not lines:
         lines.append("  (validate_scaffold reported not-ok with no specific failure recorded)")
@@ -4271,14 +4349,10 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # already loaded) rather than at config-load time (df_config never
     # reads scenarios).
     if cfg["candidate_network"] == "deny":
-        # M43a: a property scenario whose STEPS include an http action needs
-        # loopback for exactly the same reason as a when.http scenario.
-        http_scenario_ids = [
-            sc["id"] for sc in scenarios
-            if "http" in sc["when"]
-            or ("property" in sc["when"]
-                and any("http" in step for step in sc["when"]["property"]["steps"]))
-        ]
+        # DF-R5-05: the deny-vs-http rule is the SHARED validator in
+        # run_scenarios (df_init.validate_scaffold runs the same call), so a
+        # scaffold that init blessed can never fail THIS gate.
+        http_scenario_ids = deny_network_incompatible_ids(scenarios)
         if http_scenario_ids:
             journal.write("CANDIDATE_NETWORK_GATE_FAILED", scenarios=http_scenario_ids)
             mf = dict(manifest_base, outcome="GATE_FAILED", iterations=0, qualified=False,
@@ -4497,6 +4571,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
                   file_count=len(manifest["files"]))
     manifest_base["snapshot_sha256"] = snap_hash
 
+    # DF-R5-09: pin the image identity BEFORE resolve_isolation — its container
+    # probes are the FIRST _effective_image consumers, so the pin must already
+    # be seeded (fresh: resolve+journal; nothing yet to reuse) or the probe and
+    # the later dispatch could disagree on which image bytes they exercised.
+    _pin_effective_image(cfg, run_dir, journal)
     try:
         eff_tier, exec_prefix, backend_name, probe_passed = resolve_isolation(
             cfg, control_root, workspace, journal, allow_downgrade)
@@ -4667,6 +4746,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     scenario_set_sha256 = mb_clean.get("scenario_set_sha256")
     journal.write("MODE", mode=mode, source=cfg.get("_intervention_source", "default"),
                   start_iter=start_iter)
+    # DF-R5-09: pin the container image identity for the WHOLE logical run —
+    # first segment resolves + journals it, every resume segment reuses the
+    # journaled pin instead of re-resolving a possibly-moved mutable tag.
+    _pin_effective_image(cfg, run_dir, journal)
     # H4 (lights-out) MUST never take a pause transition. This is asserted at
     # each would-be pause point below; if the invariant is ever violated the
     # run fails closed (a real raise, not a bare assert -- the suite runs under
@@ -6602,6 +6685,11 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         # decision == "continue" (or "reconcile", now cleared) — isolation
         # cannot be trusted across a pause; re-probe (and re-wrap) before
         # re-entering the loop.
+        # DF-R5-09: seed the run's PINNED image identity from the journal
+        # BEFORE the re-probe, so the resume-segment probes exercise the SAME
+        # image bytes every dispatch of this logical run uses — never a
+        # re-resolved (possibly moved) tag.
+        _pin_effective_image(cfg, run_dir, journal)
         try:
             eff_tier, exec_prefix, backend_name, probe_passed = resolve_isolation(
                 cfg, control_root, state["workspace"], journal, allow_downgrade)

@@ -45,14 +45,16 @@ class ShipError(RuntimeError):
     pass
 
 
-def toolchain_identity(action_name, argv0, cwd):
+def toolchain_identity(action_name, argv0, cwd, child_env=None):
     """DF-R4-08: resolve + hash an executable's identity as it is ABOUT to run.
 
     Records WHAT is spawning, resolved EXACTLY as the OS will resolve argv[0] for
     a child launched with cwd=`cwd`:
       - a name WITH a path separator is relative to the ACTION's cwd (the ship
         workspace), NOT the supervisor cwd — matching execve semantics;
-      - a bare command is looked up on PATH (the child inherits it), via which().
+      - a bare command is looked up on PATH (the child inherits it) with every
+        relative/empty PATH entry resolved against the ACTION cwd, exactly as
+        the child's post-chdir execvpe will (DF-R5-10).
     The sha256 is the PRE-exec bytes, so a self-modifying deploy tool that rewrites
     its own bytes AFTER running cannot make the manifest record the post-run image.
     HONEST: a non-resolvable / non-regular / unreadable target is recorded with a
@@ -76,8 +78,24 @@ def toolchain_identity(action_name, argv0, cwd):
         resolved = candidate if os.path.exists(candidate) else None
         miss = "relative argv0 not found under the action cwd (operator-controlled)"
     else:
-        # A bare command: the child searches PATH (inherited), so do the same.
-        resolved = shutil.which(argv0)
+        # A bare command: the child searches PATH (inherited) — but only AFTER
+        # chdir to the action cwd (subprocess chdirs in the child before exec),
+        # so a RELATIVE or empty PATH entry resolves against the ACTION cwd,
+        # not the supervisor cwd (DF-R5-10: with PATH="." the child finds a
+        # tool in the action directory that a supervisor-cwd which() missed —
+        # the evidence recorded a null hash for a command that actually ran).
+        # Mirror execvpe-after-chdir exactly: absolutize every non-absolute
+        # PATH entry against the action cwd before the lookup — using the
+        # CHILD's env when given (a resolved credential could shadow PATH;
+        # the child would search THAT one, so the evidence must too).
+        env_for_path = child_env if child_env is not None else os.environ
+        path_env = env_for_path.get("PATH", os.defpath)
+        abs_path = os.pathsep.join(
+            entry if os.path.isabs(entry)
+            else os.path.normpath(os.path.join(cwd, entry or "."))
+            for entry in path_env.split(os.pathsep))
+        which_hit = shutil.which(argv0, path=abs_path)
+        resolved = os.path.realpath(which_hit) if which_hit else None
         miss = "argv0 not resolvable to a file on PATH (operator-controlled)"
     if resolved is None:
         entry["note"] = miss
@@ -328,7 +346,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # DF-R4-08: resolve + hash argv[0] NOW — against the action's cwd, and
         # BEFORE the spawn — so a self-modifying tool's recorded sha256 is the
         # bytes that actually started this action, not a post-run re-read.
-        tc_entry = toolchain_identity(name, argv0, cwd)
+        tc_entry = toolchain_identity(name, argv0, cwd,
+                                      child_env=_child_env(base_env, cred_values))
         toolchain.append(tc_entry)
 
         idk = idempotency_key(run_id, name, index)
@@ -421,7 +440,8 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
         # DF-R4-08: record the rollback executable's identity BEFORE it runs, too
         # (a rollback tool is as security-relevant as the forward action) —
         # resolved against the rollback's cwd, pre-exec.
-        rb_tc_entry = toolchain_identity(name, rollback_argv[0] if rollback_argv else None, cwd)
+        rb_tc_entry = toolchain_identity(name, rollback_argv[0] if rollback_argv else None, cwd,
+                                         child_env=_child_env(base_env, cred_values))
         rb_toolchain.append(rb_tc_entry)
         journal.write("SHIP_ROLLBACK_INTENT", action=name, toolchain=rb_tc_entry)
         exit_code, timed_out, out, err, dur = _run_one(
