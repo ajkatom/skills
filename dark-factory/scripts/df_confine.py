@@ -183,20 +183,29 @@ def _file_sha256(path: str):
         return None
 
 
-def _structural_identity_ok(cli: str, adapter_path: str, expected_sha256) -> bool:
-    """DF-R3-05: is `adapter_path` a TRUSTED identity for structural profile
-    `cli`? True iff EITHER it realpath-equals this skill's OWN shipped adapter
-    file (trusted installation path — the audit explicitly accepts this), OR its
-    content sha256 matches a pinned `expected_sha256` (a digest match certifies a
-    relocated copy is byte-identical to the shipped adapter). Fail-closed:
-    anything else (a renamed impostor, a relocated copy with no digest pin, an
-    unreadable file) is False."""
-    if os.path.realpath(adapter_path) == os.path.realpath(_shipped_adapter_path(cli)):
+def _structural_identity_ok(cli: str, adapter_path: str, expected_sha256=None) -> bool:
+    """DF-R3-05 (+ R5 DF-R5-03): is `adapter_path` a TRUSTED identity for the
+    structural profile `cli`? True iff EITHER it realpath-equals this skill's OWN
+    shipped adapter file (trusted installation path), OR its content is
+    BYTE-IDENTICAL to the shipped adapter (its sha256 equals the SHIPPED adapter's
+    sha256 — a relocated exact copy).
+
+    R5 DF-R5-03: the structural `supported:true` claim is bound to the CANONICAL
+    SHIPPED bytes — NOT to an operator-supplied `expected_sha256`. Accepting a
+    match against the operator's own pin let a custom executable with a real
+    agentic/tool surface pin its OWN digest and inherit the shipped adapter's
+    "no-tool" structural guarantee (a false-assurance defect on a tier whose value
+    is its enforced guarantee). `expected_sha256` (the M47 integrity pin) is a
+    SEPARATE concern and is intentionally NOT consulted here. Fail-closed: a
+    renamed/different-bytes impostor (even one pinning its own digest), or an
+    unreadable file, is False."""
+    shipped = _shipped_adapter_path(cli)
+    if os.path.realpath(adapter_path) == os.path.realpath(shipped):
         return True
-    if expected_sha256:
-        actual = _file_sha256(adapter_path)
-        if actual is not None and actual.lower() == expected_sha256.lower():
-            return True
+    shipped_digest = _file_sha256(shipped)
+    actual = _file_sha256(adapter_path)
+    if shipped_digest is not None and actual is not None and actual == shipped_digest:
+        return True
     return False
 
 

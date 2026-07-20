@@ -418,16 +418,23 @@ def test_structural_unsupported_for_impostor_copy_no_digest(cli, tmp_path):
     ("api_openai", SHIPPED_API_OPENAI),
 ])
 def test_structural_supported_for_digest_pinned_relocated_copy(cli, shipped, tmp_path):
-    # A byte-identical relocated copy at a non-shipped path is accepted ONLY
-    # when its content digest is pinned (expected_sha256) -- the honest way to
-    # relocate the adapter and keep the structural claim.
+    # R5 DF-R5-03: structural support is bound to the CANONICAL SHIPPED bytes. A
+    # relocated copy that is BYTE-IDENTICAL to the shipped adapter is trusted by
+    # CONTENT — with or without an operator pin (the pin value is not consulted for
+    # the structural claim). A DIFFERENT-bytes file is NOT structurally supported
+    # even if it pins its own digest.
     copy = tmp_path / cli
     copy.write_bytes(open(shipped, "rb").read())
     digest = _sha256_file(str(copy))
-    assert df_confine.is_supported(cli, str(copy)) is False  # no pin -> refused
-    assert df_confine.is_supported(cli, str(copy), digest) is True  # pinned -> supported
-    # A WRONG pin is still refused (fail-closed).
-    assert df_confine.is_supported(cli, str(copy), "0" * 64) is False
+    assert df_confine.is_supported(cli, str(copy)) is True   # byte-identical -> trusted
+    assert df_confine.is_supported(cli, str(copy), digest) is True
+    assert df_confine.is_supported(cli, str(copy), "0" * 64) is True  # pin irrelevant
+    # A DIFFERENT-bytes impostor pinning its OWN digest is NOT structurally supported.
+    impostor = tmp_path / (cli + "_impostor") / cli
+    impostor.parent.mkdir(parents=True, exist_ok=True)
+    impostor.write_bytes(open(shipped, "rb").read() + b"\n# extra agentic surface\n")
+    imp_digest = _sha256_file(str(impostor))
+    assert df_confine.is_supported(cli, str(impostor), imp_digest) is False
 
 
 @pytest.mark.parametrize("cli", ["api_anthropic", "api_openai"])

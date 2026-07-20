@@ -1548,6 +1548,18 @@ def _satisfying_approvers(manifest_bytes, signatures, approvers):
 # eligibility/receipt logic is defined once, not re-derived ad hoc.
 # ---------------------------------------------------------------------------
 
+def _effective_tier_of(manifest_obj: dict):
+    """R5 DF-R5-04: the EFFECTIVE assurance tier the sealed run actually ran at —
+    what every post-seal decision (qualification, custody, release, ship) MUST
+    consume, so a permitted --allow-downgrade never yields a requested-vs-effective
+    mismatch (e.g. an enterprise run downgraded to hardened that seals
+    COMPLETE_QUALIFIED via the hardened branch but is then un-shippable because
+    ship/custody read the configured `tier:"enterprise"` and demand a custody
+    attestation that can never attach). Falls back to `tier` for pre-M57 manifests
+    that sealed only the configured tier."""
+    return manifest_obj.get("effective_tier", manifest_obj.get("tier"))
+
+
 def _precustody_substates(manifest_obj: dict) -> dict:
     """RA-03: recompute the five qualification substates from a SEALED
     manifest's OWN fields via df_qualify.derive — never trust a stored
@@ -1559,7 +1571,7 @@ def _precustody_substates(manifest_obj: dict) -> dict:
     a mandatory tier (gates optional there), otherwise "gates checked AND
     nothing failed". barrier/host_isolation/control_plane read the sealed
     tier / host_isolation.qualified / bound artifact object_id."""
-    tier = manifest_obj.get("tier")
+    tier = _effective_tier_of(manifest_obj)  # R5 DF-R5-04: consume the EFFECTIVE tier
     hi = manifest_obj.get("host_isolation") or {}
     art = manifest_obj.get("artifact")
     sec = manifest_obj.get("security") or {}
@@ -4637,6 +4649,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     candidate_prefix = candidate_prefix if candidate_prefix is not None else exec_prefix
     effective = manifest_base.get("_effective_tier", "cooperative")
     mb_clean = {k: v for k, v in manifest_base.items() if k != "_effective_tier"}
+    # R5 DF-R5-04: seal BOTH the requested and the EFFECTIVE assurance tier on
+    # every terminal. `tier` continues to echo the CONFIGURED tier (back-compat +
+    # docs), but `requested_tier`/`effective_tier` make an --allow-downgrade
+    # explicit in the sealed evidence, and every downstream decision
+    # (qualification, custody, release, ship) consumes `effective_tier` so a
+    # downgraded run can never seal COMPLETE_QUALIFIED via one branch while
+    # shipping/custody demand the other (the enterprise-downgrade dead-end).
+    mb_clean["requested_tier"] = mb_clean.get("tier")
+    mb_clean["effective_tier"] = effective
     # M36a: the resolved intervention mode drives WHICH transitions pause. It's
     # recorded on every terminal manifest (auditability) and journaled at loop
     # entry (fresh run AND every resume, so a paused-then-resumed run's mode is
@@ -6932,7 +6953,7 @@ def _ship_eligible(cfg, control_root, run_dir):
                 f"current {current_sha}); refusing to ship under a drifted policy", None, None)
 
     run_id = os.path.basename(os.path.abspath(run_dir).rstrip(os.sep))
-    tier = manifest_obj.get("tier")
+    tier = _effective_tier_of(manifest_obj)  # R5 DF-R5-04: ship on the EFFECTIVE tier
     if tier == "enterprise":
         # Enterprise ships ONLY after df-custody attach qualifies it (invariant
         # #1). qualification lives in custody_attestation.json, never in the
@@ -7874,7 +7895,7 @@ def attach_release(control_root, run_dir):
     # Mirror _ship_eligible's qualification requirement (the ship phase also
     # enforces it) so an ineligible run cannot even collect an approval that
     # would imply it is a ship candidate.
-    _rtier = manifest_obj.get("tier")
+    _rtier = _effective_tier_of(manifest_obj)  # R5 DF-R5-04: EFFECTIVE tier
     if _rtier == "enterprise":
         _release_eligible = (manifest_obj.get("outcome") == "CUSTODY_PENDING"
                              and _precustody_substates(manifest_obj)["qualified"]

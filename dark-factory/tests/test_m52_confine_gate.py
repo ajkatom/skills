@@ -144,53 +144,80 @@ def test_impostor_not_required_runs_unconfined_manifest_honest(tmp_path, marker)
 
 
 # ---------------------------------------------------------------------------
-# A DIGEST-PINNED copy is a TRUSTED identity -> dispatches normally (no false
-# refusal). Offline stand-in for "shipped api_anthropic / claude not refused".
+# R5 DF-R5-03: structural confinement is bound to the CANONICAL SHIPPED bytes,
+# NOT to an operator-supplied pin. An impostor that pins its OWN digest is NOT
+# structurally supported (it could carry an agentic/tool surface) and is refused
+# under required confinement; only a BYTE-IDENTICAL copy of the shipped adapter
+# is trusted.
 # ---------------------------------------------------------------------------
 
-def test_digest_pinned_identity_is_not_falsely_refused(tmp_path, marker):
+def test_impostor_pinning_its_own_digest_is_refused_not_trusted(tmp_path, marker):
     cr = setup_control(tmp_path, IMPOSTOR, checkpoint="auto")
     _patch_config(cr, builder_confinement={"enabled": True, "required": True})
-    _set_builder_sha256(cr, _sha256(IMPOSTOR))  # pin the exact bytes -> trusted
+    _set_builder_sha256(cr, _sha256(IMPOSTOR))  # pin the IMPOSTOR's OWN bytes
 
     rc = supervisor.run(str(cr), None)
 
-    assert rc == 0, "a digest-pinned api_anthropic must dispatch, not be refused"
-    assert marker.exists()  # builder WAS invoked — gate correctly stood aside
-    mf = _manifest(cr)
-    assert mf["outcome"] == "COMPLETE_UNQUALIFIED"  # converged; NOT a refusal
-    assert mf["outcome"] != "CONFINEMENT_REFUSED"
+    # Pinning your own impostor's digest must NOT grant the shipped adapter's
+    # structural "no-tool" guarantee -> fail-closed, builder never spawned.
+    assert rc != 0
+    assert not marker.exists()
+    assert _manifest(cr)["outcome"] == "CONFINEMENT_REFUSED"
+
+
+def test_byte_identical_copy_of_shipped_adapter_is_trusted(tmp_path, marker):
+    # A relocated copy that is byte-identical to the SHIPPED api_anthropic IS a
+    # trusted structural identity -> dispatches (no false refusal).
+    copy = tmp_path / "relocated_api_anthropic"
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    with open(SHIPPED_API_ANTHROPIC, "rb") as src:
+        copy.write_bytes(src.read())
+    copy.chmod(0o755)
+    # rename to the structural basename so profile_for picks the api_anthropic profile.
+    trusted = copy.parent / "api_anthropic"
+    copy.rename(trusted)
+    prof = df_confine.profile_for("api_anthropic", os.path.realpath(str(trusted)), None)
+    assert prof.get("supported") is True, "a byte-identical shipped-adapter copy is trusted"
 
 
 # ---------------------------------------------------------------------------
 # RESUME path: an identity swap across a pause is caught before re-dispatch.
 # ---------------------------------------------------------------------------
 
-def test_resume_identity_swap_refused_before_redispatch(tmp_path, marker):
-    # Fresh run under a TRUSTED (digest-pinned) identity, checkpoint=pause so it
-    # PAUSES after the first (buggy) iteration's failing verify.
-    cr = setup_control(tmp_path, IMPOSTOR, checkpoint="pause")
+def test_resume_identity_swap_refused_before_redispatch(tmp_path, monkeypatch):
+    # R5 DF-R5-03: a fake adapter can no longer be made "trusted" by self-pinning,
+    # so the fresh-run TRUSTED identity is a BYTE-IDENTICAL copy of the shipped
+    # api_anthropic; invoke_adapter is stubbed (the real API adapter never runs) to
+    # write a NON-converging build so checkpoint=pause pauses.
+    trusted = tmp_path / "adp" / "api_anthropic"
+    trusted.parent.mkdir(parents=True)
+    with open(SHIPPED_API_ANTHROPIC, "rb") as src:
+        trusted.write_bytes(src.read())
+    trusted.chmod(0o755)
+    cr = setup_control(tmp_path, str(trusted), checkpoint="pause")
     _patch_config(cr, builder_confinement={"enabled": True, "required": True})
-    _set_builder_sha256(cr, _sha256(IMPOSTOR))
+
+    calls = []
+
+    def fake_invoke(adapter, role, workdir, prompt_file, timeout_s, **kw):
+        calls.append(adapter)
+        return {"adapter_protocol": "0.1", "status": "ok"}, None  # writes nothing → verify fails → pause
+
+    monkeypatch.setattr(supervisor, "invoke_adapter", fake_invoke)
 
     rc = supervisor.run(str(cr), None)
     assert rc == supervisor.PAUSED, f"expected pause, got {rc}"
-    assert marker.exists()
-    first_dispatches = marker.read_text().count("invoked")
-    assert first_dispatches == 1  # exactly one build so far
+    assert len(calls) == 1  # exactly one build so far (trusted identity dispatched)
 
-    # The adapter identity is no longer trusted across the pause: drop the pin
-    # (now it is a bare-basename impostor again). Resume must refuse BEFORE
-    # dispatching a second builder call.
-    _set_builder_sha256_removed(cr)
-
+    # Swap the adapter to an UNTRUSTED impostor; resume must re-run the pre-dispatch
+    # confinement gate and REFUSE before a second dispatch.
+    _patch_config(cr, roles={"builder": {"adapter": IMPOSTOR, "timeout_s": 30}})
     rc2 = supervisor.resume(str(cr), "continue")
     assert rc2 == 2, f"resume must fail-closed refuse, got {rc2}"
     mf = _manifest(cr)
     assert mf["outcome"] == "CONFINEMENT_REFUSED"
     assert mf["qualified"] is False
-    # No SECOND dispatch happened — the marker line-count did not grow.
-    assert marker.read_text().count("invoked") == first_dispatches
+    assert len(calls) == 1  # NO second dispatch
     assert "CONFINEMENT_UNSUPPORTED" in _journal_states(cr)
 
 
