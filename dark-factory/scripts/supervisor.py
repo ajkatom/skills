@@ -1643,7 +1643,22 @@ def _sink_readback(sink: dict, receipt: dict, att_text: str):
         except (urllib.error.URLError, TimeoutError, OSError):
             return None  # unreachable → inconclusive, not a rejection
         return hashlib.sha256(body).hexdigest() == receipt.get("body_sha256")
-    # s3-objectlock and other kinds: no cheap stdlib readback here; inconclusive.
+    if kind == "s3-objectlock":
+        # R5 DF-R5-07: a signed S3 GET of the exact recorded object key makes an
+        # S3-backed receipt idempotently re-verifiable (previously always None →
+        # a completed S3 ship could never positively re-verify and every re-entry
+        # re-pushed / flipped to audit-pending). 200 → compare bytes; 404 → absent
+        # off-box (reject); unreachable/uncredentialed → inconclusive (None).
+        sink_key = receipt.get("sink_key")
+        if not sink_key:
+            return None
+        status, body = df_audit_sink.signed_s3_get(sink, str(sink_key))
+        if status == 200 and body is not None:
+            return hashlib.sha256(body).hexdigest() == receipt.get("body_sha256")
+        if status == 404:
+            return False
+        return None
+    # other kinds: no cheap stdlib readback here; inconclusive.
     return None
 
 
@@ -6730,12 +6745,32 @@ def _ship_journal_events(run_dir):
     path = os.path.join(run_dir, SHIP_JOURNAL_FILE)
     if not os.path.exists(path):
         return []
-    out = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
+        raw = [ln.strip() for ln in f]
+    nonempty = [(i, ln) for i, ln in enumerate(raw) if ln]
+    out = []
+    for pos, (idx, line) in enumerate(nonempty):
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            # R5 DF-R5-08: distinguish a torn TAIL from interior corruption, and
+            # NEVER let a JSONDecodeError escape uncaught. The ship journal is
+            # reserve-before: journal.write fsyncs a COMPLETE line BEFORE the
+            # subprocess spawns. So a malformed FINAL line is a torn append (a crash
+            # DURING the write, before its fsync returned) — the action it would have
+            # announced never started, so it is SAFELY dropped. A malformed line that
+            # is NOT last is real corruption of an already-durable record → a
+            # controlled fail-closed refusal (df_ship.ShipError), never an uncaught
+            # crash and never "no actions ran".
+            if pos == len(nonempty) - 1:
+                sys.stderr.write(
+                    "dark-factory: WARNING — dropping a torn (incomplete) trailing line in the "
+                    "ship journal; by reserve-before-fsync ordering the action it would announce "
+                    "never spawned.\n")
+                break
+            raise df_ship.ShipError(
+                f"ship journal is corrupt: a non-trailing line ({idx + 1}) is malformed JSON — "
+                "refusing to trust the recovered ship state (fail-closed)")
     return out
 
 
@@ -7077,14 +7112,29 @@ def _ship_toolchain_identity(actions):
     return out
 
 
-def _ship_action_commit_payload(run_id, action, idk):
+def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
+                                reversible=None, approval_ref=None):
     """The canonical bytes whose sha256 is a completed ship action's chain-anchored
-    completion token (M49 DF-R3-03). Binds the run, the action name, and its
-    idempotency_key, so the token is reconstructible from the journal's
-    SHIP_ACTION_RESULT `ok` event on re-entry yet unforgeable without the audit
-    key (the signature over the chain entry is the real gate)."""
+    completion token (M49 DF-R3-03; R5 DF-R5-01). Binds the run, the action name,
+    its idempotency_key, AND every per-action EVIDENCE field — the PRE-EXEC
+    toolchain identity, the `reversible` classification, and the `approval_ref` that
+    authorized it — so the token is reconstructible from the journal on re-entry yet
+    unforgeable without the audit key (the signature over the chain entry is the
+    real gate).
+
+    DF-R5-01: binding these is what lets the final SHIPPED record be RECONSTRUCTED
+    from authenticated facts — a control-root writer who edits the toolchain (which
+    tool ran), the reversibility claim, or the approval that authorized an
+    irreversible action in the writable pending record cannot make the
+    reconstructed, chain-authenticated token match, so the forged value never
+    reaches the signed/off-box final bytes. (An authenticated-`ok` action is exit-0
+    by definition, and the shipped artifact id is reconstructed from the sealed
+    manifest, so those two need no separate binding here; `duration_s` is genuinely
+    cosmetic and is dropped by the reconstruction.)"""
     return canonical_json({"kind": "ship-action-ok", "run_id": run_id,
-                           "action": action, "idempotency_key": idk})
+                           "action": action, "idempotency_key": idk,
+                           "toolchain": toolchain, "reversible": reversible,
+                           "approval_ref": approval_ref})
 
 
 def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
@@ -7100,25 +7150,43 @@ def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
     single last-digest cannot distinguish 'no anchor because a legit crash happened
     before the first seal' from 'anchor missing because tampered' — both look
     anchor-less. A per-action signed entry makes the two distinguishable."""
-    def _commit(action_name, idk):
-        payload = _ship_action_commit_payload(run_id, action_name, idk)
-        # Local signed anchor only (per-action tokens never go off-box). Fire-and
-        # -forget: a failed anchor here surfaces on re-entry via
-        # _authenticate_ship_actions (the recovered `ok` would lack its signed token).
-        _anchor_ship_local(cfg, control_root, run_id, payload, "ship-action")
+    def _commit(action_name, idk, toolchain=None, reversible=None, approval_ref=None):
+        payload = _ship_action_commit_payload(run_id, action_name, idk, toolchain,
+                                              reversible, approval_ref)
+        # Local signed anchor only (per-action tokens never go off-box).
+        # DF-R5-01/R5-02: return the anchor status so run_actions can make an
+        # anchor FAILURE a first-class result (do NOT journal `ok` for an action
+        # whose completion token could not be signed — that would brick re-entry).
+        return _anchor_ship_local(cfg, control_root, run_id, payload, "ship-action")
     return _commit
 
 
 def _ship_completed_action_facts(run_dir):
-    """(action, idempotency_key) for every SHIP_ACTION_RESULT with status 'ok'
-    recovered from the ship journal — the exact set `already_done` skips, paired
-    with the idempotency_key each completion token binds (M49 DF-R3-03)."""
+    """(action, idempotency_key, toolchain) for every SHIP_ACTION_RESULT with status
+    'ok' recovered from the ship journal — the exact set `already_done` skips, paired
+    with the idempotency_key AND the PRE-EXEC toolchain each completion token binds
+    (M49 DF-R3-03; R5 DF-R5-01). The toolchain is journaled on the matching
+    SHIP_ACTION_INTENT (written before the spawn); it is recovered here so
+    _authenticate_ship_actions can recompute the toolchain-bound signed token — a
+    control-root writer who edits the toolchain cannot make the recomputed token
+    match, so a forged toolchain is refused and never reconstructed into a signed
+    final SHIPPED record."""
+    intents = {}
+    for e in _ship_journal_events(run_dir):
+        d = e.get("data", {})
+        if e.get("state") == "SHIP_ACTION_INTENT" and d.get("idempotency_key") is not None:
+            intents[d.get("idempotency_key")] = d
     facts = []
     for e in _ship_journal_events(run_dir):
         d = e.get("data", {})
         if e.get("state") == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
             if d.get("action") is not None:
-                facts.append((d.get("action"), d.get("idempotency_key")))
+                idk = d.get("idempotency_key")
+                intent = intents.get(idk) or {}
+                facts.append({"name": d.get("action"), "idk": idk,
+                              "toolchain": intent.get("toolchain"),
+                              "reversible": intent.get("reversible"),
+                              "approval_ref": intent.get("approval_ref")})
     return facts
 
 
@@ -7182,11 +7250,13 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
     prefix = f"{run_id}.ship-action."
     anchored = {e.get("manifest_sha256") for e in entries
                 if str(e.get("invocation", "")).startswith(prefix)}
-    for action, idk in facts:
-        token = sha256_str(_ship_action_commit_payload(run_id, action, idk))
+    for f in facts:
+        token = sha256_str(_ship_action_commit_payload(
+            run_id, f["name"], f["idk"], f["toolchain"], f["reversible"], f["approval_ref"]))
         if token not in anchored:
-            return (False, f"completed ship action {action!r} is not individually anchored in "
-                    "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`)")
+            return (False, f"completed ship action {f['name']!r} is not individually anchored in "
+                    "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`, or a "
+                    "tampered toolchain / reversibility / approval_ref)")
     return (True, "all completed ship actions authenticated against the signed audit chain")
 
 
@@ -7230,7 +7300,7 @@ def _pending_ship_authenticated(cfg, control_root, run_dir, run_id, prior, prior
     ok_j, why_j = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
     if not ok_j:
         return (False, why_j)
-    anchored_ok = {name for name, _idk in facts}
+    anchored_ok = {f["name"] for f in facts}
     configured = {n for n in configured_action_names if n is not None}
     if anchored_ok != configured:
         # An ok-token is missing for some configured action → not all actions
@@ -7344,8 +7414,43 @@ def _seal_ship_result(cfg, control_root, run_dir, run_id, ship_journal, result,
     return record, sink_status, local_anchor_status
 
 
+def _reconstruct_authenticated_ship_record(prior, artifact_object_id, facts, redactor):
+    """R5 DF-R5-01: build the authoritative SHIPPED record + its bytes from ONLY
+    AUTHENTICATED facts, never trusting the same-user-writable pending record's
+    evidence fields.
+
+    - `ship_workspace_object_id` = `artifact_object_id`, the id from the sealed
+      (HMAC/hash-bound) manifest via _ship_eligible — NOT the pending record's
+      (a forged `ffff…` object id in the pending file is discarded).
+    - Each shipped action is `status:"ok"`, `exit:0` BY DEFINITION (it is chain-
+      authenticated-ok) — a forged `exit:999` is discarded.
+    - Each action's `toolchain` is the CHAIN-BOUND toolchain from `facts` (the
+      signed per-action token binds it) — a forged `/evil` tool path is discarded.
+    - Only cosmetic, non-evidence fields (reversible/approval_ref/duration_s) are
+      carried from the prior record by action name, and never affect the signed
+      claim about what shipped or what ran.
+
+    `facts` is the chain-authenticated (name, idk, toolchain) list, in order."""
+    actions, toolchain = [], []
+    for f in facts:
+        # EVERY per-action evidence field comes from the chain-authenticated token
+        # (name/toolchain/reversible/approval_ref) or is true by definition
+        # (status:ok, exit:0). NOTHING is taken from the writable pending record.
+        actions.append({"name": f["name"], "reversible": bool(f["reversible"]),
+                        "status": "ok", "exit": 0,
+                        "approval_ref": f["approval_ref"], "duration_s": None})
+        if f["toolchain"] is not None:
+            toolchain.append(f["toolchain"])
+    record = {"ship_version": "1", "outcome": df_ship.SHIPPED, "actions": actions,
+              "rollbacks": [], "rollback_failed": False, "pending_action": None,
+              "failed_action": None, "ship_workspace_object_id": artifact_object_id,
+              "toolchain": toolchain, "ts": _now()}
+    obj = redactor.redact_obj(record) if redactor is not None else record
+    return record, canonical_json(obj)
+
+
 def _ship_audit_retry(cfg, control_root, run_dir, run_id, ship_journal, prior_text,
-                      redactor):
+                      redactor, artifact_object_id):
     """DF-R3-02 / DF-R4-03 / DF-R4-04 idempotent audit-only retry. The prior seal is
     SHIPPED_AUDIT_PENDING (or a SHIPPED whose REQUIRED off-box receipt is
     absent/unbound/non-authentic): the real-world actions ALREADY ran and are NEVER
@@ -7363,12 +7468,30 @@ def _ship_audit_retry(cfg, control_root, run_dir, run_id, ship_journal, prior_te
     except json.JSONDecodeError as e:
         sys.stderr.write(f"dark-factory: ship refused — prior ship record is unreadable ({e}).\n")
         return 2
-    shipped = dict(prior)
-    shipped["outcome"] = df_ship.SHIPPED
-    shipped["ts"] = _now()
-    shipped_obj = redactor.redact_obj(shipped) if redactor is not None else shipped
-    shipped_text = canonical_json(shipped_obj)
     signing = bool(cfg.get("_audit", {}).get("signing"))
+    # R5 DF-R5-01: NEVER derive the final SHIPPED bytes by copying the writable
+    # pending record. RECONSTRUCT from authenticated facts — the sealed manifest's
+    # artifact id + the chain-authenticated per-action facts (name/ok/toolchain).
+    # Under signing, re-authenticate the completed actions here (defense in depth)
+    # so a forged pending field can never ride into the signed/off-box bytes.
+    if signing:
+        ok_a, why_a = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
+        if not ok_a:
+            sys.stderr.write(f"dark-factory: ship refused — completed ship actions could not be "
+                             f"authenticated for the audit retry: {why_a}\n")
+            return SHIP_STATE_UNAUTHENTICATED
+        facts = _ship_completed_action_facts(run_dir)
+        shipped, shipped_text = _reconstruct_authenticated_ship_record(
+            prior, artifact_object_id, facts, redactor)
+    else:
+        # Detection-grade only (no signed chain to reconstruct from): keep the
+        # prior record but pin the artifact id to the authenticated manifest.
+        shipped = dict(prior)
+        shipped["outcome"] = df_ship.SHIPPED
+        shipped["ship_workspace_object_id"] = artifact_object_id
+        shipped["ts"] = _now()
+        shipped_obj = redactor.redact_obj(shipped) if redactor is not None else shipped
+        shipped_text = canonical_json(shipped_obj)
 
     # 1) push the SHIPPED bytes off-box FIRST (a required sink demands a
     #    server-authentic receipt — a forged/local receipt is not evidence).
@@ -7478,7 +7601,7 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
         # DF-R3-02 idempotent audit-only retry: re-anchor the off-box evidence for
         # the EXISTING sealed record; the actions are DONE and are NEVER re-run.
         return _ship_audit_retry(cfg, control_root, run_dir, run_id, ship_journal,
-                                 prior_text, redactor)
+                                 prior_text, redactor, artifact_object_id)
 
     # Crash-safety (invariant #4): an INTENT with no RESULT is UNKNOWN. Refuse
     # (exit 11) under plain `continue`; `reconcile` consents to a possible
@@ -7680,6 +7803,11 @@ def ship_cmd(control_root, run_dir, decision="continue"):
         return 2
     try:
         return _ship_phase(cfg, control_root, run_dir, redactor, creds, decision=decision)
+    except df_ship.ShipError as e:
+        # R5 DF-R5-08: a corrupt/torn ship journal (or other controlled ship-state
+        # error) is a fail-closed REFUSAL with a diagnostic, never an uncaught crash.
+        sys.stderr.write(f"dark-factory: ship refused (fail-closed) — {e}\n")
+        return 2
     finally:
         release_lock(lock)
 

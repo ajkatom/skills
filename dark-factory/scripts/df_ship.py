@@ -103,6 +103,13 @@ SHIP_APPROVAL_PENDING = "SHIP_APPROVAL_PENDING"
 # the required attestation missing. The actions are done and are NEVER re-run;
 # an idempotent audit-only retry re-anchors off-box and flips this to SHIPPED.
 SHIPPED_AUDIT_PENDING = "SHIPPED_AUDIT_PENDING"
+# R5 DF-R5-02: a real action ran successfully, but its per-action completion
+# token could not be signed/anchored into the local chain (a transient audit-key
+# failure). A DISTINCT, RECOVERABLE sealed outcome: the loop stops (no further
+# actions run), and an authenticated evidence-only retry re-anchors the completed
+# actions' tokens and continues — never a silent journal `ok` with no signed
+# token (which would make re-entry authentication refuse and BRICK recovery).
+SHIP_EVIDENCE_PENDING = "SHIP_EVIDENCE_PENDING"
 
 
 def idempotency_key(run_id, action_name, index):
@@ -338,11 +345,15 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
 
         success = (exit_code == 0) and not timed_out
         status = "ok" if success else ("timed_out" if timed_out else "failed")
-        # M49 DF-R3-03: anchor this action's completion into the signed chain
-        # BEFORE its RESULT is journaled, so every `already_done` entry recovered
-        # on re-entry is individually chain-backed (best-effort; never raises).
+        # M49 DF-R3-03 / R5 DF-R5-01: anchor this action's completion (bound to its
+        # PRE-EXEC toolchain identity) into the signed chain BEFORE its RESULT is
+        # journaled, so every `already_done` entry recovered on re-entry is
+        # individually chain-backed AND its toolchain is authenticated (a forged
+        # toolchain in the writable pending record cannot reconstruct a matching
+        # signed token). Best-effort anchor; a failed anchor surfaces on re-entry
+        # via _authenticate_ship_actions.
         if success and commit_action is not None:
-            commit_action(name, idk)
+            commit_action(name, idk, tc_entry, reversible, approval_ref)
         journal.write("SHIP_ACTION_RESULT", action=name, index=index, idempotency_key=idk,
                       exit=exit_code, timed_out=timed_out, status=status,
                       duration_s=round(dur, 3))
