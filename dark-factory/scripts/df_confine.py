@@ -183,6 +183,28 @@ def _file_sha256(path: str):
         return None
 
 
+def _shipped_identity_ok(cli: str, adapter_path: str) -> bool:
+    """DF-R6-03: is `adapter_path` THIS skill's own shipped adapter for `cli` —
+    by trusted install path, or byte-identical content? The single identity test
+    behind EVERY profile's `supported: True`, structural or not."""
+    shipped = _shipped_adapter_path(cli)
+    try:
+        if os.path.realpath(adapter_path) == os.path.realpath(shipped):
+            return True
+        # Ordered cheapest-first: a SIZE mismatch proves non-identity without
+        # hashing. This matters because profile_for runs per dispatch and an
+        # operator adapter can be a large binary (hashing it every call is a
+        # real slowdown, not just waste).
+        if os.path.getsize(adapter_path) != os.path.getsize(shipped):
+            return False
+    except OSError:
+        return False  # unreadable/absent -> fail-closed, no identity
+    shipped_digest = _file_sha256(shipped)
+    actual = _file_sha256(adapter_path)
+    return (shipped_digest is not None and actual is not None
+            and actual == shipped_digest)
+
+
 def _structural_identity_ok(cli: str, adapter_path: str, expected_sha256=None) -> bool:
     """DF-R3-05 (+ R5 DF-R5-03): is `adapter_path` a TRUSTED identity for the
     structural profile `cli`? True iff EITHER it realpath-equals this skill's OWN
@@ -199,14 +221,7 @@ def _structural_identity_ok(cli: str, adapter_path: str, expected_sha256=None) -
     SEPARATE concern and is intentionally NOT consulted here. Fail-closed: a
     renamed/different-bytes impostor (even one pinning its own digest), or an
     unreadable file, is False."""
-    shipped = _shipped_adapter_path(cli)
-    if os.path.realpath(adapter_path) == os.path.realpath(shipped):
-        return True
-    shipped_digest = _file_sha256(shipped)
-    actual = _file_sha256(adapter_path)
-    if shipped_digest is not None and actual is not None and actual == shipped_digest:
-        return True
-    return False
+    return _shipped_identity_ok(cli, adapter_path)
 
 
 def profile_for(cli: str, adapter_path=None, expected_sha256=None) -> dict:
@@ -227,15 +242,25 @@ def profile_for(cli: str, adapter_path=None, expected_sha256=None) -> dict:
     profile = PROFILES.get(cli)
     if profile is None:
         return {"supported": False, "reason": f"unknown cli {cli!r}"}
-    if (profile.get("structural") and adapter_path is not None
-            and not _structural_identity_ok(cli, adapter_path, expected_sha256)):
+    # DF-R6-03: EVERY `supported: True` claim — structural or not — is bound to
+    # THIS skill's shipped adapter identity. Previously only the structural
+    # profiles were identity-bound, so an ARBITRARY executable merely NAMED
+    # `claude` inherited the stock profile's mcp_disabled/tool_allowlist claims
+    # and could satisfy `builder_confinement.required: true` while proving
+    # nothing (the run's sealed evidence then reported a mandatory tier
+    # guarantee that did not hold). The non-structural profiles' support rests
+    # on a live tool-denial probe performed against THE SHIPPED WRAPPER, so the
+    # claim only transfers to those exact bytes.
+    if (profile.get("supported") and adapter_path is not None
+            and not _shipped_identity_ok(cli, adapter_path)):
         return {
             "supported": False,
-            "structural": True,
+            "structural": bool(profile.get("structural")),
+            "identity_verified": False,
             "reason": (
-                "structural confinement claim requires the shipped adapter "
-                f"identity; {adapter_path} is neither the shipped adapter "
-                f"({_shipped_adapter_path(cli)}) nor a digest-pinned match"
+                f"the {cli!r} confinement claim requires this skill's shipped "
+                f"adapter identity; {adapter_path} is neither the shipped adapter "
+                f"({_shipped_adapter_path(cli)}) nor byte-identical to it"
             ),
         }
     return profile

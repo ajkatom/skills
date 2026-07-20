@@ -93,7 +93,12 @@ def test_fixture_is_an_untrusted_structural_impostor():
     # ...and the trusted forms the gate must NOT refuse:
     assert df_confine.profile_for(
         "api_anthropic", os.path.realpath(SHIPPED_API_ANTHROPIC), None).get("supported") is True
-    assert df_confine.profile_for("claude", os.path.realpath(IMPOSTOR), None).get("supported") is True
+    # DF-R6-03: a NON-structural profile is identity-bound too — arbitrary bytes
+    # merely NAMED `claude` no longer inherit the stock profile's confinement
+    # claims (the audit's exact repro: this used to assert `is True`).
+    imp_as_claude = df_confine.profile_for("claude", os.path.realpath(IMPOSTOR), None)
+    assert imp_as_claude.get("supported") is False
+    assert imp_as_claude.get("identity_verified") is False
 
 
 # ---------------------------------------------------------------------------

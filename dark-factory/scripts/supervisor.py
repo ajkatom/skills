@@ -4157,6 +4157,44 @@ def _builder_identity_field(cfg):
     return field
 
 
+def _verify_support_files_at_dispatch(cfg, manifest_base, journal):
+    """DF-R6-04: re-resolve and re-hash EVERY builder support file at the moment
+    of dispatch, and refuse on any drift from the digest sealed into the manifest.
+
+    M60 hashed the support files ONCE, when the manifest base was assembled —
+    time-of-CHECK. The mount loops then re-checked only path disjointness, so a
+    support file could change between the snapshot and the builder importing it
+    (or between iterations): the sealed manifest would attest bytes that were
+    NOT the bytes the builder executed. Because the shipped CLI adapters IMPORT
+    these files in-container, that is an execution-path integrity gap, not just
+    an evidence one.
+
+    Fail-closed on drift, on a vanished/unreadable file, and on a type change
+    (a path swapped to a directory hashes to None — the M60 seal recorded that
+    honestly, but dispatching against it is refused here). Returns None when
+    every file matches, else an error string; the caller raises SandboxError.
+    """
+    sealed = ((manifest_base.get("builder_identity") or {}).get("support_files") or [])
+    sealed_by_path = {e.get("path"): e.get("sha256") for e in sealed}
+    for sf in (cfg.get("_support_files") or []):
+        actual = sha256_file(sf) if os.path.isfile(sf) else None
+        expected = sealed_by_path.get(sf)
+        if actual is None:
+            journal.write("SUPPORT_FILE_UNREADABLE_AT_DISPATCH", path=sf,
+                          sealed_sha256=expected)
+            return (f"builder support file {sf} is missing, unreadable, or no longer a "
+                    "regular file at dispatch — refusing to mount bytes that cannot be "
+                    "verified against the sealed manifest digest")
+        if expected is not None and actual != expected:
+            journal.write("SUPPORT_FILE_DRIFT_AT_DISPATCH", path=sf,
+                          sealed_sha256=expected, actual_sha256=actual)
+            return (f"builder support file {sf} CHANGED after it was sealed into the "
+                    f"manifest (sealed {expected[:16]}…, now {actual[:16]}…) — refusing "
+                    "to dispatch a builder that would import bytes the manifest does not "
+                    "attest")
+    return None
+
+
 def _enforce_adapter_digests(cfg, journal):
     """M47 condition #7: if a role pinned `adapter_sha256`, the adapter FILE's
     actual content sha256 must match at run start, else REFUSE (fail-closed).
@@ -5594,6 +5632,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # validated the dir exists, but this is the moment it's about
                     # to be bind-mounted into the container.
                     ro_mounts = [adapter_ro_file]
+                    # DF-R6-04: bytes-at-DISPATCH, not bytes-at-snapshot.
+                    _sf_err = _verify_support_files_at_dispatch(cfg, mb_clean, journal)
+                    if _sf_err is not None:
+                        raise df_sandbox.SandboxError(f"hardened: {_sf_err}")
                     # DF-R4-07: the builder adapter's declared support files
                     # (e.g. df_confine.py, which the shipped CLI adapters import)
                     # ro-mounted alongside the adapter. df_container mounts each
@@ -5680,6 +5722,10 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # var (enterprise_provider is None for them) — unchanged
                     # behavior, no descriptor, same as pre-M32.
                     ro_mounts_ent = [adapter_ro_file]
+                    # DF-R6-04: bytes-at-DISPATCH, not bytes-at-snapshot.
+                    _sf_err = _verify_support_files_at_dispatch(cfg, mb_clean, journal)
+                    if _sf_err is not None:
+                        raise df_sandbox.SandboxError(f"enterprise: {_sf_err}")
                     # DF-R4-07: builder adapter support files (e.g. df_confine.py)
                     # ro-mounted alongside the adapter, same as hardened — a
                     # multi-file CLI adapter's sibling import resolves in-container.

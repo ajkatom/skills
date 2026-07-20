@@ -445,9 +445,19 @@ def test_structural_back_compat_no_adapter_path_unchanged(cli):
     assert df_confine.is_supported(cli) is True
 
 
-def test_non_structural_profile_ignores_adapter_path(tmp_path):
-    # claude's support is probe-based, not identity-based: an arbitrary
-    # adapter_path must NOT downgrade it (the identity binding is structural-
-    # only).
-    assert df_confine.profile_for("claude", str(tmp_path / "whatever")) is df_confine.PROFILES["claude"]
-    assert df_confine.is_supported("claude", "/some/other/path") is True
+def test_non_structural_profile_is_identity_bound_too(tmp_path):
+    # DF-R6-03 (flipped): claude's support rests on a live tool-denial probe
+    # performed against THE SHIPPED WRAPPER, so the claim transfers only to those
+    # exact bytes. An arbitrary adapter_path named `claude` must NOT inherit it —
+    # previously it did, letting arbitrary bytes satisfy
+    # `builder_confinement.required: true` while proving nothing.
+    refused = df_confine.profile_for("claude", str(tmp_path / "whatever"))
+    assert refused.get("supported") is False
+    assert refused.get("identity_verified") is False
+    assert df_confine.is_supported("claude", "/some/other/path") is False
+    # ...and the SHIPPED wrapper (or a byte-identical copy) still is supported.
+    shipped = os.path.join(os.path.dirname(os.path.abspath(df_confine.__file__)),
+                           "adapters", "claude")
+    assert df_confine.is_supported("claude", shipped) is True
+    # no adapter_path at all stays byte-identical to pre-M62 callers.
+    assert df_confine.profile_for("claude") is df_confine.PROFILES["claude"]
