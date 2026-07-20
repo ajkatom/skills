@@ -4127,6 +4127,31 @@ def _variant_seed_extra(twin_defs):
     return None
 
 
+def _source_identity_field():
+    """DF-R6-07: the SKILL source revision, sealed into the terminal manifest so
+    the production-evidence bundle can report a value BOUND to the run (HMAC-
+    signed when the run is signed), never a `git rev-parse` performed at bundle
+    assembly time (which reflects whatever the checkout is THEN, not what ran).
+
+    Records the skill repo's HEAD commit + whether the working tree was dirty at
+    run start (an uncommitted change makes the commit alone an incomplete source
+    identity). Best-effort: a non-git checkout seals {commit: null, dirty: null},
+    still an honest sealed statement. Never raises."""
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    commit, dirty = None, None
+    try:
+        r = subprocess.run(["git", "-C", skill_dir, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            commit = r.stdout.strip()
+            st = subprocess.run(["git", "-C", skill_dir, "status", "--porcelain"],
+                                capture_output=True, text=True, timeout=10)
+            dirty = bool(st.returncode == 0 and st.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"commit": commit, "dirty": dirty}
+
+
 def _builder_identity_field(cfg):
     """The sealed `builder_identity` manifest field (or None). Carries the
     operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
@@ -4414,6 +4439,9 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         # authored_by/critic model_identity). Absent -> None -> byte-identical
         # manifest to pre-M55.
         "builder_identity": _builder_identity_field(cfg),
+        # DF-R6-07: the SKILL source revision, sealed so the evidence bundle
+        # reports a value BOUND to the run, not a post-hoc rev-parse.
+        "source_identity": _source_identity_field(),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -6561,6 +6589,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
             # the builder's model_identity AND every support-file digest, sealed
             # on resume too.
             "builder_identity": _builder_identity_field(cfg),
+            "source_identity": _source_identity_field(),  # DF-R6-07
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -7117,6 +7146,26 @@ def _load_release_attestation(run_dir, cfg=None):
             sys.stderr.write(
                 "dark-factory: release approval ignored — required off-box sink receipt "
                 f"missing/unbound ({_why}); the irreversible action stays gated.\n")
+            return None
+    # DF-R6-08: under signing, the attestation must be a MEMBER of the signed
+    # audit chain — the M64 transaction anchors it (and refuses to consume the
+    # nonce otherwise). A same-user writer who plants a release_attestation.json
+    # (to authorize an irreversible action) cannot forge a signature-valid chain
+    # entry over its bytes, so an unanchored attestation covers nothing.
+    if cfg is not None and bool(cfg.get("_audit", {}).get("signing")):
+        run_id = os.path.basename(run_dir.rstrip(os.sep))
+        try:
+            mp = os.path.join(run_dir, "manifest.json")
+            run_id = json.loads(open(mp, encoding="utf-8").read()).get("invocation") or run_id
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        ok_c, why_c = _authenticate_ship_chain(
+            cfg, os.path.dirname(os.path.dirname(run_dir)), run_id,
+            sha256_str(att_raw), "release")
+        if not ok_c:
+            sys.stderr.write(
+                "dark-factory: release approval ignored — the attestation is not anchored in "
+                f"the signed audit chain ({why_c}); the irreversible action stays gated.\n")
             return None
     return att
 
@@ -8698,15 +8747,36 @@ def attach_release(control_root, run_dir):
         if push_status == "optional_fail":
             sys.stderr.write(f"dark-factory: audit sink push warning (not required): {detail}\n")
 
-        df_release.record_nonce(control_root, nonce, run_id=run_id,
-                                artifact_object_id=object_id, applied_at=_now())
+        # DF-R6-08: a REPLAY-SAFE release-evidence transaction. The one-time
+        # nonce is consumed LAST, only after every piece of evidence is durable,
+        # so a crash at ANY earlier point leaves the nonce UNCONSUMED and a plain
+        # re-run of `df-release attach` (same collected claim) redoes all of this
+        # idempotently — recovery never needs fresh approver signatures.
+        # Previously the nonce was recorded FIRST and the anchor result was
+        # ignored: a crash after nonce/before-attestation burned the approval,
+        # and an anchor failure still printed RELEASE ATTESTED with no chain
+        # entry (so ship-time `_load_release_attestation` then rejected it).
+        # 1) attestation bytes (idempotent atomic write).
         atomic_write(os.path.join(run_dir, RELEASE_ATTESTATION_FILE), att_text)
-        # Anchor into the tamper-evident chain; the off-box push (if any) already
-        # happened above (_push_qualification_offbox), so anchor locally only.
-        _anchor_ship_local(cfg, control_root, run_id, att_text, "release")
+        # 2) the off-box receipt (if any) — bound to those exact bytes.
         if receipt is not None:
             atomic_write(os.path.join(run_dir, "release_sink_receipt.json"),
                          canonical_json(receipt))
+        # 3) anchor into the tamper-evident chain and CHECK the result. Under
+        #    signing, a failed anchor means the attestation is NOT chain-backed;
+        #    do NOT consume the nonce — report evidence-pending so a retry
+        #    (once the audit key is available) re-anchors and then consumes it.
+        anchor_status = _anchor_ship_local(cfg, control_root, run_id, att_text, "release")
+        if bool(cfg.get("_audit", {}).get("signing")) and anchor_status != "anchored":
+            sys.stderr.write(
+                "dark-factory: RELEASE EVIDENCE PENDING — the attestation was written and "
+                "pushed off-box, but its local signed anchor could not be committed (audit "
+                "key). The approval nonce was NOT consumed; re-run `df-release attach` once "
+                "the signer is available to finish anchoring.\n")
+            return SHIP_EVIDENCE_PENDING_EXIT
+        # 4) consume the one-time nonce LAST — the transaction is now durable.
+        df_release.record_nonce(control_root, nonce, run_id=run_id,
+                                artifact_object_id=object_id, applied_at=_now())
         scope = claim.get("action_names")
         print(f"dark-factory: RELEASE ATTESTED — {reason}; scope="
               f"{scope!r}; nonce recorded. Now ship:\n"
@@ -8883,6 +8953,10 @@ def main():
     p_eb.add_argument("--key-path", default=None,
                       help="path to the audit key; supply it to record a real signed-chain "
                            "verification result in the bundle (else it records UNVERIFIED)")
+    p_eb.add_argument("--require-production", action="store_true",
+                      help="DF-R6-07: add a production_ready verdict that fails closed (exit 3) "
+                           "on ANY missing/unverified required section — so a partial or mock "
+                           "exercise can never read as production-GO evidence")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort", "reconcile"],
@@ -9109,7 +9183,9 @@ def main():
             except df_audit.AuditKeyError as e:
                 sys.stderr.write(f"dark-factory: audit key error: {e}\n")
                 sys.exit(2)
-        bundle, err = df_evidence_bundle.assemble(args.control_root, args.run_dir, key=ekey)
+        bundle, err = df_evidence_bundle.assemble(
+            args.control_root, args.run_dir, key=ekey,
+            require_production=args.require_production)
         if err is not None:
             sys.stderr.write(f"dark-factory: {err}\n")
             sys.exit(2)
@@ -9119,6 +9195,13 @@ def main():
             print(f"dark-factory: evidence bundle written to {args.out}")
         else:
             print(text)
+        # DF-R6-07: in production mode, a bundle with any unmet requirement exits
+        # nonzero so automation cannot read a partial exercise as production-GO.
+        if args.require_production and not bundle.get("production_ready"):
+            sys.stderr.write(
+                "dark-factory: production evidence INCOMPLETE — "
+                f"{bundle.get('production_unmet')}\n")
+            sys.exit(3)
         sys.exit(0)
     elif args.cmd == "resume":
         sys.exit(resume(args.control_root, args.decision, allow_downgrade=args.allow_downgrade,
