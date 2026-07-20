@@ -342,6 +342,25 @@ def test_candidate_prefix_for_twins_pins_this_pass_ports(tmp_path):
 # -------------------------------------------------------------------- live
 
 @needs_live
+def test_probe_passes_when_launched_from_a_denied_home_cwd(tmp_path, monkeypatch):
+    """DF-R6-05 regression: the default-deny profile denies $HOME, so the
+    WRAPPED probe child must run from the ALLOWED workspace, never the caller's
+    inherited CWD. Before the fix, invoking the supervisor from a repository
+    checkout under $HOME made the wrapped Python abort with 'failed to make
+    path absolute' BEFORE the first check — a fail-closed probe failure that
+    broke the entire standard/hardened/enterprise happy path. Here we chdir the
+    PARENT into a $HOME-resident directory the profile denies and require the
+    probe to still pass (it runs the child with cwd=workspace)."""
+    ws = tmp_path / "ws"; ws.mkdir()
+    dr = tmp_path / "deny"; dr.mkdir()
+    denied_cwd = os.path.expanduser("~")  # $HOME itself is denied by the profile
+    monkeypatch.chdir(denied_cwd)
+    ok, rep = df_sandbox.probe_candidate_confinement(_macos, str(dr), str(ws), "deny")
+    assert ok, f"probe must pass despite a denied inherited CWD: {rep}"
+    assert rep["checks"]["workspace_write"] == "DF-WS-WRITE-OK"
+
+
+@needs_live
 def test_probe_passes_and_reports_measured_truth(tmp_path):
     """The HONESTY test: whatever this machine measures, the residual list
     and check transcript must agree with each other -- for keychain, DNS

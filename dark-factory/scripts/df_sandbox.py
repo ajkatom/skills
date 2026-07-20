@@ -813,9 +813,13 @@ def probe_denial(backend, deny_root, workspace):
         if is_linux:
             argv.append(remount_probe)
         try:
+            # DF-R6-05: run from the ALLOWED workspace, never the caller's
+            # inherited CWD (which the deny profile blocks — the wrapped Python
+            # then aborts before the probe).
             proc = subprocess.run(
                 argv,
                 capture_output=True, text=True, errors="replace", timeout=30,
+                cwd=workspace,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -922,9 +926,11 @@ def probe_network_denial(backend, deny_root, workspace, network):
         )
         argv = prefix + [sys.executable, "-c", code]
         try:
+            # DF-R6-05: run from the ALLOWED workspace (see probe_denial).
             proc = subprocess.run(
                 argv,
                 capture_output=True, text=True, errors="replace", timeout=30,
+                cwd=workspace,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False, "wrapped network-probe process failed to launch or timed out"
@@ -1175,8 +1181,15 @@ def _probe_linux_candidate_confinement(backend, deny_root, workspace, network,
                          network, _NET_PROBE_EXTERNAL_HOST, str(_NET_PROBE_EXTERNAL_PORT),
                          remount_target, "\n".join(sysdata_targets)]
         try:
+            # DF-R6-05: launch from the ALLOWED workspace, never the caller's
+            # inherited CWD. The default-deny profile denies $HOME (re-allowing
+            # only workspace/runtime/scratch), so a probe inherited from a
+            # repository checkout under $HOME cannot even resolve its own
+            # current directory (Python aborts with "failed to make path
+            # absolute" before the first check) — the NORMAL documented
+            # invocation then fails closed before any build.
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  errors="replace", timeout=60)
+                                  errors="replace", timeout=60, cwd=workspace)
         except (OSError, subprocess.TimeoutExpired):
             return False, {"mode": "default_deny", "network": network, "checks": {},
                            "residuals": [],
@@ -1494,8 +1507,15 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
                          _NET_PROBE_EXTERNAL_HOST, str(_NET_PROBE_EXTERNAL_PORT),
                          "\n".join(sysdata_targets)]
         try:
+            # DF-R6-05: launch from the ALLOWED workspace, never the caller's
+            # inherited CWD. The default-deny profile denies $HOME (re-allowing
+            # only workspace/runtime/scratch), so a probe inherited from a
+            # repository checkout under $HOME cannot even resolve its own
+            # current directory (Python aborts with "failed to make path
+            # absolute" before the first check) — the NORMAL documented
+            # invocation then fails closed before any build.
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  errors="replace", timeout=60)
+                                  errors="replace", timeout=60, cwd=workspace)
         except (OSError, subprocess.TimeoutExpired):
             return False, {"mode": "default_deny", "network": network, "checks": {},
                            "residuals": [],

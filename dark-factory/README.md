@@ -63,19 +63,31 @@ ln -sfn "$PWD/dark-factory" ~/.claude/skills/dark-factory
 
 ## Quickstart
 
+Requires **Python 3.10+** (the supervisor refuses older interpreters with an
+actionable error). Use the repo virtualenv, and run every command from the
+`dark-factory/` directory:
+
 ```bash
+cd dark-factory
+PY=../.venv/bin/python   # or any Python >= 3.10
+
 # 1. Scaffold a control root from a spec + behaviors + scenarios (see
 #    references/authoring.md for the interview, or copy the worked example):
-python3 scripts/supervisor.py init --control-root /path/to/cr \
+$PY scripts/supervisor.py init --control-root /path/to/cr \
   --answers examples/kv-service/answers.json
 
 # 2. Run the build/verify loop:
-python3 scripts/supervisor.py run --control-root /path/to/cr
+$PY scripts/supervisor.py run --control-root /path/to/cr
 
 # 3. Verify a run's sealed result (byte-integrity + bound-artifact identity):
-python3 scripts/supervisor.py verify-manifest --run-dir /path/to/cr/runs/<run-id>
-#    (and, at hardened/enterprise, verify the tamper-evident audit chain:)
-python3 scripts/supervisor.py verify-chain --control-root /path/to/cr
+$PY scripts/supervisor.py verify-manifest --run-dir /path/to/cr/runs/<run-id>
+#    at hardened/enterprise the manifest is SIGNED — pass --key-path or it
+#    reports UNVERIFIED (fail-closed), never OK:
+$PY scripts/supervisor.py verify-manifest --run-dir /path/to/cr/runs/<run-id> \
+  --key-path /path/to/audit.key
+#    and verify the tamper-evident audit chain (control_root is POSITIONAL;
+#    add --key-path for a signed chain):
+$PY scripts/supervisor.py verify-chain /path/to/cr --key-path /path/to/audit.key
 ```
 
 `init` validates structure (oracle discrimination, behavior coverage, no
