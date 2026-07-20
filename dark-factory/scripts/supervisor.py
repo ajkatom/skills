@@ -21,6 +21,20 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# DF-R6-06: the codebase uses PEP 604 (`X | None`) runtime annotations, which
+# require Python >= 3.10. Enforce the floor HERE — before the df_* imports that
+# would otherwise crash at import time with an opaque
+# `TypeError: unsupported operand type(s) for |` on 3.9 — so an operator on an
+# old interpreter gets an actionable message instead. (README/runbooks now name
+# the supported interpreter; this is the fail-closed backstop.)
+if sys.version_info < (3, 10):
+    sys.stderr.write(
+        "dark-factory requires Python 3.10 or newer (found "
+        f"{sys.version_info.major}.{sys.version_info.minor}). Re-run with a 3.10+ "
+        "interpreter, e.g. the repo virtualenv: `.venv/bin/python "
+        "dark-factory/scripts/supervisor.py ...`.\n")
+    raise SystemExit(2)
+
 import df_audit
 import df_audit_chain
 import df_audit_sink
