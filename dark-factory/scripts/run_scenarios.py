@@ -500,6 +500,22 @@ def _validate(sc: dict, fname: str) -> None:
     _validate_twin_then(then, fname)
 
 
+def deny_network_incompatible_ids(scenarios: list) -> list:
+    """DF-R5-05: ids of scenarios that REQUIRE loopback networking — a when.http
+    scenario polls the candidate over 127.0.0.1, and a property scenario with an
+    http STEP does the same — which candidate_network "deny" blocks (only
+    "loopback" keeps 127.0.0.1 reachable). This is THE single shared pre-build
+    compatibility rule: `supervisor` fails its pre-build gate on a non-empty
+    result, and `df_init.validate_scaffold` refuses to bless the scaffold on the
+    SAME call, so init can never hand over a root that run then rejects."""
+    return [
+        sc["id"] for sc in scenarios
+        if "http" in sc["when"]
+        or ("property" in sc["when"]
+            and any("http" in step for step in sc["when"]["property"]["steps"]))
+    ]
+
+
 def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None) -> list:
     """Load scenarios from `scenarios_dir` (the control-plane, human-authored
     set) unioned with `extra_scenarios_dir` if given (M15: the supervisor's
