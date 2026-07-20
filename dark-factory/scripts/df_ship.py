@@ -379,7 +379,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # action from scratch.
         if commit_action is not None:
             intent_committed = commit_action(name, idk, tc_entry, reversible,
-                                             approval_ref, phase="intent")
+                                             approval_ref, phase="intent",
+                                             attempt_id=attempt_id)
             if intent_committed != "anchored":
                 journal.write("SHIP_ACTION_RESULT", action=name, index=index,
                               idempotency_key=idk, attempt_id=attempt_id, exit=None,
@@ -416,7 +417,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # intent-authenticated facts and continues.
         committed = "anchored"
         if success and commit_action is not None:
-            committed = commit_action(name, idk, tc_entry, reversible, approval_ref)
+            committed = commit_action(name, idk, tc_entry, reversible, approval_ref,
+                                      attempt_id=attempt_id)
         if success and committed != "anchored":
             journal.write("SHIP_ACTION_RESULT", action=name, index=index,
                           idempotency_key=idk, attempt_id=attempt_id, exit=exit_code,
@@ -446,7 +448,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         rb = _rollback(action_has_own=action, stack=rollback_stack, journal=journal,
                        ship_ws=ship_ws, base_env=base_env,
                        base_secret_values=base_secret_values,
-                       resolve_action_creds=resolve_action_creds, log_dir=log_dir)
+                       resolve_action_creds=resolve_action_creds, log_dir=log_dir,
+                       commit_action=commit_action, run_id=run_id)
         return {"outcome": SHIP_FAILED, "actions": records, "pending_action": None,
                 "failed_action": name, "rollbacks": rb["records"],
                 "rollback_failed": rb["failed"],
@@ -458,7 +461,8 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
 
 
 def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
-              base_secret_values, resolve_action_creds, log_dir):
+              base_secret_values, resolve_action_creds, log_dir,
+              commit_action=None, run_id=None):
     """Roll back in REVERSE order: the FAILED action's OWN rollback first (it may
     have partially applied), then each already-succeeded prior action's rollback
     from `stack` in reverse. A rollback that itself FAILS (nonzero/timeout/launch
@@ -512,6 +516,13 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
             timeout_s=action["timeout_s"])
         _write_logs(log_dir, name, ".rollback", out, err, redactor)
         if exit_code == 0 and not timed_out:
+            # DF-R7-01: anchor the SUCCESSFUL rollback's signed token BEFORE its
+            # SHIP_ROLLED_BACK is journaled — so recovery can authenticate the
+            # removal of this action from the applied set (a planted, unsigned
+            # SHIP_ROLLED_BACK is refused, never allowed to force a re-run).
+            if commit_action is not None:
+                commit_action(name, None, None, None, None, phase="rollback",
+                              attempt_id=rb_attempt_id)
             journal.write("SHIP_ROLLED_BACK", action=name, attempt_id=rb_attempt_id,
                           duration_s=round(dur, 3))
             rb_records.append({"name": name, "status": "rolled_back", "exit": 0})

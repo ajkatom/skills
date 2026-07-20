@@ -4182,6 +4182,12 @@ def _builder_identity_field(cfg):
     return field
 
 
+def _is_sha256_hex(v):
+    """True iff `v` is a 64-character hex sha256 string (DF-R7-02)."""
+    return (isinstance(v, str) and len(v) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in v))
+
+
 def _verify_support_files_at_dispatch(cfg, manifest_base, journal):
     """DF-R6-04: re-resolve and re-hash EVERY builder support file at the moment
     of dispatch, and refuse on any drift from the digest sealed into the manifest.
@@ -4200,17 +4206,43 @@ def _verify_support_files_at_dispatch(cfg, manifest_base, journal):
     every file matches, else an error string; the caller raises SandboxError.
     """
     sealed = ((manifest_base.get("builder_identity") or {}).get("support_files") or [])
-    sealed_by_path = {e.get("path"): e.get("sha256") for e in sealed}
+    # DF-R7-02: index by path AND count occurrences — a configured support file
+    # must have EXACTLY ONE sealed entry (a duplicate or a missing entry is a
+    # tampered/ambiguous seal, not a match).
+    sealed_by_path = {}
+    seal_count = {}
+    for e in sealed:
+        p = e.get("path")
+        sealed_by_path[p] = e.get("sha256")
+        seal_count[p] = seal_count.get(p, 0) + 1
     for sf in (cfg.get("_support_files") or []):
-        actual = sha256_file(sf) if os.path.isfile(sf) else None
         expected = sealed_by_path.get(sf)
+        # DF-R7-02: a null / missing / non-64-hex sealed digest is NOT a
+        # "match anything" wildcard. The M60 seal records `sha256: null` for a
+        # file that was a directory / unreadable at snapshot; dispatching a
+        # builder against bytes the manifest does not actually attest is exactly
+        # the bytes-used gap R6-04 set out to close. Require a real sealed
+        # digest, exactly one entry, and actual == expected.
+        if seal_count.get(sf, 0) != 1:
+            journal.write("SUPPORT_FILE_SEAL_AMBIGUOUS_AT_DISPATCH", path=sf,
+                          entries=seal_count.get(sf, 0))
+            return (f"builder support file {sf} does not have exactly one sealed manifest "
+                    f"entry ({seal_count.get(sf, 0)} found) — refusing to dispatch against "
+                    "an ambiguous/missing seal")
+        if not _is_sha256_hex(expected):
+            journal.write("SUPPORT_FILE_SEAL_UNDIGESTED_AT_DISPATCH", path=sf,
+                          sealed_sha256=expected)
+            return (f"builder support file {sf} has no valid sealed sha256 "
+                    f"(sealed {expected!r}) — the manifest attests no bytes for it; "
+                    "refusing to mount bytes that cannot be verified")
+        actual = sha256_file(sf) if os.path.isfile(sf) else None
         if actual is None:
             journal.write("SUPPORT_FILE_UNREADABLE_AT_DISPATCH", path=sf,
                           sealed_sha256=expected)
             return (f"builder support file {sf} is missing, unreadable, or no longer a "
                     "regular file at dispatch — refusing to mount bytes that cannot be "
                     "verified against the sealed manifest digest")
-        if expected is not None and actual != expected:
+        if actual != expected:
             journal.write("SUPPORT_FILE_DRIFT_AT_DISPATCH", path=sf,
                           sealed_sha256=expected, actual_sha256=actual)
             return (f"builder support file {sf} CHANGED after it was sealed into the "
@@ -7445,7 +7477,7 @@ def _ship_toolchain_identity(actions):
 
 
 def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
-                                reversible=None, approval_ref=None):
+                                reversible=None, approval_ref=None, attempt_id=None):
     """The canonical bytes whose sha256 is a completed ship action's chain-anchored
     completion token (M49 DF-R3-03; R5 DF-R5-01). Binds the run, the action name,
     its idempotency_key, AND every per-action EVIDENCE field — the PRE-EXEC
@@ -7465,12 +7497,24 @@ def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
     cosmetic and is dropped by the reconstruction.)"""
     return canonical_json({"kind": "ship-action-ok", "run_id": run_id,
                            "action": action, "idempotency_key": idk,
+                           "attempt_id": attempt_id,
                            "toolchain": toolchain, "reversible": reversible,
                            "approval_ref": approval_ref})
 
 
+def _ship_rollback_payload(run_id, action, attempt_id):
+    """DF-R7-01: the canonical bytes whose sha256 is a SUCCESSFUL rollback's
+    chain-anchored token. Signing rollbacks (not just forward completions) is
+    what lets recovery derive the applied set from AUTHENTICATED transitions: a
+    same-user writer who appends a bare `SHIP_ROLLED_BACK` for a real applied
+    action — to force it to re-run and DUPLICATE — has no matching signed token,
+    so the removal is refused. Bound to the rollback's own attempt_id."""
+    return canonical_json({"kind": "ship-rollback-ok", "run_id": run_id,
+                           "action": action, "attempt_id": attempt_id})
+
+
 def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
-                                reversible=None, approval_ref=None):
+                                reversible=None, approval_ref=None, attempt_id=None):
     """R5 DF-R5-02: the canonical bytes of a ship action's PRE-SPAWN intent token —
     the SAME evidence fields as the completion token, under a DISTINCT kind so the
     two can never collide. Signed BEFORE the action spawns, it is what makes the
@@ -7482,6 +7526,7 @@ def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
     produce the matching SIGNED intent token, so the retry refuses it."""
     return canonical_json({"kind": "ship-action-intent", "run_id": run_id,
                            "action": action, "idempotency_key": idk,
+                           "attempt_id": attempt_id,
                            "toolchain": toolchain, "reversible": reversible,
                            "approval_ref": approval_ref})
 
@@ -7500,16 +7545,21 @@ def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
     before the first seal' from 'anchor missing because tampered' — both look
     anchor-less. A per-action signed entry makes the two distinguishable."""
     def _commit(action_name, idk, toolchain=None, reversible=None, approval_ref=None,
-                phase="done"):
+                phase="done", attempt_id=None):
         # R5 DF-R5-02: phase "intent" signs the PRE-SPAWN intent token (distinct
-        # payload kind); the default "done" signs the completion token exactly as
-        # before. Both are chain-only, never off-box.
+        # payload kind); "done" signs the completion token; DF-R7-01: "rollback"
+        # signs a SUCCESSFUL rollback's token. Every payload binds the dispatch's
+        # `attempt_id`, so a signed token authenticates EXACTLY its own attempt
+        # (an old attempt's token can no longer authenticate a planted new one).
+        # All chain-only, never off-box.
         if phase == "intent":
             payload = _ship_action_intent_payload(run_id, action_name, idk, toolchain,
-                                                  reversible, approval_ref)
+                                                  reversible, approval_ref, attempt_id)
+        elif phase == "rollback":
+            payload = _ship_rollback_payload(run_id, action_name, attempt_id)
         else:
             payload = _ship_action_commit_payload(run_id, action_name, idk, toolchain,
-                                                  reversible, approval_ref)
+                                                  reversible, approval_ref, attempt_id)
         # DF-R5-01/R5-02: return the anchor status so run_actions can make an
         # anchor FAILURE a first-class result (do NOT journal `ok` for an action
         # whose completion token could not be signed — that would brick re-entry).
@@ -7547,6 +7597,11 @@ def _ship_completed_action_facts(run_dir):
         intent = intents_by_key.get(_resolution_key(result)) \
             or intents_by_idk.get(result.get("idempotency_key")) or {}
         facts.append({"name": name, "idk": result.get("idempotency_key"),
+                      # DF-R7-01: the applied attempt's own id, so the recomputed
+                      # completion token authenticates EXACTLY that attempt — an
+                      # earlier attempt's signed token no longer matches a planted
+                      # later `ok` that shares the stable fields.
+                      "attempt_id": result.get("attempt_id"),
                       "toolchain": intent.get("toolchain"),
                       "reversible": intent.get("reversible"),
                       "approval_ref": intent.get("approval_ref")})
@@ -7593,7 +7648,14 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
     matching signed token → REFUSED. Fail-closed on any key/chain error. Returns
     (ok, reason)."""
     facts = _ship_completed_action_facts(run_dir)
-    if not facts:
+    # DF-R7-01: a forged SHIP_ROLLED_BACK can EMPTY the applied set (so `facts` is
+    # []) precisely to force a real action to re-run — so we must authenticate
+    # the rollback transitions even when there are no completed actions left. Only
+    # short-circuit when there is genuinely nothing to authenticate (no completed
+    # actions AND no rollback events).
+    rollback_events = [e for e in _ship_journal_events(run_dir)
+                       if e.get("state") == "SHIP_ROLLED_BACK"]
+    if not facts and not rollback_events:
         return (True, "no completed ship actions to authenticate")
     audit = cfg.get("_audit", {})
     try:
@@ -7615,12 +7677,40 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
                 if str(e.get("invocation", "")).startswith(prefix)}
     for f in facts:
         token = sha256_str(_ship_action_commit_payload(
-            run_id, f["name"], f["idk"], f["toolchain"], f["reversible"], f["approval_ref"]))
+            run_id, f["name"], f["idk"], f["toolchain"], f["reversible"], f["approval_ref"],
+            attempt_id=f.get("attempt_id")))
         if token not in anchored:
             return (False, f"completed ship action {f['name']!r} is not individually anchored in "
-                    "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`, or a "
-                    "tampered toolchain / reversibility / approval_ref)")
-    return (True, "all completed ship actions authenticated against the signed audit chain")
+                    "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`, a "
+                    "tampered toolchain / reversibility / approval_ref, or an unsigned re-run "
+                    "attempt claiming an earlier attempt's token)")
+    # DF-R7-01: authenticate the ROLLBACK transitions too. A same-user writer who
+    # appends a bare SHIP_ROLLED_BACK for a real applied action would make
+    # recovery DROP it from `applied` and RE-RUN it (a duplicate). Every
+    # SHIP_ROLLED_BACK under a signed run MUST carry its own signed rollback
+    # token; a planted one has none → refuse (never silently re-run).
+    seen_rb_attempts = set()
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") != "SHIP_ROLLED_BACK":
+            continue
+        d = e.get("data", {})
+        rb_attempt = d.get("attempt_id")
+        # DF-R7-01 (mini-audit): a rollback attempt is single-use. A REPLAYED
+        # SHIP_ROLLED_BACK (same real, signed attempt_id appended again — e.g.
+        # AFTER the action was re-applied under a new forward attempt) would
+        # otherwise pass the token check yet wrongly remove the re-applied
+        # action from `applied`, forcing a duplicate re-run. Refuse a duplicate.
+        if rb_attempt in seen_rb_attempts:
+            return (False, f"rollback of ship action {d.get('action')!r} is REPLAYED "
+                    f"(attempt {rb_attempt!r} appears more than once) — refusing")
+        seen_rb_attempts.add(rb_attempt)
+        rb_token = sha256_str(_ship_rollback_payload(
+            run_id, d.get("action"), rb_attempt))
+        if rb_token not in anchored:
+            return (False, f"rollback of ship action {d.get('action')!r} is not anchored in the "
+                    "signed audit chain (a planted SHIP_ROLLED_BACK trying to force a "
+                    "possibly-applied action to re-run) — refusing")
+    return (True, "all completed ship actions + rollbacks authenticated against the signed chain")
 
 
 def _terminal_anchor_pending_sha(run_dir):
@@ -7846,24 +7936,27 @@ def _repair_ship_evidence(cfg, control_root, run_dir, run_id, ship_journal,
     for intent, result in pending:
         name = intent.get("action")
         idk = result.get("idempotency_key")
+        # DF-R7-01: bind the intent's attempt_id into both recomputed tokens, so
+        # the re-signed completion authenticates EXACTLY this attempt.
+        att = intent.get("attempt_id")
         intent_token = sha256_str(_ship_action_intent_payload(
             run_id, intent.get("action"), idk, intent.get("toolchain"),
-            intent.get("reversible"), intent.get("approval_ref")))
+            intent.get("reversible"), intent.get("approval_ref"), attempt_id=att))
         if intent_token not in anchored:
             return ("refused", f"evidence-pending ship action {name!r} has no SIGNED intent "
                     "token in the audit chain — its journaled facts cannot be authenticated "
                     "(a planted intent/evidence_pending pair, or a tampered intent)")
         done_payload = _ship_action_commit_payload(
             run_id, intent.get("action"), idk, intent.get("toolchain"),
-            intent.get("reversible"), intent.get("approval_ref"))
+            intent.get("reversible"), intent.get("approval_ref"), attempt_id=att)
         if _anchor_ship_local(cfg, control_root, run_id, done_payload,
                               "ship-action") != "anchored":
             return ("pending", f"the completion token for ship action {name!r} still could "
                     "not be signed; the evidence stays pending (retry later)")
         ship_journal.write("SHIP_ACTION_RESULT", action=intent.get("action"),
                            index=intent.get("index"), idempotency_key=idk,
-                           exit=result.get("exit"), timed_out=False, status="ok",
-                           duration_s=result.get("duration_s"))
+                           attempt_id=att, exit=result.get("exit"), timed_out=False,
+                           status="ok", duration_s=result.get("duration_s"))
         ship_journal.write("SHIP_EVIDENCE_RESIGNED", action=intent.get("action"),
                            idempotency_key=idk,
                            note="completion token re-signed on retry from the SIGNED "
@@ -8392,7 +8485,16 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
     # anchor-less), and so would brick crash recovery. Reconcile's own journal
     # lines (status `reconciled_unknown`, not `ok`) do not enter `already_done`, so
     # this stays correct after the reconcile writes above.
-    if signing_on and already_done:
+    # DF-R7-01 (M66 opus review): authenticate whenever there is ANYTHING to
+    # authenticate — NOT only when `already_done` is non-empty. A planted bare
+    # SHIP_ROLLED_BACK pops the (only) applied action, EMPTYING already_done; if
+    # the guard were `and already_done`, authentication would be skipped in
+    # exactly the scenario it exists for and the action would re-run (a
+    # duplicate). Trigger it when there is a completed action OR any rollback
+    # event; the authenticator handles the empty-facts+rollback case.
+    _rollback_present = any(e.get("state") == "SHIP_ROLLED_BACK"
+                            for e in _ship_journal_events(run_dir))
+    if signing_on and (already_done or _rollback_present):
         ok_j, why_j = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
         if not ok_j:
             sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the ship journal that "
