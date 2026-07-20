@@ -12,10 +12,11 @@ The four modes (human name aliases in parentheses):
   H1 directed  -- most hands-on: the human approves/edits before every rebuild
                   (i>=2), reviews every non-converged checkpoint, AND approves
                   the ship on convergence.
-  H2 supervised-- the FAITHFUL EQUIVALENT of legacy `checkpoint:"pause"`: pause
-                  after every non-converged verify (i<cap). This is the
-                  DEFAULT, and it reproduces today's observable pause behavior
-                  byte-for-byte (no before-build gate, no before-ship gate).
+  H2 supervised-- pause after every non-converged verify (i<cap) AND before
+                  the ship on convergence (BEFORE_SHIP, M36b — see below).
+                  This is the DEFAULT. It extends legacy `checkpoint:"pause"`
+                  with the before-ship sign-off (no before-build gate; that
+                  remains H1-only).
   H3 guarded   -- the FAITHFUL EQUIVALENT of legacy `checkpoint:"auto"`
                   (autonomy 4): run the build/verify loop with NO per-iteration
                   pause, but still PAUSE at a genuine budget guard so a human

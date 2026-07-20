@@ -5,7 +5,10 @@ everything `hardened` provides (container barrier, signed audit, required
 off-box sink, required builder confinement):
 
 1. **Split-custody sign-off** — a run is `qualified` only after **K-of-N distinct
-   approvers** each ed25519-sign the run's manifest. No single operator can ship.
+   approvers** each ed25519-sign the run's manifest. With `custody.threshold >= 2`
+   no single key-holder can ship alone (`threshold: 1` is a permitted config that
+   deliberately waives that separation); K-of-N proves distinct *keys/signatures*,
+   not distinct human owners — key custody is an organizational control.
 2. **Host-side credential proxy** — the raw provider token never enters the
    sandbox; the builder reaches providers only through a proxy that injects the
    token host-side and allowlists destination hosts.
@@ -456,10 +459,14 @@ real provider through the run's real, operator-configured proxy/allowlist:
   `probe_enterprise_egress` this way directly, skipped cleanly when no
   docker daemon is available).
 
-`policy_digest` is a `sha256` over `{allowlist, header, proxy_endpoint}` —
-the egress policy this specific run is configured with — so the manifest
-records not just *that* a probe ran, but a compact fingerprint of *what* was
-verified. Covered by `tests/test_enterprise_egress.py`.
+`policy_digest` is a `sha256` over `{allowlist, header, image,
+seccomp_profile}` — the egress policy this specific run is configured with.
+`image` is the EFFECTIVE (digest-pinned) reference probes and dispatch
+actually use (DF-R5-09), so a moved mutable tag shows up as policy drift;
+the ephemeral proxy port is deliberately EXCLUDED so the digest is
+comparable across runs. The manifest thus records not just *that* a probe
+ran, but a compact fingerprint of *what* was verified. Covered by
+`tests/test_enterprise_egress.py`.
 
 ## Token never in the sandbox
 

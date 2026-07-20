@@ -231,12 +231,17 @@ a real-model build in-container, or authoritative cost metering. See
 `init` scaffolds `custody`/`credential_proxy`/`audit.sink` automatically at
 `assurance: "enterprise"` when `answers` supplies the operator inputs
 listed in "Enterprise answers" above (otherwise it fails closed, or
-downgrades under `allow_dev_downgrade` — never a broken scaffold). It does
-**not** currently scaffold `hardened.*` (including `hardened.dep_cache_dir`
-— the offline pinned-dependency cache for a network-restricted builder,
-spec §7.3, see `references/hardened.md`), `credentials`, or `brownfield`
-blocks at any tier — add those to the scaffolded `config.json` by hand per
-`references/config-reference.md` if your tier or workflow needs them.
+downgrades under `allow_dev_downgrade` — never a broken scaffold). The
+`hardened` block (network/image/memory/pids and `hardened.dep_cache_dir` —
+the offline pinned-dependency cache for a network-restricted builder, spec
+§7.3, see `references/hardened.md`), `credentials`, and `brownfield` blocks
+pass through `answers.options` verbatim (DF-R5-06), and a fully-shaped
+`answers.roles.builder` may carry `timeout_s`/`adapter_sha256`/
+`model_identity`/`support_files` — `df_config.load_config` stays the single
+validator of every block's shape, and unknown option/builder keys are
+refused (never silently dropped). No post-init hand edit is needed for a
+live hardened builder; `references/config-reference.md` documents each
+block.
 
 ## Then: init → review → run
 

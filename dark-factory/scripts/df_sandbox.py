@@ -1283,10 +1283,12 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
     measured) leaves stat/existence of paths outside $HOME/deny_root
     visible.
 
-    Linux/legacy backends (no `supports_default_deny`): delegates to the
+    Legacy backends (no `supports_default_deny` — since M29c BOTH shipped
+    backends, macOS sandbox-exec and Linux bwrap, have a default-deny
+    profile, so this is only a non-default/test backend): delegates to the
     existing probe_denial + probe_network_denial pair and reports
     mode="legacy_allow_host_read" with RESIDUAL_HOST_READ_OPEN — the honest
-    truth that the candidate can still read the host there until M29c.
+    truth that the candidate can still read the host under such a backend.
     """
     if network not in _NETWORK_MODES:
         return False, {"mode": None, "network": network, "checks": {},
@@ -1304,7 +1306,8 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
             "checks": {"legacy_denial_probe": bool(legacy_ok),
                        "legacy_network_probe": bool(net_ok)},
             "residuals": [RESIDUAL_HOST_READ_OPEN],
-            "detail": ("legacy candidate wrapper (host reads open until M29c); "
+            "detail": ("legacy candidate wrapper (backend has no default-deny "
+                       "profile; host reads open); "
                        f"network probe: {net_reason}"),
         }
         return bool(legacy_ok and net_ok), report

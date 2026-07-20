@@ -57,10 +57,12 @@ list.)
    setting you opt into, not something hardened does automatically.
 4. **enterprise** — everything in hardened, plus: the container can't quietly
    phone home to the internet (only one pre-approved, credential-injecting
-   gateway), and before anything ships, a *separate group of people* (not
-   just the one operator who ran it) have to independently sign off,
-   cryptographically, that the result is real. Nobody can ship something
-   alone even if they wanted to fake success.
+   gateway), and before anything ships, the configured approvers have to
+   independently sign off, cryptographically, that the result is real.
+   Configure a signing threshold of 2 or more and no single person can ship
+   alone — with the honest caveat that the system proves *distinct keys*,
+   not distinct humans: keeping those keys with genuinely separate people
+   is an organizational duty, not something the engine can verify.
 
 **Tiers vs. how-much-a-human-watches — two different questions.** The four
 items above answer "how hard is it for the builder to cheat." A separate
