@@ -31,6 +31,15 @@ from test_config import write_config
 from test_hardened_config import GREET_PY
 from test_supervisor import read_journal, setup_control
 
+# DF-R6-03: the `claude` confinement claim is bound to THIS skill's SHIPPED
+# adapter bytes (arbitrary bytes merely NAMED `claude` no longer inherit the
+# profile's mcp_disabled/tool_allowlist claims). These supervisor-level tests
+# exercise the CONFIG->manifest wiring for a TRUSTED adapter, so they point at
+# the shipped wrapper (they previously used a fictional /usr/local/bin/claude,
+# which encoded the pre-M62 basename-only trust).
+SHIPPED_CLAUDE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "adapters", "claude")
+
 # ---------------------------------------------------------------------------
 # config matrix: cfg["_confine"]
 # ---------------------------------------------------------------------------
@@ -182,7 +191,7 @@ def _ok_write_greet(workdir):
 
 
 def test_enabled_confine_true_passed_and_present_on_converged_manifest(tmp_path, monkeypatch):
-    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="auto")
+    cr = setup_control(tmp_path, SHIPPED_CLAUDE, checkpoint="auto")
     _set_confine(cr)  # enabled True, required True (default)
 
     captured = []
@@ -293,7 +302,7 @@ def test_builder_confinement_present_on_generic_aborted_build_error(tmp_path, mo
     # mistaken for a confinement refusal. Uses claude (the one supported,
     # probe-verified profile) so the confined field reflects a real enforced
     # profile.
-    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="auto")
+    cr = setup_control(tmp_path, SHIPPED_CLAUDE, checkpoint="auto")
     _set_confine(cr, required=False)
 
     def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
@@ -328,7 +337,7 @@ def test_builder_confinement_present_on_aborted_by_human_resume_manifest(tmp_pat
     # with decision="abort" -- this exercises resume()'s OWN manifest_base
     # construction (a separate code path from _run_locked's), which must
     # carry builder_confinement exactly like the fresh-run path.
-    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="pause")
+    cr = setup_control(tmp_path, SHIPPED_CLAUDE, checkpoint="pause")
     _set_confine(cr, required=False)
 
     def fake_invoke_incomplete(adapter, role, workdir, prompt_file, timeout_s,
@@ -357,7 +366,7 @@ def test_builder_confinement_present_on_aborted_by_human_resume_manifest(tmp_pat
 
 
 def test_disabled_confine_false_and_manifest_field_disabled(tmp_path, monkeypatch):
-    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="auto")
+    cr = setup_control(tmp_path, SHIPPED_CLAUDE, checkpoint="auto")
     # No builder_confinement block at all -> absent -> disabled defaults.
 
     captured = []
@@ -411,7 +420,7 @@ def test_disabled_confine_kwarg_never_passed_to_legacy_invoke_signature(tmp_path
     # absent, the supervisor must not even ATTEMPT to pass a `confine` kwarg —
     # proven here by a fake_invoke with a pre-M14 signature that would raise
     # TypeError on an unexpected kwarg.
-    cr = setup_control(tmp_path, "/usr/local/bin/claude", checkpoint="auto")
+    cr = setup_control(tmp_path, SHIPPED_CLAUDE, checkpoint="auto")
 
     def fake_invoke(adapter, role, workdir, prompt_file, timeout_s,
                     exec_prefix=None, env_extra=None, env_full=None):
