@@ -7154,9 +7154,29 @@ def _resolution_key(data):
     """DF-R6-01: the token that binds a SHIP_ACTION_RESULT to the specific
     SHIP_ACTION_INTENT it resolves. The `attempt_id` (fresh per dispatch) when
     present; else the stable idempotency_key (a pre-M61 legacy journal, whose
-    single-attempt semantics the key still matches correctly)."""
+    single-attempt semantics the key still matches correctly). (Forward result
+    name/idk consistency is enforced separately by _repair_ship_evidence before
+    any mint; see also _rollback_resolution_key for the rollback path.)"""
     aid = data.get("attempt_id")
     return aid if aid is not None else ("idk:" + str(data.get("idempotency_key")))
+
+
+def _rollback_resolution_key(data):
+    """DF-R8-01 (opus review F3): the (action, attempt) pair binding a
+    SHIP_ROLLED_BACK / SHIP_ROLLBACK_FAILED to the SHIP_ROLLBACK_INTENT it
+    resolves. Unlike forward results, SHIP_ROLLBACK_FAILED is unauthenticated and
+    same-user-forgeable, and its `attempt_id` (which feeds resolution) is DECOUPLED
+    from its `action` (which feeds applied.pop). Keying rollback resolution on
+    attempt_id ALONE let a planted SHIP_ROLLBACK_FAILED for action B (with an
+    attempt_id colliding a DIFFERENT action A's rollback intent) spoof resolution
+    of A's dangling rollback intent — hiding it from the any-unresolved halt so a
+    rolled-back A stayed in `applied` (the reorder-shadow's sibling). Binding the
+    action forces the forged event to name A to resolve A's rollback intent — which
+    then pops A from `applied` AND marks it unknown-effect (an operator halt),
+    never a silent re-add."""
+    aid = data.get("attempt_id")
+    aid = aid if aid is not None else ("idk:" + str(data.get("idempotency_key")))
+    return (data.get("action"), aid)
 
 
 def _ship_action_recovery_state(run_dir):
@@ -7176,12 +7196,10 @@ def _ship_action_recovery_state(run_dir):
     reuses the stable idempotency_key — is a DISTINCT attempt: an old
     `reconciled_unknown` result can never resolve the retry's fresh intent, and a
     second crash re-surfaces the unknown outcome instead of silently re-firing."""
-    forward_intents = {}       # attempt-key -> intent data (latest per key)
+    forward_intents = {}       # attempt-key -> intent data (journal order)
     forward_resolved = set()   # attempt-keys with a result
-    latest_forward_intent = None
-    rollback_intents = {}      # attempt-key -> rollback intent data
+    rollback_intents = {}      # attempt-key -> rollback intent data (journal order)
     rollback_resolved = set()
-    latest_rollback_intent = None
     applied = {}               # action -> latest ok result data (not yet rolled back)
     unknown_effect = set()     # actions whose rollback FAILED (real state unknown)
     for e in _ship_journal_events(run_dir):
@@ -7189,7 +7207,6 @@ def _ship_action_recovery_state(run_dir):
         state = e.get("state")
         if state == "SHIP_ACTION_INTENT":
             forward_intents[_resolution_key(d)] = d
-            latest_forward_intent = d
         elif state == "SHIP_ACTION_RESULT":
             forward_resolved.add(_resolution_key(d))
             if d.get("status") == "ok" and d.get("action") is not None:
@@ -7197,17 +7214,16 @@ def _ship_action_recovery_state(run_dir):
                 # A fresh successful re-run resolves a prior unknown state.
                 unknown_effect.discard(d["action"])
         elif state == "SHIP_ROLLBACK_INTENT":
-            rollback_intents[_resolution_key(d)] = d
-            latest_rollback_intent = d
+            rollback_intents[_rollback_resolution_key(d)] = d
         elif state == "SHIP_ROLLED_BACK":
-            rollback_resolved.add(_resolution_key(d))
+            rollback_resolved.add(_rollback_resolution_key(d))
             # A SUCCESSFUL rollback PROVES the effect is gone: drop it from
             # `applied` so the action re-runs before any SHIPPED (DF-R6-02).
             if d.get("action") is not None:
                 applied.pop(d["action"], None)
                 unknown_effect.discard(d["action"])
         elif state == "SHIP_ROLLBACK_FAILED":
-            rollback_resolved.add(_resolution_key(d))
+            rollback_resolved.add(_rollback_resolution_key(d))
             # A FAILED rollback proves NOTHING about the real-world state: the
             # undo may have partially applied, or not at all (the effect may
             # still be fully present). Neither silently skipping (omission) nor
@@ -7218,16 +7234,28 @@ def _ship_action_recovery_state(run_dir):
             if d.get("action") is not None:
                 applied.pop(d["action"], None)
                 unknown_effect.add(d["action"])
-    unresolved_forward = (
-        latest_forward_intent
-        if (latest_forward_intent is not None
-            and _resolution_key(latest_forward_intent) not in forward_resolved)
-        else None)
-    unresolved_rollback = (
-        latest_rollback_intent
-        if (latest_rollback_intent is not None
-            and _resolution_key(latest_rollback_intent) not in rollback_resolved)
-        else None)
+    # DF-R8-01 (opus review F2 — reorder-shadow): surface ANY unresolved intent,
+    # not just the LATEST. The latest-only check was dodgeable: an attacker who
+    # deletes a rollback's SHIP_ROLLED_BACK (to re-add the rolled-back action) but
+    # KEEPS its SHIP_ROLLBACK_INTENT (so the intent-orphan check in
+    # _authenticate_ship_actions still attributes the anchored token) could then
+    # REORDER that dangling intent to sit BEHIND another, resolved rollback intent
+    # — making `latest_rollback_intent` resolved and hiding the dangling one. With
+    # every unresolved intent surfaced, the dangling rollback re-triggers the
+    # SHIP_UNKNOWN_OUTCOME halt (which reconcile then pops → re-run, never a silent
+    # re-add). Legit runs resolve EVERY intent, so this never false-positives; a
+    # genuine crash leaves exactly one unresolved intent, still caught. The
+    # last-journaled unresolved intent is reported (stable messaging). The same
+    # symmetry closes the forward analogue (a hidden dangling forward intent whose
+    # deleted result would otherwise let the action silently re-run as a DUPLICATE).
+    unresolved_forward = None
+    for _k, _d in forward_intents.items():
+        if _k not in forward_resolved:
+            unresolved_forward = _d
+    unresolved_rollback = None
+    for _k, _d in rollback_intents.items():
+        if _k not in rollback_resolved:
+            unresolved_rollback = _d
     return {"applied": applied,
             "unknown_effect": unknown_effect,
             "unresolved_forward": unresolved_forward,
@@ -7578,7 +7606,8 @@ def _ship_toolchain_identity(actions):
 
 
 def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
-                                reversible=None, approval_ref=None, attempt_id=None):
+                                reversible=None, approval_ref=None, attempt_id=None,
+                                seq=None):
     """The canonical bytes whose sha256 is a completed ship action's chain-anchored
     completion token (M49 DF-R3-03; R5 DF-R5-01). Binds the run, the action name,
     its idempotency_key, AND every per-action EVIDENCE field — the PRE-EXEC
@@ -7598,7 +7627,7 @@ def _ship_action_commit_payload(run_id, action, idk, toolchain=None,
     cosmetic and is dropped by the reconstruction.)"""
     return canonical_json({"kind": "ship-action-ok", "run_id": run_id,
                            "action": action, "idempotency_key": idk,
-                           "attempt_id": attempt_id,
+                           "attempt_id": attempt_id, "seq": seq,
                            "toolchain": toolchain, "reversible": reversible,
                            "approval_ref": approval_ref})
 
@@ -7609,13 +7638,25 @@ def _ship_rollback_payload(run_id, action, attempt_id):
     what lets recovery derive the applied set from AUTHENTICATED transitions: a
     same-user writer who appends a bare `SHIP_ROLLED_BACK` for a real applied
     action — to force it to re-run and DUPLICATE — has no matching signed token,
-    so the removal is refused. Bound to the rollback's own attempt_id."""
+    so the removal is refused. Bound to the rollback's own attempt_id.
+
+    DF-R8-01: deliberately NOT `seq`-bound (unlike forward completions). The token
+    is recomputable from the SHIP_ROLLBACK_INTENT alone (run_id + action +
+    attempt_id — the intent is journaled+fsynced BEFORE the rollback runs), which
+    is what lets recovery ATTRIBUTE every anchored rollback token to a surviving
+    intent and so detect a DELETED rollback (opus review F1): an attacker who
+    strips a rollback's journal lines to re-add a rolled-back action leaves an
+    anchored token that maps to no surviving intent → refused. Rollback ORDERING
+    is enforced separately, by the running-applied-set membership check in
+    _verify_ship_transition_chain (a rollback for a not-currently-applied action is
+    refused), so a seq is not needed here and would only break that attribution."""
     return canonical_json({"kind": "ship-rollback-ok", "run_id": run_id,
                            "action": action, "attempt_id": attempt_id})
 
 
 def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
-                                reversible=None, approval_ref=None, attempt_id=None):
+                                reversible=None, approval_ref=None, attempt_id=None,
+                                seq=None):
     """R5 DF-R5-02: the canonical bytes of a ship action's PRE-SPAWN intent token —
     the SAME evidence fields as the completion token, under a DISTINCT kind so the
     two can never collide. Signed BEFORE the action spawns, it is what makes the
@@ -7627,7 +7668,7 @@ def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
     produce the matching SIGNED intent token, so the retry refuses it."""
     return canonical_json({"kind": "ship-action-intent", "run_id": run_id,
                            "action": action, "idempotency_key": idk,
-                           "attempt_id": attempt_id,
+                           "attempt_id": attempt_id, "seq": seq,
                            "toolchain": toolchain, "reversible": reversible,
                            "approval_ref": approval_ref})
 
@@ -7644,7 +7685,16 @@ def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
     This is why per-action anchoring (not one last-digest at seal) is required: a
     single last-digest cannot distinguish 'no anchor because a legit crash happened
     before the first seal' from 'anchor missing because tampered' — both look
-    anchor-less. A per-action signed entry makes the two distinguishable."""
+    anchor-less. A per-action signed entry makes the two distinguishable.
+
+    DF-R8-01: forward completions and successful rollbacks also draw a monotonic
+    `seq` from ONE per-run counter (seeded from the journal so a resume/repair
+    continues, never reuses, the sequence). The seq is bound into the signed token
+    and returned so run_actions can journal it — this is what makes replay/reorder/
+    deletion of otherwise-genuine signed transitions detectable on recovery. Intent
+    tokens do NOT consume a seq (they don't determine the applied set)."""
+    head = [_max_ship_seq(run_dir) + 1]
+
     def _commit(action_name, idk, toolchain=None, reversible=None, approval_ref=None,
                 phase="done", attempt_id=None):
         # R5 DF-R5-02: phase "intent" signs the PRE-SPAWN intent token (distinct
@@ -7653,18 +7703,42 @@ def _make_ship_action_committer(cfg, control_root, run_dir, run_id):
         # `attempt_id`, so a signed token authenticates EXACTLY its own attempt
         # (an old attempt's token can no longer authenticate a planted new one).
         # All chain-only, never off-box.
+        # DF-R8-05: anchor each token TYPE under a DISTINCT chain namespace so a
+        # recovery query can tell an intent from a completion from a rollback.
+        # (Before, all three shared `{run}.ship-action.`, so _is_no_action_terminal
+        # wrongly treated a genuine pre-spawn INTENT — which every unresolved
+        # action has — as proof the run shipped, and refused the governed abort
+        # reseal.) Completions keep the `ship-action` namespace so the existing
+        # completion authentication is byte-unchanged.
+        # DF-R8-01: only forward COMPLETIONS draw the next monotonic seq (consumed
+        # only if the anchor lands). Intents and rollbacks carry no seq — rollback
+        # tokens are attributed by attempt_id (see _ship_rollback_payload) and their
+        # ordering is checked by applied-set membership, not a seq.
         if phase == "intent":
+            seq = None
             payload = _ship_action_intent_payload(run_id, action_name, idk, toolchain,
                                                   reversible, approval_ref, attempt_id)
+            kind = "ship-action-intent"
         elif phase == "rollback":
+            seq = None
             payload = _ship_rollback_payload(run_id, action_name, attempt_id)
+            kind = "ship-rollback"
         else:
+            seq = head[0]
             payload = _ship_action_commit_payload(run_id, action_name, idk, toolchain,
-                                                  reversible, approval_ref, attempt_id)
+                                                  reversible, approval_ref, attempt_id,
+                                                  seq=seq)
+            kind = "ship-action"
         # DF-R5-01/R5-02: return the anchor status so run_actions can make an
         # anchor FAILURE a first-class result (do NOT journal `ok` for an action
         # whose completion token could not be signed — that would brick re-entry).
-        return _anchor_ship_local(cfg, control_root, run_id, payload, "ship-action")
+        status = _anchor_ship_local(cfg, control_root, run_id, payload, kind)
+        # DF-R8-01: only advance the counter when the transition actually anchored,
+        # so a failed anchor (evidence-pending) leaves the seq free for the retry —
+        # the sequence stays gapless.
+        if seq is not None and status == "anchored":
+            head[0] += 1
+        return (status, seq)
     return _commit
 
 
@@ -7703,6 +7777,12 @@ def _ship_completed_action_facts(run_dir):
                       # earlier attempt's signed token no longer matches a planted
                       # later `ok` that shares the stable fields.
                       "attempt_id": result.get("attempt_id"),
+                      # DF-R8-01: the applied completion's monotonic chain position,
+                      # journaled on its SHIP_ACTION_RESULT — bound into the signed
+                      # token so recovery recomputes it at the exact seq it was
+                      # signed at (a tampered seq yields a token that was never
+                      # anchored).
+                      "seq": result.get("seq"),
                       "toolchain": intent.get("toolchain"),
                       "reversible": intent.get("reversible"),
                       "approval_ref": intent.get("approval_ref")})
@@ -7736,6 +7816,97 @@ def _authenticate_ship_chain(cfg, control_root, run_id, target_sha, kind):
             return (True, f"ship {kind} authenticated against the signed audit chain")
     return (False, f"no signature-valid audit-chain entry anchors this ship {kind}'s digest "
             "(a planted or altered local ship state)")
+
+
+def _max_ship_seq(run_dir):
+    """DF-R8-01: the highest monotonic `seq` journaled on any signed forward
+    COMPLETION (a SHIP_ACTION_RESULT `ok`), or -1 if none. A fresh or RESUMED
+    committer continues the contiguous completion chain at max+1, so a
+    crash/resume/repair-evidence re-entry never reuses or gaps a seq that an
+    earlier process already signed. (Rollbacks are attempt-attributed, not
+    seq-bound — see _ship_rollback_payload — so they do not participate here.)"""
+    hi = -1
+    for e in _ship_journal_events(run_dir):
+        d = e.get("data", {})
+        seq = d.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            continue
+        if e.get("state") == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
+            hi = max(hi, seq)
+    return hi
+
+
+def _verify_ship_transition_chain(run_dir, run_id, anchored, anchored_rb):
+    """DF-R8-01: verify the ORDERED chain of SIGNED ship transitions.
+
+    FORWARD COMPLETIONS (SHIP_ACTION_RESULT `ok`) each bind a monotonic `seq` into
+    their signed token. Walking the journal IN ORDER, these completion seqs MUST be
+    contiguous and strictly increasing from 0 (0,1,...,N-1), each token recomputed
+    WITH its journaled seq and anchored. This catches, for completions:
+      * REPLAY — a genuine completion copied back in after its rollback repeats an
+        already-seen seq (the applied-set reducer keys by action NAME, so the
+        replay would otherwise silently re-add a rolled-back action with a single
+        real anchored token the per-attempt duplicate guard cannot see);
+      * REORDER — two completions swapped → seqs out of order;
+      * INTERIOR DELETION — a dropped completion leaves a seq gap;
+      * SEQ REWRITE — an edited seq yields a token that was never anchored.
+
+    ROLLBACKS (SHIP_ROLLED_BACK) are NOT seq-bound; their tokens are attributed by
+    attempt_id (see _ship_rollback_payload) and their ORDERING is enforced here by
+    running-applied-set MEMBERSHIP: replaying the journal in order, a
+    SHIP_ROLLED_BACK is valid only when its action is CURRENTLY applied. A rollback
+    moved before the completion it removes (or planted for a never-applied action)
+    fails membership → refused. Deleted rollbacks are caught by the chain→journal
+    orphan check in _authenticate_ship_actions. Fail-closed. Returns (ok, reason)."""
+    intents_by_attempt = {}
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_ACTION_INTENT":
+            d = e.get("data", {})
+            if d.get("attempt_id") is not None:
+                intents_by_attempt[d.get("attempt_id")] = d
+    expected = 0            # next completion seq required (contiguous from 0)
+    applied_now = set()     # running applied set, in journal order
+    saw_completion = False
+    for e in _ship_journal_events(run_dir):
+        st = e.get("state")
+        d = e.get("data", {})
+        if st == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
+            saw_completion = True
+            seq = d.get("seq")
+            label = f"completion of {d.get('action')!r}"
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                return (False, f"signed ship transition ({label}) is missing its monotonic "
+                        "`seq` (a pre-chain legacy or a stripped transition) — refusing "
+                        "(fail-closed)")
+            intent = intents_by_attempt.get(d.get("attempt_id"), {})
+            token = sha256_str(_ship_action_commit_payload(
+                run_id, d.get("action"), d.get("idempotency_key"),
+                intent.get("toolchain"), intent.get("reversible"),
+                intent.get("approval_ref"), attempt_id=d.get("attempt_id"),
+                seq=seq))
+            if token not in anchored:
+                return (False, f"signed ship transition ({label}, seq {seq}) is not anchored in "
+                        "the signed chain at its journaled sequence position (a rewritten `seq`, "
+                        "a reordered, or an unsigned transition) — refusing (fail-closed)")
+            if seq != expected:
+                return (False, f"ship transition ({label}) is out of sequence: expected seq "
+                        f"{expected}, found {seq} (a replayed, reordered, or deleted signed "
+                        "completion) — refusing (fail-closed)")
+            expected += 1
+            applied_now.add(d.get("action"))
+        elif st == "SHIP_ROLLED_BACK":
+            action = d.get("action")
+            # Ordering: a rollback is valid only for a CURRENTLY-applied action. A
+            # rollback moved ahead of the completion it removes — or planted for an
+            # action that never applied — fails here (the per-token anchor + orphan
+            # checks handle authenticity/deletion separately).
+            if action not in applied_now:
+                return (False, f"rollback of ship action {action!r} appears before that action "
+                        "is applied (a reordered or planted rollback) — refusing (fail-closed)")
+            applied_now.discard(action)
+    if not saw_completion:
+        return (True, "no signed forward completions to order")
+    return (True, f"ordered ship-transition chain verified ({expected} completions)")
 
 
 def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
@@ -7773,13 +7944,33 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
         entries = df_audit_chain.read_chain(chain_path)
     except df_audit_chain.ChainError as e:
         return (False, f"the audit chain is unreadable ({e}); refusing (fail-closed)")
-    prefix = f"{run_id}.ship-action."
-    anchored = {e.get("manifest_sha256") for e in entries
-                if str(e.get("invocation", "")).startswith(prefix)}
+    # DF-R8-05: token TYPES now live in distinct chain namespaces.
+    def _anchored_under(kind):
+        pre = f"{run_id}.{kind}."
+        return {e.get("manifest_sha256") for e in entries
+                if str(e.get("invocation", "")).startswith(pre)}
+    anchored = _anchored_under("ship-action")            # completions
+    anchored_rb = _anchored_under("ship-rollback")        # rollbacks
+    # DF-R8-01: verify the ORDERED, monotonic signed-transition sequence FIRST —
+    # a genuine signed completion REPLAYED after its rollback (or any reorder /
+    # deletion of a signed transition) is rejected here, before the applied set
+    # is trusted, because each transition binds a `seq` that must form a
+    # contiguous 0..N-1 with no gap and no duplicate.
+    ok_seq, why_seq = _verify_ship_transition_chain(run_dir, run_id, anchored,
+                                                    anchored_rb)
+    if not ok_seq:
+        return (False, why_seq)
+    seen_fwd_attempts = set()
     for f in facts:
+        # DF-R8-01: a forward completion attempt is single-use too (mirrors the
+        # rollback replay guard). A replayed completion has a duplicate attempt.
+        if f.get("attempt_id") in seen_fwd_attempts:
+            return (False, f"completed ship action {f['name']!r} attempt "
+                    f"{f.get('attempt_id')!r} appears more than once (a replayed completion)")
+        seen_fwd_attempts.add(f.get("attempt_id"))
         token = sha256_str(_ship_action_commit_payload(
             run_id, f["name"], f["idk"], f["toolchain"], f["reversible"], f["approval_ref"],
-            attempt_id=f.get("attempt_id")))
+            attempt_id=f.get("attempt_id"), seq=f.get("seq")))
         if token not in anchored:
             return (False, f"completed ship action {f['name']!r} is not individually anchored in "
                     "the signed audit chain (a planted or edited SHIP_ACTION_RESULT `ok`, a "
@@ -7807,10 +7998,37 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
         seen_rb_attempts.add(rb_attempt)
         rb_token = sha256_str(_ship_rollback_payload(
             run_id, d.get("action"), rb_attempt))
-        if rb_token not in anchored:
+        if rb_token not in anchored_rb:
             return (False, f"rollback of ship action {d.get('action')!r} is not anchored in the "
                     "signed audit chain (a planted SHIP_ROLLED_BACK trying to force a "
                     "possibly-applied action to re-run) — refusing")
+    # DF-R8-01 (opus review F1): the checks above are JOURNAL-driven — they verify
+    # the SHIP_ROLLED_BACK lines PRESENT, but not that every SIGNED rollback still
+    # HAS its journal lines. A same-user writer who DELETES a rollback's journal
+    # lines (SHIP_ROLLBACK_INTENT + SHIP_ROLLED_BACK) leaves the rolled-back
+    # action's genuine completion (seq 0) unpopped and the completion seqs still
+    # contiguous — re-adding a rolled-back action to `applied` with its effect
+    # actually GONE. Close the loop the other way: every rollback token anchored in
+    # the signed chain MUST be ATTRIBUTABLE to a surviving SHIP_ROLLBACK_INTENT
+    # (the intent is journaled+fsynced BEFORE the rollback runs, so a genuine
+    # anchored rollback ALWAYS has one — a legit crash-window or reconcile keeps
+    # the intent; only tampering removes it). Because the rollback token is NOT
+    # seq-bound, it recomputes exactly from the intent's (action, attempt_id), so
+    # this attribution is precise: a planted decoy intent recomputes to a DIFFERENT
+    # (unanchored) token and cannot cover a real orphan. A deleted rollback leaves
+    # an anchored token no surviving intent maps to → refuse.
+    intent_rb_tokens = set()
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") != "SHIP_ROLLBACK_INTENT":
+            continue
+        d = e.get("data", {})
+        intent_rb_tokens.add(sha256_str(_ship_rollback_payload(
+            run_id, d.get("action"), d.get("attempt_id"))))
+    orphan_rb = anchored_rb - intent_rb_tokens
+    if orphan_rb:
+        return (False, "a rollback anchored in the signed audit chain is attributable to no "
+                "surviving SHIP_ROLLBACK_INTENT (its rollback journal lines were deleted to "
+                "re-add a rolled-back action to the applied set) — refusing (fail-closed)")
     return (True, "all completed ship actions + rollbacks authenticated against the signed chain")
 
 
@@ -7850,10 +8068,18 @@ def _is_no_action_terminal(run_dir, run_id, prior, cfg=None, control_root=None):
             return False
     # DF-R7-05 (opus review F1): the journal is same-user writable, so re-root
     # the "nothing shipped" claim on the SIGNED CHAIN — the real M56b trust
-    # boundary. If ANY signature-valid per-action ship token exists, the run DID
-    # ship something; it is NOT a no-action terminal and must go through full
-    # evidence binding (never the reseal shortcut), even if the journal was
-    # emptied to hide it. Fail-closed on any chain read/verify error.
+    # boundary. If ANY signature-valid COMPLETION or ROLLBACK ship token exists,
+    # the run DID apply (and maybe undo) something; it is NOT a no-action terminal
+    # and must go through full evidence binding (never the reseal shortcut), even
+    # if the journal was emptied to hide it. Fail-closed on any chain read/verify
+    # error.
+    # DF-R8-05: INTENT tokens now live in their OWN namespace (`ship-action-intent`)
+    # and are DELIBERATELY not disqualifying — every dispatched action signs a
+    # pre-spawn intent, so matching intents here (as the pre-split code did with a
+    # shared `ship-action.` prefix) wrongly treated a genuine materialize-failure /
+    # reconcile-abort as "shipped" and refused its governed reseal. Only a
+    # COMPLETION (`ship-action.`) or a ROLLBACK (`ship-rollback.`) proves something
+    # ran.
     if cfg is not None and bool(cfg.get("_audit", {}).get("signing")):
         try:
             key = df_audit.load_key(cfg["_audit"]["key_path"])
@@ -7861,9 +8087,11 @@ def _is_no_action_terminal(run_dir, run_id, prior, cfg=None, control_root=None):
             ok, _why = df_audit_chain.verify_chain(chain_path, key)
             if not ok:
                 return False
-            prefix = f"{run_id}.ship-action."
+            completion_pre = f"{run_id}.ship-action."
+            rollback_pre = f"{run_id}.ship-rollback."
             for entry in df_audit_chain.read_chain(chain_path):
-                if str(entry.get("invocation", "")).startswith(prefix):
+                inv = str(entry.get("invocation", ""))
+                if inv.startswith(completion_pre) or inv.startswith(rollback_pre):
                     return False
         except (df_audit.AuditKeyError, df_audit_chain.ChainError, OSError, KeyError):
             return False
@@ -8080,9 +8308,13 @@ def _repair_ship_evidence(cfg, control_root, run_dir, run_id, ship_journal,
         entries = df_audit_chain.read_chain(chain_path)
     except df_audit_chain.ChainError as e:
         return ("refused", f"the audit chain is unreadable ({e})")
-    prefix = f"{run_id}.ship-action."
+    # DF-R8-05: the intent token now lives in its OWN chain namespace.
+    prefix = f"{run_id}.ship-action-intent."
     anchored = {e.get("manifest_sha256") for e in entries
                 if str(e.get("invocation", "")).startswith(prefix)}
+    # DF-R8-01: the re-signed completion continues the monotonic transition chain
+    # at max+1 (never reusing/gapping a seq an earlier process already signed).
+    next_seq = _max_ship_seq(run_dir) + 1
     for intent, result in pending:
         name = intent.get("action")
         idk = result.get("idempotency_key")
@@ -8098,7 +8330,8 @@ def _repair_ship_evidence(cfg, control_root, run_dir, run_id, ship_journal,
                     "(a planted intent/evidence_pending pair, or a tampered intent)")
         done_payload = _ship_action_commit_payload(
             run_id, intent.get("action"), idk, intent.get("toolchain"),
-            intent.get("reversible"), intent.get("approval_ref"), attempt_id=att)
+            intent.get("reversible"), intent.get("approval_ref"), attempt_id=att,
+            seq=next_seq)
         if _anchor_ship_local(cfg, control_root, run_id, done_payload,
                               "ship-action") != "anchored":
             return ("pending", f"the completion token for ship action {name!r} still could "
@@ -8106,7 +8339,9 @@ def _repair_ship_evidence(cfg, control_root, run_dir, run_id, ship_journal,
         ship_journal.write("SHIP_ACTION_RESULT", action=intent.get("action"),
                            index=intent.get("index"), idempotency_key=idk,
                            attempt_id=att, exit=result.get("exit"), timed_out=False,
-                           status="ok", duration_s=result.get("duration_s"))
+                           status="ok", duration_s=result.get("duration_s"),
+                           seq=next_seq)
+        next_seq += 1
         ship_journal.write("SHIP_EVIDENCE_RESIGNED", action=intent.get("action"),
                            idempotency_key=idk,
                            note="completion token re-signed on retry from the SIGNED "

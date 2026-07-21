@@ -378,9 +378,10 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # with the RECOVERABLE SHIP_EVIDENCE_PENDING — the retry re-runs this
         # action from scratch.
         if commit_action is not None:
-            intent_committed = commit_action(name, idk, tc_entry, reversible,
-                                             approval_ref, phase="intent",
-                                             attempt_id=attempt_id)
+            # DF-R8-01: the committer returns (status, seq); intents carry no seq.
+            intent_committed, _ = commit_action(name, idk, tc_entry, reversible,
+                                                approval_ref, phase="intent",
+                                                attempt_id=attempt_id)
             if intent_committed != "anchored":
                 journal.write("SHIP_ACTION_RESULT", action=name, index=index,
                               idempotency_key=idk, attempt_id=attempt_id, exit=None,
@@ -416,9 +417,12 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
         # RAN and is NEVER re-run; the retry re-signs its token from the
         # intent-authenticated facts and continues.
         committed = "anchored"
+        commit_seq = None
         if success and commit_action is not None:
-            committed = commit_action(name, idk, tc_entry, reversible, approval_ref,
-                                      attempt_id=attempt_id)
+            # DF-R8-01: capture the monotonic seq bound into the signed completion
+            # token so it is journaled on the RESULT and recomputable on recovery.
+            committed, commit_seq = commit_action(name, idk, tc_entry, reversible,
+                                                  approval_ref, attempt_id=attempt_id)
         if success and committed != "anchored":
             journal.write("SHIP_ACTION_RESULT", action=name, index=index,
                           idempotency_key=idk, attempt_id=attempt_id, exit=exit_code,
@@ -434,7 +438,7 @@ def run_actions(actions, ship_ws, *, approval_ctx, journal, run_id,
                     "toolchain": toolchain, "rollback_toolchain": []}
         journal.write("SHIP_ACTION_RESULT", action=name, index=index, idempotency_key=idk,
                       attempt_id=attempt_id, exit=exit_code, timed_out=timed_out,
-                      status=status, duration_s=round(dur, 3))
+                      status=status, duration_s=round(dur, 3), seq=commit_seq)
         records.append({"name": name, "reversible": reversible, "status": status,
                         "exit": exit_code, "approval_ref": approval_ref,
                         "duration_s": round(dur, 3)})
@@ -521,6 +525,8 @@ def _rollback(*, action_has_own, stack, journal, ship_ws, base_env,
             # removal of this action from the applied set (a planted, unsigned
             # SHIP_ROLLED_BACK is refused, never allowed to force a re-run).
             if commit_action is not None:
+                # DF-R8-01: rollback tokens are attempt-attributed, not seq-bound
+                # (see _ship_rollback_payload); the returned seq is always None here.
                 commit_action(name, None, None, None, None, phase="rollback",
                               attempt_id=rb_attempt_id)
             journal.write("SHIP_ROLLED_BACK", action=name, attempt_id=rb_attempt_id,
