@@ -51,7 +51,10 @@ def _fail_anchor_for(monkeypatch, payload_kind, action_name=None):
     orig = supervisor._anchor_ship_local
 
     def wrapper(cfg, control_root, run_id, payload, kind):
-        if kind == "ship-action":
+        # DF-R8-05: per-action tokens now anchor under DISTINCT chain namespaces
+        # (ship-action / ship-action-intent / ship-rollback); match the outage on
+        # the PAYLOAD kind across all three so an intent-token outage is still hit.
+        if kind in ("ship-action", "ship-action-intent", "ship-rollback"):
             p = json.loads(payload)
             if p.get("kind") == payload_kind and (
                     action_name is None or p.get("action") == action_name):

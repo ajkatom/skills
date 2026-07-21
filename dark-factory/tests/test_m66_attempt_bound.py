@@ -197,4 +197,8 @@ def test_replayed_signed_rollback_is_refused(tmp_path):
     with open(run_dir / "ship_journal.jsonl", "a", encoding="utf-8") as f:
         f.write(rb_line + "\n")
     ok, why = supervisor._authenticate_ship_actions(cfg, str(cr), str(run_dir), rid)
-    assert not ok and "REPLAYED" in why
+    # DF-R8-01: the transition-chain check now catches an identical replayed
+    # rollback EARLIER — the second SHIP_ROLLED_BACK targets an action that is no
+    # longer applied (membership check), before the per-attempt duplicate guard.
+    # Either way it is a fail-closed refusal, never a silent re-run.
+    assert not ok and ("REPLAYED" in why or "before that action is applied" in why)
