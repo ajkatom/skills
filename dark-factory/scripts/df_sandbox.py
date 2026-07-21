@@ -104,6 +104,24 @@ _NETWORK_MODES = ("unrestricted", "deny", "loopback")
 _NET_PROBE_EXTERNAL_HOST = "1.1.1.1"
 _NET_PROBE_EXTERNAL_PORT = 443
 
+
+def _sbpl_str(path: str) -> str:
+    """DF-R7-06: the ONE encoder for a filesystem path embedded in an SBPL
+    (macOS sandbox-profile) double-quoted string literal. Inside a quoted SBPL
+    string the parser-significant characters are the backslash and the double
+    quote; a path containing either (both legal in a macOS filename) would
+    otherwise terminate the string early or create a misleading rule. Escapes
+    `\\`→`\\\\` and `"`→`\\"`. A NUL or newline cannot appear in a realpath'd
+    existing file path, but is rejected defensively so a malformed profile is a
+    clear ValueError at build time, never a silently wrong sandbox. Returns the
+    escaped body WITHOUT the surrounding quotes (callers add them, matching the
+    existing `(subpath "...")` sites)."""
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise ValueError(
+            f"path contains a NUL/newline and cannot be encoded into an SBPL "
+            f"string literal (refusing to build a malformed sandbox profile): {path!r}")
+    return path.replace("\\", "\\\\").replace('"', '\\"')
+
 # Mach bootstrap services that back the two side channels M27 documented as
 # open under the (allow default) builder wrapper. Under the candidate's
 # (deny default) profile a bootstrap_look_up of either name is DENIED
@@ -246,8 +264,8 @@ class _MacOSBackend:
         profile = (
             "(version 1)"
             "(allow default)"
-            f'(deny file-read* (subpath "{real}"))'
-            f'(deny file-write* (subpath "{real}"))'
+            f'(deny file-read* (subpath "{_sbpl_str(real)}"))'
+            f'(deny file-write* (subpath "{_sbpl_str(real)}"))'
         )
         if network == "deny":
             profile += "(deny network*)"
@@ -314,7 +332,7 @@ class _MacOSBackend:
         real_home = os.path.realpath(home) if os.path.isabs(home) else None
 
         def subpaths(paths):
-            return " ".join(f'(subpath "{p}")' for p in paths)
+            return " ".join(f'(subpath "{_sbpl_str(p)}")' for p in paths)
 
         # System paths a runtime needs to START (measured by removal: each of
         # these was individually verified either required or deliberately
@@ -437,8 +455,8 @@ class _MacOSBackend:
             # readable/writable even if a system allow above ever overlaps
             # it. The workspace/runtime/scratch allows BELOW survive because
             # SBPL is last-match-wins (verified live).
-            parts.append(f'(deny file-read* (subpath "{real_home}"))')
-            parts.append(f'(deny file-write* (subpath "{real_home}"))')
+            parts.append(f'(deny file-read* (subpath "{_sbpl_str(real_home)}"))')
+            parts.append(f'(deny file-write* (subpath "{_sbpl_str(real_home)}"))')
         parts.append("(allow file-read* "
                      + subpaths([real_ws] + runtime + real_scratch) + ")")
         parts.append("(allow file-write* " + subpaths([real_ws] + real_scratch) + ")")
@@ -477,8 +495,8 @@ class _MacOSBackend:
         # ordering rule) can override the control-root denial. file-read*
         # includes file-read-metadata: the holdout's existence/shape is not
         # even statable.
-        parts.append(f'(deny file-read* (subpath "{real_deny}"))')
-        parts.append(f'(deny file-write* (subpath "{real_deny}"))')
+        parts.append(f'(deny file-read* (subpath "{_sbpl_str(real_deny)}"))')
+        parts.append(f'(deny file-write* (subpath "{_sbpl_str(real_deny)}"))')
         return ["sandbox-exec", "-p", "".join(parts)]
 
 

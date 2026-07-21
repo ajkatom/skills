@@ -7826,6 +7826,50 @@ def _terminal_anchor_pending_sha(run_dir):
     return sha
 
 
+def _is_no_action_terminal(run_dir, run_id, prior, cfg=None, control_root=None):
+    """DF-R7-05: True iff `prior` is a SHIP_FAILED terminal with NO successfully
+    APPLIED action — a materialization failure (failed_action:null, nothing
+    spawned) or a reconcile-abort (an action's effect is UNKNOWN, never a
+    completed `ok`). Requires:
+      * the record claims NO `ok` action, AND
+      * the journal has NO SHIP_ACTION_RESULT with status 'ok' (no completed
+        per-action evidence).
+    Because NOTHING was successfully applied, re-sealing this as a no-action
+    SHIP_FAILED is inert — it cannot launder to SHIPPED, cannot skip an applied
+    effect, and no future ship reads this terminal for `already_done` (that comes
+    from the signed journal tokens). A record with ANY completed action fails
+    this and must go through the full _failed_ship_record_bound check."""
+    if prior.get("outcome") != df_ship.SHIP_FAILED:
+        return False
+    if any(isinstance(a, dict) and a.get("status") == "ok"
+           for a in (prior.get("actions") or [])):
+        return False
+    for e in _ship_journal_events(run_dir):
+        if (e.get("state") == "SHIP_ACTION_RESULT"
+                and e.get("data", {}).get("status") == "ok"):
+            return False
+    # DF-R7-05 (opus review F1): the journal is same-user writable, so re-root
+    # the "nothing shipped" claim on the SIGNED CHAIN — the real M56b trust
+    # boundary. If ANY signature-valid per-action ship token exists, the run DID
+    # ship something; it is NOT a no-action terminal and must go through full
+    # evidence binding (never the reseal shortcut), even if the journal was
+    # emptied to hide it. Fail-closed on any chain read/verify error.
+    if cfg is not None and bool(cfg.get("_audit", {}).get("signing")):
+        try:
+            key = df_audit.load_key(cfg["_audit"]["key_path"])
+            chain_path = os.path.join(control_root, "audit-chain.jsonl")
+            ok, _why = df_audit_chain.verify_chain(chain_path, key)
+            if not ok:
+                return False
+            prefix = f"{run_id}.ship-action."
+            for entry in df_audit_chain.read_chain(chain_path):
+                if str(entry.get("invocation", "")).startswith(prefix):
+                    return False
+        except (df_audit.AuditKeyError, df_audit_chain.ChainError, OSError, KeyError):
+            return False
+    return True
+
+
 def _failed_ship_record_bound(cfg, control_root, run_dir, run_id, prior,
                               artifact_object_id=None):
     """R5 DF-R5-02: bind an UNANCHORED SHIP_FAILED record to the run's signed +
@@ -7868,6 +7912,11 @@ def _failed_ship_record_bound(cfg, control_root, run_dir, run_id, prior,
                 f"{sorted(x for x in claimed_ok if x is not None)} do not match the signed "
                 f"per-action evidence {sorted(anchored_ok)}")
     failed = prior.get("failed_action")
+    # DF-R7-05 (opus review F2): a planted non-string failed_action (dict/list)
+    # is unhashable and would crash the `failed in anchored_ok` test with an
+    # uncaught TypeError — refuse it as a clean fail-closed, never a traceback.
+    if not (failed is None or isinstance(failed, str)):
+        return (False, "the record's failed_action is not a string/null (a tampered record)")
     # Opus-review HIGH: a record naming NO failed action binds nothing checkable
     # beyond the ok-set — an EMPTY one (the materialize-failure/reconcile-abort
     # shape, and equally a pure forgery) binds NOTHING at all, and a failed:None
@@ -8400,6 +8449,57 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                                                         run_id, prior,
                                                         artifact_object_id=artifact_object_id)
                 if not ok_b:
+                    # DF-R7-05 (R6-10): a NO-ACTION terminal — a materialization
+                    # failure (failed_action:null) or a reconcile-abort — sealed
+                    # during a signer outage cannot self-authenticate (it bound no
+                    # signed evidence, by construction it RAN NOTHING). M56b left
+                    # it a fail-closed refusal recoverable only by MANUALLY
+                    # deleting the record. Replace that state surgery with a
+                    # GOVERNED, operator-consented reseal: under `--decision
+                    # abort`, reconstruct a CLEAN no-action SHIP_FAILED from
+                    # AUTHENTICATED facts (empty action set + the manifest's
+                    # artifact id — never the writable prior blob) and anchor
+                    # THOSE bytes. This is SAFE: it runs no action, cannot launder
+                    # to SHIPPED (outcome stays SHIP_FAILED), cannot skip an
+                    # action, and is gated on explicit operator consent — the M56b
+                    # HIGH (SILENT re-anchor of a forged terminal) stays closed.
+                    if _is_no_action_terminal(run_dir, run_id, prior, cfg=cfg,
+                                              control_root=control_root):
+                        if decision == "abort":
+                            # DF-R7-05 (opus review F4): reconstruct from FACTS
+                            # only — no field taken from the writable prior blob.
+                            # The cause lives in the SHIP_TERMINAL_CAUSE_RESEALED
+                            # journal event, so failed_action need not (and does
+                            # not) carry the attacker-controlled prior value.
+                            clean = {"outcome": df_ship.SHIP_FAILED, "actions": [],
+                                     "pending_action": None, "failed_action": None,
+                                     "rollbacks": [], "rollback_failed": False}
+                            ship_journal.write("SHIP_TERMINAL_CAUSE_RESEALED",
+                                               cause=("materialize_failure"
+                                                      if prior.get("failed_action") is None
+                                                      else "reconcile_abort"))
+                            rec2, _s, anchor2 = _seal_ship_result(
+                                cfg, control_root, run_dir, run_id, ship_journal, clean,
+                                artifact_object_id, redactor,
+                                ship_actions=ship_cfg["actions"])
+                            if signing_on and anchor2 != "anchored":
+                                sys.stderr.write(
+                                    "dark-factory: SHIP_EVIDENCE_PENDING — the no-action "
+                                    "SHIP_FAILED was rebuilt from authenticated facts but its "
+                                    "signed anchor still could not be committed; retry once the "
+                                    "signer is available.\n")
+                                return SHIP_EVIDENCE_PENDING_EXIT
+                            print("dark-factory: no-action SHIP_FAILED terminal re-sealed from "
+                                  "authenticated facts under operator consent (no action ran). "
+                                  f"See {result_path}.")
+                            return 3
+                        sys.stderr.write(
+                            "dark-factory: ship refused (fail-closed) — a no-action SHIP_FAILED "
+                            "terminal (materialize-failure / reconcile-abort) was sealed during a "
+                            "signer outage and cannot self-authenticate. It ran NOTHING; re-run "
+                            "`ship --decision abort` to re-seal it from authenticated facts under "
+                            "the now-available signer (no action runs).\n")
+                        return SHIP_STATE_UNAUTHENTICATED
                     sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the "
                                      f"unanchored SHIP_FAILED record could not be bound to "
                                      f"the run's evidence: {why_b}\n")
