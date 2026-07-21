@@ -111,7 +111,8 @@ def _full_bundle(profile):
     """A production bundle dict + manifest with EVERY required fact satisfied for
     `profile`. Each negative test mutates exactly one fact."""
     common = {
-        "source": {"sealed_commit": "a" * 40, "sealed_clean": True, "matches_sealed": True},
+        "source": {"sealed_commit": "a" * 40, "sealed_clean": True,
+                   "sealed_tree_digest": "t" * 64, "matches_sealed": True},
         "audit_chain": {"verified": True}, "config_sha256": "c" * 64,
         "ship_result": {"outcome": "SHIPPED", "authenticated": True,
                         "actions": [{"name": "deploy", "status": "ok", "reversible": True}]},

@@ -4190,6 +4190,41 @@ def _source_identity_field():
             "tree_digest": tree_digest}
 
 
+def _source_identity_stable(cfg):
+    """DF-R8-04: the CURRENT skill source identity, recomputed NOW, must be
+    non-null AND equal to this run's sealed anchor (`cfg["_source_identity"]`,
+    set at first dispatch and re-sealed on resume). Returns (ok, reason, si_now).
+
+    This is the per-dispatch guard: the pre-M71 code computed the source identity
+    ONCE at run setup and never re-checked it before each builder dispatch, so the
+    control-plane/support bytes could change (or become unknown) between dispatches
+    within one logical run and be restored before the final evidence seal. A git
+    failure that makes the current digest UNKNOWN fails CLOSED here (never a silent
+    proceed). A run that sealed NO tree digest (pre-M67 / non-git) has nothing to
+    enforce — it is stable by definition (there is no anchor to drift from).
+
+    DEPLOYMENT CONSTRAINT (opus review F3): the tree_digest hashes every
+    non-gitignored UNTRACKED file under the skill checkout, so the `control_root`
+    (whose run artifacts grow during the run) MUST live OUTSIDE the skill's git
+    working tree, or be gitignored — otherwise the run's own writes register as
+    source churn between dispatches and this guard seals a spurious SOURCE_DRIFT
+    (fail-closed, never unsafe). The runbook + examples already place the control
+    root outside the checkout."""
+    anchor = cfg.get("_source_identity") or {}
+    od = anchor.get("tree_digest")
+    if od is None:
+        return (True, "no sealed source-tree digest to enforce (legacy/non-git run)", None)
+    si_now = _source_identity_field()
+    nd = si_now.get("tree_digest")
+    if nd is None:
+        return (False, "the current skill source-tree digest is UNKNOWN (a git failure "
+                "must fail closed, never dispatch)", si_now)
+    if nd != od:
+        return (False, "the skill SOURCE changed mid-run (sealed tree/content digest != "
+                "current) — a logical run must execute under ONE source identity", si_now)
+    return (True, "source identity stable", si_now)
+
+
 def _builder_identity_field(cfg):
     """The sealed `builder_identity` manifest field (or None). Carries the
     operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
@@ -5926,6 +5961,42 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 if confine_state["enabled"]:
                     _confined_kwargs["confine"] = True
 
+                # DF-R8-04: recompute the skill SOURCE identity immediately before
+                # EVERY builder dispatch and refuse if it is unknown or drifted from
+                # the run's sealed anchor. The pre-M71 code sealed the source ONCE
+                # at run setup and never re-checked it, so the control-plane/support
+                # bytes could change between dispatches within one logical run (then
+                # be restored before the final evidence seal). Refuse BEFORE the
+                # dispatch intent / budget reservation, so a drift neither spends nor
+                # leaves a dangling intent. (Adapter + support-file identity is
+                # separately re-verified per dispatch — M62 _enforce_adapter_digests
+                # / _verify_support_files_at_dispatch.)
+                _src_ok, _src_why, _src_now = _source_identity_stable(cfg)
+                if not _src_ok:
+                    journal.write(
+                        "SOURCE_DRIFT_REFUSED", iteration=i,
+                        sealed_commit=(cfg.get("_source_identity") or {}).get("commit"),
+                        current_commit=(_src_now or {}).get("commit"),
+                        current_digest_known=((_src_now or {}).get("tree_digest") is not None),
+                        phase=f"dispatch_{i}")
+                    mf = dict(mb_clean, outcome="SOURCE_DRIFT", iterations=i, qualified=False,
+                             final_exam={"ran": False, "passed": None, "count": 0},
+                             regressions=sorted(regressed),
+                             budget=_budget_manifest_field(cfg["_budget"], builder_calls,
+                                                           estimated_usd),
+                             usage=_usage_manifest_field(cfg["_budget"], usage_known,
+                                                         builder_input_tokens,
+                                                         builder_output_tokens))
+                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                                digest, audit_key, journal)
+                    _clear_state()
+                    _kb_writeback(cfg, journal, mf, [])
+                    sys.stderr.write(
+                        f"dark-factory: builder dispatch refused (fail-closed) at iteration {i} — "
+                        f"{_src_why}. No builder ran; start a fresh run under the current source.\n")
+                    return anchor_exit or 2
+
                 # --- DF-08/M35: crash-safe dispatch. Journal INTENT to dispatch
                 # a paid builder call, and COMMIT the reservation computed above
                 # (calls_after/est_after) to durable state, BOTH before the call
@@ -6519,14 +6590,18 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         # identity (they match), so the manifest stays run-stable.
         # DF-R7-04 (opus F1): the ORIGINAL source identity comes from the JOURNAL
         # (SOURCE_IDENTITY, written at first dispatch — always present for an
-        # M67-era run, unlike the per-pause manifest). Its presence is the
-        # reliable "this run tracked source identity" signal:
-        #   * present (M67 run): recompute and REFUSE on any tree-digest drift —
-        #     a resume under different source bytes (even same commit) fails
-        #     closed. The anchor file is cross-checked as defense in depth but
-        #     the journal is authoritative, so DELETING the anchor cannot
-        #     fail-open (the journal still carries the original).
+        # M67-era run, unlike the per-pause manifest). The PRESENCE of the event is
+        # the reliable "this run tracked source identity" signal:
+        #   * present (M67+ run): recompute and REFUSE on any drift (below) — a
+        #     resume under different source bytes (even same commit) fails closed.
         #   * absent (pre-M67 run): resume through the legacy path unchanged.
+        # DF-R8-04 (opus review F1): enforcement now triggers on the EVENT's
+        # presence, NOT on `tree_digest is not None`. The journal is same-user
+        # writable (no per-line HMAC), so gating on a non-null digest let an
+        # attacker NULL the journaled tree_digest to skip both this check AND the
+        # per-dispatch guard (which no-ops when `cfg["_source_identity"]` is unset).
+        # A nulled anchor is distinguished from a genuine non-git run by the CURRENT
+        # checkout: a real git repo recomputes a non-null digest now (see below).
         si_orig = None
         try:
             with open(os.path.join(run_dir, "journal.jsonl"), encoding="utf-8") as _jf:
@@ -6540,18 +6615,52 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                         break
         except OSError:
             si_orig = None
-        if isinstance(si_orig, dict) and si_orig.get("tree_digest") is not None:
+        if isinstance(si_orig, dict):
             si_now = _source_identity_field()
             od, nd = si_orig.get("tree_digest"), si_now.get("tree_digest")
-            if nd is not None and od != nd:
+            # DF-R8-04: fail CLOSED unless the CURRENT source is confirmed identical
+            # to the sealed anchor.
+            #   * anchor HAS a digest (normal git run): the current digest must be
+            #     non-null AND equal — an UNKNOWN current digest (a git failure) must
+            #     never resume-proceed (the pre-M71 `nd is not None and od != nd`
+            #     let it through).
+            #   * anchor digest is NULL: this is HONEST only when the digest was
+            #     genuinely unknowable at seal — in which case `clean` is ALSO None
+            #     (both are computed together in _source_identity_field; a null
+            #     tree_digest never coexists with a definite clean). So a null anchor
+            #     with `clean` still True/False is a FORGED/emptied anchor: an
+            #     attacker nulled the journaled tree_digest (or forged clean=True) to
+            #     dodge this check AND make the bundle's matches_sealed degrade to a
+            #     commit-only comparison (opus review F1 + its residual). Refuse on
+            #     the impossible (clean, tree_digest) combination — this also catches
+            #     the attacker who additionally suppresses the CURRENT git digest
+            #     (nd None), which an nd-based check would miss. A genuinely
+            #     unknown-source run (clean None) has nothing to enforce and proceeds
+            #     (matching pre-M71, no new false refusal).
+            if od is not None:
+                drift = (nd is None or nd != od)
+            else:
+                drift = (si_orig.get("clean") is not None)
+            if drift:
                 journal.write("SOURCE_DRIFT_REFUSED",
                               sealed_commit=si_orig.get("commit"),
-                              current_commit=si_now.get("commit"))
+                              current_commit=si_now.get("commit"),
+                              sealed_digest_known=(od is not None),
+                              current_digest_known=(nd is not None))
+                if od is None:
+                    _reason = ("this run's sealed source anchor is INTERNALLY INCONSISTENT "
+                               "(a null tree-digest paired with a definite cleanliness) — an "
+                               "emptied/forged source anchor")
+                elif nd is None:
+                    _reason = ("the current skill source-tree digest is UNKNOWN (a git failure "
+                               "must never resume-proceed)")
+                else:
+                    _reason = "the tree/content digest differs"
                 sys.stderr.write(
-                    "dark-factory: resume refused (fail-closed) — the skill SOURCE changed "
-                    f"since this run's first dispatch (original commit {si_orig.get('commit')}, "
-                    f"now {si_now.get('commit')}; tree/content digest differs). A logical run "
-                    "must execute under ONE source identity; start a fresh run under the new "
+                    "dark-factory: resume refused (fail-closed) — the skill SOURCE could not be "
+                    f"confirmed identical to this run's first dispatch ({_reason}; original commit "
+                    f"{si_orig.get('commit')}, now {si_now.get('commit')}). A logical run must "
+                    "execute under ONE source identity; start a fresh run under the current "
                     "source instead of resuming.\n")
                 release_lock(lock)
                 return 2

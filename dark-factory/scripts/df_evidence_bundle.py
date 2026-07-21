@@ -524,6 +524,15 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
         unmet.append("no sealed source commit")
     if src.get("sealed_clean") is not True:      # DF-R7-04: clean must be EXPLICIT True
         unmet.append("source tree not explicitly clean at run start")
+    # DF-R8-04 (opus review, M71 residual): a null sealed tree_digest makes
+    # `matches_sealed` degrade to a COMMIT-ONLY comparison (the exact weakness the
+    # R7-04 tree_digest exists to remove) — and `{clean:True, tree_digest:null}` is
+    # an impossible honest combination (a forged/emptied anchor). Require a real
+    # sealed tree digest for a production GO; a commit-only source binding is not
+    # sufficient.
+    if not src.get("sealed_tree_digest"):
+        unmet.append("no sealed source-tree digest (a commit-only source binding is not "
+                     "sufficient for production evidence — R7-04/R8-04)")
     if not src.get("matches_sealed"):
         unmet.append("assembly-time source does not match the sealed source identity")
     if bundle["audit_chain"].get("verified") is not True:
