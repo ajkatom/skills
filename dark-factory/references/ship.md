@@ -121,7 +121,12 @@ If ANY action is `reversible: false`:
    crash-before-seal recovery (and the `--decision reconcile` path) still
    authenticates every action that really ran, while a planted/edited
    `SHIP_ACTION_RESULT ok` (to skip a real action) or a planted terminal result is
-   **refused** (exit 2, `SHIP_STATE_UNAUTHENTICATED`). Per-action anchoring is
+   **refused** (exit 2, `SHIP_STATE_UNAUTHENTICATED`). A re-entry onto an
+   already-terminal `SHIPPED` record runs no action and, under signing, journals a
+   signed `SHIP_REENTRY_VERIFIED` token (binding the exact authenticated
+   `ship_result.json` bytes + a fresh nonce) — the positive, chain-authenticated
+   proof of an idempotent re-entry that the production evidence bundle
+   (`reentry.reentry_verified`) requires. Per-action anchoring is
    deliberate: a single seal-time journal digest could not tell a legitimate
    crash-before-first-seal (no anchor yet) from a tampered journal (both look
    anchor-less), and would brick crash recovery. Fail-closed on any chain
