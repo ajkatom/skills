@@ -201,6 +201,22 @@ ship (`AWAIT_SHIP`). At **enterprise**, a converged run instead seals the
 split-custody attestation is attached (`df-custody attach`), so the human gate
 there is the custody sign-off, not a pause.
 
+**No-action terminal recovery (DF-R7-05).** A materialization failure or a
+reconcile-abort seals a SHIP_FAILED that ran NOTHING. If the audit signer was
+down at that moment its local anchor is pending and the record cannot
+self-authenticate on re-entry. A plain `ship` re-entry stays fail-closed (exit
+2, never a silent re-anchor); to recover, re-run `ship --decision abort` — under
+that explicit operator consent the no-action terminal is **rebuilt from
+authenticated facts** (empty action set + the manifest's artifact id, never the
+writable prior record) and anchored under the now-available signer. No action
+runs, and it can never become SHIPPED — so this replaces the old "manually delete
+the record" step with a governed command. A terminal that shows ANY completed
+`ok` action (in the record OR the signed audit chain) is NOT eligible for this
+shortcut and goes through full evidence binding. **`--decision abort` is
+destructive, not a repair:** it seals the run FAILED. Use it only for a genuine
+no-run failure; on a plain re-entry a healthy run proceeds normally, so reach for
+abort only when you intend to abandon the ship.
+
 ## Honest scope — NOT sandboxed
 
 Ship actions legitimately need **real network + credentials** (that is the
