@@ -283,6 +283,10 @@ SHIP_AUDIT_PENDING = 12
 # family: 13.
 SHIP_EVIDENCE_PENDING_EXIT = 13
 
+# DF-R7-04: the run-state anchor for the source identity computed at the first
+# dispatch — the resume drift-check compares a fresh computation against this.
+SOURCE_IDENTITY_FILE = "source_identity.json"
+
 # M49 DF-R3-03: on re-entry a prior ship_result.json (or the ship journal that
 # feeds `already_done`) could not be AUTHENTICATED against the signed audit chain
 # (missing/mismatched/tampered) while audit.signing is on — a same-user
@@ -4133,23 +4137,57 @@ def _source_identity_field():
     signed when the run is signed), never a `git rev-parse` performed at bundle
     assembly time (which reflects whatever the checkout is THEN, not what ran).
 
-    Records the skill repo's HEAD commit + whether the working tree was dirty at
-    run start (an uncommitted change makes the commit alone an incomplete source
-    identity). Best-effort: a non-git checkout seals {commit: null, dirty: null},
-    still an honest sealed statement. Never raises."""
+    Records the skill repo's HEAD commit, a DETERMINISTIC source-tree/content
+    digest (DF-R7-04 — the commit alone does not identify uncommitted bytes, and
+    two different working trees can share one commit), and a TRI-STATE
+    cleanliness (`clean`: True / False / None-unknown). The `tree_digest` binds
+    HEAD + the full uncommitted diff of tracked files + the untracked-file
+    listing, so a resume under different bytes (even at the same commit) is
+    detectable. Best-effort: a non-git checkout seals nulls, still an honest
+    sealed statement. `clean` is None (UNKNOWN), never a false `True`/`False`,
+    when a git command fails after rev-parse — the production gate treats
+    unknown-cleanliness as not-production-ready. Never raises."""
     skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    commit, dirty = None, None
+    commit, clean, tree_digest = None, None, None
+
+    def _git(*args):
+        return subprocess.run(["git", "-C", skill_dir, *args],
+                              capture_output=True, text=True, timeout=15)
     try:
-        r = subprocess.run(["git", "-C", skill_dir, "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=10)
+        r = _git("rev-parse", "HEAD")
         if r.returncode == 0:
             commit = r.stdout.strip()
-            st = subprocess.run(["git", "-C", skill_dir, "status", "--porcelain"],
-                                capture_output=True, text=True, timeout=10)
-            dirty = bool(st.returncode == 0 and st.stdout.strip())
+            status = _git("status", "--porcelain")
+            diff = _git("diff", "HEAD")            # tracked-file content changes
+            if status.returncode == 0 and diff.returncode == 0:
+                porcelain = status.stdout
+                clean = not porcelain.strip()
+                # DF-R7-04 (opus F3): `git diff HEAD` + `status --porcelain`
+                # capture committed state + tracked-file content changes, but
+                # UNTRACKED files appear by NAME only — their CONTENT is not
+                # bound. Hash each untracked file's bytes so a new/changed
+                # untracked source file changes the digest (the "identify all
+                # code used" claim needs content, not just names).
+                untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+                untracked_digests = {}
+                if untracked.returncode == 0 and untracked.stdout:
+                    for rel in untracked.stdout.split("\0"):
+                        if not rel:
+                            continue
+                        ap = os.path.join(skill_dir, rel)
+                        untracked_digests[rel] = sha256_file(ap) if os.path.isfile(ap) else None
+                tree_digest = sha256_str(
+                    canonical_json({"commit": commit,
+                                    "diff": diff.stdout,
+                                    "status": porcelain,
+                                    "untracked": untracked_digests}))
+            # else: clean stays None (UNKNOWN) — a git failure is not "clean".
     except (OSError, subprocess.SubprocessError):
         pass
-    return {"commit": commit, "dirty": dirty}
+    # `dirty` kept for back-compat readers (== not clean); None-safe.
+    dirty = (not clean) if clean is not None else None
+    return {"commit": commit, "clean": clean, "dirty": dirty,
+            "tree_digest": tree_digest}
 
 
 def _builder_identity_field(cfg):
@@ -4293,6 +4331,17 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     run_dir = os.path.join(control_root, "runs", invocation)
     os.makedirs(run_dir, exist_ok=True)
     journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
+
+    # DF-R7-04: compute the source identity ONCE at run start, stash it on cfg
+    # (so the fresh manifest seals it), persist it as the run-state anchor, AND
+    # journal it. The JOURNAL (always present for any dispatched run, unlike the
+    # per-pause manifest) is the reliable "this run tracked source identity"
+    # signal + the original value the resume drift-check compares against.
+    cfg["_source_identity"] = _source_identity_field()
+    atomic_write(os.path.join(run_dir, SOURCE_IDENTITY_FILE),
+                 canonical_json(cfg["_source_identity"]))
+    # (the SOURCE_IDENTITY journal event is written after SNAPSHOT below, so the
+    #  documented INIT -> GATE_PASSED -> SNAPSHOT journal prefix is preserved.)
 
     audit_key, audit_err = _load_audit_key(cfg, journal)
     if audit_err is not None:
@@ -4473,7 +4522,7 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         "builder_identity": _builder_identity_field(cfg),
         # DF-R6-07: the SKILL source revision, sealed so the evidence bundle
         # reports a value BOUND to the run, not a post-hoc rev-parse.
-        "source_identity": _source_identity_field(),
+        "source_identity": cfg.get("_source_identity") or _source_identity_field(),
     }
 
     # --- Pre-build gate (M7): mutation validation + coverage traceability,
@@ -4728,6 +4777,10 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     atomic_write(os.path.join(workspace, "spec.md"), spec_text)
     journal.write("SNAPSHOT", workspace=workspace, snapshot_sha256=snap_hash,
                   file_count=len(manifest["files"]))
+    # DF-R7-04: journal the source identity (pre-dispatch, after SNAPSHOT so the
+    # INIT->GATE_PASSED->SNAPSHOT prefix is preserved). The resume drift-check
+    # reads this event; its presence marks an M67-era source-tracked run.
+    journal.write("SOURCE_IDENTITY", **cfg["_source_identity"])
     manifest_base["snapshot_sha256"] = snap_hash
 
     # DF-R5-09: pin the image identity BEFORE resolve_isolation — its container
@@ -6456,6 +6509,54 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
 
+        # DF-R7-04: refuse SOURCE DRIFT. The first dispatch persisted its source
+        # identity (commit + tree/content digest); if the checkout has since
+        # moved — even to a different working tree at the same commit — the
+        # logical run would seal an artifact partly built under DIFFERENT
+        # supervisor/control-plane bytes than it started with. Compare the
+        # persisted anchor to a fresh computation; a mismatch is a fail-closed
+        # refusal (exit 2). The resume then re-seals the ORIGINAL sealed source
+        # identity (they match), so the manifest stays run-stable.
+        # DF-R7-04 (opus F1): the ORIGINAL source identity comes from the JOURNAL
+        # (SOURCE_IDENTITY, written at first dispatch — always present for an
+        # M67-era run, unlike the per-pause manifest). Its presence is the
+        # reliable "this run tracked source identity" signal:
+        #   * present (M67 run): recompute and REFUSE on any tree-digest drift —
+        #     a resume under different source bytes (even same commit) fails
+        #     closed. The anchor file is cross-checked as defense in depth but
+        #     the journal is authoritative, so DELETING the anchor cannot
+        #     fail-open (the journal still carries the original).
+        #   * absent (pre-M67 run): resume through the legacy path unchanged.
+        si_orig = None
+        try:
+            with open(os.path.join(run_dir, "journal.jsonl"), encoding="utf-8") as _jf:
+                for _line in _jf:
+                    try:
+                        _e = json.loads(_line)
+                    except ValueError:
+                        continue
+                    if _e.get("state") == "SOURCE_IDENTITY":
+                        si_orig = _e.get("data", {})
+                        break
+        except OSError:
+            si_orig = None
+        if isinstance(si_orig, dict) and si_orig.get("tree_digest") is not None:
+            si_now = _source_identity_field()
+            od, nd = si_orig.get("tree_digest"), si_now.get("tree_digest")
+            if nd is not None and od != nd:
+                journal.write("SOURCE_DRIFT_REFUSED",
+                              sealed_commit=si_orig.get("commit"),
+                              current_commit=si_now.get("commit"))
+                sys.stderr.write(
+                    "dark-factory: resume refused (fail-closed) — the skill SOURCE changed "
+                    f"since this run's first dispatch (original commit {si_orig.get('commit')}, "
+                    f"now {si_now.get('commit')}; tree/content digest differs). A logical run "
+                    "must execute under ONE source identity; start a fresh run under the new "
+                    "source instead of resuming.\n")
+                release_lock(lock)
+                return 2
+            cfg["_source_identity"] = si_orig  # re-seal the ORIGINAL on resume
+
         # M36a Task 3: validate the phase-aware FSM hash chain BEFORE doing any
         # work. A 0.2 state records a head into a per-run fsm_chain.jsonl; recompute
         # the whole chain + verify head-of-chain. ANY mismatch -> refuse,
@@ -6621,7 +6722,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
             # the builder's model_identity AND every support-file digest, sealed
             # on resume too.
             "builder_identity": _builder_identity_field(cfg),
-            "source_identity": _source_identity_field(),  # DF-R6-07
+            "source_identity": cfg.get("_source_identity") or _source_identity_field(),  # DF-R6-07 / DF-R7-04
         }
 
         # M7: coverage/oracle are deterministic from the control root +
@@ -9056,9 +9157,14 @@ def main():
                       help="path to the audit key; supply it to record a real signed-chain "
                            "verification result in the bundle (else it records UNVERIFIED)")
     p_eb.add_argument("--require-production", action="store_true",
-                      help="DF-R6-07: add a production_ready verdict that fails closed (exit 3) "
-                           "on ANY missing/unverified required section — so a partial or mock "
-                           "exercise can never read as production-GO evidence")
+                      help="DF-R6-07/R7-03: add a production_ready verdict that fails closed "
+                           "(exit 3) unless EVERY fact the named --profile requires is present, "
+                           "bound, and cryptographically verified — a partial or mock exercise "
+                           "can never read as production-GO evidence")
+    p_eb.add_argument("--profile", choices=["hardened-h4", "enterprise"], default=None,
+                      help="DF-R7-03: the production evidence profile to enforce with "
+                           "--require-production (hardened-h4 = Exercise A, enterprise = "
+                           "Exercise B)")
     p_res = sub.add_parser("resume", help="resume a paused run")
     p_res.add_argument("--control-root", required=True)
     p_res.add_argument("--decision", choices=["continue", "accept", "abort", "reconcile"],
@@ -9287,7 +9393,7 @@ def main():
                 sys.exit(2)
         bundle, err = df_evidence_bundle.assemble(
             args.control_root, args.run_dir, key=ekey,
-            require_production=args.require_production)
+            require_production=args.require_production, profile=args.profile)
         if err is not None:
             sys.stderr.write(f"dark-factory: {err}\n")
             sys.exit(2)

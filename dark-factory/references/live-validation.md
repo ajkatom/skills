@@ -81,9 +81,15 @@ supervisor.py evidence-bundle <control_root> --run-dir <run_dir> \
     --key-path <audit_key> --out bundle.json
 ```
 
-`df_evidence_bundle` is **read-only** — it makes no network calls and re-runs
-nothing. It pulls, from the sealed artifacts, exactly the fields the arbitration
-requires and drops any secret-bearing value:
+`df_evidence_bundle` is **read-only** and re-runs nothing, but it is **not
+offline** (DF-R7-07): verifying a required off-box sink receipt performs a
+read-only HTTP GET (http-append) or a signed S3 GET (s3-objectlock) against the
+remote sink — so bundle assembly needs network reachability to the sink and, for
+S3, usable read credentials (`DF_AUDIT_S3_ACCESS_KEY` / `DF_AUDIT_S3_SECRET_KEY`).
+It never writes to the sink. Pass `--require-production --profile hardened-h4`
+(Exercise A) or `--profile enterprise` (Exercise B) to get a fail-closed
+production verdict. It pulls, from the sealed artifacts, exactly the fields the
+arbitration requires and drops any secret-bearing value:
 
 - exact source commit + `config_sha256` / `spec_sha256` / `scenario_set_sha256`;
 - `requested_tier` and `effective_tier`;
