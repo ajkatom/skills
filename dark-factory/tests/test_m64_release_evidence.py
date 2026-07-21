@@ -123,7 +123,7 @@ def test_planted_unanchored_attestation_is_ignored_at_ship(tmp_path):
 # ---------------------------------------------------------------------------
 
 import df_evidence_bundle
-from test_supervisor import FAKE, setup_control, stub_network_probe
+from test_supervisor import FAKE, setup_control, stub_candidate_sandbox
 
 
 def _standard_converged_run(tmp_path, monkeypatch):
@@ -131,7 +131,7 @@ def _standard_converged_run(tmp_path, monkeypatch):
     cfg = json.loads((cr / "config.json").read_text())
     cfg["assurance"] = "standard"
     (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    stub_network_probe(monkeypatch)
+    stub_candidate_sandbox(monkeypatch)
     monkeypatch.setattr(supervisor, "resolve_isolation",
                         lambda *a, **k: ("standard", [], "fake-standard-backend", True))
     assert supervisor.run(str(cr), None) == 0

@@ -60,6 +60,44 @@ def stub_network_probe(monkeypatch):
     monkeypatch.setattr(supervisor.df_sandbox, "probe_candidate_confinement",
                         lambda *a, **k: (True, {"mode": "default_deny", "residuals": []}))
 
+
+class _FakeDenyBackend:
+    """A default-deny-capable sandbox double for IN-PROCESS qualified-standard
+    convergence tests that fake resolve_isolation. Stubbing the probes alone is
+    NOT enough on a host without the real primitive (GitHub's ubuntu runners
+    ship no bwrap): resolve_candidate_prefix would still build a REAL candidate
+    wrapper via df_sandbox.current_backend(), so every scenario dispatch either
+    fail-closes before the loop ("no sandbox backend available", exit 2) or
+    crashes on the missing binary and the run caps out. This double keeps the
+    qualification WIRING identical (supports_default_deny, mode "default_deny",
+    the soft process_group_escape residual -- same qualified host_isolation the
+    macOS host backend produces) while the candidate runs unwrapped. The real
+    profiles stay covered by test_candidate_confinement.py and the live tests,
+    which skip honestly where the OS primitive is absent."""
+    name = "fake-standard-backend"
+    supports_default_deny = True
+    provides_pid_namespace = False
+
+    def available(self):
+        return True
+
+    def wrap_prefix(self, control_root, workspace, network=None, **kw):
+        return []
+
+    def wrap_candidate_prefix(self, control_root, workspace, network=None,
+                              allowed_loopback_ports=None, **kw):
+        return []
+
+
+def stub_candidate_sandbox(monkeypatch):
+    """Everything an in-process qualified-standard run needs to stay hermetic
+    on ANY host: the network/confinement probes (stub_network_probe) plus a
+    backend double so no real sandbox binary is ever exec'd. Pair with a faked
+    supervisor.resolve_isolation for the builder half."""
+    stub_network_probe(monkeypatch)
+    monkeypatch.setattr(supervisor.df_sandbox, "current_backend",
+                        lambda: _FakeDenyBackend())
+
 TOY_SPEC = """# greet CLI
 Create an executable python file `greet.py` in the workspace root.
 - `python3 greet.py <name>` prints exactly `Hello, <name>!` and exits 0.
