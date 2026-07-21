@@ -7789,6 +7789,34 @@ def _ship_completed_action_facts(run_dir):
     return facts
 
 
+def _ship_reentry_payload(run_id, ship_result_sha256, nonce):
+    """DF-R8-02: the canonical bytes whose sha256 is a SHIP_REENTRY_VERIFIED
+    token. It binds the run, the sha256 of the EXACT authenticated ship_result.json
+    the re-entry re-verified, and a fresh per-re-entry nonce. Anchored into the
+    signed chain, it is the POSITIVE proof — recomputable from the journal — that
+    the mandated 'ship again and prove idempotence' exercise actually ran against
+    THIS terminal and dispatched no new action (the re-entry returns before the
+    action loop; its very existence attests no redispatch)."""
+    return canonical_json({"kind": "ship-reentry-verified", "run_id": run_id,
+                           "ship_result_sha256": ship_result_sha256, "nonce": nonce})
+
+
+def _record_ship_reentry_verified(cfg, control_root, run_dir, run_id, ship_journal,
+                                  ship_result_sha256):
+    """DF-R8-02: on an authenticated terminal-SHIPPED re-entry that runs NOTHING,
+    anchor a signed SHIP_REENTRY_VERIFIED token (binding the authenticated
+    ship_result bytes + a fresh nonce) and journal it, so the production evidence
+    bundle has a positive, chain-authenticated re-entry fact. Fail-soft: if the
+    anchor cannot commit (signer down), the event is journaled `anchored:false` and
+    the bundle simply won't count it — never a brick of the idempotent re-entry."""
+    nonce = uuid.uuid4().hex
+    payload = _ship_reentry_payload(run_id, ship_result_sha256, nonce)
+    status = _anchor_ship_local(cfg, control_root, run_id, payload, "ship-reentry")
+    ship_journal.write("SHIP_REENTRY_VERIFIED", ship_result_sha256=ship_result_sha256,
+                       nonce=nonce, anchored=(status == "anchored"))
+    return status
+
+
 def _authenticate_ship_chain(cfg, control_root, run_id, target_sha, kind):
     """M49 DF-R3-03 core (ship record): verify the signed audit chain and confirm
     ANY signature-valid chain entry for this run's `kind` ('ship') anchors
@@ -8777,6 +8805,16 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
             if not ok_r:
                 needs_audit_retry = True
         if not needs_audit_retry:
+            # DF-R8-02: this re-entry AUTHENTICATED the existing terminal SHIPPED
+            # (prior_text is chain-anchored under signing) and ran NOTHING — the
+            # mandated idempotence exercise. Record a signed SHIP_REENTRY_VERIFIED
+            # event binding these exact bytes so the production bundle has POSITIVE
+            # proof the re-entry occurred without redispatch (the terminal auth
+            # alone left no trace). Only under signing (else the chain is not a
+            # trust boundary and the event would attest nothing).
+            if signing_on:
+                _record_ship_reentry_verified(cfg, control_root, run_dir, run_id,
+                                              ship_journal, sha256_str(prior_text))
             print(f"dark-factory: ship already terminal (SHIPPED); see {result_path}. "
                   "Not re-shipping.")
             return 0
