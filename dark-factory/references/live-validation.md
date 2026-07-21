@@ -50,8 +50,10 @@ storage keeps you at **"mechanism tested,"** never "production-validated."
    equal across every dispatch.
 3. `supervisor.py verify-manifest --run-dir <run> --key-path <key>` and
    `supervisor.py verify-chain <cr> --key-path <key>` — both must verify.
-4. Ship a reversible action; then re-run `ship` and confirm it is idempotent
-   (no duplicate action).
+4. Ship a reversible action; then re-run `ship` and confirm it is idempotent —
+   the second `ship` authenticates the terminal and journals a signed
+   `SHIP_REENTRY_VERIFIED` event (no duplicate action, no re-dispatch), which the
+   bundle's `reentry.reentry_verified` fact requires.
 
 ## Exercise B — enterprise custody + required WORM sink
 
@@ -74,33 +76,60 @@ storage keeps you at **"mechanism tested,"** never "production-validated."
 
 ## Assemble the evidence bundle
 
-After each exercise completes, produce the machine-checkable bundle:
+After each exercise completes, produce the machine-checkable bundle. Pass
+`--require-production` with the exercise's `--profile` so the bundle carries a
+fail-closed `production_ready` verdict (exit 3 unless every required fact is
+present, bound, and verified) — the example is executable as written:
 
 ```
+# Exercise A (hardened H4):
 supervisor.py evidence-bundle <control_root> --run-dir <run_dir> \
-    --key-path <audit_key> --out bundle.json
+    --key-path <audit_key> --require-production --profile hardened-h4 \
+    --out bundle.json
+
+# Exercise B (enterprise): same, with --profile enterprise
 ```
+
+> The `control_root` MUST live OUTSIDE the skill's git checkout (or be
+> gitignored). The source-identity tree digest (DF-R7-04/R8-04) hashes untracked
+> files under the checkout, so a control root nested in the skill tree would make
+> the run's own artifacts read as source drift and fail closed mid-run.
 
 `df_evidence_bundle` is **read-only** and re-runs nothing, but it is **not
 offline** (DF-R7-07): verifying a required off-box sink receipt performs a
 read-only HTTP GET (http-append) or a signed S3 GET (s3-objectlock) against the
 remote sink — so bundle assembly needs network reachability to the sink and, for
 S3, usable read credentials (`DF_AUDIT_S3_ACCESS_KEY` / `DF_AUDIT_S3_SECRET_KEY`).
-It never writes to the sink. Pass `--require-production --profile hardened-h4`
-(Exercise A) or `--profile enterprise` (Exercise B) to get a fail-closed
-production verdict. It pulls, from the sealed artifacts, exactly the fields the
-arbitration requires and drops any secret-bearing value:
+It never writes to the sink. It pulls, from the sealed artifacts, exactly the
+fields the arbitration requires and drops any secret-bearing value:
 
-- exact source commit + `config_sha256` / `spec_sha256` / `scenario_set_sha256`;
+- exact source commit + **`source.sealed_tree_digest`** (a null digest — a
+  commit-only binding — is not production-sufficient) + `config_sha256` /
+  `spec_sha256` / `scenario_set_sha256`;
 - `requested_tier` and `effective_tier`;
-- resolved/persisted image digest;
-- denial, confinement, seccomp, and egress probe results;
+- image identity — `image.pinned` and `resolved_image_digest` (a mutable tag that
+  merely *resolves* to a digest is not pinned; the profile requires `image_pinned`
+  or an `@sha256`-pinned reference);
+- `denial_probe_passed`, `builder_confinement` (enabled), `enterprise_seccomp`
+  (probe `verified`), and `enterprise_egress` probe results;
 - sealed `manifest_sha256` and artifact object identity;
 - signed-chain verification output;
 - custody claim / signatures / attestation facts;
-- off-box sink key + **version_id** + body sha256 for each receipt;
-- ship result + release-approval result; and
-- re-entry proof (`no_duplicate_actions`).
+- each receipt (ship / **`custody_sink_receipt`** / release), server-issued +
+  bound to its exact record bytes + read back, with sink key + **version_id** +
+  body sha256 — and, for an irreversible enterprise ship, the release scope must
+  cover every irreversible action;
+- **`ship_result.authenticated`** — the exact final `ship_result.json` bytes are
+  anchored in the signed chain (not merely present in the writable file); and
+- the idempotent re-entry proof: `reentry.no_duplicate_or_unknown_actions` **and**
+  `reentry.reentry_verified.verified` — a signed `SHIP_REENTRY_VERIFIED` token
+  proving the mandated second `ship` (below) authenticated THIS exact terminal and
+  dispatched no new action.
+
+> The production verdict requires the re-entry exercise: run `ship` **twice** (the
+> reversible-action step in each exercise already does — the second `ship`
+> authenticates the terminal and records the signed `SHIP_REENTRY_VERIFIED`
+> proof). A single-ship run reads `production_ready: false` until re-entered.
 
 **The bundle contains no credential values.** Review it, then attach it to the
 re-audit submission.
