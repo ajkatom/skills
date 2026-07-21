@@ -18,7 +18,7 @@ import pytest
 
 import df_evidence_bundle
 import supervisor
-from test_supervisor import FAKE, setup_control, stub_network_probe
+from test_supervisor import FAKE, setup_control, stub_candidate_sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ def _standard_run(tmp_path, monkeypatch, checkpoint="auto"):
     cfg = json.loads((cr / "config.json").read_text())
     cfg["assurance"] = "standard"
     (cr / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    stub_network_probe(monkeypatch)
+    stub_candidate_sandbox(monkeypatch)
     monkeypatch.setattr(supervisor, "resolve_isolation",
                         lambda *a, **k: ("standard", [], "fake-standard-backend", True))
     return cr

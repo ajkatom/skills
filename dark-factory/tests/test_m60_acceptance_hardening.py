@@ -28,7 +28,7 @@ import df_audit_sink
 import df_evidence_bundle
 import df_ship
 import supervisor
-from test_supervisor import FAKE, setup_control, read_journal
+from test_supervisor import FAKE, setup_control, read_journal, stub_candidate_sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,7 @@ def test_evidence_bundle_assembles_from_a_completed_run(tmp_path, monkeypatch):
     cfg["assurance"] = "standard"
     cfg["roles"]["builder"]["support_files"] = [str(support)]
     (cr / "config.json").write_text(json.dumps(cfg))
+    stub_candidate_sandbox(monkeypatch)
     monkeypatch.setattr(supervisor, "resolve_isolation",
                         lambda *a, **k: ("standard", [], "fake-standard-backend", True))
     assert supervisor.run(str(cr), None) == 0
