@@ -70,6 +70,16 @@ def _read_json(path):
         return None, f"unreadable ({e})"
 
 
+def _read_text(path):
+    """The exact on-disk bytes as text, or None — for chain authentication /
+    token binding that must hash the real record, never a re-serialization."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def _source_commit(control_root):
     """The exact git commit of the SKILL source (this repo), or None. Best
     effort — a bundle from a non-git checkout just records None."""
@@ -246,7 +256,12 @@ def _verified_receipt(control_root, run_dir, basename):
              "body_sha256": receipt.get("body_sha256"),
              "server_issued": receipt.get("server_issued")}
     # The bytes the receipt binds are the sealed record it accompanies.
-    record_name = {"ship_sink_receipt.json": "ship_result.json"}.get(basename)
+    # DF-R8-03: bind the custody + release receipts too (the v2 map covered only
+    # the ship receipt, so a custody/release receipt read back as "verified" from
+    # readback alone without proving it accompanies THIS run's attestation bytes).
+    record_name = {"ship_sink_receipt.json": "ship_result.json",
+                   "custody_sink_receipt.json": "custody_attestation.json",
+                   "release_sink_receipt.json": "release_attestation.json"}.get(basename)
     att_text = None
     if record_name:
         try:
@@ -324,6 +339,62 @@ def _ship_journal_events_safe(run_dir):
     return out
 
 
+def _ship_result_authenticated(control_root, run_id, ship_result_text):
+    """DF-R8-02: verify the EXACT ship_result.json bytes are anchored in the signed
+    chain under this run's `ship` namespace — not merely present in a writable file.
+    None when there is no ship_result to authenticate."""
+    if ship_result_text is None:
+        return None
+    import supervisor
+    try:
+        ok, _why = supervisor._authenticate_ship_chain(
+            _cfg_of(control_root), control_root, run_id,
+            df_common.sha256_str(ship_result_text), "ship")
+        return bool(ok)
+    except Exception as e:
+        return f"ERROR: {e.__class__.__name__}: {e}"
+
+
+def _reentry_verified(control_root, run_dir, run_id, ship_result_text):
+    """DF-R8-02: True iff a signed SHIP_REENTRY_VERIFIED token exists — recomputed
+    from a journaled event (nonce + ship_result_sha256) and ANCHORED in the signed
+    chain — binding the sha256 of the EXACT current ship_result bytes. That is the
+    positive proof the mandated idempotent re-entry ran against THIS terminal
+    without redispatch (the emitting path returns before the action loop)."""
+    if ship_result_text is None:
+        return {"present": False, "verified": False, "reason": "no ship_result.json"}
+    import supervisor
+    import df_audit
+    import df_audit_chain
+    target_sha = df_common.sha256_str(ship_result_text)
+    cfg = _cfg_of(control_root)
+    try:
+        key = df_audit.load_key(cfg.get("_audit", {}).get("key_path"))
+    except Exception as e:
+        return {"present": False, "verified": False, "reason": f"key: {e}"}
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        ok, why = df_audit_chain.verify_chain(chain_path, key)
+        if not ok:
+            return {"present": False, "verified": False, "reason": f"chain: {why}"}
+        anchored = {e.get("manifest_sha256") for e in df_audit_chain.read_chain(chain_path)
+                    if str(e.get("invocation", "")).startswith(f"{run_id}.ship-reentry.")}
+    except Exception as e:
+        return {"present": False, "verified": False, "reason": f"{e.__class__.__name__}: {e}"}
+    events = [e for e in _ship_journal_events_safe(run_dir)
+              if e.get("state") == "SHIP_REENTRY_VERIFIED"]
+    for e in events:
+        d = e.get("data", {})
+        if d.get("ship_result_sha256") != target_sha:
+            continue
+        token = df_common.sha256_str(supervisor._ship_reentry_payload(
+            run_id, target_sha, d.get("nonce")))
+        if token in anchored:
+            return {"present": True, "verified": True, "count": len(events)}
+    return {"present": bool(events), "verified": False,
+            "reason": "no anchored SHIP_REENTRY_VERIFIED binds the current ship_result bytes"}
+
+
 def assemble(control_root, run_dir, key=None, require_production=False, profile=None):
     """Return (bundle_dict, error). error is a string only when the run is
     unreadable (no manifest). With require_production=True the bundle also carries
@@ -338,6 +409,9 @@ def assemble(control_root, run_dir, key=None, require_production=False, profile=
 
     container = manifest.get("container") or {}
     ship_result, _ = _read_json(os.path.join(run_dir, "ship_result.json"))
+    # DF-R8-02: the RAW ship_result bytes (for chain authentication + the re-entry
+    # token binding), never a re-serialization.
+    ship_result_text = _read_text(os.path.join(run_dir, "ship_result.json"))
     # DF-R6-07: the SEALED source identity (bound to the run, HMAC-signed when the
     # run is signed) vs. the value git shows at assembly time — reported both so a
     # mismatch (a checkout moved after the run) is visible, and the SEALED value is
@@ -376,7 +450,10 @@ def assemble(control_root, run_dir, key=None, require_production=False, profile=
         "denial_probe_passed": manifest.get("denial_probe_passed"),
         "sandbox_backend": manifest.get("sandbox_backend"),
         "builder_confinement": manifest.get("builder_confinement"),
-        "seccomp": manifest.get("seccomp"),
+        # DF-R8-03: the supervisor seals the enterprise seccomp proof under
+        # `enterprise_seccomp` (supervisor.py _finalize; NOT `seccomp`). The v2
+        # bundle read the wrong key, so the enterprise profile could never see it.
+        "enterprise_seccomp": manifest.get("enterprise_seccomp"),
         "enterprise_egress": manifest.get("enterprise_egress"),
         "adapter_sha256": manifest.get("adapter_sha256"),
         "builder_identity": manifest.get("builder_identity"),
@@ -391,8 +468,12 @@ def assemble(control_root, run_dir, key=None, require_production=False, profile=
         "release": _verified_release(control_root, run_dir, key),
         # receipts: positively read back + binding-checked.
         "ship_sink_receipt": _verified_receipt(control_root, run_dir, "ship_sink_receipt.json"),
-        "qualification_sink_receipt": _verified_receipt(
-            control_root, run_dir, "qualification_sink_receipt.json"),
+        # DF-R8-03: custody attach writes/verifies `custody_sink_receipt.json`
+        # (supervisor.py attach_custody); the v2 bundle looked for a nonexistent
+        # `qualification_sink_receipt.json`, so the enterprise custody receipt was
+        # always "absent". Read the real filename and bind it to its attestation.
+        "custody_sink_receipt": _verified_receipt(
+            control_root, run_dir, "custody_sink_receipt.json"),
         "release_sink_receipt": _verified_receipt(
             control_root, run_dir, "release_sink_receipt.json"),
         "ship_result": {
@@ -401,9 +482,18 @@ def assemble(control_root, run_dir, key=None, require_production=False, profile=
             "actions": [{"name": a.get("name"), "status": a.get("status"),
                          "reversible": a.get("reversible")}
                         for a in (ship_result or {}).get("actions", [])],
+            # DF-R8-02: the EXACT ship_result bytes must be chain-anchored, not
+            # merely present in the writable file.
+            "authenticated": _ship_result_authenticated(
+                control_root, _run_id_of(run_dir), ship_result_text),
         },
         # attempt-aware re-entry proof (M61), not the raw journal.
-        "reentry": _attempt_aware_reentry(control_root, run_dir),
+        "reentry": dict(_attempt_aware_reentry(control_root, run_dir),
+                        # DF-R8-02: positive, chain-authenticated proof the mandated
+                        # idempotent re-entry ran against THIS terminal.
+                        reentry_verified=_reentry_verified(
+                            control_root, run_dir, _run_id_of(run_dir),
+                            ship_result_text)),
     }
 
     if require_production:
@@ -440,16 +530,55 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
         unmet.append("signed audit chain not verified")
     if bundle["ship_result"]["outcome"] != "SHIPPED":
         unmet.append("no final SHIPPED ship_result")
+    # DF-R8-02: the FINAL ship record itself must be authenticated against the
+    # signed chain — not merely present with outcome "SHIPPED" in a writable file.
+    if bundle["ship_result"].get("authenticated") is not True:
+        unmet.append("the final ship_result.json is not anchored in the signed audit chain")
     if bundle["reentry"].get("no_duplicate_or_unknown_actions") is not True:
         unmet.append("no authenticated idempotent re-entry proof (unshipped or unresolved)")
+    # DF-R8-02: require the POSITIVE, signed re-entry fact — a SHIP_REENTRY_VERIFIED
+    # token binding the exact ship_result bytes — so the mandated 'ship again' proof
+    # is present and no new action was dispatched on re-entry.
+    if bundle["reentry"].get("reentry_verified", {}).get("verified") is not True:
+        unmet.append("no signed SHIP_REENTRY_VERIFIED proof of an idempotent re-entry "
+                     "against this exact terminal")
+    # DF-R8-03: the sealed configuration policy must be bound. config_sha256 is
+    # HMAC-covered by a verified manifest, so a non-null config_sha256 under a
+    # verified manifest proves the run's config policy (approver allowlist, tier,
+    # gates) is the sealed one. A null config binding is fail-closed.
+    if not bundle.get("config_sha256"):
+        unmet.append("no sealed config_sha256 (configuration policy not bound)")
+
     # DF-R7-03 (opus F2): an irreversible action's release must verify under EVERY
     # profile, not only enterprise. `reversible is True` counts an action as
     # reversible — a missing/None label is treated as irreversible (fail-closed).
-    irreversible = any(a.get("reversible") is not True
-                       for a in bundle["ship_result"].get("actions", []))
+    irr_actions = {a.get("name") for a in bundle["ship_result"].get("actions", [])
+                   if a.get("reversible") is not True}
+    irreversible = bool(irr_actions)
     if irreversible and bundle["release"].get("verified") is not True:
         unmet.append("an irreversible (or unlabeled) action shipped but the release "
                      "attestation is not cryptographically verified")
+    # DF-R8-03: the release approval must COVER every irreversible shipped action —
+    # a release scoped to a subset (or a removed release receipt) leaves an
+    # irreversible effect unauthorized.
+    if irreversible:
+        covered = set(bundle["release"].get("action_names") or [])
+        if not irr_actions.issubset(covered):
+            unmet.append("the release attestation scope does not cover every irreversible "
+                         f"shipped action (covered {sorted(covered)}, irreversible "
+                         f"{sorted(irr_actions)})")
+
+    def _image_digest_pinned():
+        # DF-R8-03: a resolved digest is necessary but NOT sufficient — a mutable
+        # `:latest` tag resolves to a digest at run time yet is not pinned. Accept
+        # EITHER an @sha256-pinned configured image REFERENCE (a cryptographic pin
+        # on its own — no resolved digest needed; opus review LOW: `resolve_image_
+        # digest` fails open to None on a docker outage, which must not falsely fail
+        # a genuinely-pinned run) OR image_pinned==true backed by a resolved digest.
+        img = bundle["image"]
+        if "@sha256:" in str(img.get("image") or ""):
+            return True
+        return img.get("pinned") is True and bool(img.get("resolved_image_digest"))
 
     if profile == "hardened-h4":
         if bundle["effective_tier"] != "hardened":
@@ -458,8 +587,9 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
             unmet.append("run is not qualified")
         if (manifest.get("intervention_mode") not in ("H4", "lights_out")):
             unmet.append("run was not H4 (lights-out)")
-        if not container.get("resolved_image_digest"):
-            unmet.append("no resolved/digest-pinned image identity")
+        if not _image_digest_pinned():
+            unmet.append("container image is not digest-pinned "
+                         "(need image_pinned or an @sha256-pinned image reference)")
         if bundle["denial_probe_passed"] is not True:
             unmet.append("denial/confinement probe did not pass")
 
@@ -468,16 +598,41 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
             unmet.append(f"effective tier is {bundle['effective_tier']!r}, not enterprise")
         if bundle["custody"].get("verified") is not True:
             unmet.append("enterprise custody not cryptographically verified")
-        if not container.get("resolved_image_digest"):
-            unmet.append("no resolved/digest-pinned image identity")
+        if not _image_digest_pinned():
+            unmet.append("container image is not digest-pinned "
+                         "(need image_pinned or an @sha256-pinned image reference)")
         egress = bundle.get("enterprise_egress") or {}
         if not (egress.get("probed") and egress.get("passed")):
             unmet.append("enterprise egress probe did not pass")
+        # DF-R8-03: the sealed enterprise seccomp proof (was read from the wrong
+        # manifest key by the v2 bundle, so this was never checkable).
+        sec = bundle.get("enterprise_seccomp") or {}
+        if sec.get("probe") != "verified":
+            unmet.append("enterprise seccomp proof not sealed/verified")
+        # DF-R8-03: denial probe + builder confinement ACTUALLY applied.
+        if bundle["denial_probe_passed"] is not True:
+            unmet.append("denial/confinement probe did not pass")
+        conf = bundle.get("builder_confinement") or {}
+        if conf.get("enabled") is not True or conf.get("probe") == "unsupported":
+            unmet.append("builder confinement was not applied (enabled/probe)")
         # a required S3 Object-Lock sink, server-issued + bound + read back:
         rcpt = bundle["ship_sink_receipt"]
         if not (rcpt.get("present") and rcpt.get("kind") == "s3-objectlock"
                 and rcpt.get("server_issued") and rcpt.get("version_id")
                 and rcpt.get("verified") is True):
             unmet.append("required s3-objectlock ship receipt not server-issued/bound/read-back")
+        # DF-R8-03: the custody attestation's off-box receipt must be bound + read
+        # back too (enterprise mandates the WORM sink for custody, not only ship).
+        crcpt = bundle["custody_sink_receipt"]
+        if not (crcpt.get("present") and crcpt.get("verified") is True):
+            unmet.append("custody sink receipt not present/bound/read-back")
+        # DF-R8-03: when an irreversible action shipped, its release attestation's
+        # off-box receipt must be bound + read back (a removed release receipt after
+        # shipping leaves the authorization unattested off-box).
+        if irreversible:
+            rrcpt = bundle["release_sink_receipt"]
+            if not (rrcpt.get("present") and rrcpt.get("verified") is True):
+                unmet.append("release sink receipt not present/bound/read-back for an "
+                             "irreversible enterprise ship")
 
     return (not unmet, unmet)
