@@ -172,12 +172,16 @@ def test_tampered_toolchain_breaks_per_action_authentication(tmp_path, monkeypat
 
     ok_a, why = supervisor._authenticate_ship_actions(cfg, str(cr), str(run_dir), rid)
     assert not ok_a, "a tampered toolchain must break per-action authentication"
-    # DF-R8-01: the ordered transition-chain check runs FIRST and recomputes the
-    # completion token (bound to the intent's toolchain) — a forged toolchain makes
-    # that token miss its anchor, so the refusal now surfaces there ("not anchored
-    # at its journaled sequence position"). Either message is the same fail-closed.
+    # DF-R9-02 (opus review of M75): the chain->journal INTENT coverage check runs
+    # first and recomputes the intent token (bound to the toolchain) — a forged
+    # toolchain makes the journal intent recompute to a DIFFERENT token, so the real
+    # anchored intent is now an orphan and the refusal surfaces there
+    # ("attributable to no surviving SHIP_ACTION_INTENT"). Failing that, the ordered
+    # transition-chain check recomputes the completion token and misses its anchor
+    # ("not anchored at its journaled sequence position"). Every message is the same
+    # fail-closed.
     assert ("toolchain" in why or "not individually anchored" in why
-            or "not anchored" in why)
+            or "not anchored" in why or "SHIP_ACTION_INTENT" in why)
 
 
 # --- DF-R5-08: a torn/corrupt ship journal must never raise an uncaught exception -
