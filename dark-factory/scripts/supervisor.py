@@ -8211,8 +8211,6 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
     # actions AND no rollback events).
     rollback_events = [e for e in _ship_journal_events(run_dir)
                        if e.get("state") == "SHIP_ROLLED_BACK"]
-    if not facts and not rollback_events:
-        return (True, "no completed ship actions to authenticate")
     audit = cfg.get("_audit", {})
     try:
         key = df_audit.load_key(audit["key_path"])
@@ -8235,6 +8233,15 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
                 if str(e.get("invocation", "")).startswith(pre)}
     anchored = _anchored_under("ship-action")            # completions
     anchored_rb = _anchored_under("ship-rollback")        # rollbacks
+    # DF-R9-01: short-circuit ONLY when there is genuinely nothing to authenticate
+    # — no completed/rolled-back journal transitions AND no anchored completion/
+    # rollback tokens in the signed chain. The pre-M74 short-circuit fired on empty
+    # journal facts ALONE, so deleting a completed action's journal attribution
+    # (SHIP_ACTION_INTENT + SHIP_ACTION_RESULT) while its genuine completion token
+    # stayed anchored returned "nothing to authenticate" — and the action re-ran
+    # (a duplicate). Now an orphaned anchored completion (below) is caught.
+    if not facts and not rollback_events and not anchored and not anchored_rb:
+        return (True, "no completed ship actions to authenticate")
     # DF-R8-01: verify the ORDERED, monotonic signed-transition sequence FIRST —
     # a genuine signed completion REPLAYED after its rollback (or any reorder /
     # deletion of a signed transition) is rejected here, before the applied set
@@ -8313,6 +8320,60 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
         return (False, "a rollback anchored in the signed audit chain is attributable to no "
                 "surviving SHIP_ROLLBACK_INTENT (its rollback journal lines were deleted to "
                 "re-add a rolled-back action to the applied set) — refusing (fail-closed)")
+    # DF-R9-01: the SAME chain→journal reverse-completeness check for COMPLETIONS.
+    # Every anchored `ship-action` completion token must be recomputable from a
+    # SURVIVING SHIP_ACTION_RESULT `ok` (paired with its intent for the sealed
+    # toolchain/reversible/approval_ref fields). Deleting a completed action's
+    # journal lines (to make recovery re-run it — a duplicate) leaves an anchored
+    # completion token that no surviving ok-result maps to → refuse. A LEGITIMATE
+    # crash AFTER the completion anchor but BEFORE its RESULT is journaled leaves
+    # the SHIP_ACTION_INTENT UNRESOLVED, which halts the ship at SHIP_UNKNOWN_OUTCOME
+    # BEFORE this authentication runs — so this check never false-refuses that
+    # window; only a deletion of BOTH the intent and the result reaches here.
+    intents_by_attempt = {}
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_ACTION_INTENT":
+            d = e.get("data", {})
+            if d.get("attempt_id") is not None:
+                intents_by_attempt[d.get("attempt_id")] = d
+    journal_completion_tokens = set()
+    for e in _ship_journal_events(run_dir):
+        d = e.get("data", {})
+        if e.get("state") == "SHIP_ACTION_RESULT" and d.get("status") == "ok":
+            intent = intents_by_attempt.get(d.get("attempt_id"), {})
+            journal_completion_tokens.add(sha256_str(_ship_action_commit_payload(
+                run_id, d.get("action"), d.get("idempotency_key"),
+                intent.get("toolchain"), intent.get("reversible"), intent.get("approval_ref"),
+                attempt_id=d.get("attempt_id"), seq=d.get("seq"))))
+    # DF-R9-01 (opus review F1): an anchored completion whose attempt was
+    # operator-RECONCILED is NOT a deletion-orphan. A genuine crash AFTER the
+    # completion anchor but BEFORE its RESULT leaves the intent UNRESOLVED; the
+    # operator is told to run `--decision reconcile`/`abort`, which resolves the
+    # intent to `reconciled_unknown` (accepting a possible duplicate re-run) and
+    # then reaches this authenticator. The anchored completion has no `ok` RESULT
+    # to recompute it, so — WITHOUT this — it would be a false orphan and PERMANENTLY
+    # brick the run. The `reconciled_unknown` RESULT carries no seq, so recompute the
+    # completion token from the SURVIVING intent across the seq range to cover it.
+    # (An ATTACKER who PLANTS a `reconciled_unknown` to force a re-run is a DISTINCT
+    # class — the non-ok resolution must itself be authenticated; DF-R9-02.)
+    reconciled_attempts = {d.get("attempt_id") for e in _ship_journal_events(run_dir)
+                           for d in [e.get("data", {})]
+                           if e.get("state") == "SHIP_ACTION_RESULT"
+                           and d.get("status") == "reconciled_unknown"}
+    for _att in reconciled_attempts:
+        _intent = intents_by_attempt.get(_att)
+        if not _intent:
+            continue
+        for _seq in range(len(anchored) + 2):
+            journal_completion_tokens.add(sha256_str(_ship_action_commit_payload(
+                run_id, _intent.get("action"), _intent.get("idempotency_key"),
+                _intent.get("toolchain"), _intent.get("reversible"), _intent.get("approval_ref"),
+                attempt_id=_att, seq=_seq)))
+    orphan_completions = anchored - journal_completion_tokens
+    if orphan_completions:
+        return (False, "a completion anchored in the signed audit chain has no surviving "
+                "SHIP_ACTION_RESULT `ok` (its journal attribution was deleted to force a "
+                "duplicate re-run of an already-completed action) — refusing (fail-closed)")
     return (True, "all completed ship actions + rollbacks authenticated against the signed chain")
 
 
@@ -9237,9 +9298,13 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
     # exactly the scenario it exists for and the action would re-run (a
     # duplicate). Trigger it when there is a completed action OR any rollback
     # event; the authenticator handles the empty-facts+rollback case.
-    _rollback_present = any(e.get("state") == "SHIP_ROLLED_BACK"
-                            for e in _ship_journal_events(run_dir))
-    if signing_on and (already_done or _rollback_present):
+    # DF-R9-01: authenticate UNCONDITIONALLY under signing — NOT only when
+    # `already_done`/rollback events are present. Deleting a completed action's
+    # journal lines empties both (the attacker's goal: re-run the action), so a
+    # guard keyed on them would skip authentication in exactly the scenario it
+    # exists for. The authenticator short-circuits cheaply when there is genuinely
+    # nothing anchored, and refuses an orphaned anchored completion otherwise.
+    if signing_on:
         ok_j, why_j = _authenticate_ship_actions(cfg, control_root, run_dir, run_id)
         if not ok_j:
             sys.stderr.write(f"dark-factory: ship refused (fail-closed) — the ship journal that "
