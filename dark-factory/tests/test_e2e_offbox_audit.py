@@ -234,13 +234,18 @@ def test_signed_chain_verifies_with_key_and_refuses_without(tmp_path):
     p = _run(cr, "run")
     assert p.returncode == 0, p.stderr
 
+    # DF-R9-03: a SIGNED run now also anchors its source identity at first dispatch
+    # (a separate signed chain entry) so a resume can authenticate it — so a signed
+    # single run chains TWO signed entries: the source-identity anchor + the terminal
+    # audit anchor. Both are signed and the chain verifies.
     entries = _chain_entries(cr)
-    assert len(entries) == 1
-    assert "sig" in entries[0] and entries[0]["sig"]
+    assert len(entries) == 2
+    assert all("sig" in e and e["sig"] for e in entries)
+    assert any(".source-identity." in e["invocation"] for e in entries)
 
     ok = _verify_chain(cr, key_path=kp)
     assert ok.returncode == 0, ok.stderr
-    assert ok.stdout.strip() == "OK: 1 entries"
+    assert ok.stdout.strip() == "OK: 2 entries"
 
     # fail-closed: a signed chain verified WITHOUT the key must never read OK
     # (mirrors verify-manifest's UNVERIFIED-without-key semantics).

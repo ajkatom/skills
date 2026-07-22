@@ -4353,6 +4353,103 @@ def _source_identity_stable(cfg):
     return (True, "source identity stable", si_now)
 
 
+def _source_identity_payload(run_id, si):
+    """DF-R9-03: the canonical bytes whose sha256 is anchored as this run's SIGNED
+    source-identity token at first dispatch. Binds the run_id + the FULL identity
+    (commit / clean / dirty / tree_digest — the exact fields journaled as the
+    SOURCE_IDENTITY event) so a resume can AUTHENTICATE the recovered journal event
+    against the chain: a deleted or replaced event recomputes to a token that was
+    never anchored."""
+    return canonical_json({"kind": "source-identity", "run_id": run_id,
+                           "commit": si.get("commit"), "clean": si.get("clean"),
+                           "dirty": si.get("dirty"), "tree_digest": si.get("tree_digest")})
+
+
+def _authenticated_source_identity(cfg, control_root, run_dir, run_id):
+    """DF-R9-03: recover this run's ORIGINAL source identity AUTHENTICATED against
+    the SIGNED audit chain. Returns (status, si_orig):
+
+      "authenticated" — a source-identity token is anchored in the chain AND a
+                        surviving journal SOURCE_IDENTITY event recomputes to it
+                        (si_orig = that event's data);
+      "tampered"      — signing is ON but authentication fails: a source token is
+                        anchored with NO surviving journal event that recomputes to
+                        it (DELETED/REPLACED event); OR the chain failed verification
+                        / could not be confirmed untruncated; OR the chain holds NO
+                        source token at all (the anchor — or the whole chain — was
+                        deleted; a signed run always anchors at first dispatch or
+                        fails closed there, so on RESUME an empty set is tampering)
+                        → the caller FAILS CLOSED;
+      "unanchored"    — signing is OFF or the key is unloadable: an unsigned / no-key
+                        tier with no detection-grade guarantee → the caller uses the
+                        tier-independent source_identity.json cross-check (best-effort,
+                        unchanged for those runs).
+
+    M71 recovered the original identity from the ordinary journal SOURCE_IDENTITY
+    event ALONE. That event is same-user writable, so DELETING it made the resume
+    drift-check no-op and DOWNGRADE to the legacy (no-enforcement) path under a
+    drifted identity (DF-R9-03). The identity is now ALSO anchored into the signed
+    chain at first dispatch; the chain is hash-linked + HMAC-signed, so an interior
+    deletion of the anchor breaks verify_chain and a tail-truncation is caught by
+    the off-box checkpoint probe — either way this returns "tampered", never
+    "unanchored". Never raises."""
+    if not bool(cfg.get("_audit", {}).get("signing")):
+        return ("unanchored", None)
+    try:
+        key = df_audit.load_key(cfg.get("_audit", {}).get("key_path"))
+    except (df_audit.AuditKeyError, KeyError, TypeError):
+        return ("unanchored", None)  # no key → no detection-grade guarantee; legacy
+    # DF-R9-04: a tail-truncation could have erased the source anchor while the
+    # surviving prefix still verifies — treat an unconfirmed-untruncated REQUIRED
+    # chain as tampered rather than reading a short chain as "unanchored" and
+    # silently downgrading. No-op (ok) when no sink is configured.
+    ok_tr, _why_tr = _verify_chain_untruncated(cfg, control_root)
+    if not ok_tr:
+        return ("tampered", None)
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        ok, _why = df_audit_chain.verify_chain(chain_path, key)
+        if not ok:
+            return ("tampered", None)
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError:
+        return ("tampered", None)
+    pre = f"{run_id}.source-identity."
+    anchored = {e.get("manifest_sha256") for e in entries
+                if str(e.get("invocation", "")).startswith(pre)}
+    if not anchored:
+        # DF-R9-03 (opus re-review): verify_chain accepts a 0-entry chain as valid
+        # ("OK: 0 entries"), so a signed run whose ENTIRE audit-chain.jsonl was
+        # DELETED (not just truncated) reads with an empty anchor set — and an
+        # earlier journal-event backstop was defeatable (the attacker strips the
+        # SNAPSHOT/SOURCE_IDENTITY lines while leaving the rest, so the journal still
+        # shows dispatch). This function is reached ONLY on RESUME (a paused run), and
+        # a SIGNED run FAILS CLOSED at first dispatch if it cannot anchor its source
+        # identity (SOURCE_ANCHOR_FAILED, _run_locked) — so EVERY paused signed run
+        # provably HAS the anchor. An empty set on a signed run therefore means the
+        # anchor — or the whole chain — was DELETED: fail closed, unconditionally, off
+        # the chain (which the attacker cannot forge) rather than any strippable local
+        # dispatch evidence. (A PRE-M76 signed run has no anchor either and also fails
+        # closed on its first post-upgrade resume — an accepted one-time migration:
+        # restart it under M76. The sink-configured case is already caught earlier by
+        # _verify_chain_untruncated; this is the sink-less backstop.)
+        return ("tampered", None)
+    try:
+        with open(os.path.join(run_dir, "journal.jsonl"), encoding="utf-8") as jf:
+            for line in jf:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("state") == "SOURCE_IDENTITY":
+                    data = e.get("data", {})
+                    if sha256_str(_source_identity_payload(run_id, data)) in anchored:
+                        return ("authenticated", data)
+    except OSError:
+        pass
+    return ("tampered", None)
+
+
 def _builder_identity_field(cfg):
     """The sealed `builder_identity` manifest field (or None). Carries the
     operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
@@ -4944,6 +5041,39 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
     # INIT->GATE_PASSED->SNAPSHOT prefix is preserved). The resume drift-check
     # reads this event; its presence marks an M67-era source-tracked run.
     journal.write("SOURCE_IDENTITY", **cfg["_source_identity"])
+    # DF-R9-03: on a SIGNED run, ALSO anchor the source identity into the signed
+    # audit chain so a resume AUTHENTICATES it (see _authenticated_source_identity).
+    # The journal event alone is same-user writable — deleting/replacing it
+    # downgraded resume to the legacy no-enforcement path; the chain anchor makes
+    # that fail closed even if source_identity.json is also deleted. Only when
+    # signing is ON: the chain is a trust boundary only when signed, and an unsigned
+    # run's chain must not be polluted with an unauthenticated marker (unsigned tiers
+    # rely on the source_identity.json cross-check in resume).
+    #
+    # DF-R9-03 (opus re-review): this anchor is a signed run's authenticator-of-
+    # record for its source identity across EVERY resume. So if it cannot be
+    # committed, FAIL CLOSED HERE at first dispatch (before any builder work) — do
+    # NOT proceed to a paused state a later resume could not tell apart from a
+    # DELETED-anchor tamper (a signed run with no anchor is, at resume, exactly the
+    # tamper signature). Failing closed here means every paused/resumable signed run
+    # provably HAS the anchor, so resume can treat "signed run, no source token" as
+    # tampering with no benign exception. The key/chain is broken (append or key-load
+    # failed); fix it and start a fresh run — no builder work has run yet.
+    if bool(cfg.get("_audit", {}).get("signing")):
+        _src_anchor = _anchor_ship_local(
+            cfg, control_root, invocation,
+            _source_identity_payload(invocation, cfg["_source_identity"]),
+            "source-identity")
+        if _src_anchor != "anchored":
+            journal.write("SOURCE_ANCHOR_FAILED",
+                          commit=cfg["_source_identity"].get("commit"))
+            sys.stderr.write(
+                "dark-factory: refusing to proceed (fail-closed) — this SIGNED run could not "
+                "anchor its source identity into the audit chain at first dispatch (the signing "
+                "key or a chain append failed), so the run could never be authenticated on "
+                "resume. Fix the audit key/chain and start a fresh run (no builder work has "
+                "run).\n")
+            return 2
     manifest_base["snapshot_sha256"] = snap_hash
 
     # DF-R5-09: pin the image identity BEFORE resolve_isolation — its container
@@ -6707,6 +6837,7 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
     try:
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
+        run_id = os.path.basename(run_dir.rstrip(os.sep))  # == first-dispatch invocation
 
         # DF-R7-04: refuse SOURCE DRIFT. The first dispatch persisted its source
         # identity (commit + tree/content digest); if the checkout has since
@@ -6730,19 +6861,76 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         # per-dispatch guard (which no-ops when `cfg["_source_identity"]` is unset).
         # A nulled anchor is distinguished from a genuine non-git run by the CURRENT
         # checkout: a real git repo recomputes a non-null digest now (see below).
-        si_orig = None
-        try:
-            with open(os.path.join(run_dir, "journal.jsonl"), encoding="utf-8") as _jf:
-                for _line in _jf:
-                    try:
-                        _e = json.loads(_line)
-                    except ValueError:
-                        continue
-                    if _e.get("state") == "SOURCE_IDENTITY":
-                        si_orig = _e.get("data", {})
-                        break
-        except OSError:
+        # DF-R9-03: the journal event is same-user writable, so DELETING it (M71's
+        # blind spot) made this whole block no-op and DOWNGRADED resume to the legacy
+        # path under a drifted identity. Recover the original identity AUTHENTICATED
+        # against the SIGNED audit chain (the identity is also anchored at first
+        # dispatch): a source token anchored with no surviving journal event that
+        # recomputes to it — or a chain that failed verification / could not be
+        # confirmed untruncated — FAILS CLOSED here, and can no longer downgrade.
+        _src_status, si_orig = _authenticated_source_identity(
+            cfg, control_root, run_dir, run_id)
+        if _src_status == "tampered":
+            journal.write("SOURCE_DRIFT_REFUSED",
+                          sealed_commit=None,
+                          current_commit=_source_identity_field().get("commit"),
+                          reason="source-anchor-unauthenticated")
+            sys.stderr.write(
+                "dark-factory: resume refused (fail-closed) — this run's SIGNED source-identity "
+                "anchor could not be authenticated against the audit chain (the SOURCE_IDENTITY "
+                "record or the audit chain was deleted/replaced, the signed chain failed "
+                "verification, or a REQUIRED off-box audit sink is unreachable so a truncation "
+                "could not be ruled out). A logical run must execute under ONE authenticated "
+                "source identity; start a fresh run under the current source instead of "
+                "resuming.\n")
+            release_lock(lock)
+            return 2
+        if _src_status == "unanchored":
+            # A pre-M76 or unsigned run has no chain anchor — fall back to the M71
+            # journal-presence path (unchanged for those runs).
             si_orig = None
+            try:
+                with open(os.path.join(run_dir, "journal.jsonl"), encoding="utf-8") as _jf:
+                    for _line in _jf:
+                        try:
+                            _e = json.loads(_line)
+                        except ValueError:
+                            continue
+                        if _e.get("state") == "SOURCE_IDENTITY":
+                            si_orig = _e.get("data", {})
+                            break
+            except OSError:
+                si_orig = None
+            # DF-R9-03 (tier-independent fallback): source_identity.json is written
+            # at first dispatch for EVERY run (see _run_locked), with byte-identical
+            # content to the journal SOURCE_IDENTITY event. If the FILE is present
+            # (this run tracked source identity) but the journal event is now MISSING
+            # or ALTERED, the event was deleted/replaced to dodge the drift check —
+            # fail closed. This catches the deletion on UNSIGNED tiers too, where no
+            # chain anchor exists. It is best-effort there: an attacker who ALSO
+            # deletes source_identity.json leaves nothing to cross-check — that tier
+            # is not detection-grade by construction; the signed chain anchor above
+            # is the robust guarantee. A pre-M67 run has NEITHER file (no false
+            # refusal). Reads that fail leave _si_file None (no cross-check).
+            _si_file = None
+            try:
+                with open(os.path.join(run_dir, SOURCE_IDENTITY_FILE), encoding="utf-8") as _sf:
+                    _si_file = json.load(_sf)
+            except (OSError, ValueError):
+                _si_file = None
+            if isinstance(_si_file, dict) and si_orig != _si_file:
+                journal.write("SOURCE_DRIFT_REFUSED",
+                              sealed_commit=_si_file.get("commit"),
+                              current_commit=_source_identity_field().get("commit"),
+                              reason="source-journal-event-deleted-or-replaced")
+                sys.stderr.write(
+                    "dark-factory: resume refused (fail-closed) — this run recorded a source "
+                    "identity at first dispatch (source_identity.json) but its journal "
+                    "SOURCE_IDENTITY event is now missing or altered (deleted/replaced to dodge "
+                    "the resume drift check). A logical run must execute under ONE source "
+                    "identity; start a fresh run under the current source instead of resuming.\n")
+                release_lock(lock)
+                return 2
         if isinstance(si_orig, dict):
             si_now = _source_identity_field()
             od, nd = si_orig.get("tree_digest"), si_now.get("tree_digest")
