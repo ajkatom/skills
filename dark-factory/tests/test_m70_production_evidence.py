@@ -221,6 +221,35 @@ def test_release_scope_must_cover_irreversible_actions():
     assert not ready and any("scope does not cover" in u for u in unmet)
 
 
+def test_wildcard_release_scope_covers_irreversible_actions():
+    # DF-R9-05: a cryptographically-verified WILDCARD ("*") release approval is the
+    # documented universal scope and MUST read as covering every irreversible action
+    # — the pre-M78 predicate did set("*") == {"*"}, so no real action name was a
+    # subset and a legitimate wildcard enterprise release could never be production-
+    # ready (it could still ship at runtime — the false negative was bundle-only).
+    def m(b, mf):
+        b["ship_result"]["actions"] = [
+            {"name": "deploy", "status": "ok", "reversible": False},
+            {"name": "migrate", "status": "ok", "reversible": False},
+        ]
+        b["release"] = {"present": True, "verified": True, "action_names": "*"}
+        b["release_sink_receipt"] = {"present": True, "verified": True}
+    ready, unmet = _ready("enterprise", m)
+    assert ready, unmet
+    assert not any("scope does not cover" in u for u in unmet)
+
+
+def test_explicit_list_release_scope_still_covers_when_complete():
+    # Regression guard for the normalization path: an explicit list that DOES list
+    # every irreversible action still reads as covered (no wildcard shortcut needed).
+    def m(b, mf):
+        b["ship_result"]["actions"] = [{"name": "deploy", "status": "ok", "reversible": False}]
+        b["release"] = {"present": True, "verified": True, "action_names": ["deploy"]}
+        b["release_sink_receipt"] = {"present": True, "verified": True}
+    ready, unmet = _ready("enterprise", m)
+    assert ready, unmet
+
+
 def test_missing_reentry_verified_is_not_ready():
     ready, unmet = _ready("hardened-h4",
                           lambda b, mf: b.update({"reentry": {"no_duplicate_or_unknown_actions": True,
