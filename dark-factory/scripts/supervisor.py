@@ -4450,6 +4450,51 @@ def _authenticated_source_identity(cfg, control_root, run_dir, run_id):
     return ("tampered", None)
 
 
+def _run_started_signed(control_root, run_id):
+    """DF-R9-05 (M77): True iff this run anchored a source-identity token in the
+    per-control-root audit chain — the tamper-evident proof that the run STARTED with
+    `audit.signing` ON. Every SIGNED run anchors exactly this token at first dispatch
+    (or FAILS CLOSED there — see _run_locked / SOURCE_ANCHOR_FAILED); a genuinely
+    UNSIGNED run NEVER writes a `source-identity` entry (that anchor is gated on
+    `audit.signing` at first dispatch — the ONLY writer of the `source-identity` kind),
+    so the mere PRESENCE of a `{run_id}.source-identity.` entry is a reliable
+    "started signed" signal.
+
+    Keyed on PRESENCE, not on the `sig` field: `sig` is NOT part of `chain_hash`
+    (df_audit_chain hashes only invocation/manifest_sha256/ts), so a control-root
+    attacker could BLANK an honest anchor's `sig` — a write that does NOT break chain
+    linkage — and a `sig`-based check would then read the run as unsigned and let the
+    downgrade through. Presence-keying closes that: blanking `sig` leaves the entry
+    present (still detected); to evade detection the attacker must DELETE the anchor
+    line, which breaks the hash chain and (deleting the WHOLE chain) is the documented
+    construction limit — a required off-box sink makes even that independently
+    detectable. The attacker holds control-root read/write but NOT the HMAC key; a
+    FORGED unsigned `source-identity` entry only causes a (safe) refuse of an unsigned
+    resume, never a bypass.
+
+    Read WITHOUT the audit key, straight off the raw chain lines (not read_chain): a
+    malformed/corrupted OTHER line must not blind the detector to a present anchor, and
+    a partly-corrupted chain that read_chain would reject entirely must still surface
+    the anchor if it is there."""
+    pre = f"{run_id}.source-identity."
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        with open(chain_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and str(e.get("invocation", "")).startswith(pre):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _builder_identity_field(cfg):
     """The sealed `builder_identity` manifest field (or None). Carries the
     operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
@@ -6838,6 +6883,36 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
         state = load_state(run_dir)
         journal = Journal(os.path.join(run_dir, "journal.jsonl"), redactor=redactor)
         run_id = os.path.basename(run_dir.rstrip(os.sep))  # == first-dispatch invocation
+
+        # DF-R9-05 (M77): audit signing is STICKY across a resume. `audit.signing` is
+        # re-derived fresh from the same-user-writable config.json on EVERY resume, so
+        # a control-root attacker (who does NOT hold the HMAC key) could flip it
+        # true->false and resume — the resumed run would then take the UNSIGNED /
+        # no-enforcement path for EVERYTHING (source-identity AND ship-completion
+        # authentication, chain verification), silently bypassing the detection-grade
+        # signed model and reaching the DF-R9-03 downgrade M76 otherwise closes (this
+        # is BROADER than source identity, so it is gated FIRST, before that block). A
+        # run that anchored a SIGNED source-identity token at first dispatch (every
+        # signed run does, or fails closed there) provably STARTED signed; if the
+        # freshly loaded config now says signing is OFF, REFUSE (fail closed) — a run
+        # cannot switch signed->unsigned across a resume. The anchor is detected WITHOUT
+        # the key, so the attacker cannot forge it away undetectably. ON->ON / OFF->OFF
+        # / genuine unsigned runs are unaffected (no signed anchor, or signing still
+        # on); OFF->ON is already caught downstream (an unsigned run has no signed
+        # anchor -> _authenticated_source_identity reads it as tampered).
+        if (not bool(cfg.get("_audit", {}).get("signing"))
+                and _run_started_signed(control_root, run_id)):
+            journal.write("AUDIT_SIGNING_DOWNGRADE_REFUSED", run_id=run_id)
+            sys.stderr.write(
+                "dark-factory: resume refused (fail-closed) — this run STARTED with audit "
+                "signing ON (it holds a signed source-identity anchor in the audit chain) but "
+                "config.json now sets audit.signing: false. A run cannot be downgraded from "
+                "signed to unsigned across a resume: the unsigned path disables source-identity "
+                "and ship-completion authentication and chain verification for the remainder of "
+                "the run. Restore audit.signing: true (and key_path) to resume this run, or start "
+                "a fresh run under the new config.\n")
+            release_lock(lock)
+            return 2
 
         # DF-R7-04: refuse SOURCE DRIFT. The first dispatch persisted its source
         # identity (commit + tree/content digest); if the checkout has since
