@@ -582,12 +582,27 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
     # DF-R8-03: the release approval must COVER every irreversible shipped action —
     # a release scoped to a subset (or a removed release receipt) leaves an
     # irreversible effect unauthorized.
+    # DF-R9-05: the scope may be the documented WILDCARD ("*") — a valid approval
+    # covering EVERY action — or an explicit list. NORMALIZE it the same way the
+    # runtime coverage check (df_release.ApprovalContext.covers) does, so a legitimate
+    # cryptographically-verified wildcard release is NOT falsely reported not-ready:
+    # the pre-M78 `set(action_names)` turned "*" into {"*"}, which no real action name
+    # is a subset of, so an enterprise release approved by wildcard could ship at
+    # runtime yet never produce a production-ready bundle.
     if irreversible:
-        covered = set(bundle["release"].get("action_names") or [])
-        if not irr_actions.issubset(covered):
-            unmet.append("the release attestation scope does not cover every irreversible "
-                         f"shipped action (covered {sorted(covered)}, irreversible "
-                         f"{sorted(irr_actions)})")
+        import df_release
+        try:
+            scope = df_release.normalize_action_names(bundle["release"].get("action_names"))
+        except df_release.ReleaseError:
+            scope = None  # malformed scope covers nothing (fail-closed)
+        if scope == df_release.ACTION_WILDCARD:
+            pass  # the wildcard covers every irreversible action
+        else:
+            covered = set(scope or [])
+            if not irr_actions.issubset(covered):
+                unmet.append("the release attestation scope does not cover every irreversible "
+                             f"shipped action (covered {sorted(covered)}, irreversible "
+                             f"{sorted(irr_actions)})")
 
     def _image_digest_pinned():
         # DF-R8-03: a resolved digest is necessary but NOT sufficient — a mutable
