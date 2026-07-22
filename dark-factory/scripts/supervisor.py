@@ -2974,11 +2974,22 @@ def fork_cmd(control_root: str, parent_run: str, allow_downgrade: bool = False) 
         sys.stderr.write(f"dark-factory: cannot read parent manifest: {e}\n")
         return 2
 
-    # Verify the parent clean. If the parent's manifest is signed, load the audit
-    # key so verification is a real signature check (not UNVERIFIED). Object
-    # store is this control root's.
+    # Verify the parent clean. Load the audit key so verification is a real HMAC
+    # signature check (not UNVERIFIED). Object store is this control root's.
+    # DF-R9-08 (M80): the "is this signed?" decision MUST come from the config-signing
+    # ANCHOR (`cfg._audit.signing`), NOT from the same-user-writable parent
+    # `audit_signing` field alone — mirroring `_authenticate_manifest`'s
+    # `signed = cfg.signing OR manifest.audit_signing`. Gating on the writable field
+    # let a keyless control-root attacker DE-SIGN a genuinely-signed parent (flip
+    # audit_signing:false + DELETE the manifest.hmac sidecar + recompute the plain
+    # manifest.sha256) so vkey stayed None and _verify_manifest_status(key=None) read
+    # the now-hmac-less manifest as OK — accepting a TAMPERED parent (e.g. artifact
+    # repointed to a self-frozen malicious object) as "verified clean", forging
+    # lineage and seeding the child from attacker bytes. With the config anchor, a
+    # signed control root always loads the key → expect_sig True → the deleted/stale
+    # HMAC yields UNVERIFIED/TAMPERED → refuse.
     vkey = None
-    if parent_manifest.get("audit_signing"):
+    if bool(cfg.get("_audit", {}).get("signing")) or parent_manifest.get("audit_signing"):
         try:
             vkey = df_audit.load_key(cfg["_audit"]["key_path"])
         except df_audit.AuditKeyError as e:
