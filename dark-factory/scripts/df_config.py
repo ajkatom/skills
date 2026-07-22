@@ -1806,6 +1806,34 @@ def load_config(control_root: str) -> dict:
     else:
         cfg_custody = None
 
+    # DF-R9-07 (M79) SECURITY: a custody block REQUIRES a SIGNED audit manifest —
+    # split-custody qualification is only single-operator-PROOF when the sealed
+    # config_sha256 (hence the approver allowlist + threshold) is HMAC-pinned AND the
+    # custody attach/verify paths authenticate that HMAC (they now do). With signing
+    # OFF, a control-root writer rewrites the allowlist to their OWN key, recomputes
+    # the PLAIN manifest.sha256, self-signs, and self-qualifies. Enterprise already
+    # rejects signing:false (above), but a `custody` block is ALSO accepted at
+    # standard/cooperative (where signing defaults OFF) — so require it here too,
+    # MIRRORING security_gates.waivers / resume_overrides / ship.approval: an EXPLICIT
+    # false is a hard rejection, an absent/defaulted-false is forced ON with the same
+    # key_path default + disjointness guard. (The waiver comment's "split-custody is
+    # enterprise-only" assumption did not hold — custody is not tier-gated here.)
+    if cfg_custody is not None:
+        if audit_raw.get("signing") is False:
+            raise ConfigError(
+                "custody requires audit.signing: true so the sealed config (hence the custody "
+                "approver allowlist + threshold) is HMAC-protected — an unsigned manifest's "
+                "config_sha256 can be forged by anyone with control-root write")
+        if not audit_signing:
+            audit_signing = True
+            if not audit_key_path:
+                audit_key_path = os.path.expanduser("~/.dark-factory/audit.key")
+            key_dir = os.path.dirname(os.path.abspath(audit_key_path))
+            if not _disjoint(key_dir, control_root) or not _disjoint(key_dir, ws):
+                raise ConfigError(
+                    "audit.key_path must live outside both the control root and "
+                    "workspace_root (the signing key must never be reachable by a run)")
+
     # Optional `credential_proxy` block -> cfg["_proxy"] (M17 Task 2): a
     # host-side allowlist credential proxy (see scripts/df_proxy.py). The
     # provider token is NEVER accepted inline here -- only the NAME of an
