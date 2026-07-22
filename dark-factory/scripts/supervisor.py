@@ -7508,6 +7508,83 @@ def _unresolved_ship_action(run_dir):
     return st["unresolved_forward"] or st["unresolved_rollback"]
 
 
+def _dangling_signed_dispatch(cfg, control_root, run_dir, run_id):
+    """DF-R9-02: the intent-data of a SIGNED (anchored) forward dispatch whose
+    real-world outcome is UNAUTHENTICATED — its attempt has NO anchored completion
+    token AND no signed operator-reconcile token — else None (latest, mirroring
+    `unresolved_forward`).
+
+    The reserve-before check (`unresolved_forward`) only catches a dispatch with NO
+    result. DF-R9-02: a same-user writer can instead PLANT an unsigned non-`ok`
+    RESULT (failed/timed_out/reconciled_unknown) for a genuine dangling dispatch
+    whose action ALREADY RAN — the recovery reducer marks the intent resolved by
+    ANY status, so `unresolved_forward` goes None and the action RE-RUNS with no
+    SHIP_UNKNOWN_OUTCOME consent gate (a duplicate). A dispatched action is only
+    AUTHENTICALLY resolved by a signed COMPLETION (ran + exited 0) or a signed
+    RECONCILE (operator consent); an unsigned result is forgeable and does not
+    count. Fail-soft (None) on any key/chain error — the unconditional
+    `_authenticate_ship_actions` under signing then fails closed before the action
+    loop. Unsigned runs are detection-grade (no signed intents) → None."""
+    if not bool(cfg.get("_audit", {}).get("signing")):
+        return None
+    try:
+        key = df_audit.load_key(cfg.get("_audit", {}).get("key_path"))
+    except (df_audit.AuditKeyError, KeyError, TypeError):
+        return None
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        ok, _why = df_audit_chain.verify_chain(chain_path, key)
+        if not ok:
+            return None
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError:
+        return None
+
+    def _anchored_under(kind):
+        pre = f"{run_id}.{kind}."
+        return {e.get("manifest_sha256") for e in entries
+                if str(e.get("invocation", "")).startswith(pre)}
+
+    anchored_intents = _anchored_under("ship-action-intent")
+    anchored_completions = _anchored_under("ship-action")
+    anchored_reconciled = _anchored_under("ship-action-reconciled")
+    n = len(anchored_completions) + 2  # bounded seq search for a completion
+    # M56b evidence-pending states (`evidence_pending` — the action RAN but its
+    # completion anchor failed; `not_run_evidence_halt` — the intent could not be
+    # signed pre-spawn so nothing ran) legitimately have a signed intent and NO
+    # completion; they are handled by the authenticated `--decision repair-evidence`
+    # flow (which never silently re-runs), NOT the unknown-outcome gate. Exclude
+    # those attempts so this check does not double-flag them.
+    m56b_attempts = {d.get("attempt_id") for e in _ship_journal_events(run_dir)
+                     for d in [e.get("data", {})]
+                     if e.get("state") == "SHIP_ACTION_RESULT"
+                     and d.get("status") in ("evidence_pending", "not_run_evidence_halt")}
+    dangling = None
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") != "SHIP_ACTION_INTENT":
+            continue
+        d = e.get("data", {})
+        att = d.get("attempt_id")
+        if att in m56b_attempts:
+            continue
+        intent_token = sha256_str(_ship_action_intent_payload(
+            run_id, d.get("action"), d.get("idempotency_key"), d.get("toolchain"),
+            d.get("reversible"), d.get("approval_ref"), attempt_id=att))
+        if intent_token not in anchored_intents:
+            continue  # unsigned dispatch — out of the signed trust boundary
+        has_completion = any(
+            sha256_str(_ship_action_commit_payload(
+                run_id, d.get("action"), d.get("idempotency_key"), d.get("toolchain"),
+                d.get("reversible"), d.get("approval_ref"), attempt_id=att, seq=s))
+            in anchored_completions for s in range(n))
+        if has_completion:
+            continue
+        if sha256_str(_ship_reconciled_payload(run_id, d.get("action"), att)) in anchored_reconciled:
+            continue  # operator-consented reconcile of this attempt
+        dangling = d  # signed dispatch, no authenticated outcome → unknown
+    return dangling
+
+
 def _ship_completed_actions(run_dir):
     """Names of actions currently APPLIED (a prior attempt succeeded and was NOT
     later rolled back) — recovered so a re-ship SKIPS them, never re-runs a
@@ -7900,6 +7977,20 @@ def _ship_rollback_payload(run_id, action, attempt_id):
                            "action": action, "attempt_id": attempt_id})
 
 
+def _ship_reconciled_payload(run_id, action, attempt_id):
+    """DF-R9-02: the canonical bytes whose sha256 is a signed operator-RECONCILE
+    token — the authenticated proof that the operator ran `--decision reconcile`
+    for THIS dispatched action's unknown outcome. A dispatched (signed-intent)
+    action is only AUTHENTICALLY resolved by a signed completion (it ran + exited
+    0) or this signed reconcile (the operator consented to re-run, accepting a
+    possible duplicate). An UNSIGNED non-`ok` RESULT (failed/timed_out/
+    reconciled_unknown) a same-user writer can forge does NOT resolve a signed
+    intent — a FORGED reconciled_unknown has no matching token, so recovery keeps
+    the action UNKNOWN rather than silently re-running it. Bound to the attempt."""
+    return canonical_json({"kind": "ship-action-reconciled", "run_id": run_id,
+                           "action": action, "attempt_id": attempt_id})
+
+
 def _ship_action_intent_payload(run_id, action, idk, toolchain=None,
                                 reversible=None, approval_ref=None, attempt_id=None,
                                 seq=None):
@@ -8233,6 +8324,35 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
                 if str(e.get("invocation", "")).startswith(pre)}
     anchored = _anchored_under("ship-action")            # completions
     anchored_rb = _anchored_under("ship-rollback")        # rollbacks
+    anchored_intents = _anchored_under("ship-action-intent")  # pre-spawn intents
+    # DF-R9-02 (opus review of M75): the SAME chain->journal reverse-completeness
+    # for INTENTS. Reserve-before (df_ship) fsyncs the SHIP_ACTION_INTENT journal
+    # line BEFORE it anchors the intent token, so a GENUINE anchored intent ALWAYS
+    # has a surviving journal line — the reverse (anchored intent, no journal line)
+    # happens ONLY under tampering. Deleting that line orphans a SIGNED dispatch
+    # whose outcome is then invisible to BOTH journal-driven checks
+    # (`unresolved_forward` AND `_dangling_signed_dispatch`, which iterate surviving
+    # SHIP_ACTION_INTENT events): the action may have RUN with its completion never
+    # anchored (the crash / M56b evidence-pending window) yet recovery sees nothing
+    # and RE-RUNS it (a duplicate) with no SHIP_UNKNOWN_OUTCOME consent gate. This
+    # runs BEFORE the short-circuit so an intent-ONLY orphan (no completion, no
+    # rollback) cannot return "nothing to authenticate" vacuously. A planted decoy
+    # intent recomputes to a DIFFERENT (unanchored) token and cannot mask a real
+    # orphan; a legitimate crash BEFORE the intent anchored leaves the token
+    # unanchored (not in anchored_intents), so this never false-refuses.
+    journal_intent_tokens = set()
+    for e in _ship_journal_events(run_dir):
+        if e.get("state") == "SHIP_ACTION_INTENT":
+            d = e.get("data", {})
+            journal_intent_tokens.add(sha256_str(_ship_action_intent_payload(
+                run_id, d.get("action"), d.get("idempotency_key"), d.get("toolchain"),
+                d.get("reversible"), d.get("approval_ref"), attempt_id=d.get("attempt_id"))))
+    orphan_intents = anchored_intents - journal_intent_tokens
+    if orphan_intents:
+        return (False, "an intent anchored in the signed audit chain is attributable to no "
+                "surviving SHIP_ACTION_INTENT (its pre-spawn journal line was deleted to hide a "
+                "signed dispatch whose action may have run — recovery would re-run it as a "
+                "duplicate with no unknown-outcome gate) — refusing (fail-closed)")
     # DF-R9-01: short-circuit ONLY when there is genuinely nothing to authenticate
     # — no completed/rolled-back journal transitions AND no anchored completion/
     # rollback tokens in the signed chain. The pre-M74 short-circuit fired on empty
@@ -9160,7 +9280,17 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
     # duplicate; `abort` seals SHIP_FAILED. DF-R6-02: a dangling ROLLBACK intent
     # is ALSO an unknown outcome (the undo may or may not have applied).
     _rec = _ship_action_recovery_state(run_dir)
+    # DF-R9-02: a SIGNED dispatch with no authenticated outcome (no signed
+    # completion, no signed reconcile) is unknown too — even if a forged unsigned
+    # non-`ok` RESULT made the reducer mark its intent "resolved". Fold it into the
+    # forward-unresolved set so the same SHIP_UNKNOWN_OUTCOME consent gate applies.
     unresolved_fwd = _rec["unresolved_forward"]
+    if decision != "repair-evidence":
+        # `repair-evidence` belongs to the M56b evidence-pending flow (below); a
+        # dangling signed dispatch under that decision is re-checked AFTER the
+        # repair (a repair that resolves nothing must not then silently re-run).
+        unresolved_fwd = unresolved_fwd or \
+            _dangling_signed_dispatch(cfg, control_root, run_dir, run_id)
     unresolved_rb = _rec["unresolved_rollback"]
     unknown_effect = sorted(_rec["unknown_effect"])
     unresolved = unresolved_fwd or unresolved_rb
@@ -9236,6 +9366,13 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                                idempotency_key=unresolved.get("idempotency_key"),
                                attempt_id=unresolved.get("attempt_id"),
                                status="reconciled_unknown", exit=None, timed_out=False)
+            # DF-R9-02: SIGN the operator-consented reconcile so recovery can tell
+            # it apart from a FORGED reconciled_unknown (which has no such token) —
+            # else the next re-entry would re-flag this attempt as unknown forever.
+            _anchor_ship_local(cfg, control_root, run_id,
+                               _ship_reconciled_payload(run_id, unresolved.get("action"),
+                                                        unresolved.get("attempt_id")),
+                               "ship-action-reconciled")
         else:
             # A dangling ROLLBACK: resolve it as an operator-consented unknown
             # failure AND drop the action from `applied` (its effect is now
@@ -9275,6 +9412,26 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
     if repair_status == "repaired":
         print("dark-factory: ship evidence repaired — the pending completion token(s) were "
               "re-signed from the intent-authenticated facts (no action re-ran); continuing.")
+
+    # DF-R9-02: after evidence-repair, a SIGNED dispatch that STILL has no
+    # authenticated outcome (no signed completion, no signed reconcile) must not be
+    # silently re-run. This catches a forged non-`ok` result under `repair-evidence`
+    # (where the dangling gate above is deferred so repair can run first) and any
+    # dangling that survived the repair. Fail-closed: the operator must reconcile
+    # (consent to a possible duplicate) or abort. A reconcile that reached here has
+    # already signed its reconcile token, so it is no longer dangling and proceeds.
+    _dangling = _dangling_signed_dispatch(cfg, control_root, run_dir, run_id)
+    if _dangling is not None:
+        ship_journal.write("SHIP_UNKNOWN_OUTCOME", action=_dangling.get("action"),
+                           idempotency_key=_dangling.get("idempotency_key"),
+                           attempt_id=_dangling.get("attempt_id"), kind="action")
+        sys.stderr.write(
+            f"dark-factory: ship action {_dangling.get('action')!r} has a SIGNED dispatch with "
+            "no authenticated outcome — its real-world effect is UNKNOWN (an unsigned non-`ok` "
+            "result does not resolve a signed intent). Refusing to re-run. Inspect the target, "
+            "then `ship --decision reconcile` (re-run, accepting a possible duplicate) or "
+            "`--decision abort` (seal SHIP_FAILED).\n")
+        return UNKNOWN_OUTCOME
 
     already_done = _ship_completed_actions(run_dir)
 
