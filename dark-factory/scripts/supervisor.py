@@ -2068,6 +2068,18 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         sys.stderr.write("dark-factory: control root has no `custody` block; nothing to attach\n")
         return 2
 
+    # DF-R9-07 (M79): AUTHENTICATE the sealed manifest (HMAC) BEFORE trusting the
+    # config_sha256 binding below — see verify_custody_cmd. A control-root writer who
+    # rewrites config.json + the manifest's config_sha256 + the PLAIN manifest.sha256
+    # and self-signs with their own approver key leaves the manifest HMAC STALE; this
+    # returns TAMPERED and refuses, so custody cannot be self-qualified.
+    ok_m, why_m = _authenticate_manifest(cfg, control_root, run_dir)
+    if not ok_m:
+        sys.stderr.write(
+            f"dark-factory: custody attach refused — the sealed manifest failed authentication "
+            f"({why_m}); refusing to attest an unauthenticated manifest (fail-closed).\n")
+        return 3
+
     # Refuse if config.json changed since the run — the custody policy
     # (approvers/threshold) is bound to the manifest's sealed config_sha256,
     # so post-run threshold/approver tampering fails closed (see
@@ -2245,6 +2257,21 @@ def verify_custody_cmd(control_root: str, run_dir: str) -> bool:
         return False
     if cfg["_custody"] is None:
         print("NO CUSTODY CONFIGURED (control root has no `custody` block)")
+        return False
+
+    # DF-R9-07 (M79): AUTHENTICATE the sealed manifest (HMAC) BEFORE trusting ANY of
+    # its fields — the config_sha256 binding below is only tamper-proof when the
+    # manifest carrying it is HMAC-signed. Without this, a control-root writer (no
+    # audit key, no approver key) rewrites config.json's custody block to their OWN
+    # 1-of-1 key, rewrites the manifest's config_sha256 to match + recomputes the
+    # PLAIN manifest.sha256, self-signs the manifest, and gets QUALIFIED — the exact
+    # single-operator-proof bypass every sibling surface (ship/release/waiver) already
+    # closes with _authenticate_manifest. A stale HMAC → TAMPERED → refuse. (The
+    # config_sha256 check remains below as defense in depth against a signing-off /
+    # legacy manifest and to surface an intended-config mismatch.)
+    ok_m, why_m = _authenticate_manifest(cfg, control_root, run_dir)
+    if not ok_m:
+        print(f"INVALID (the sealed manifest failed authentication: {why_m})")
         return False
 
     # The custody policy is bound to the run's sealed config_sha256: a
