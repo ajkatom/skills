@@ -474,12 +474,40 @@ def _redacted_write(path: str, payload, redactor) -> str:
     return text
 
 
+def _state_integrity_payload(run_id, seq, state_sha256):
+    """DF-R9 (M77): the canonical bytes whose sha256 is anchored as a SIGNED
+    resumable-state token every time state.json is written. Binds run_id + a
+    monotonic seq + the sha256 of the EXACT state.json bytes, so a resume can
+    AUTHENTICATE the checkpoint it is about to trust: any same-user edit of
+    state.json (a forged build_approved_through, budget counter, FSM head, or phase)
+    changes the digest and no longer matches the signed anchor, and an OLDER
+    checkpoint cannot be replayed because seq must be the HIGHEST anchored."""
+    return canonical_json({"kind": "resumable-state", "run_id": run_id,
+                           "seq": seq, "state_sha256": state_sha256})
+
+
+def _resumable_state_seqs(control_root, run_id):
+    """The set of monotonic seqs for which a resumable-state token is anchored for
+    `run_id` — parsed from the deterministic chain key `{run_id}.resumable-state.
+    {seq:08d}`. Empty on any chain/read error (the caller treats that as none)."""
+    seqs = set()
+    pre = f"{run_id}.resumable-state."
+    try:
+        for e in df_audit_chain.read_chain(os.path.join(control_root, "audit-chain.jsonl")):
+            inv = str(e.get("invocation", ""))
+            if inv.startswith(pre) and inv[len(pre):].isdigit():
+                seqs.add(int(inv[len(pre):]))
+    except (df_audit_chain.ChainError, OSError):
+        pass
+    return seqs
+
+
 def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regressions=None,
               builder_calls=0, estimated_usd=0.0, budget_alerted=False, reason="checkpoint",
               redactor=None, builder_input_tokens=0, builder_output_tokens=0,
               usage_known=False, phase=None, chain_append=False,
               scenario_set_sha256=None, artifact_object_id=None,
-              build_approved_through=0, ship_meta=None):
+              build_approved_through=0, ship_meta=None, cfg=None):
     # M36a Task 3: state_version 0.2 additionally records the FSM `phase` and
     # the head of the per-run hash chain. Genuine resumable pause transitions
     # (chain_append=True: the checkpoint / budget / before-build pauses) append
@@ -494,6 +522,19 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
                                        artifact_object_id, redactor=redactor)
     else:
         chain_head = _fsm_chain_head(run_dir)
+    # DF-R9 (M77): on a SIGNED run, every state.json write is bound to the SIGNED
+    # audit chain (the FSM chain above is an UNSIGNED sha256 chain a same-user writer
+    # can rewrite wholesale, and build_approved_through / budget counters are not
+    # bound by it at all). Compute the monotonic seq for THIS write now (highest
+    # anchored + 1); it is sealed INTO state.json below, then the written bytes are
+    # digested and anchored. Unsigned tiers keep state_seq None and are not anchored.
+    _signing = bool((cfg or {}).get("_audit", {}).get("signing"))
+    _control_root = (cfg or {}).get("_control_root")
+    _run_id = os.path.basename(run_dir.rstrip(os.sep))
+    state_seq = None
+    if _signing and _control_root:
+        _existing = _resumable_state_seqs(_control_root, _run_id)
+        state_seq = (max(_existing) + 1) if _existing else 0
     # state.json must NEVER carry a credential value: it holds only control-
     # plane bookkeeping (iteration counters, ID/taxonomy feedback, paths), but
     # it goes through the same redaction choke point as every other artifact
@@ -502,6 +543,10 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
         os.path.join(run_dir, "state.json"),
         {
             "state_version": STATE_VERSION,
+            # DF-R9 (M77): the monotonic integrity seq sealed into these very bytes;
+            # the SIGNED resumable-state anchor below binds sha256(state.json) at this
+            # seq. None on unsigned tiers (no detection-grade guarantee to offer).
+            "state_seq": state_seq,
             "next_iter": next_iter,
             "feedback": feedback,
             "workspace": workspace,
@@ -541,6 +586,16 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
         },
         redactor,
     )
+    # DF-R9 (M77): anchor the SIGNED resumable-state token binding the EXACT written
+    # bytes at this seq, under the deterministic key `{run_id}.resumable-state.
+    # {seq:08d}` so resume can find the highest/matching anchor. Best-effort: a
+    # failed anchor leaves state_seq unmatched at resume, which fails closed — the
+    # safe outcome for a checkpoint whose integrity could not be committed.
+    if _signing and _control_root and state_seq is not None:
+        _digest = sha256_file(os.path.join(run_dir, "state.json"))
+        _anchor_ship_local(cfg, _control_root, _run_id,
+                           _state_integrity_payload(_run_id, state_seq, _digest),
+                           "resumable-state", key_suffix=f"{state_seq:08d}")
 
 
 def load_state(run_dir):
@@ -566,6 +621,10 @@ def load_state(run_dir):
     state.setdefault("state_version", "0.1")
     state.setdefault("phase", None)
     state.setdefault("fsm_chain_head", None)
+    # DF-R9 (M77): the SIGNED resumable-state integrity seq. Absent on a pre-M77
+    # state.json (→ None); on a signed run that is a fail-closed refusal at resume
+    # (an unauthenticatable checkpoint), on an unsigned run it is simply unused.
+    state.setdefault("state_seq", None)
     # RA-05/M45: additive. A pre-M45 state.json (0.1 legacy OR a 0.2 state
     # written before this field existed) defaults to None -> the sealed hash
     # comes from the FSM chain genesis when available, else the run is treated
@@ -4450,6 +4509,94 @@ def _authenticated_source_identity(cfg, control_root, run_dir, run_id):
     return ("tampered", None)
 
 
+def _authenticate_resumable_state(cfg, control_root, run_dir, run_id, state):
+    """DF-R9 (M77): AUTHENTICATE the loaded resumable checkpoint (state.json) against
+    the SIGNED audit chain before resume trusts ANY of its control-plane decisions.
+    Returns (ok, reason). SIGNED runs only — the caller gates on signing.
+
+    The M36a FSM chain (fsm_chain.jsonl) is an UNSIGNED sha256 chain: a same-user
+    writer (no audit key) can rewrite it wholesale AND set state.json's recorded head
+    to match, so it detects accidental corruption, not tampering. And the security-
+    critical fields it never bound — `build_approved_through` (forge it high to skip
+    the before-build approval pause) and `builder_calls`/`estimated_usd` (forge them
+    low to defeat the budget ceiling) — are trusted raw. Each state.json write now
+    also anchors a SIGNED token binding its EXACT bytes at a monotonic seq; here we
+    require the loaded checkpoint to BE that latest signed state:
+      * the run has ≥1 anchored resumable-state token (else the anchor / whole audit
+        chain was deleted, or the run predates M77 — fail closed, mirroring M76);
+      * the loaded `state_seq` is the HIGHEST anchored seq (no replay of an older,
+        lower-budget / lower-approval checkpoint);
+      * the token for (run_id, state_seq, sha256(state.json now)) is anchored — any
+        edited field changes the digest → no match → fail closed.
+
+    RESIDUAL (opus M77 review; the inherited DF-R9-04/M73 truncatability, NOT new to
+    this mechanism): anti-replay keys on the HIGHEST seq in the LOCAL chain, and a
+    same-owner local chain is truncatable to any prefix that still verifies. So on a
+    signed run WITHOUT a REQUIRED off-box sink, a same-user attacker can snapshot an
+    early checkpoint (state.json + fsm_chain.jsonl + audit-chain.jsonl), let the run
+    advance, then roll ALL of them back to that snapshot: the truncated chain's tip
+    IS the restored state_seq and its digest matches, so resume authenticates a stale
+    checkpoint — reverting the budget counters (repeatable → defeats the ceiling).
+    build_approved_through can only be reverted to an OLDER (lower, safe-direction)
+    value, so this is a BUDGET-integrity residual, not an approval-skip. It is CLOSED
+    by a required, reachable off-box sink: _checkpoint_chain_to_sink keeps committed
+    lengths dense, so `_verify_chain_untruncated` below probes length local+1, gets
+    200, and fails closed on the truncation. This is the SAME sink-conditional
+    boundary as ship-completion and source-identity truncation detection (M73/M76);
+    the cross-pause budget-ceiling guarantee is therefore sink-conditional on a
+    signed run, robust against in-place forgery + same-chain replay unconditionally.
+    Never raises."""
+    try:
+        key = df_audit.load_key(cfg.get("_audit", {}).get("key_path"))
+    except (df_audit.AuditKeyError, KeyError, TypeError):
+        return (False, "the audit signing key required to authenticate the resumable "
+                "checkpoint could not be loaded; refusing to resume (fail-closed)")
+    # DF-R9-04 / M73: a tail-truncation could have erased the tip state anchor (or
+    # rolled the whole chain back to an earlier prefix — the truncation-replay
+    # residual above) while the surviving prefix still verifies — treat an
+    # unconfirmed-untruncated REQUIRED chain as fail-closed. This is what makes the
+    # cross-pause budget guarantee hold on a sink-backed signed run. No-op (ok) when
+    # no sink is configured (the documented sink-conditional residual).
+    ok_tr, why_tr = _verify_chain_untruncated(cfg, control_root)
+    if not ok_tr:
+        return (False, why_tr)
+    chain_path = os.path.join(control_root, "audit-chain.jsonl")
+    try:
+        ok, why = df_audit_chain.verify_chain(chain_path, key)
+        if not ok:
+            return (False, f"the signed audit chain failed verification ({why}); refusing "
+                    "to resume the recorded checkpoint (fail-closed)")
+        entries = df_audit_chain.read_chain(chain_path)
+    except df_audit_chain.ChainError as e:
+        return (False, f"the audit chain is unreadable ({e}); refusing (fail-closed)")
+    pre = f"{run_id}.resumable-state."
+    anchored = {}  # seq -> anchored token digest
+    for e in entries:
+        inv = str(e.get("invocation", ""))
+        if inv.startswith(pre) and inv[len(pre):].isdigit():
+            anchored[int(inv[len(pre):])] = e.get("manifest_sha256")
+    if not anchored:
+        return (False, "this SIGNED run has NO anchored resumable-state token — the "
+                "checkpoint integrity anchor (or the whole audit chain) was deleted, or the "
+                "run predates M77; refusing to resume (fail-closed)")
+    state_seq = state.get("state_seq")
+    if not isinstance(state_seq, int) or isinstance(state_seq, bool):
+        return (False, "the resumable checkpoint carries no integrity seq on a signed run "
+                "(a forged or pre-M77 state.json); refusing to resume (fail-closed)")
+    max_seq = max(anchored)
+    if state_seq != max_seq:
+        return (False, f"the resumable checkpoint is not the latest signed state (seq "
+                f"{state_seq} != highest anchored {max_seq}) — an older checkpoint was "
+                "replayed to revert budget/approval state; refusing to resume (fail-closed)")
+    digest = sha256_file(os.path.join(run_dir, "state.json"))
+    token = sha256_str(_state_integrity_payload(run_id, state_seq, digest))
+    if token != anchored[max_seq]:
+        return (False, "the resumable checkpoint's bytes do not match their SIGNED integrity "
+                "anchor — state.json was edited after the pause (a forged build_approved_through, "
+                "budget counter, FSM head, or phase); refusing to resume (fail-closed)")
+    return (True, "resumable state authenticated against the signed chain")
+
+
 def _builder_identity_field(cfg):
     """The sealed `builder_identity` manifest field (or None). Carries the
     operator-ASSERTED model_identity (DF-R4-09) AND — new for the R5 arbitration
@@ -5467,7 +5614,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                        phase="AWAIT_SHIP", chain_append=True,
                        scenario_set_sha256=scenario_set_sha256,
                        artifact_object_id=object_id,
-                       build_approved_through=build_approved_through, redactor=redactor,
+                       build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                        builder_input_tokens=builder_input_tokens,
                        builder_output_tokens=builder_output_tokens,
                        usage_known=usage_known,
@@ -5843,7 +5990,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget_alerted=budget_alerted, reason="build",
                           phase=f"AWAIT_BUILD_{i}", chain_append=True,
                           scenario_set_sha256=scenario_set_sha256,
-                          build_approved_through=build_approved_through, redactor=redactor,
+                          build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens, usage_known=usage_known)
                 journal.write("CHECKPOINT", iteration=i, phase=f"AWAIT_BUILD_{i}",
@@ -5980,7 +6127,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                               budget_alerted=budget_alerted, reason="budget",
                               phase=f"AWAIT_BUDGET_{i}", chain_append=True,
                               scenario_set_sha256=scenario_set_sha256,
-                              build_approved_through=build_approved_through, redactor=redactor,
+                              build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                               builder_input_tokens=builder_input_tokens,
                               builder_output_tokens=builder_output_tokens,
                               usage_known=usage_known)
@@ -6279,7 +6426,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           builder_calls=builder_calls, estimated_usd=estimated_usd,
                           budget_alerted=budget_alerted, reason="dispatch",
                           phase=f"DISPATCH_{i}", chain_append=False,
-                          build_approved_through=build_approved_through, redactor=redactor,
+                          build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
                           usage_known=usage_known)
@@ -6679,7 +6826,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget_alerted=budget_alerted, reason="checkpoint",
                           phase=f"AWAIT_VERIFY_{i}", chain_append=True,
                           scenario_set_sha256=scenario_set_sha256,
-                          build_approved_through=build_approved_through, redactor=redactor,
+                          build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
                           usage_known=usage_known)
@@ -7003,6 +7150,24 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                           phase=state.get("phase"))
         else:
             journal.write("FSM_CHAIN_ABSENT_LEGACY", state_version=state.get("state_version"))
+
+        # DF-R9 (M77): the FSM chain above is UNSIGNED (sha256) — it detects
+        # accidental corruption, but a same-user writer (no audit key) can rewrite it
+        # + state.json's head consistently, and it never bound build_approved_through
+        # or the budget counters. On a SIGNED run, additionally AUTHENTICATE the
+        # loaded checkpoint against the signed audit chain (each state.json write
+        # anchored its exact bytes at a monotonic seq): a forged field or a replayed
+        # older checkpoint fails closed here, BEFORE any resume override, budget
+        # admission, or approval-cursor decision reads the state.
+        if bool(cfg.get("_audit", {}).get("signing")):
+            ok_st, why_st = _authenticate_resumable_state(
+                cfg, control_root, run_dir, run_id, state)
+            if not ok_st:
+                journal.write("STATE_INTEGRITY_REFUSED", detail=why_st)
+                sys.stderr.write(f"dark-factory: resume refused (fail-closed) — {why_st}\n")
+                release_lock(lock)
+                return 2
+            journal.write("STATE_INTEGRITY_VERIFIED", state_seq=state.get("state_seq"))
 
         audit_key, audit_err = _load_audit_key(cfg, journal)
         if audit_err is not None:
@@ -7430,6 +7595,12 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                 # iteration -- carry the cursor up to it so the loop does NOT
                 # re-pause the build it just approved. Every other resume simply
                 # threads the persisted cursor forward.
+                # DF-R9 (M77): this cursor is ADVANCE-ONLY — it is only ever set to
+                # `next_iter` (the approved iteration) or threaded forward unchanged,
+                # NEVER lowered by any legitimate path. That is what makes the M77
+                # truncation-replay residual a BUDGET-only concern: replaying an
+                # OLDER signed checkpoint yields a LOWER cursor → MORE approval pauses
+                # (the safe direction), never an approval-skip. Keep it advance-only.
                 build_approved_through=(
                     state["next_iter"] if state.get("reason") == "build"
                     else state.get("build_approved_through", 0)),
@@ -7958,12 +8129,15 @@ def _resolve_ship_action_creds(action):
     return df_creds.load_credentials({"source": "env", "allowlist": list(env_names)})
 
 
-def _anchor_ship_local(cfg, control_root, run_id, record_text, kind):
+def _anchor_ship_local(cfg, control_root, run_id, record_text, kind, key_suffix=None):
     """DF-R4-03 primitive #1 — the LOCAL signed anchor ONLY (no off-box push).
     Append one entry binding `record_text`'s digest into the tamper-evident
-    per-control-root hash chain. `kind` is 'ship' / 'ship-action' / 'release'; the
-    chain key is uniquified so repeated attempts (pending → attach → ship, plus the
-    audit-only retry) each anchor without colliding.
+    per-control-root hash chain. `kind` is 'ship' / 'ship-action' / 'release' /
+    'source-identity' / 'resumable-state'; the chain key is uniquified so repeated
+    attempts (pending → attach → ship, plus the audit-only retry) each anchor
+    without colliding. `key_suffix` (M77) overrides that random uniquifier with a
+    DETERMINISTIC suffix (e.g. a monotonic `{seq:08d}`) so a later recovery can read
+    the seq back out of the chain key and find the highest/matching anchor.
 
     Uses df_audit.load_key (NEVER load_or_create_key): an established signed run's
     audit key MUST already exist. A key that is missing/unloadable AFTER an action
@@ -7981,7 +8155,7 @@ def _anchor_ship_local(cfg, control_root, run_id, record_text, kind):
     off-box push (see _push_ship_offbox) is what lets the ship seal push off-box
     FIRST and anchor/commit an authoritative SHIPPED only after the evidence lands."""
     chain_path = os.path.join(control_root, "audit-chain.jsonl")
-    chain_key = f"{run_id}.{kind}.{uuid.uuid4().hex[:8]}"
+    chain_key = f"{run_id}.{kind}.{key_suffix if key_suffix is not None else uuid.uuid4().hex[:8]}"
     if bool(cfg.get("_audit", {}).get("signing")):
         # CRITICAL (M49): never append an UNSIGNED entry to a SIGNED chain — it would
         # make verify_chain fail the ENTIRE control-root chain. A key that cannot be
