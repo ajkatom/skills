@@ -100,6 +100,40 @@ def signed_s3_get(sink_cfg: dict, key: str, *, version_id: str = "", timeout_s: 
         return (0, None)
 
 
+def probe(sink_cfg: dict, key: str, *, timeout_s: int = 20):
+    """DF-R9-04: does `key` EXIST off-box? Returns (status, body):
+      (200, bytes) — the object exists off-box (a committed chain checkpoint)
+      (404, None)  — absent off-box
+      (0,   None)  — inconclusive (sink unreachable / creds unavailable / kind none)
+    Never raises. This is the truncation-detection primitive: after each chain
+    append a checkpoint is pushed to a MONOTONIC write-once key `chainlen.<N>`; on
+    re-entry we probe `chainlen.<local_len+1>` — a 200 proves the off-box (WORM /
+    append-only) sink recorded a LONGER chain than the local file now holds, i.e.
+    the local chain was tail-truncated. Because keys are write-once (http-append
+    409s a duplicate; an object-lock bucket refuses an overwrite/delete), an
+    attacker cannot roll a committed length back."""
+    kind = sink_cfg.get("kind", "none")
+    if kind == "s3-objectlock":
+        return signed_s3_get(sink_cfg, key, timeout_s=timeout_s)
+    if kind == "http-append":
+        return _get_http_append(sink_cfg, key, timeout_s=timeout_s)
+    return (0, None)
+
+
+def _get_http_append(sink_cfg: dict, key: str, *, timeout_s: int):
+    url = sink_cfg["url"].rstrip("/") + f"/audit/{urllib.parse.quote(key, safe='')}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if 200 <= resp.status < 300:
+                return (200, resp.read())
+            return (0, None)
+    except urllib.error.HTTPError as e:
+        return (404, None) if e.code == 404 else (0, None)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return (0, None)
+
+
 def _push_http_append(sink_cfg: dict, key: str, body: bytes, *, timeout_s: int) -> dict:
     url = sink_cfg["url"].rstrip("/") + f"/audit/{urllib.parse.quote(key, safe='')}"
     req = urllib.request.Request(url, data=body, method="PUT")

@@ -1514,6 +1514,14 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     if sink.get("kind", "none") == "none":
         return 0
 
+    # DF-R9-04: commit THIS new chain length off-box (best-effort) BEFORE the
+    # (larger) audit-record push and regardless of whether that push then succeeds,
+    # so the committed lengths stay DENSE (no HOLE the truncation probe could fall
+    # into). A required sink that is DOWN fails the record push below (return 3), so
+    # this needn't be separately fatal; the re-entry truncation gate fails a
+    # required sink closed when completeness can't be confirmed.
+    _checkpoint_chain_to_sink(cfg, control_root)
+
     try:
         receipt = df_audit_sink.push(sink, invocation, json.dumps(entry).encode("utf-8"))
     except df_audit_sink.SinkError as e:
@@ -1526,6 +1534,117 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     atomic_write(os.path.join(run_dir, "audit_sink_receipt.json"), canonical_json(receipt))
     _event("AUDIT_SINK_OK", kind=sink["kind"], receipt=receipt)
     return 0
+
+
+def _chain_sink_namespace(cfg, control_root):
+    """DF-R9-04: a truncation-SURVIVING namespace for the off-box chain-length
+    checkpoints — sha256 of the audit key fingerprint (a one-way hash, never the
+    key) BOUND to this control root's absolute path. Deriving it from the key +
+    control-root path (inputs, not the chain) means it survives truncation of the
+    LOCAL chain to EMPTY (so a full truncation is still detectable), while binding
+    the control root prevents two roots that SHARE one signing key from aliasing
+    each other's checkpoints (opus review F2 — a shared org key would otherwise make
+    one root's length falsely read as another's truncation). None when unsigned or
+    the key can't be loaded."""
+    audit = cfg.get("_audit", {})
+    if not audit.get("signing"):
+        return None
+    try:
+        key = df_audit.load_key(audit["key_path"])
+    except (df_audit.AuditKeyError, KeyError, TypeError, OSError):
+        return None
+    kb = key if isinstance(key, (bytes, bytearray)) else str(key).encode("utf-8")
+    root = os.path.realpath(control_root).encode("utf-8")
+    return hashlib.sha256(b"dfchain-ns:" + bytes(kb) + b"|" + root).hexdigest()[:24]
+
+
+def _chain_length(control_root):
+    """DF-R9-04: the number of entries in the local signed chain (0 if empty/
+    unreadable — a truncation-to-empty reads as 0, which the checkpoint probe then
+    catches against the off-box committed length)."""
+    try:
+        return len(df_audit_chain.read_chain(os.path.join(control_root, "audit-chain.jsonl")))
+    except df_audit_chain.ChainError:
+        return 0
+
+
+def _chain_checkpoint_key(ns, length):
+    return f"dfchain.{ns}.{length:08d}"
+
+
+def _checkpoint_chain_to_sink(cfg, control_root):
+    """DF-R9-04: commit the current chain length to the off-box sink under a
+    MONOTONIC WRITE-ONCE key (`dfchain.<ns>.<len>`), so a later tail-truncation of
+    the local chain is detectable — the sink still holds a checkpoint for the longer
+    length the local file no longer reaches. Returns True iff the current length is
+    CONFIRMED committed off-box (freshly pushed OR already present — write-once).
+    Returns False iff a sink is configured but the length could NOT be confirmed
+    committed. Callers checkpoint at EVERY chain-append site so committed lengths
+    stay DENSE (a missing checkpoint — a HOLE — at length h would let an attacker
+    truncate to h-1 and pass the `local+1` probe; opus review F1). True when no
+    sink / unsigned (nothing to commit).
+
+    RESIDUAL (opus review, documented LOW): the push is best-effort here, so a
+    TRANSIENT single-checkpoint drop — the sink up for the required record push but
+    failing for exactly this one checkpoint PUT — leaves a hole a later truncation
+    to length h-1 would pass. Under the stated threat model (control-root read/write
+    only; every op holds acquire_lock) a pure control-root attacker CANNOT
+    selectively fail one egress request, so this arises only from genuine sink
+    flakiness; it escalates only if same-user network/egress interference is in
+    scope. The committed-bool this returns lets a specific site (e.g. the ship
+    completion anchor) be made fatal if that broader model must be covered — kept
+    best-effort here to preserve the SHIPPED_AUDIT_PENDING crash-window recovery."""
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none"})
+    if sink.get("kind", "none") == "none":
+        return True
+    ns = _chain_sink_namespace(cfg, control_root)
+    length = _chain_length(control_root)
+    if ns is None or length == 0:
+        return True
+    key = _chain_checkpoint_key(ns, length)
+    body = canonical_json({"length": length})
+    try:
+        df_audit_sink.push(sink, key, body.encode("utf-8"))
+        return True
+    except df_audit_sink.SinkError:
+        # A write-once duplicate (this length already committed) is SUCCESS; any
+        # other failure is not — distinguish by an existence probe.
+        status, _ = df_audit_sink.probe(sink, key)
+        return status == 200
+
+
+def _verify_chain_untruncated(cfg, control_root):
+    """DF-R9-04: refuse a LOCAL chain shorter than what the off-box sink has
+    already committed — a tail-truncation (up to and including truncation to EMPTY)
+    that erases completion/rollback/terminal/re-entry tokens while the surviving
+    prefix still passes verify_chain. Probe the monotonic checkpoint ONE PAST the
+    local length: its existence off-box proves a longer chain was committed to the
+    WORM/append-only trust domain, which a same-user writer cannot roll back
+    (write-once keys). Returns (ok, reason).
+      * no sink configured    -> (True) sink-less tiers are detection-grade only.
+      * chainlen<local+1> 200  -> (False) truncated.
+      * 404                    -> (True) local chain is complete.
+      * inconclusive           -> required sink: (False) fail-closed; else (True)."""
+    sink = cfg.get("_audit", {}).get("sink", {"kind": "none"})
+    if sink.get("kind", "none") == "none":
+        return (True, "no off-box audit sink configured; local-chain completeness is "
+                "detection-grade best-effort (sink-less tier)")
+    ns = _chain_sink_namespace(cfg, control_root)
+    if ns is None:
+        return (True, "unsigned run — no off-box chain trust boundary")
+    length = _chain_length(control_root)
+    status, _body = df_audit_sink.probe(sink, _chain_checkpoint_key(ns, length + 1))
+    if status == 200:
+        return (False, "the off-box audit sink records a LONGER signed chain than the local "
+                f"audit-chain.jsonl (a committed checkpoint for length {length + 1} exists "
+                f"off-box; the local chain has {length} entries) — the local chain was "
+                "tail-truncated to erase audit evidence")
+    if status == 404:
+        return (True, f"off-box sink confirms the local chain (length {length}) is untruncated")
+    if sink.get("required"):
+        return (False, "the REQUIRED off-box audit sink is unreachable, so local-chain "
+                "completeness cannot be confirmed — refusing (fail-closed)")
+    return (True, "off-box sink unreachable; local-chain completeness unconfirmed (optional sink)")
 
 
 def verify_chain_cmd(control_root: str, key: bytes = None) -> bool:
@@ -2003,6 +2122,11 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         chain_path = os.path.join(control_root, "audit-chain.jsonl")
         entry = df_audit_chain.append_entry(
             chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
+        # DF-R9-04: keep the off-box committed lengths DENSE — checkpoint this
+        # custody anchor too (best-effort; the required-sink record push above
+        # already fails closed when the sink is down), else its length would be a
+        # HOLE an attacker could truncate to undetected (opus review F1).
+        _checkpoint_chain_to_sink(cfg, control_root)
         if receipt is not None:
             atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"),
                          canonical_json(receipt))
@@ -2383,6 +2507,10 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
         atomic_write(att_path, att_text)
         entry = df_audit_chain.append_entry(
             chain_path, waiver_chain_key, sha256_str(att_text), _now(), audit_key)
+        # DF-R9-04: keep the off-box committed lengths DENSE (best-effort; the
+        # required-sink record push above already fails closed when down) — else
+        # this waiver anchor's length is a HOLE (opus review F1).
+        _checkpoint_chain_to_sink(cfg, control_root)
         if receipt is not None:
             atomic_write(os.path.join(run_dir, "waiver_sink_receipt.json"),
                          canonical_json(receipt))
@@ -7610,6 +7738,15 @@ def _anchor_ship_local(cfg, control_root, run_id, record_text, kind):
                 f"dark-factory: WARNING — could not anchor the {kind} record into the signed "
                 f"audit chain ({e}); the local signed anchor is PENDING.\n")
             return "anchor_failed"
+        # DF-R9-04: commit this new chain length off-box (best-effort) so a later
+        # tail-truncation of THIS just-anchored ship token is detectable on
+        # re-entry. Best-effort — NOT fatal — here: a required sink that is DOWN is
+        # handled by the SEAL's required off-box record push (SHIPPED_AUDIT_PENDING)
+        # and by the re-entry truncation gate (a required sink whose completeness
+        # can't be confirmed fails closed), so the action still runs and recovers
+        # rather than being blocked pre-spawn. The checkpoint succeeds whenever the
+        # sink is up (a normal run), keeping committed lengths DENSE.
+        _checkpoint_chain_to_sink(cfg, control_root)
         return "anchored"
     # signing off: best-effort unsigned chain (not a trust boundary).
     try:
@@ -8056,6 +8193,16 @@ def _authenticate_ship_actions(cfg, control_root, run_dir, run_id):
     edited SHIP_ACTION_RESULT `ok` line for an action that never ran has no
     matching signed token → REFUSED. Fail-closed on any key/chain error. Returns
     (ok, reason)."""
+    # DF-R9-04: before trusting ANY recovered ship state, refuse if the local
+    # signed chain was TAIL-TRUNCATED (the off-box sink committed a longer chain
+    # than the local file now holds). A truncation erases completion/rollback/
+    # terminal tokens while the surviving prefix still passes verify_chain — so
+    # this gate MUST run BEFORE the "nothing to authenticate" short-circuit below,
+    # which a truncation could otherwise satisfy vacuously. No-op (best-effort)
+    # when no sink is configured; fail-closed when a REQUIRED sink is unreachable.
+    ok_tr, why_tr = _verify_chain_untruncated(cfg, control_root)
+    if not ok_tr:
+        return (False, why_tr)
     facts = _ship_completed_action_facts(run_dir)
     # DF-R7-01: a forged SHIP_ROLLED_BACK can EMPTY the applied set (so `facts` is
     # []) precisely to force a real action to re-run — so we must authenticate
@@ -8778,6 +8925,21 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
 
     ship_journal = Journal(os.path.join(run_dir, SHIP_JOURNAL_FILE), redactor=redactor)
     signing_on = bool(cfg.get("_audit", {}).get("signing"))
+
+    # DF-R9-04: refuse to ship (or re-ship) against a TAIL-TRUNCATED signed chain.
+    # A same-user writer can truncate the local chain to a still-verifying prefix
+    # (or to empty) to erase ship-action / terminal tokens AND their journal
+    # attribution, then re-run a non-idempotent action — nothing survives for the
+    # per-action authentication to catch. The off-box WORM/append sink still holds
+    # a monotonic checkpoint for the longer length, so this UNCONDITIONAL gate
+    # (before any `already_done` is derived) detects it. No-op when unsigned or
+    # sink-less (detection-grade best-effort); fail-closed on a REQUIRED sink that
+    # cannot confirm completeness.
+    ok_tr, why_tr = _verify_chain_untruncated(cfg, control_root)
+    if not ok_tr:
+        ship_journal.write("SHIP_CHAIN_TRUNCATED_REFUSED", detail=why_tr)
+        sys.stderr.write(f"dark-factory: ship refused (fail-closed) — {why_tr}\n")
+        return SHIP_STATE_UNAUTHENTICATED
 
     # Idempotent terminal: a completed ship never re-ships. SHIP_APPROVAL_PENDING
     # is NOT terminal (an attach + re-`ship` resumes it), so it falls through.
