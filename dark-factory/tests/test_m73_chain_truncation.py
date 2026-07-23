@@ -124,7 +124,11 @@ def test_optional_sink_unreachable_is_best_effort_pass(tmp_path, monkeypatch):
     monkeypatch.setattr(df_audit_sink, "probe", lambda *a, **k: (0, None))
     cr, cfg = _signed_chain(tmp_path, 2)
     ok, why = supervisor._verify_chain_untruncated(cfg, str(cr))
-    assert ok and "unconfirmed" in why
+    # DF-R10-03: an OPTIONAL unreachable sink still proceeds (recovery best-effort);
+    # the completeness STATE is 'unreachable' (not off-box confirmed), so it is the
+    # production predicate — not this recovery gate — that withholds a prod verdict.
+    assert ok and "unreachable" in why
+    assert supervisor._chain_completeness(cfg, str(cr))[0] == "unreachable"
 
 
 def test_r9_04_repro_tail_truncation_ship_refused(tmp_path, monkeypatch):

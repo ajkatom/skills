@@ -113,7 +113,8 @@ def _full_bundle(profile):
     common = {
         "source": {"sealed_commit": "a" * 40, "sealed_clean": True,
                    "sealed_tree_digest": "t" * 64, "matches_sealed": True},
-        "audit_chain": {"verified": True, "untruncated": True}, "config_sha256": "c" * 64,
+        "audit_chain": {"verified": True, "untruncated": True,
+                        "completeness": "confirmed_offbox"}, "config_sha256": "c" * 64,
         "ship_result": {"outcome": "SHIPPED", "authenticated": True,
                         "actions": [{"name": "deploy", "status": "ok", "reversible": True}]},
         "reentry": {"no_duplicate_or_unknown_actions": True,
@@ -155,12 +156,13 @@ def test_full_hardened_profile_is_ready():
 
 
 def test_truncated_chain_is_not_production_ready():
-    # DF-R9-04: a chain that verifies but is not confirmed untruncated off-box
-    # cannot read as production-ready.
+    # DF-R9-04 / DF-R10-03: a chain that verifies but is not off-box CONFIRMED
+    # complete cannot read as production-ready.
     ready, unmet = _ready("hardened-h4", lambda b, mf: b.update(
         {"audit_chain": {"verified": True, "untruncated": False,
-                         "untruncated_message": "tail-truncated"}}))
-    assert not ready and any("completeness not confirmed" in u for u in unmet)
+                         "completeness": "truncated",
+                         "completeness_message": "tail-truncated"}}))
+    assert not ready and any("NOT off-box confirmed" in u for u in unmet)
 
 
 def test_full_enterprise_profile_is_ready():

@@ -1672,38 +1672,58 @@ def _checkpoint_chain_to_sink(cfg, control_root):
         return status == 200
 
 
-def _verify_chain_untruncated(cfg, control_root):
-    """DF-R9-04: refuse a LOCAL chain shorter than what the off-box sink has
-    already committed — a tail-truncation (up to and including truncation to EMPTY)
-    that erases completion/rollback/terminal/re-entry tokens while the surviving
-    prefix still passes verify_chain. Probe the monotonic checkpoint ONE PAST the
-    local length: its existence off-box proves a longer chain was committed to the
-    WORM/append-only trust domain, which a same-user writer cannot roll back
-    (write-once keys). Returns (ok, reason).
-      * no sink configured    -> (True) sink-less tiers are detection-grade only.
-      * chainlen<local+1> 200  -> (False) truncated.
-      * 404                    -> (True) local chain is complete.
-      * inconclusive           -> required sink: (False) fail-closed; else (True)."""
+def _chain_completeness(cfg, control_root):
+    """DF-R10-03: the OFF-BOX completeness ASSURANCE STATE of the local signed chain,
+    as a tri(+)-state — NOT a lossy boolean — so a PRODUCTION verdict can require
+    genuine off-box confirmation and never read sink-less 'best-effort' as complete
+    (the R9/M70 boolean flattened `unconfirmed` into `untruncated:true`). Probes the
+    monotonic checkpoint ONE PAST the local length; its existence off-box proves a
+    longer chain was committed to the WORM/append-only trust domain, which a same-user
+    writer cannot roll back (write-once keys). Returns (state, message):
+      'confirmed_offbox' — a sink is configured + reachable and confirms the local
+                           chain is NOT tail-truncated (no longer checkpoint exists).
+      'unconfirmed'      — no sink configured (or unsigned): completeness is
+                           detection-grade best-effort ONLY, never off-box-proven.
+      'truncated'        — the sink holds a checkpoint for a LONGER chain than local
+                           (the local chain was tail-truncated to erase evidence).
+      'unreachable'      — a sink is configured but could not be reached to confirm."""
     sink = cfg.get("_audit", {}).get("sink", {"kind": "none"})
     if sink.get("kind", "none") == "none":
-        return (True, "no off-box audit sink configured; local-chain completeness is "
+        return ("unconfirmed", "no off-box audit sink configured; local-chain completeness is "
                 "detection-grade best-effort (sink-less tier)")
     ns = _chain_sink_namespace(cfg, control_root)
     if ns is None:
-        return (True, "unsigned run — no off-box chain trust boundary")
+        return ("unconfirmed", "unsigned run — no off-box chain trust boundary")
     length = _chain_length(control_root)
     status, _body = df_audit_sink.probe(sink, _chain_checkpoint_key(ns, length + 1))
     if status == 200:
-        return (False, "the off-box audit sink records a LONGER signed chain than the local "
-                f"audit-chain.jsonl (a committed checkpoint for length {length + 1} exists "
+        return ("truncated", "the off-box audit sink records a LONGER signed chain than the "
+                f"local audit-chain.jsonl (a committed checkpoint for length {length + 1} exists "
                 f"off-box; the local chain has {length} entries) — the local chain was "
                 "tail-truncated to erase audit evidence")
     if status == 404:
-        return (True, f"off-box sink confirms the local chain (length {length}) is untruncated")
-    if sink.get("required"):
+        return ("confirmed_offbox",
+                f"off-box sink confirms the local chain (length {length}) is untruncated")
+    return ("unreachable", "the off-box audit sink is unreachable, so local-chain completeness "
+            "cannot be confirmed off-box")
+
+
+def _verify_chain_untruncated(cfg, control_root):
+    """DF-R9-04 recovery-path gate, derived from `_chain_completeness`. Returns
+    (ok, reason) for the RECOVERY consumers (ship auth / source identity / resumable
+    state / resume): ok=False ONLY when the chain is provably TRUNCATED, or a REQUIRED
+    sink is unreachable (fail-closed). A sink-less 'unconfirmed' still PROCEEDS
+    (detection-grade best-effort) — the PRODUCTION predicate separately requires
+    completeness == 'confirmed_offbox' (df_evidence_bundle), which is the DF-R10-03
+    fix: recovery stays available sink-less, but no production verdict claims off-box
+    completeness it never obtained."""
+    state, why = _chain_completeness(cfg, control_root)
+    if state == "truncated":
+        return (False, why)
+    if state == "unreachable" and cfg.get("_audit", {}).get("sink", {}).get("required"):
         return (False, "the REQUIRED off-box audit sink is unreachable, so local-chain "
                 "completeness cannot be confirmed — refusing (fail-closed)")
-    return (True, "off-box sink unreachable; local-chain completeness unconfirmed (optional sink)")
+    return (True, why)
 
 
 def verify_chain_cmd(control_root: str, key: bytes = None) -> bool:
