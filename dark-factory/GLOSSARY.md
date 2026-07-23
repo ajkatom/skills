@@ -31,7 +31,7 @@ This glossary consolidates the security terminology used by Dark Factory. It inc
 - **Standard tier** — Uses a probe-verified operating-system sandbox to deny builder access to the control root and constrain candidate access.
 - **Hardened tier** — Runs the builder in Docker without mounting the control root. It also requires the standard-tier sandbox for verification and forces signed auditing.
 - **Enterprise tier** — Hardened plus seccomp, kernel-enforced egress restrictions, a host credential proxy, required off-box auditing, builder confinement, and K-of-N approval.
-- **Qualified** — The run satisfied every required isolation, candidate-egress, host-isolation, final-exam, application-security, audit, and applicable custody condition.
+- **Qualified** — The run satisfied every required isolation, candidate-egress, host-isolation, application-security, audit, and applicable custody condition. (A sealed final-exam is administered and must pass ONLY when a `final` cohort exists; a run configured with no `final` scenarios records `final_exam.ran: false` and still qualifies — the manifest never claims a passed exam that never ran. See `SKILL.md`.)
 - **Unqualified** — The candidate may work, but the run lacks the security evidence required for an approved shipping candidate.
 - **Downgrade** — An explicit reduction to a weaker tier when a requested control cannot be established. It must be requested, journaled, and reflected in qualification.
 - **H1 Directed** — Pauses frequently: after failures, before rebuilds, at budget limits, and before shipping.
