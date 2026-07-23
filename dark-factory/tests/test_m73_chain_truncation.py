@@ -335,6 +335,8 @@ def test_checkpoint_key_is_monotonic_and_write_once(tmp_path, monkeypatch):
     cr, cfg = _signed_chain(tmp_path, 2)
     supervisor._checkpoint_chain_to_sink(cfg, str(cr))
     supervisor._checkpoint_chain_to_sink(cfg, str(cr))  # duplicate length → 409, tolerated
-    keys = [k for k in fake.store if k.startswith("dfchain.")]
-    assert len(keys) == 1  # one checkpoint for length 2
-    assert json.loads(fake.store[keys[0]])["length"] == 2
+    keys = sorted(k for k in fake.store if k.startswith("dfchain."))
+    # DF-R10-04: checkpoints are now DENSE — a checkpoint at length 2 backfills 1..2,
+    # so the invariant "L committed ⇒ 1..L committed" holds and the one-past probe is
+    # sufficient. Each length key is write-once and carries its own length.
+    assert [json.loads(fake.store[k])["length"] for k in keys] == [1, 2]

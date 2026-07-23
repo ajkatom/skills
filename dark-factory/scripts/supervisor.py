@@ -1803,16 +1803,54 @@ def _checkpoint_chain_to_sink(cfg, control_root):
     length = _chain_length(control_root)
     if ns is None or length == 0:
         return True
-    key = _chain_checkpoint_key(ns, length)
-    body = canonical_json({"length": length})
-    try:
-        df_audit_sink.push(sink, key, body.encode("utf-8"))
-        return True
-    except df_audit_sink.SinkError:
-        # A write-once duplicate (this length already committed) is SUCCESS; any
-        # other failure is not — distinguish by an existence probe.
-        status, _ = df_audit_sink.probe(sink, key)
-        return status == 200
+
+    def _probe(n):
+        try:
+            return df_audit_sink.probe(sink, _chain_checkpoint_key(ns, n))[0]
+        except Exception:
+            return 0
+
+    def _commit(n):
+        try:
+            df_audit_sink.push(sink, _chain_checkpoint_key(ns, n),
+                               canonical_json({"length": n}).encode("utf-8"))
+            return True
+        except df_audit_sink.SinkError:
+            return _probe(n) == 200  # write-once duplicate (already committed) = SUCCESS
+        except Exception:
+            return False
+
+    # DF-R10-04: keep the off-box checkpoints DENSE. A HOLE at length h (a checkpoint
+    # that transiently failed, or a pre-sink/pre-M73 chain adopting a sink) would let a
+    # same-user writer truncate to h-1 and pass the one-past `local+1` probe. Maintain
+    # the invariant "dfchain.<ns>.L committed ⇒ 1..L ALL committed" by BACKFILLING every
+    # missing length up to L before this length is treated as committed — so a
+    # transient hole self-heals on the next checkpoint, and a fresh-sink/migration chain
+    # gets a dense baseline on its first checkpoint.
+    st = _probe(length)
+    if st == 200:
+        return True  # dense invariant: L committed ⇒ 1..L committed (steady state: 1 probe)
+    if st != 404:
+        # sink UNREACHABLE (status 0) — cannot confirm or backfill. Return False WITHOUT
+        # the downward scan: probing every length on a down sink would be O(L)×timeout
+        # (independent-audit regression). A required caller fails closed; retry next time.
+        return False
+    # genuine 404 gap: find the highest committed length below L, aborting the scan the
+    # moment the sink drops (so an unreachable sink never triggers the unbounded walk).
+    h = 0
+    for cand in range(length - 1, 0, -1):
+        sc = _probe(cand)
+        if sc == 200:
+            h = cand
+            break
+        if sc != 404:
+            return False  # unreachable mid-scan → abort (bounded)
+    for n in range(h + 1, length + 1):
+        if not _commit(n):
+            # a gap could NOT be fully backfilled — committed-bool False (a REQUIRED
+            # caller fails closed); the next checkpoint retries the backfill.
+            return False
+    return True
 
 
 def _chain_completeness(cfg, control_root):
