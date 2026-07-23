@@ -1583,13 +1583,19 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     if sink.get("kind", "none") == "none":
         return 0
 
-    # DF-R9-04: commit THIS new chain length off-box (best-effort) BEFORE the
-    # (larger) audit-record push and regardless of whether that push then succeeds,
-    # so the committed lengths stay DENSE (no HOLE the truncation probe could fall
-    # into). A required sink that is DOWN fails the record push below (return 3), so
-    # this needn't be separately fatal; the re-entry truncation gate fails a
-    # required sink closed when completeness can't be confirmed.
-    _checkpoint_chain_to_sink(cfg, control_root)
+    # DF-R9-04: commit THIS new chain length off-box BEFORE the (larger) audit-record
+    # push, so the committed lengths stay DENSE (no HOLE the truncation probe could fall
+    # into). DF-R12-01 fix #1: a REQUIRED sink that cannot confirm this checkpoint (and
+    # its dense-baseline marker) is FAIL-CLOSED — returning 0 here would leave a run whose
+    # tip length is uncheckpointed reading as a clean terminal, and a later same-user
+    # truncation to the hole would pass the completeness probe. Fold it into the same
+    # fatal exit (3) the required-record-push failure below uses; the next run's checkpoint
+    # backfills the length once the sink recovers, and completeness stays not-confirmed
+    # until then. (An OPTIONAL sink stays best-effort.)
+    _checkpoint_ok = _checkpoint_chain_to_sink(cfg, control_root)
+    if not _checkpoint_ok and sink.get("required"):
+        _event("AUDIT_CHECKPOINT_FAILED", kind=sink["kind"], length=_chain_length(control_root))
+        return 3
 
     try:
         receipt = df_audit_sink.push(sink, invocation, json.dumps(entry).encode("utf-8"))
@@ -1767,6 +1773,15 @@ def _chain_checkpoint_key(ns, length):
     return f"dfchain.{ns}.{length:08d}"
 
 
+def _chain_dense_marker_key(ns, length):
+    # DF-R12-01: a WRITE-ONCE off-box marker asserting "checkpoints 1..length are ALL
+    # committed" (a versioned dense baseline). Written only after density through
+    # `length` has actually been established (contiguous from a prior dense baseline,
+    # or by a full verify+backfill on a legacy store). Same unforgeable namespace as
+    # the checkpoints (sha256(key-fp+identity)), so a keyless attacker cannot mint one.
+    return f"dfchain.{ns}.dense.{length:08d}"
+
+
 def _checkpoint_chain_to_sink(cfg, control_root):
     """DF-R9-04: commit the current chain length to the off-box sink under a
     MONOTONIC WRITE-ONCE key (`dfchain.<ns>.<len>`), so a later tail-truncation of
@@ -1814,53 +1829,59 @@ def _checkpoint_chain_to_sink(cfg, control_root):
     if ns is None or length == 0:
         return True
 
-    def _probe(n):
+    def _probe_key(key):
         try:
-            return df_audit_sink.probe(sink, _chain_checkpoint_key(ns, n))[0]
+            return df_audit_sink.probe(sink, key)[0]
         except Exception:
             return 0
 
-    def _commit(n):
+    def _probe(n):
+        return _probe_key(_chain_checkpoint_key(ns, n))
+
+    def _commit_key(key, body):
         try:
-            df_audit_sink.push(sink, _chain_checkpoint_key(ns, n),
-                               canonical_json({"length": n}).encode("utf-8"))
+            df_audit_sink.push(sink, key, body)
             return True
         except df_audit_sink.SinkError:
-            return _probe(n) == 200  # write-once duplicate (already committed) = SUCCESS
+            return _probe_key(key) == 200  # write-once duplicate (already committed) = SUCCESS
         except Exception:
             return False
 
-    # DF-R10-04: keep the off-box checkpoints DENSE. A HOLE at length h (a checkpoint
-    # that transiently failed, or a pre-sink/pre-M73 chain adopting a sink) would let a
-    # same-user writer truncate to h-1 and pass the one-past `local+1` probe. Maintain
-    # the invariant "dfchain.<ns>.L committed ⇒ 1..L ALL committed" by BACKFILLING every
-    # missing length up to L before this length is treated as committed — so a
-    # transient hole self-heals on the next checkpoint, and a fresh-sink/migration chain
-    # gets a dense baseline on its first checkpoint.
-    st = _probe(length)
-    if st == 200:
-        return True  # dense invariant: L committed ⇒ 1..L committed (steady state: 1 probe)
-    if st != 404:
-        # sink UNREACHABLE (status 0) — cannot confirm or backfill. Return False WITHOUT
-        # the downward scan: probing every length on a down sink would be O(L)×timeout
-        # (independent-audit regression). A required caller fails closed; retry next time.
+    def _commit(n):
+        return _commit_key(_chain_checkpoint_key(ns, n),
+                           canonical_json({"length": n}).encode("utf-8"))
+
+    def _mark_dense(n):
+        return _commit_key(_chain_dense_marker_key(ns, n),
+                           canonical_json({"dense_through": n}).encode("utf-8"))
+
+    # DF-R10-04 + DF-R12-01: keep the off-box checkpoints DENSE. A HOLE at length h (a
+    # checkpoint that transiently failed, or a pre-sink/pre-M73 chain adopting a sink)
+    # would let a same-user writer truncate to h-1 and pass the one-past `local+1`
+    # probe. Maintain the invariant "1..L ALL committed" and record it with a WRITE-ONCE
+    # DENSE-BASELINE marker `dfchain.<ns>.dense.<L>` — the completeness verifier requires
+    # this marker (not the mere existence of the length-L checkpoint) as proof of
+    # density. DF-R12-01: the pre-M89 shortcut "checkpoint L exists ⇒ 1..L dense" was
+    # UNSOUND for a legacy/pre-M84 store that had L while an earlier checkpoint was
+    # missing; the marker is written ONLY after density is actually established.
+    if _probe_key(_chain_dense_marker_key(ns, length)) == 200:
+        return True  # density through L already proven off-box (steady state: 1 probe)
+    # Ensure the current tip checkpoint itself is committed (fail closed if it cannot be —
+    # a required caller must treat this as a durable pending outcome; DF-R12-01 fix #1).
+    if not _commit(length):
         return False
-    # genuine 404 gap: find the highest committed length below L, aborting the scan the
-    # moment the sink drops (so an unreachable sink never triggers the unbounded walk).
-    h = 0
-    for cand in range(length - 1, 0, -1):
-        sc = _probe(cand)
-        if sc == 200:
-            h = cand
-            break
-        if sc != 404:
-            return False  # unreachable mid-scan → abort (bounded)
-    for n in range(h + 1, length + 1):
+    # Contiguous case: density through L-1 already proven ⇒ committing L extends it.
+    if length == 1 or _probe_key(_chain_dense_marker_key(ns, length - 1)) == 200:
+        return _mark_dense(length)
+    # Legacy/holey store (no dense baseline): the length-L checkpoint may sit ABOVE a
+    # missing earlier checkpoint. VERIFY+BACKFILL every 1..L before marking dense — never
+    # infer density from the tip alone. Bounded: reachable sink only (a down sink makes
+    # _commit fail fast — no O(L)×timeout walk), and this full pass runs once per store
+    # (subsequent runs hit the contiguous fast path above).
+    for n in range(1, length + 1):
         if not _commit(n):
-            # a gap could NOT be fully backfilled — committed-bool False (a REQUIRED
-            # caller fails closed); the next checkpoint retries the backfill.
-            return False
-    return True
+            return False  # could not establish density — fail closed, no dense marker
+    return _mark_dense(length)
 
 
 def _chain_completeness(cfg, control_root):
@@ -1903,15 +1924,35 @@ def _chain_completeness(cfg, control_root):
     if ns is None:
         return ("unconfirmed", "unsigned run — no off-box chain trust boundary")
     length = _chain_length(control_root)
-    status, _body = df_audit_sink.probe(sink, _chain_checkpoint_key(ns, length + 1))
-    if status == 200:
+    # Truncation check FIRST: a committed checkpoint for a LONGER chain than local means
+    # the local chain was tail-truncated (write-once keys can't be rolled back).
+    status_next, _b = df_audit_sink.probe(sink, _chain_checkpoint_key(ns, length + 1))
+    if status_next == 200:
         return ("truncated", "the off-box audit sink records a LONGER signed chain than the "
                 f"local audit-chain.jsonl (a committed checkpoint for length {length + 1} exists "
                 f"off-box; the local chain has {length} entries) — the local chain was "
                 "tail-truncated to erase audit evidence")
-    if status == 404:
+    if status_next not in (200, 404):
+        return ("unreachable", "the off-box audit sink is unreachable, so local-chain "
+                "completeness cannot be confirmed off-box")
+    if length == 0:
+        return ("confirmed_offbox", "the local chain is empty and no longer chain is committed "
+                "off-box")
+    # DF-R12-01: a 404 for length+1 is NOT completeness on its own. If a checkpoint UNDER the
+    # tip is missing (a hole at h < length — a transiently-dropped checkpoint, or a pre-M84
+    # legacy store), an attacker could truncate to h-1 and the one-past probe would 404 there
+    # too. Require the WRITE-ONCE DENSE-BASELINE marker for the current length: it is written
+    # (_checkpoint_chain_to_sink) ONLY after 1..length are all confirmed committed. Its
+    # absence means the tip/range is not proven dense — NOT off-box confirmed (fail-closed for
+    # a production verdict; recovery still proceeds best-effort, see _verify_chain_untruncated).
+    status_dense, _b2 = df_audit_sink.probe(sink, _chain_dense_marker_key(ns, length))
+    if status_dense == 200:
         return ("confirmed_offbox",
-                f"off-box sink confirms the local chain (length {length}) is untruncated")
+                f"off-box sink confirms the local chain (length {length}) is dense + untruncated")
+    if status_dense == 404:
+        return ("unconfirmed", f"the current chain tip (length {length}) has no off-box "
+                "dense-baseline marker — its checkpoint range is not proven dense (a hole under "
+                "the tip could hide a truncation); re-run to establish the dense baseline")
     return ("unreachable", "the off-box audit sink is unreachable, so local-chain completeness "
             "cannot be confirmed off-box")
 
@@ -2422,10 +2463,16 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         entry = df_audit_chain.append_entry(
             chain_path, custody_key, sha256_str(att_text), _now(), audit_key)
         # DF-R9-04: keep the off-box committed lengths DENSE — checkpoint this
-        # custody anchor too (best-effort; the required-sink record push above
-        # already fails closed when the sink is down), else its length would be a
-        # HOLE an attacker could truncate to undetected (opus review F1).
-        _checkpoint_chain_to_sink(cfg, control_root)
+        # custody anchor too (the required-sink record push above already fails closed
+        # when the sink is down), else its length would be a HOLE an attacker could
+        # truncate to undetected (opus review F1). DF-R12-01: a required-sink checkpoint
+        # that does not land leaves this run not off-box-complete (the production
+        # predicate requires the dense-baseline marker) — surfaced, not silent.
+        if not _checkpoint_chain_to_sink(cfg, control_root) and sink.get("required"):
+            sys.stderr.write(
+                "dark-factory: WARNING — the custody chain-length checkpoint did not land on "
+                "the REQUIRED off-box sink; this run is NOT off-box-complete until the next "
+                "checkpoint backfills the length.\n")
         if receipt is not None:
             atomic_write(os.path.join(run_dir, "custody_sink_receipt.json"),
                          canonical_json(receipt))
@@ -2821,10 +2868,16 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
         atomic_write(att_path, att_text)
         entry = df_audit_chain.append_entry(
             chain_path, waiver_chain_key, sha256_str(att_text), _now(), audit_key)
-        # DF-R9-04: keep the off-box committed lengths DENSE (best-effort; the
-        # required-sink record push above already fails closed when down) — else
-        # this waiver anchor's length is a HOLE (opus review F1).
-        _checkpoint_chain_to_sink(cfg, control_root)
+        # DF-R9-04: keep the off-box committed lengths DENSE (the required-sink record
+        # push above already fails closed when down) — else this waiver anchor's length
+        # is a HOLE (opus review F1). DF-R12-01: a required-sink checkpoint that does not
+        # land leaves this run not off-box-complete (the production predicate requires the
+        # dense-baseline marker) — surfaced, not silent.
+        if not _checkpoint_chain_to_sink(cfg, control_root) and sink.get("required"):
+            sys.stderr.write(
+                "dark-factory: WARNING — the waiver chain-length checkpoint did not land on "
+                "the REQUIRED off-box sink; this run is NOT off-box-complete until the next "
+                "checkpoint backfills the length.\n")
         if receipt is not None:
             atomic_write(os.path.join(run_dir, "waiver_sink_receipt.json"),
                          canonical_json(receipt))
@@ -8646,15 +8699,21 @@ def _anchor_ship_local(cfg, control_root, run_id, record_text, kind, key_suffix=
                 f"dark-factory: WARNING — could not anchor the {kind} record into the signed "
                 f"audit chain ({e}); the local signed anchor is PENDING.\n")
             return "anchor_failed"
-        # DF-R9-04: commit this new chain length off-box (best-effort) so a later
-        # tail-truncation of THIS just-anchored ship token is detectable on
-        # re-entry. Best-effort — NOT fatal — here: a required sink that is DOWN is
-        # handled by the SEAL's required off-box record push (SHIPPED_AUDIT_PENDING)
-        # and by the re-entry truncation gate (a required sink whose completeness
-        # can't be confirmed fails closed), so the action still runs and recovers
-        # rather than being blocked pre-spawn. The checkpoint succeeds whenever the
-        # sink is up (a normal run), keeping committed lengths DENSE.
-        _checkpoint_chain_to_sink(cfg, control_root)
+        # DF-R9-04: commit this new chain length off-box so a later tail-truncation of
+        # THIS just-anchored ship token is detectable on re-entry. Kept NON-fatal here
+        # by design: a required sink that is DOWN is handled by the SEAL's required
+        # off-box record push (SHIPPED_AUDIT_PENDING) and the production predicate
+        # requires completeness == confirmed_offbox (DF-R12-01 fix #2 now requires the
+        # dense-baseline marker, so a checkpoint that did NOT land leaves the run
+        # not-confirmed → no production GO until the next run backfills it). Making it
+        # fatal here would break the SHIPPED_AUDIT_PENDING crash-window recovery. We DO
+        # surface a required-sink checkpoint miss so it is auditable, not silent.
+        if not _checkpoint_chain_to_sink(cfg, control_root) \
+                and cfg.get("_audit", {}).get("sink", {}).get("required"):
+            sys.stderr.write(
+                f"dark-factory: WARNING — the {kind} chain-length checkpoint did not land on "
+                "the REQUIRED off-box sink; this run is NOT off-box-complete (no production "
+                "verdict) until the next checkpoint backfills the length.\n")
         return "anchored"
     # signing off: best-effort unsigned chain (not a trust boundary).
     try:

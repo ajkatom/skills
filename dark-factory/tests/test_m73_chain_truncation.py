@@ -335,8 +335,13 @@ def test_checkpoint_key_is_monotonic_and_write_once(tmp_path, monkeypatch):
     cr, cfg = _signed_chain(tmp_path, 2)
     supervisor._checkpoint_chain_to_sink(cfg, str(cr))
     supervisor._checkpoint_chain_to_sink(cfg, str(cr))  # duplicate length → 409, tolerated
-    keys = sorted(k for k in fake.store if k.startswith("dfchain."))
     # DF-R10-04: checkpoints are now DENSE — a checkpoint at length 2 backfills 1..2,
     # so the invariant "L committed ⇒ 1..L committed" holds and the one-past probe is
-    # sufficient. Each length key is write-once and carries its own length.
+    # sufficient. Each length key is write-once and carries its own length. DF-R12-01
+    # also writes a separate WRITE-ONCE dense-baseline marker (dfchain.<ns>.dense.<L>);
+    # filter those out here — this test is about the length checkpoints.
+    keys = sorted(k for k in fake.store if k.startswith("dfchain.") and ".dense." not in k)
     assert [json.loads(fake.store[k])["length"] for k in keys] == [1, 2]
+    # the dense-baseline marker for the tip length exists and records its coverage
+    ns = supervisor._chain_sink_namespace(cfg, str(cr))
+    assert json.loads(fake.store[supervisor._chain_dense_marker_key(ns, 2)])["dense_through"] == 2

@@ -128,7 +128,8 @@ def test_dense_steady_state_is_cheap(tmp_path, monkeypatch):
     cr, cfg = _signed_chain(tmp_path, 2)
     assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is True  # dense 1..2
     probes.clear()
-    # re-checkpoint the same length: L already committed → one probe, no writes
+    # re-checkpoint the same length: the DENSE-BASELINE marker for L already exists
+    # (DF-R12-01) → one probe of that marker, no checkpoint writes / no backfill scan.
     assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is True
     ns = supervisor._chain_sink_namespace(cfg, str(cr))
-    assert probes == [supervisor._chain_checkpoint_key(ns, 2)]
+    assert probes == [supervisor._chain_dense_marker_key(ns, 2)]
