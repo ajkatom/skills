@@ -507,7 +507,8 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
               redactor=None, builder_input_tokens=0, builder_output_tokens=0,
               usage_known=False, phase=None, chain_append=False,
               scenario_set_sha256=None, artifact_object_id=None,
-              build_approved_through=0, ship_meta=None, cfg=None):
+              build_approved_through=0, ship_meta=None, cfg=None,
+              generated_set_sha256=None):
     # M36a Task 3: state_version 0.2 additionally records the FSM `phase` and
     # the head of the per-run hash chain. Genuine resumable pause transitions
     # (chain_append=True: the checkpoint / budget / before-build pauses) append
@@ -570,6 +571,14 @@ def save_state(run_dir, next_iter, feedback, workspace, dev_status=None, regress
             # immutability. A pre-M45 0.1 state.json has neither this field nor
             # a chain -> resume journals SCENARIO_BUNDLE_UNSEALED_LEGACY.
             "scenario_set_sha256": scenario_set_sha256,
+            # M86 (post-R10 audit): the brownfield-GENERATED regression cohort
+            # (run_dir/generated-scenarios/*.json, created after the run-start seal so
+            # it is NOT in scenario_set_sha256) is sealed HERE — state.json is
+            # M77-anchored into the signed chain, so a same-user edit of a generated
+            # BHV-REGRESS scenario across a pause is tamper-evident (RA-05's
+            # immutability, extended to the generated guard cohort). None when there
+            # is no generated cohort.
+            "generated_set_sha256": generated_set_sha256,
             "build_approved_through": build_approved_through,
             # M36b Part C: the post-convergence data an AWAIT_SHIP pause needs to
             # SEAL on resume WITHOUT rebuilding — the frozen artifact object_id +
@@ -630,6 +639,7 @@ def load_state(run_dir):
     # comes from the FSM chain genesis when available, else the run is treated
     # as unsealed-legacy (journaled, proceeds) rather than false-refused.
     state.setdefault("scenario_set_sha256", None)
+    state.setdefault("generated_set_sha256", None)  # M86: brownfield generated cohort seal
     state.setdefault("build_approved_through", 0)
     # M36b Part C: only an AWAIT_SHIP pause records this; every other state has
     # None (they resume by rebuilding, not sealing).
@@ -5744,6 +5754,13 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
     mode = cfg.get("_intervention_mode", "H2")
     mb_clean["intervention_mode"] = mode
     scenario_set_sha256 = mb_clean.get("scenario_set_sha256")
+    # M86 (post-R10 audit): hash of the brownfield-GENERATED regression cohort
+    # (created after the run-start seal, so not covered by scenario_set_sha256). Sealed
+    # into state.json at each pause so a same-user edit of a generated BHV-REGRESS
+    # scenario across a pause is detected on resume. None when there is no cohort.
+    generated_set_sha256 = (_scenario_set_hash(extra_scenarios_dir)
+                            if extra_scenarios_dir and os.path.isdir(extra_scenarios_dir)
+                            else None)
     journal.write("MODE", mode=mode, source=cfg.get("_intervention_source", "default"),
                   start_iter=start_iter)
     # DF-R5-09: pin the container image identity for the WHOLE logical run —
@@ -5961,6 +5978,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                        budget_alerted=budget_alerted, reason="ship",
                        phase="AWAIT_SHIP", chain_append=True,
                        scenario_set_sha256=scenario_set_sha256,
+                       generated_set_sha256=generated_set_sha256,
                        artifact_object_id=object_id,
                        build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                        builder_input_tokens=builder_input_tokens,
@@ -6338,6 +6356,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget_alerted=budget_alerted, reason="build",
                           phase=f"AWAIT_BUILD_{i}", chain_append=True,
                           scenario_set_sha256=scenario_set_sha256,
+                       generated_set_sha256=generated_set_sha256,
                           build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens, usage_known=usage_known)
@@ -6475,6 +6494,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                               budget_alerted=budget_alerted, reason="budget",
                               phase=f"AWAIT_BUDGET_{i}", chain_append=True,
                               scenario_set_sha256=scenario_set_sha256,
+                       generated_set_sha256=generated_set_sha256,
                               build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                               builder_input_tokens=builder_input_tokens,
                               builder_output_tokens=builder_output_tokens,
@@ -6775,6 +6795,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget_alerted=budget_alerted, reason="dispatch",
                           phase=f"DISPATCH_{i}", chain_append=False,
                           build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
+                          scenario_set_sha256=scenario_set_sha256,
+                          generated_set_sha256=generated_set_sha256,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
                           usage_known=usage_known)
@@ -7174,6 +7196,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget_alerted=budget_alerted, reason="checkpoint",
                           phase=f"AWAIT_VERIFY_{i}", chain_append=True,
                           scenario_set_sha256=scenario_set_sha256,
+                       generated_set_sha256=generated_set_sha256,
                           build_approved_through=build_approved_through, redactor=redactor, cfg=cfg,
                           builder_input_tokens=builder_input_tokens,
                           builder_output_tokens=builder_output_tokens,
@@ -7617,6 +7640,39 @@ def resume(control_root, decision="continue", allow_downgrade: bool = False,
                     "across a pause.\n")
                 return 2
             journal.write("SCENARIO_BUNDLE_VERIFIED", sealed=sealed_hash)
+
+        # M86 (post-R10 audit): RA-05 immutability EXTENDED to the brownfield-GENERATED
+        # regression cohort (run_dir/generated-scenarios/*.json), which is created after
+        # the run-start seal so `scenario_set_sha256` never covered it. Its hash is
+        # sealed into state.json (M77-anchored into the signed chain) at each pause; a
+        # same-user writer who WEAKENS or DELETES a generated BHV-REGRESS scenario across
+        # a pause (to make a build that broke original behavior converge) is caught here.
+        # Only enforced when a seal exists (a run that produced a cohort) — a run with no
+        # generated cohort has None on both sides.
+        sealed_gen = state.get("generated_set_sha256")
+        _gd = os.path.join(run_dir, "generated-scenarios")
+        _has_gen = os.path.isdir(_gd) and any(n.endswith(".json") for n in os.listdir(_gd))
+        if sealed_gen is None and _has_gen:
+            # A generated cohort exists but carries NO seal — a genuinely pre-M86 paused
+            # run (every M86+ pause, including the dispatch crash-safe save, seals it).
+            # Journal it (auditable, not a silent skip) and proceed; we cannot enforce an
+            # immutability that was never established — same posture as
+            # SCENARIO_BUNDLE_UNSEALED_LEGACY.
+            journal.write("GENERATED_BUNDLE_UNSEALED_LEGACY",
+                          state_version=state.get("state_version"))
+        if sealed_gen is not None:
+            current_gen = (_scenario_set_hash(_gd) if os.path.isdir(_gd) else None)
+            if current_gen != sealed_gen:
+                journal.write("GENERATED_BUNDLE_CHANGED", sealed=sealed_gen, current=current_gen)
+                sys.stderr.write(
+                    "dark-factory: GENERATED_BUNDLE_CHANGED — the brownfield-generated "
+                    "regression cohort (generated-scenarios/) changed since this run started "
+                    f"(sealed {sealed_gen[:12]}…, live "
+                    f"{(current_gen or 'absent')[:12] if current_gen else 'absent'}…); refusing "
+                    "to resume (fail-closed). The generated regression guard is sealed at run "
+                    "start and must not be edited or deleted across a pause.\n")
+                return 2
+            journal.write("GENERATED_BUNDLE_VERIFIED", sealed=sealed_gen)
 
         adapter = cfg["roles"]["builder"]["adapter"]
         timeout_s = cfg["roles"]["builder"].get("timeout_s", 600)

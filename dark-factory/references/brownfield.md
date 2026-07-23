@@ -165,11 +165,20 @@ auto-detection can reach the zero-probe no-op above.)
 
 `resume()` doesn't receive `--project-src` and must not re-observe a
 possibly-changed source mid-run. It reuses the ORIGINAL run's `<run_dir>/
-generated-scenarios/` verbatim — recovering `mode`/`legacy_ignored` from the
+generated-scenarios/` — recovering `mode`/`legacy_ignored` from the
 `MODE_DETECTED` journal entry — rather than calling `df_brownfield.
 characterize` again. If the real source changes between a pause and a
 `resume`, the sealed guard reflects the system **as it was when
 characterized**, not as it is now.
+
+The generated cohort is SEALED (M86): its hash (`generated_set_sha256`) is
+written into `state.json` — which is anchored into the signed audit chain on a
+signed run (M77) — at every pause, and re-verified on `resume`. A same-user
+control-root writer who WEAKENS or DELETES a `BHV-REGRESS-*.json` guard across a
+pause (to let a build that broke original behavior converge) is caught fail-closed
+(`GENERATED_BUNDLE_CHANGED`, exit 2) — the same RA-05 immutability the hand-authored
+acceptance scenarios in `control_root/scenarios/` get. On a sink-less/unsigned tier
+the seal is detection-grade best-effort, exactly like the RA-05 scenario-set seal.
 
 ## See also
 
