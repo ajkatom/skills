@@ -1595,16 +1595,139 @@ def _anchor_audit(cfg, control_root, run_dir, invocation, digest, audit_key, jou
     return 0
 
 
-def _chain_sink_namespace(cfg, control_root):
-    """DF-R9-04: a truncation-SURVIVING namespace for the off-box chain-length
-    checkpoints — sha256 of the audit key fingerprint (a one-way hash, never the
-    key) BOUND to this control root's absolute path. Deriving it from the key +
-    control-root path (inputs, not the chain) means it survives truncation of the
-    LOCAL chain to EMPTY (so a full truncation is still detectable), while binding
-    the control root prevents two roots that SHARE one signing key from aliasing
-    each other's checkpoints (opus review F2 — a shared org key would otherwise make
-    one root's length falsely read as another's truncation). None when unsigned or
-    the key can't be loaded."""
+CONTROL_ROOT_ID_FILE = ".dfchain_root_id"
+
+
+def _key_fingerprint(key):
+    kb = key if isinstance(key, (bytes, bytearray)) else str(key).encode("utf-8")
+    return hashlib.sha256(b"dfroot-fp:" + bytes(kb)).hexdigest()[:24]
+
+
+def _control_root_identity(cfg, control_root, allow_bootstrap=False):
+    """DF-R10-01: a STABLE control-root identity for the off-box checkpoint namespace
+    — relocation-invariant, truncation-surviving, per-root-unique, and (with a
+    reachable sink) tamper-proof. Returns a hex id, or None (unsigned / no key).
+
+    Pre-M83 the namespace bound `realpath(control_root)`, a MUTABLE deployment
+    attribute: moving/copying a signed control root minted a NEW namespace, so the
+    one-past probe queried an empty namespace, got 404, and read a tail-TRUNCATED
+    local chain as complete (DF-R10-01) even with a required sink.
+
+    The identity now lives in a local cache file (`.dfchain_root_id`, created once —
+    it travels inside the control root, so it is relocation-invariant and survives
+    truncation of the chain to empty), AUTHORITATIVELY confirmed off-box when a sink
+    is reachable: `dfroot.<fp(key)>` is a WRITE-ONCE slot keyed by the audit-key
+    FINGERPRINT — a same-user attacker who does NOT hold the key cannot compute that
+    slot, so cannot read, forge, or overwrite it. Bootstrap registers the local id
+    there once; later calls read the OFF-BOX id back as authoritative, so a control-
+    root writer who edits the local `.dfchain_root_id` to mint a fresh (checkpoint-
+    free) namespace is OVERRIDDEN when the sink is reachable. Sink unreachable →
+    fall back to the local id (best-effort; detection-grade only anyway).
+
+    Returns (identity, state) where state is one of:
+      'confirmed'    — AUTHORITATIVE: the off-box `dfroot.<fp(key)>` slot returned the
+                       id (200); or — ONLY on a WRITE path (allow_bootstrap) — we just
+                       registered it write-once; or there is no off-box sink domain.
+      'unregistered' — a REACHABLE sink returned 404 for `dfroot` on a VERIFY path: this
+                       control root has committed NO authoritative off-box identity yet
+                       (first run, or a required write that fails closed at write time),
+                       so completeness is best-effort but there is nothing off-box to
+                       miss — recovery proceeds; a production verdict is withheld.
+      'unreachable'  — the sink could not be reached (status 0): a required sink fails
+                       closed; an optional sink proceeds best-effort.
+
+    Bootstrap (registering `dfroot` from the writable local file) happens ONLY on a
+    write/append path (allow_bootstrap=True) — NEVER on a verify path. The M83 opus
+    regression: with an ORPHANED `dfroot` (registration dropped), a verify-time
+    bootstrap re-registered the ATTACKER's edited `.dfchain_root_id` as authoritative
+    and re-namespaced the whole chain → a truncated chain read `confirmed_offbox`.
+    Verify now treats an unconfirmed identity as fail-closed instead.
+
+    Residual (documented, fail-SAFE): sharing ONE audit key across MANY control roots
+    aliases the `dfroot.<fp(key)>` slot → the first root's id becomes authoritative
+    for all → conservative FALSE-POSITIVE truncation refusals (never a bypass). Give
+    each control root its own key. Cached (identity, confirmed) on cfg per invocation."""
+    cached = cfg.get("_control_root_id")
+    if cached is not None and cached[0] == control_root:  # bound to THIS control root
+        return cached[1]
+    audit = cfg.get("_audit", {})
+    if not audit.get("signing"):
+        return (None, "unreachable")
+    try:
+        key = df_audit.load_key(audit["key_path"])
+    except (df_audit.AuditKeyError, KeyError, TypeError, OSError):
+        return (None, "unreachable")
+
+    def _decode(b, fallback):
+        s = (b.decode("utf-8") if isinstance(b, (bytes, bytearray)) else str(b)).strip()
+        return s or fallback
+
+    id_path = os.path.join(control_root, CONTROL_ROOT_ID_FILE)
+    local_id = None
+    try:
+        with open(id_path, encoding="utf-8") as f:
+            local_id = f.read().strip() or None
+    except OSError:
+        local_id = None
+    if local_id is None:
+        local_id = uuid.uuid4().hex
+        try:
+            atomic_write(id_path, local_id)
+        except OSError:
+            pass
+    sink = audit.get("sink", {"kind": "none"})
+    if sink.get("kind", "none") == "none":
+        result = (local_id, "confirmed")  # no off-box domain — local id IS the identity
+    else:
+        root_key = f"dfroot.{_key_fingerprint(key)}"
+        try:
+            status, body = df_audit_sink.probe(sink, root_key)
+        except Exception:
+            status, body = 0, None
+        if status == 200 and body:
+            ident = _decode(body, local_id)
+            if ident != local_id:
+                try:
+                    atomic_write(id_path, ident)  # off-box id is authoritative
+                except OSError:
+                    pass
+            result = (ident, "confirmed")
+        elif status == 404 and allow_bootstrap:
+            try:
+                df_audit_sink.push(sink, root_key, local_id.encode("utf-8"))
+                result = (local_id, "confirmed")
+            except Exception:
+                # concurrent bootstrap may have won the write-once race — re-read
+                try:
+                    st2, body2 = df_audit_sink.probe(sink, root_key)
+                except Exception:
+                    st2, body2 = 0, None
+                result = ((_decode(body2, local_id), "confirmed") if st2 == 200 and body2
+                          else (local_id, "unreachable"))
+        elif status == 404:
+            # VERIFY path, reachable sink, no dfroot yet: this control root has
+            # registered NO off-box identity — nothing has been committed off-box
+            # under an authoritative namespace (a required-sink write that could NOT
+            # register dfroot fails closed at WRITE time — see _checkpoint_chain_to_sink
+            # / R10-04 — so no orphaned checkpoints exist to miss). Proceed best-effort.
+            result = (local_id, "unregistered")
+        else:
+            result = (local_id, "unreachable")  # sink unreachable (status 0)
+    # Cache ONLY a CONFIRMED identity: an unconfirmed (unregistered / unreachable)
+    # result must NOT be cached, or an early verify call would poison a later WRITE
+    # path's bootstrap (which registers dfroot) in the same invocation.
+    if result[1] == "confirmed":
+        cfg["_control_root_id"] = (control_root, result)
+    return result
+
+
+def _chain_sink_namespace(cfg, control_root, allow_bootstrap=False):
+    """DF-R9-04 + DF-R10-01: a STABLE, RELOCATION-INVARIANT namespace for the off-box
+    chain-length checkpoints — sha256 of the audit key fingerprint (never the key)
+    bound to the stable control-root IDENTITY (`_control_root_identity`), not the
+    mutable `realpath(control_root)` M73 used. None when unsigned or no identity. Note
+    the namespace is derived from the identity regardless of off-box confirmation; the
+    CALLERS gate on the `confirmed` flag (verify fails closed when unconfirmed)."""
     audit = cfg.get("_audit", {})
     if not audit.get("signing"):
         return None
@@ -1612,9 +1735,12 @@ def _chain_sink_namespace(cfg, control_root):
         key = df_audit.load_key(audit["key_path"])
     except (df_audit.AuditKeyError, KeyError, TypeError, OSError):
         return None
+    ident, _confirmed = _control_root_identity(cfg, control_root, allow_bootstrap)
+    if not ident:
+        return None
     kb = key if isinstance(key, (bytes, bytearray)) else str(key).encode("utf-8")
-    root = os.path.realpath(control_root).encode("utf-8")
-    return hashlib.sha256(b"dfchain-ns:" + bytes(kb) + b"|" + root).hexdigest()[:24]
+    return hashlib.sha256(
+        b"dfchain-ns:" + bytes(kb) + b"|" + ident.encode("utf-8")).hexdigest()[:24]
 
 
 def _chain_length(control_root):
@@ -1656,6 +1782,23 @@ def _checkpoint_chain_to_sink(cfg, control_root):
     sink = cfg.get("_audit", {}).get("sink", {"kind": "none"})
     if sink.get("kind", "none") == "none":
         return True
+    # DF-R10-01: establish the off-box control-root IDENTITY on this WRITE path
+    # (allow_bootstrap) — registering `dfroot.<fp(key)>` write-once if absent. A
+    # REQUIRED sink whose identity anchor could not be confirmed is a fail-closed
+    # checkpoint (return False): checkpoints must never be committed under an
+    # unanchored namespace a verify path would then be unable to trust.
+    ident, state = _control_root_identity(cfg, control_root, allow_bootstrap=True)
+    if ident is None:
+        return True
+    if state != "confirmed":
+        # DF-R10-01 (2nd-round audit): NEVER commit a checkpoint under an UNANCHORED
+        # namespace (dfroot unregistered/unreachable). A landed `dfchain.*` under an
+        # unconfirmed identity is an orphan a same-user writer could re-namespace by
+        # forging `dfroot` (under genuine sink flakiness) → a truncated chain reading
+        # confirmed_offbox. So the checkpoint is NOT committed, and the committed-bool
+        # is honestly False (nothing landed off-box). The caller decides severity — a
+        # REQUIRED sink treats False as fail-closed; an OPTIONAL sink is best-effort.
+        return False
     ns = _chain_sink_namespace(cfg, control_root)
     length = _chain_length(control_root)
     if ns is None or length == 0:
@@ -1691,6 +1834,23 @@ def _chain_completeness(cfg, control_root):
     if sink.get("kind", "none") == "none":
         return ("unconfirmed", "no off-box audit sink configured; local-chain completeness is "
                 "detection-grade best-effort (sink-less tier)")
+    # DF-R10-01: this is a VERIFY path — NEVER bootstrap the identity here (a verify-
+    # time bootstrap from the writable local id was the M83 regression). If the
+    # control-root identity cannot be AUTHORITATIVELY confirmed off-box (dfroot 404,
+    # or the sink is unreachable), completeness is not off-box confirmed → fail closed.
+    ident, state = _control_root_identity(cfg, control_root, allow_bootstrap=False)
+    if ident is None:
+        return ("unconfirmed", "unsigned run — no off-box chain trust boundary")
+    if state == "unreachable":
+        return ("unreachable", "the off-box audit sink is unreachable, so the control-root "
+                "identity and local-chain completeness cannot be confirmed off-box")
+    if state == "unregistered":
+        # reachable sink, but this control root registered NO off-box identity yet —
+        # nothing committed off-box under an authoritative namespace (a required-sink
+        # write that could not register fails closed at write time), so completeness is
+        # simply not off-box confirmed (best-effort); recovery proceeds, production not.
+        return ("unconfirmed", "no off-box control-root identity registered — local-chain "
+                "completeness is not off-box confirmed")
     ns = _chain_sink_namespace(cfg, control_root)
     if ns is None:
         return ("unconfirmed", "unsigned run — no off-box chain trust boundary")
