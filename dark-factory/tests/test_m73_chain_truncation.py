@@ -197,20 +197,137 @@ def test_checkpoint_dup_409_counts_as_committed(tmp_path, monkeypatch):
 
 
 def test_namespace_binds_control_root_no_cross_root_aliasing(tmp_path):
-    # Opus review F2: two control roots that SHARE one signing key must get
-    # DIFFERENT checkpoint namespaces, else one root's length reads as another's
-    # truncation (false refusal) / a truncation reads as a shared length.
+    # Opus review F2 / DF-R10-01: two control roots that SHARE one signing key must
+    # get DIFFERENT checkpoint namespaces (else one root's length reads as another's
+    # truncation). Post-M83 the namespace is anchored to the FIRST chain entry, so two
+    # roots with different chains differ even under one key.
     keydir = tmp_path / "k"
     keydir.mkdir()
     key_path = str(keydir / "audit.key")
-    df_audit.load_or_create_key(key_path)
-    cfg = {"_audit": {"signing": True, "key_path": key_path,
-                      "sink": {"kind": "http-append", "url": "u"}}}
-    ns_a = supervisor._chain_sink_namespace(cfg, str(tmp_path / "rootA"))
-    ns_b = supervisor._chain_sink_namespace(cfg, str(tmp_path / "rootB"))
+    key = df_audit.load_or_create_key(key_path)
+
+    def _cfg():  # each control root has its OWN cfg (bound to one root in real use)
+        return {"_audit": {"signing": True, "key_path": key_path,
+                           "sink": {"kind": "http-append", "url": "u"}}}  # unreachable
+
+    def _root(name, seed):
+        cr = tmp_path / name
+        cr.mkdir()
+        df_audit_chain.append_entry(str(cr / "audit-chain.jsonl"), f"run.manifest.{seed}",
+                                    "d" * 64, "2026-01-01T00:00:00Z", key)
+        return cr
+
+    cr_a, cr_b = _root("rootA", "a"), _root("rootB", "b")
+    # unreachable sink → each root falls back to its own local id → distinct namespaces
+    ns_a = supervisor._chain_sink_namespace(_cfg(), str(cr_a))
+    ns_b = supervisor._chain_sink_namespace(_cfg(), str(cr_b))
     assert ns_a and ns_b and ns_a != ns_b
-    # same root + same key is stable across calls
-    assert ns_a == supervisor._chain_sink_namespace(cfg, str(tmp_path / "rootA"))
+    # same root is stable across fresh cfgs (the local id file persists)
+    assert ns_a == supervisor._chain_sink_namespace(_cfg(), str(cr_a))
+
+
+def test_namespace_survives_control_root_relocation(tmp_path, monkeypatch):
+    # DF-R10-01: the metamorphic property M73 missed — one logical control root MUST
+    # keep its namespace across relocation (else a move mints a fresh namespace, the
+    # one-past probe 404s, and a truncated chain reads as complete even with a sink).
+    import shutil
+    fake = _FakeSink()
+    monkeypatch.setattr(df_audit_sink, "push", fake.push)
+    monkeypatch.setattr(df_audit_sink, "probe", fake.probe)
+    cr, cfg = _signed_chain(tmp_path, 3)
+    cfg["_audit"]["sink"]["required"] = True
+    assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is True  # registers id + len 3
+    ns_before = supervisor._chain_sink_namespace(cfg, str(cr))
+
+    moved = tmp_path / "relocated-control"
+    shutil.move(str(cr), str(moved))
+    # a FRESH cfg (fresh process — no cached id) must recover the SAME namespace at
+    # the new path, from the moved id file + the authoritative off-box registration.
+    cfg2 = {"_audit": dict(cfg["_audit"])}
+    ns_after = supervisor._chain_sink_namespace(cfg2, str(moved))
+    assert ns_after == ns_before  # relocation-invariant
+
+    # end-to-end: a truncation AFTER relocation is still caught (the R10-01 bypass).
+    chain = moved / "audit-chain.jsonl"
+    chain.write_text("\n".join(chain.read_text().splitlines()[:2]) + "\n")
+    cfg3 = {"_audit": dict(cfg["_audit"])}
+    ok, why = supervisor._verify_chain_untruncated(cfg3, str(moved))
+    assert not ok and "truncat" in why.lower()
+
+
+def test_orphaned_dfroot_never_confirms_on_verify(tmp_path, monkeypatch):
+    # M83 independent-regression finding: if the `dfroot.<fp(key)>` bootstrap push is
+    # DROPPED, a later VERIFY must NEVER re-register the (possibly attacker-edited)
+    # local id as authoritative and re-namespace the chain. Verify must read the
+    # identity as UNCONFIRMED → a required sink fails closed → never confirmed_offbox
+    # on a truncated chain. (Bootstrap happens ONLY on the write path now.)
+    fake = _FakeSink()
+    real_push = fake.push
+
+    def push_drop_dfroot(sink_cfg, key, body, timeout_s=20):
+        if key.startswith("dfroot."):
+            raise df_audit_sink.SinkError("dropped dfroot bootstrap")
+        return real_push(sink_cfg, key, body, timeout_s)
+
+    monkeypatch.setattr(df_audit_sink, "push", push_drop_dfroot)
+    monkeypatch.setattr(df_audit_sink, "probe", fake.probe)
+    cr, cfg = _signed_chain(tmp_path, 3)
+    cfg["_audit"]["sink"]["required"] = True
+    # WRITE-TIME protection: a required-sink checkpoint whose identity anchor could not
+    # register fails closed (returns False) and commits NO checkpoint under an
+    # unanchored namespace — so there is never an orphaned checkpoint to miss.
+    assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is False
+    assert not any(k.startswith("dfroot.") for k in fake.store)
+    assert not any(k.startswith("dfchain.") for k in fake.store)  # no orphaned checkpoint
+
+    # VERIFY: even after the attacker edits the local id, verify NEVER bootstraps
+    # (registers) it as authoritative — bootstrap is write-path only — and never reads
+    # the chain as off-box CONFIRMED complete.
+    (cr / supervisor.CONTROL_ROOT_ID_FILE).write_text("cafe" * 8, encoding="utf-8")
+    cfg2 = {"_audit": dict(cfg["_audit"])}
+    state, _why = supervisor._chain_completeness(cfg2, str(cr))
+    assert state != "confirmed_offbox"
+    assert not any(k.startswith("dfroot.") for k in fake.store)  # verify did NOT register
+
+
+def test_optional_sink_never_lands_orphan_checkpoint(tmp_path, monkeypatch):
+    # 2nd-round audit residual: on an OPTIONAL sink, a dropped `dfroot` bootstrap must
+    # NOT leave a landed `dfchain.*` checkpoint under an unanchored namespace (which an
+    # attacker could later re-namespace by forging dfroot → confirmed_offbox on a
+    # truncated chain). No checkpoint is committed while the identity is unconfirmed.
+    fake = _FakeSink()
+    real_push = fake.push
+
+    def push_drop_dfroot(sink_cfg, key, body, timeout_s=20):
+        if key.startswith("dfroot."):
+            raise df_audit_sink.SinkError("dropped dfroot bootstrap")
+        return real_push(sink_cfg, key, body, timeout_s)
+
+    monkeypatch.setattr(df_audit_sink, "push", push_drop_dfroot)
+    monkeypatch.setattr(df_audit_sink, "probe", fake.probe)
+    cr, cfg = _signed_chain(tmp_path, 3)  # optional sink (required defaults off)
+    assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is False  # nothing committed
+    assert not any(k.startswith("dfchain.") for k in fake.store)  # NO orphan checkpoint
+    assert not any(k.startswith("dfroot.") for k in fake.store)
+
+
+def test_local_id_tamper_is_overridden_by_offbox_authoritative(tmp_path, monkeypatch):
+    # DF-R10-01: editing the local .dfchain_root_id to mint a fresh (checkpoint-free)
+    # namespace must NOT evade detection when the sink is reachable — the off-box
+    # `dfroot.<fp(key)>` id is authoritative and overrides the tampered local file.
+    fake = _FakeSink()
+    monkeypatch.setattr(df_audit_sink, "push", fake.push)
+    monkeypatch.setattr(df_audit_sink, "probe", fake.probe)
+    cr, cfg = _signed_chain(tmp_path, 3)
+    cfg["_audit"]["sink"]["required"] = True
+    assert supervisor._checkpoint_chain_to_sink(cfg, str(cr)) is True
+    (cr / "audit-chain.jsonl").write_text(
+        "\n".join((cr / "audit-chain.jsonl").read_text().splitlines()[:2]) + "\n")
+    # attacker rewrites the local id to a fresh value
+    (cr / supervisor.CONTROL_ROOT_ID_FILE).write_text("deadbeef" * 4, encoding="utf-8")
+    cfg2 = {"_audit": dict(cfg["_audit"])}  # fresh (no cached id)
+    ok, why = supervisor._verify_chain_untruncated(cfg2, str(cr))
+    assert not ok and "truncat" in why.lower()
 
 
 def test_checkpoint_key_is_monotonic_and_write_once(tmp_path, monkeypatch):
