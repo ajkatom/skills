@@ -5845,19 +5845,24 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
               f"{detail}. Run: {run_dir}")
         return anchor_exit or 3
 
-    def _scenario_drift_abort(iteration, sealed_hash, live_hash):
-        # M45 RA-05 (fresh-run in-process window): the run-start scenario
-        # bundle was sealed at run start (manifest_base["scenario_set_sha256"]
-        # + the FSM-chain genesis). Resume already refuses a bundle that drifted
-        # across a pause; this seals the SAME-PROCESS window the auditor's RA-05
-        # names ("acceptance criteria can change during a run") — an operator (or
-        # a process) that edits the live scenarios dir between the run-start gate
-        # and the sealed final exam must NEVER have the exam grade the artifact
-        # against altered criteria. Fail-closed, barrier-safe (only 12-char hash
-        # prefixes ever surface — never scenario bytes).
-        journal.write("SCENARIO_BUNDLE_DRIFT", iteration=iteration,
+    def _scenario_drift_abort(iteration, sealed_hash, live_hash, kind="SCENARIO"):
+        # M45 RA-05 + M88 (DF-R12-03): the run-start scenario bundle was sealed at
+        # run start (manifest_base["scenario_set_sha256"] + the FSM-chain genesis;
+        # the brownfield-generated cohort by `generated_set_sha256` in state.json,
+        # M86). Resume already refuses a bundle that drifted across a pause; this
+        # seals the SAME-PROCESS window the auditor names ("acceptance criteria can
+        # change during a run") — an operator (or a process) that edits the live
+        # scenarios dir OR the generated-cohort dir between the run-start gate and
+        # ANY verifier load (dev verify AND the sealed final exam) must NEVER have
+        # the verifier grade the artifact against altered criteria. `kind` selects
+        # the acceptance ("SCENARIO") vs generated ("GENERATED") cohort. Fail-closed,
+        # barrier-safe (only 12-char hash prefixes ever surface — never scenario bytes).
+        outcome = "SCENARIO_BUNDLE_DRIFT" if kind == "SCENARIO" else "GENERATED_BUNDLE_DRIFT"
+        _what = ("acceptance scenarios" if kind == "SCENARIO"
+                 else "brownfield-generated regression guards")
+        journal.write(outcome, iteration=iteration,
                       sealed=sealed_hash[:12], live=live_hash[:12])
-        mf = dict(mb_clean, outcome="SCENARIO_BUNDLE_DRIFT", iterations=iteration, qualified=False,
+        mf = dict(mb_clean, outcome=outcome, iterations=iteration, qualified=False,
                   final_exam={"ran": False, "passed": None, "count": 0},
                   regressions=sorted(regressed), artifact=None,
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
@@ -5869,10 +5874,30 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         _clear_state()
         _kb_writeback(cfg, journal, mf, [])
         sys.stderr.write(
-            f"dark-factory: SCENARIO BUNDLE DRIFT — the acceptance scenarios changed "
-            f"mid-run (run-start {sealed_hash[:12]} != live {live_hash[:12]}); refusing to "
-            f"grade the sealed final exam against altered criteria. Run: {run_dir}\n")
+            f"dark-factory: {outcome} — the {_what} changed mid-run "
+            f"(run-start {sealed_hash[:12]} != live {live_hash[:12]}); refusing to "
+            f"grade the artifact against altered criteria. Run: {run_dir}\n")
         return anchor_exit or 2
+
+    def _scenario_immutability_drift():
+        # M88 (DF-R12-03) + generalization: recompute BOTH sealed scenario digests
+        # against the LIVE control-root dirs, immediately before a verifier load.
+        # Returns (kind, sealed, live) on drift else None — pure check, no side
+        # effects, so the caller can discard any throwaway validation roots before
+        # taking the fail-closed terminal. Covers the acceptance set (the reported
+        # finding only re-checked it before the FINAL exam, not the dev verify) AND
+        # the generated cohort (M86 sealed it but only re-checked it on resume).
+        _sealed = manifest_base.get("scenario_set_sha256")
+        if _sealed is not None:
+            _live = _scenario_set_hash(scenarios_dir)
+            if _live != _sealed:
+                return ("SCENARIO", _sealed, _live)
+        if (generated_set_sha256 is not None and extra_scenarios_dir
+                and os.path.isdir(extra_scenarios_dir)):
+            _live_gen = _scenario_set_hash(extra_scenarios_dir)
+            if _live_gen != generated_set_sha256:
+                return ("GENERATED", generated_set_sha256, _live_gen)
+        return None
 
     def _finalize_converged(i, object_id, artifact_field, fe, gate_target, allow_pause):
         """M36b Part C: the post-final-exam SEAL tail, shared by the straight-
@@ -6942,6 +6967,16 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
             pass_candidate_prefix = _candidate_prefix_for_twins(
                 cfg, host_isolation, workspace, candidate_prefix, verify_env_extra)
 
+            # M88 (DF-R12-03): re-verify the sealed scenario digests immediately
+            # before the DEV verify loads them — the builder just ran and a
+            # same-user control-root writer could have weakened a hidden guard
+            # (generated BHV-REGRESS-* or a hand-authored dev scenario) in the
+            # no-pause window between dispatch and this load. Resume-only / final-
+            # exam-only checking left this uninterrupted (H3/H4) window open.
+            _drift = _scenario_immutability_drift()
+            if _drift is not None:
+                return _scenario_drift_abort(i, _drift[1], _drift[2], kind=_drift[0])
+
             try:
                 # M15: extra_scenarios_dir merges the brownfield-generated
                 # BHV-REGRESS-* guards into the DEV cohort here at verify time.
@@ -7086,17 +7121,17 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 # pure churn (kill+relaunch+readiness-wait) with no variant to
                 # serve, so we reuse dev-verify's already-running twins --
                 # byte-identical to the pre-M12 final-exam path (zero restart).
-                # M45 RA-05 (fresh-run in-process): the sealed final exam below
-                # re-reads the LIVE `scenarios_dir` from the control root. Re-hash
-                # it NOW and refuse if it drifted from the run-start seal — closing
+                # M45 RA-05 + M88: the sealed final exam below re-reads the LIVE
+                # `scenarios_dir` from the control root. Re-hash BOTH sealed cohorts
+                # NOW and refuse if either drifted from the run-start seal — closing
                 # the same-process edit window (resume already covers the across-
-                # pause window). Fail-closed; discards the validation roots first.
-                _sealed_bundle = manifest_base.get("scenario_set_sha256")
-                _live_bundle = _scenario_set_hash(scenarios_dir)
-                if _sealed_bundle is not None and _live_bundle != _sealed_bundle:
+                # pause window; M88 also added this check before the dev verify).
+                # Fail-closed; discards the validation roots first.
+                _drift = _scenario_immutability_drift()
+                if _drift is not None:
                     _discard_validation_root(r_gates)
                     _discard_validation_root(r_exam)
-                    return _scenario_drift_abort(i, _sealed_bundle, _live_bundle)
+                    return _scenario_drift_abort(i, _drift[1], _drift[2], kind=_drift[0])
 
                 final_env_extra = verify_env_extra
                 # M44 RA-01: the throwaway sealed-object copies (R_gates/R_exam)
