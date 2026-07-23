@@ -3206,14 +3206,46 @@ def fork_cmd(control_root: str, parent_run: str, allow_downgrade: bool = False) 
     # lineage and seeding the child from attacker bytes. With the config anchor, a
     # signed control root always loads the key → expect_sig True → the deleted/stale
     # HMAC yields UNVERIFIED/TAMPERED → refuse.
+    # DF-R10-02 (M85): "was the parent signed?" must NOT be inferred from the two
+    # SAME-USER-WRITABLE signals M80 used (cfg._audit.signing AND parent
+    # manifest.audit_signing) — R10 defeated M80 by downgrading BOTH (standard tier
+    # permits signing off). The historical signing state is read from the SIGNED AUDIT
+    # CHAIN instead: a run that ran signed anchored a `source-identity` token for its
+    # run_id (M76). If the chain proves the parent STARTED SIGNED, the fork REQUIRES the
+    # parent manifest to authenticate under the audit key AND its exact bytes to be a
+    # chain MEMBER, whatever the current config or writable manifest field now claim: a
+    # signed parent cannot be forked as unsigned.
+    #
+    # TAMPER-EVIDENCE OF THE ANCHOR (accurate scope): df_audit_chain's linkage hash is
+    # UNKEYED (only the per-entry `sig` is HMAC-bound), so a keyless same-user attacker
+    # CAN excise the source-identity line and re-link the chain — `_run_started_signed`
+    # (presence, key-free) would then read 'unsigned'. But excision SHORTENS the chain,
+    # so the off-box sink's length checkpoint catches it: `_verify_chain_untruncated`
+    # (step 1) refuses when the sink holds a longer committed length. The guarantee is
+    # therefore SINK-CONDITIONAL, exactly like ship/source/state truncation detection
+    # (M73/M76/M77): with a required, reachable sink the excision is caught; a sink-less
+    # signed control root retains the documented detection-grade-best-effort residual
+    # (enterprise mandates a required sink). M85 strictly NARROWS M80, which accepted
+    # the chain-INTACT combined downgrade even with a sink.
+    ok_tr, why_tr = _verify_chain_untruncated(cfg, control_root)
+    if not ok_tr:
+        sys.stderr.write(f"dark-factory: refusing to fork — the control root's signed audit "
+                         f"chain could not be confirmed complete ({why_tr}); a truncation could "
+                         "hide the parent's signing history.\n")
+        return 2
+    require_signed = (_run_started_signed(control_root, parent_run_id)
+                      or bool(cfg.get("_audit", {}).get("signing"))
+                      or parent_manifest.get("audit_signing"))
     vkey = None
-    if bool(cfg.get("_audit", {}).get("signing")) or parent_manifest.get("audit_signing"):
+    if require_signed:
         try:
-            vkey = df_audit.load_key(cfg["_audit"]["key_path"])
-        except df_audit.AuditKeyError as e:
+            vkey = df_audit.load_key(cfg["_audit"].get("key_path"))
+        except (df_audit.AuditKeyError, KeyError, TypeError) as e:
             sys.stderr.write(
-                f"dark-factory: parent manifest is signed but its audit key could not be "
-                f"loaded to verify it: {e}\n")
+                "dark-factory: refusing to fork — the parent run STARTED SIGNED (it holds "
+                "signed anchors in the audit chain), but its audit key could not be loaded to "
+                f"authenticate it ({e}). A signed parent cannot be forked as unsigned; restore "
+                "audit.signing + key_path to fork it.\n")
             return 2
     status = _verify_manifest_status(
         parent_run_dir, key=vkey, object_store=_object_store_root(control_root))
@@ -3222,6 +3254,21 @@ def fork_cmd(control_root: str, parent_run: str, allow_downgrade: bool = False) 
             f"dark-factory: refusing to fork — parent run does not verify clean "
             f"(status: {status}). A fork must start from a verified parent artifact.\n")
         return 2
+    if require_signed:
+        # DF-R10-02: the exact parent-manifest bytes must be ANCHORED in the signed
+        # chain — a genuine-but-de-signed or foreign manifest that somehow verified is
+        # refused unless its digest is a chain member of THIS control root.
+        _pm_bytes, _pm_sha = _read_manifest_bytes(parent_run_dir)
+        try:
+            _entries = df_audit_chain.read_chain(os.path.join(control_root, "audit-chain.jsonl"))
+        except (df_audit_chain.ChainError, OSError):
+            _entries = []
+        if not any(e.get("manifest_sha256") == _pm_sha for e in _entries):
+            sys.stderr.write(
+                "dark-factory: refusing to fork — the parent manifest is not anchored in this "
+                "control root's signed audit chain (its terminal anchor is absent or the "
+                "manifest was replaced); a signed parent's manifest must be a chain member.\n")
+            return 2
 
     artifact = parent_manifest.get("artifact")
     if not isinstance(artifact, dict) or not isinstance(artifact.get("object_id"), str):
