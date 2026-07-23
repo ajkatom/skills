@@ -54,6 +54,14 @@ storage keeps you at **"mechanism tested,"** never "production-validated."
    the second `ship` authenticates the terminal and journals a signed
    `SHIP_REENTRY_VERIFIED` event (no duplicate action, no re-dispatch), which the
    bundle's `reentry.reentry_verified` fact requires.
+5. **Required for a production-ready bundle (DF-R10-03):** configure a reachable,
+   append-only/WORM `audit.sink` (`kind: http-append` or `s3-objectlock`, ideally
+   `required: true`) for this run. A production `evidence-bundle --require-production`
+   verdict requires `audit_chain.completeness: "confirmed_offbox"` — the sink must
+   confirm the local signed chain was not tail-truncated. A **sink-less** hardened-H4
+   run is `completeness: "unconfirmed"` (detection-grade best-effort) and will NOT be
+   production-ready, even though the run itself completes; add the sink and re-run, or
+   treat the sink-less bundle as "mechanism tested," not production-validated.
 
 ## Exercise B — enterprise custody + required WORM sink
 

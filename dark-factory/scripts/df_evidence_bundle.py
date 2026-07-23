@@ -130,9 +130,15 @@ def _verify_chain_output(control_root, key):
     # against the off-box sink's monotonic checkpoints — a production bundle must
     # not read the chain as complete when the sink recorded a longer one.
     import supervisor
-    untr_ok, untr_why = supervisor._verify_chain_untruncated(_cfg_of(control_root), control_root)
+    # DF-R10-03: record the off-box completeness ASSURANCE STATE (confirmed_offbox /
+    # unconfirmed / truncated / unreachable), not a lossy boolean — the production
+    # predicate requires 'confirmed_offbox', so a sink-less 'unconfirmed' run can no
+    # longer be labeled production-complete. `untruncated` is retained for back-compat
+    # readers as "not PROVABLY truncated", but it is NOT the production gate.
+    state, state_msg = supervisor._chain_completeness(_cfg_of(control_root), control_root)
     return {"present": True, "signed": signed, "verified": bool(ok), "message": msg,
-            "untruncated": bool(untr_ok), "untruncated_message": untr_why}
+            "completeness": state, "completeness_message": state_msg,
+            "untruncated": state != "truncated", "untruncated_message": state_msg}
 
 
 def _verified_manifest(control_root, run_dir, key):
@@ -544,11 +550,17 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
         unmet.append("assembly-time source does not match the sealed source identity")
     if bundle["audit_chain"].get("verified") is not True:
         unmet.append("signed audit chain not verified")
-    # DF-R9-04: the chain must also be confirmed UNTRUNCATED against the off-box
-    # sink — a verifying prefix is not proof of completeness.
-    if bundle["audit_chain"].get("untruncated") is not True:
-        unmet.append("signed audit chain completeness not confirmed off-box "
-                     f"({bundle['audit_chain'].get('untruncated_message')})")
+    # DF-R9-04 / DF-R10-03: the chain must be OFF-BOX CONFIRMED complete against a
+    # reachable sink — a verifying prefix is not proof of completeness, and sink-less
+    # 'best-effort' (state 'unconfirmed') is NOT off-box confirmation. A production
+    # verdict requires state == 'confirmed_offbox' (the pre-M82 boolean read
+    # 'unconfirmed' as complete → a sink-less hardened-H4 run was falsely production-
+    # ready). Both production profiles below share this gate.
+    if bundle["audit_chain"].get("completeness") != "confirmed_offbox":
+        unmet.append("signed audit chain completeness is NOT off-box confirmed (state "
+                     f"{bundle['audit_chain'].get('completeness')!r}: "
+                     f"{bundle['audit_chain'].get('completeness_message')}) — a production "
+                     "verdict requires a reachable off-box sink confirming no tail-truncation")
     if bundle["ship_result"]["outcome"] != "SHIPPED":
         unmet.append("no final SHIPPED ship_result")
     # DF-R8-02: the FINAL ship record itself must be authenticated against the
