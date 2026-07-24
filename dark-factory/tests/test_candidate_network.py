@@ -315,7 +315,7 @@ def _fake_run_all_capture(captured_verify):
     loop converges in one iteration regardless of cohort.
     """
     def fake_run_all(scenarios_dir, workspace, exec_wrapper=None, env_extra=None, cohort=None,
-                     observer_files=None, extra_scenarios_dir=None):
+                     observer_files=None, extra_scenarios_dir=None, verify_digests=None):
         captured_verify.append(list(exec_wrapper) if exec_wrapper else [])
         return {"results": [], "all_pass": True, "count": 0}
     return fake_run_all
