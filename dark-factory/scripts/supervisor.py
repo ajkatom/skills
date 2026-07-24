@@ -5860,6 +5860,26 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
         if os.path.exists(p):
             os.unlink(p)
 
+    def _seal_terminal(mf, msg, code=2, stdout=False, failing=None):
+        # AUTO-RESEARCH M92: the byte-identical fail-closed terminal seal that 13 abort
+        # paths in this loop performed inline. Extracted VERBATIM -- the ORDER IS
+        # LOAD-BEARING: finalize seals the manifest, the chain anchor binds that sealed
+        # digest, state is cleared only AFTER the seal, and the exit stays
+        # `anchor_exit or code` so an anchor failure still dominates the outcome.
+        # NOT exhaustive: 3 further terminals in `_finalize_converged` still seal inline
+        # (one canonical -- the "mandatory security gates did not run" refusal -- and two
+        # with extra trailing waiver/custody logic). A security fix applied HERE must be
+        # applied there too; do not assume this helper covers every abort path.
+        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
+        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
+                                    digest, audit_key, journal)
+        _clear_state()
+        _kb_writeback(cfg, journal, mf, [] if failing is None else failing)
+        if stdout:
+            print(msg)
+        else:
+            sys.stderr.write(msg)
+        return anchor_exit or code
     def _twin_error_abort(iteration, e):
         journal.write("TWIN_ERROR", iteration=iteration, detail=str(e))
         mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=iteration, qualified=False,
@@ -5868,13 +5888,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                   usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                               builder_input_tokens, builder_output_tokens))
-        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                    digest, audit_key, journal)
-        _clear_state()
-        _kb_writeback(cfg, journal, mf, [])
-        sys.stderr.write(f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n")
-        return anchor_exit or 2
+        return _seal_terminal(mf, f"dark-factory: twin precondition failed at iteration {iteration}: {e}\n", code=2)
 
     def _artifact_unhashable_abort(iteration, detail, fe=None, sec_report=None):
         # DF-01/M28a: fail-closed terminal for a converged workspace that
@@ -5894,14 +5908,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                   usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                               builder_input_tokens, builder_output_tokens))
-        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                    digest, audit_key, journal)
-        _clear_state()
-        _kb_writeback(cfg, journal, mf, [])
-        print(f"dark-factory: ARTIFACT UNHASHABLE (artifact rejected, not qualified): "
-              f"{detail}. Run: {run_dir}")
-        return anchor_exit or 3
+        return _seal_terminal(mf, f"dark-factory: ARTIFACT UNHASHABLE (artifact rejected, not qualified): "
+            f"{detail}. Run: {run_dir}", code=3, stdout=True)
 
     def _scenario_drift_abort(iteration, sealed_hash, live_hash, kind="SCENARIO"):
         # M45 RA-05 + M88 (DF-R12-03): the run-start scenario bundle was sealed at
@@ -5926,16 +5934,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                   usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                               builder_input_tokens, builder_output_tokens))
-        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                    digest, audit_key, journal)
-        _clear_state()
-        _kb_writeback(cfg, journal, mf, [])
-        sys.stderr.write(
-            f"dark-factory: {outcome} — the {_what} changed mid-run "
+        return _seal_terminal(mf, f"dark-factory: {outcome} — the {_what} changed mid-run "
             f"(run-start {sealed_hash[:12]} != live {live_hash[:12]}); refusing to "
-            f"grade the artifact against altered criteria. Run: {run_dir}\n")
-        return anchor_exit or 2
+            f"grade the artifact against altered criteria. Run: {run_dir}\n", code=2)
 
     def _scenario_immutability_drift():
         # M88 (DF-R12-03) + generalization: recompute BOTH sealed scenario digests
@@ -6307,16 +6308,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                       builder_input_tokens, builder_output_tokens))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                            digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-                sys.stderr.write(
-                    "dark-factory: enterprise egress probe FAILED — the transport/lock could "
+                return _seal_terminal(mf, "dark-factory: enterprise egress probe FAILED — the transport/lock could "
                     "not be empirically verified this run (fail-closed; the builder was never "
-                    f"invoked). detail: {egress_detail}\n")
-                return anchor_exit or 2
+                    f"invoked). detail: {egress_detail}\n", code=2)
             journal.write("EGRESS_PROBE_PASSED", policy_digest=policy_digest)
 
         # --- DF-R4-02 (M52): PRE-DISPATCH identity-aware confinement gate. ----
@@ -6368,19 +6362,12 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                       usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                   builder_input_tokens,
                                                   builder_output_tokens))
-            digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-            anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir,
-                                        mf["invocation"], digest, audit_key, journal)
-            _clear_state()
-            _kb_writeback(cfg, journal, mf, [])
-            sys.stderr.write(
-                f"dark-factory: intervention_mode H4 (lights-out) requires an EFFECTIVE "
+            return _seal_terminal(mf, f"dark-factory: intervention_mode H4 (lights-out) requires an EFFECTIVE "
                 f"hardened/enterprise tier, but isolation resolved to {effective!r} "
                 f"(configured {cfg['assurance']!r}, downgraded). Refusing to run "
                 f"lights-out under weaker-than-selected isolation — reconfigure the "
                 f"mode or restore the required infrastructure. The builder was never "
-                f"spawned.\n")
-            return anchor_exit or 2
+                f"spawned.\n", code=2)
 
         if confine_state["enabled"] and cfg["_confine"]["required"]:
             _resolved_adapter_path = os.path.realpath(os.path.expanduser(adapter))
@@ -6400,16 +6387,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                       builder_input_tokens,
                                                       builder_output_tokens))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir,
-                                            mf["invocation"], digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-                sys.stderr.write(
-                    "dark-factory: confinement REQUIRED but the builder adapter's "
+                return _seal_terminal(mf, "dark-factory: confinement REQUIRED but the builder adapter's "
                     f"identity-aware profile is UNSUPPORTED ({_reason}) — refusing "
-                    "BEFORE dispatch (fail-closed); the builder was never spawned.\n")
-                return anchor_exit or 2
+                    "BEFORE dispatch (fail-closed); the builder was never spawned.\n", code=2)
 
         # M36b Part C: an AWAIT_SHIP resume seals the ALREADY-frozen artifact
         # here and returns BEFORE the build for-loop — the loop is the only
@@ -6556,15 +6536,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                               budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                               usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                           builder_input_tokens, builder_output_tokens))
-                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                digest, audit_key, journal)
-                    _clear_state()
-                    _kb_writeback(cfg, journal, mf, [])
-                    print(f"dark-factory: BUDGET HALTED (lights-out) — budget cap reached "
-                          f"(estimated_usd={estimated_usd}, builder_calls={builder_calls}); "
-                          f"a lights-out run fails closed instead of pausing. Run: {run_dir}")
-                    return anchor_exit or 3
+                    return _seal_terminal(mf, f"dark-factory: BUDGET HALTED (lights-out) — budget cap reached "
+                        f"(estimated_usd={estimated_usd}, builder_calls={builder_calls}); "
+                        f"a lights-out run fails closed instead of pausing. Run: {run_dir}", code=3, stdout=True)
                 if budget_pause:
                     journal.write("BUDGET_PAUSE", estimated_usd=estimated_usd,
                                   builder_calls=builder_calls, cap_usd=b["max_usd"],
@@ -6843,15 +6817,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                              usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                          builder_input_tokens,
                                                          builder_output_tokens))
-                    digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                    anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                digest, audit_key, journal)
-                    _clear_state()
-                    _kb_writeback(cfg, journal, mf, [])
-                    sys.stderr.write(
-                        f"dark-factory: builder dispatch refused (fail-closed) at iteration {i} — "
-                        f"{_src_why}. No builder ran; start a fresh run under the current source.\n")
-                    return anchor_exit or 2
+                    return _seal_terminal(mf, f"dark-factory: builder dispatch refused (fail-closed) at iteration {i} — "
+                        f"{_src_why}. No builder ran; start a fresh run under the current source.\n", code=2)
 
                 # --- DF-08/M35: crash-safe dispatch. Journal INTENT to dispatch
                 # a paid builder call, and COMMIT the reservation computed above
@@ -6908,16 +6875,9 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                                estimated_usd),
                                  usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                              builder_input_tokens, builder_output_tokens))
-                        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                    digest, audit_key, journal)
-                        _clear_state()
-                        _kb_writeback(cfg, journal, mf, [])
-                        sys.stderr.write(
-                            f"dark-factory: confinement required but unsupported for this "
+                        return _seal_terminal(mf, f"dark-factory: confinement required but unsupported for this "
                             f"builder adapter at iteration {i} — refusing (fail-closed); "
-                            f"the builder was never run unconfined\n")
-                        return anchor_exit or 2
+                            f"the builder was never run unconfined\n", code=2)
                     # Not required: warn + fall back to an UNCONFINED call for
                     # the rest of this run (retrying confine=True every
                     # iteration would just keep re-hitting the same
@@ -6968,13 +6928,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                       builder_input_tokens, builder_output_tokens))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                            digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-                sys.stderr.write(f"dark-factory: build error at iteration {i}\n")
-                return anchor_exit or 2
+                return _seal_terminal(mf, f"dark-factory: build error at iteration {i}\n", code=2)
             # DF-08/M35: builder_calls/estimated_usd were already committed
             # BEFORE the call, right after DISPATCH_INTENT above -- nothing
             # to do here. (Historically this is where the M8 post-call
@@ -7065,13 +7019,7 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                           budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                           usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                       builder_input_tokens, builder_output_tokens))
-                digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                            digest, audit_key, journal)
-                _clear_state()
-                _kb_writeback(cfg, journal, mf, [])
-                sys.stderr.write(f"dark-factory: {e}\n")
-                return anchor_exit or 2
+                return _seal_terminal(mf, f"dark-factory: {e}\n", code=2)
             last_report = report
             # verifier_report_iter_*.json carries raw builder-produced observed
             # stdout/stderr (spec: run_all's `observed` dict) — a real smuggle
@@ -7249,14 +7197,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                                   usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                                               builder_input_tokens, builder_output_tokens))
-                        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-                        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                                    digest, audit_key, journal)
-                        _clear_state()
-                        _kb_writeback(cfg, journal, mf, [])
-                        print(f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
-                              f"scenarios not disclosed). Run: {run_dir}")
-                        return anchor_exit or 3
+                        return _seal_terminal(mf, f"dark-factory: FINAL-EXAM FAILED (artifact rejected; held-out "
+                            f"scenarios not disclosed). Run: {run_dir}", code=3, stdout=True)
 
                     # M36b Part C: the whole post-final-exam SEAL tail (mandatory
                     # gates -> object re-verify -> before-ship pause -> seal) lives
@@ -7325,14 +7267,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                   budget=_budget_manifest_field(cfg["_budget"], builder_calls, estimated_usd),
                   usage=_usage_manifest_field(cfg["_budget"], usage_known,
                                               builder_input_tokens, builder_output_tokens))
-        digest = finalize_manifest(run_dir, mf, audit_key=audit_key, redactor=redactor)
-        anchor_exit = _anchor_audit(cfg, cfg["_control_root"], run_dir, mf["invocation"],
-                                    digest, audit_key, journal)
-        _clear_state()
-        _kb_writeback(cfg, journal, mf, failing)
-        print(f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
-              f"Still failing: {', '.join(failing)}. Run: {run_dir}")
-        return anchor_exit or 3
+        return _seal_terminal(mf, f"dark-factory: CAP REACHED after {cfg['max_iterations']} iterations. "
+            f"Still failing: {', '.join(failing)}. Run: {run_dir}", code=3, stdout=True, failing=failing)
     finally:
         if ts is not None:
             ts.stop()
