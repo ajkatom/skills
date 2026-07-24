@@ -73,6 +73,7 @@ from df_config import (
 from id_feedback import project_feedback
 from run_scenarios import (
     OracleError,
+    ScenarioBundleDrift,
     deny_network_incompatible_ids,
     load_scenarios,
     run_all,
@@ -3414,10 +3415,14 @@ def invoke_adapter(adapter: str, role: str, workdir: str, prompt_file: str, time
 
 
 def _scenario_set_hash(scenarios_dir: str) -> str:
+    # M91: enumerate EXACTLY the set `run_scenarios.load_scenarios` loads and executes —
+    # `glob("*.json")`, which (unlike os.listdir+endswith) excludes leading-dot names — so
+    # the run-start seal and the verifier's load-time digest can never diverge on a stray
+    # dotfile and spuriously fail-closed (independent-audit LOW). "Seal exactly what you run."
     files = {
         name: sha256_file(os.path.join(scenarios_dir, name))
         for name in sorted(os.listdir(scenarios_dir))
-        if name.endswith(".json")
+        if name.endswith(".json") and not name.startswith(".")
     }
     return sha256_str(canonical_json(files))
 
@@ -7043,7 +7048,15 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                 report = run_all(scenarios_dir, workspace, exec_wrapper=pass_candidate_prefix,
                                   env_extra=verify_env_extra, cohort="dev",
                                   observer_files=ts.observer_files if ts else None,
-                                  extra_scenarios_dir=extra_scenarios_dir)
+                                  extra_scenarios_dir=extra_scenarios_dir,
+                                  verify_digests={"scenarios": manifest_base.get("scenario_set_sha256"),
+                                                  "generated": generated_set_sha256})
+            except ScenarioBundleDrift as e:
+                # M91: the bundle changed between the M88 pre-check above and this LOAD
+                # (the residual TOCTOU micro-window) — the verifier hashed the exact bytes
+                # it read and they no longer match the run-start seal. Fail closed.
+                _k = "SCENARIO" if e.kind == "scenarios" else "GENERATED"
+                return _scenario_drift_abort(i, e.expected, e.actual, kind=_k)
             except OracleError as e:
                 journal.write("ABORTED_BUILD_ERROR", iteration=i, detail=f"invalid scenarios: {e}")
                 mf = dict(mb_clean, outcome="ABORTED_BUILD_ERROR", iterations=i, qualified=False,
@@ -7210,7 +7223,8 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                         cfg, host_isolation, r_exam, candidate_prefix, final_env_extra)
                     final = run_all(scenarios_dir, r_exam, exec_wrapper=final_candidate_prefix,
                                      env_extra=final_env_extra, cohort="final",
-                                     observer_files=ts.observer_files if ts else None)
+                                     observer_files=ts.observer_files if ts else None,
+                                     verify_digests={"scenarios": manifest_base.get("scenario_set_sha256")})
                     _redacted_write(os.path.join(run_dir, "final_exam_report.json"), final, redactor)
                     final_ran = final["count"] > 0
                     journal.write("FINAL_EXAM", ran=final_ran,
@@ -7255,6 +7269,12 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # bytes. It still allows the before-ship pause.
                     return _finalize_converged(i, object_id, artifact_field, fe,
                                                r_gates, allow_pause=True)
+                except ScenarioBundleDrift as e:
+                    # M91: the acceptance bundle changed between the M88 pre-check and this
+                    # final-exam LOAD (the residual TOCTOU micro-window). The finally below
+                    # discards the throwaway validation roots; fail closed.
+                    _k = "SCENARIO" if e.kind == "scenarios" else "GENERATED"
+                    return _scenario_drift_abort(i, e.expected, e.actual, kind=_k)
                 finally:
                     _discard_validation_root(r_exam)
                     _discard_validation_root(r_gates)

@@ -96,6 +96,7 @@ seed.
 """
 import concurrent.futures
 import glob
+import hashlib
 import http.client
 import json
 import os
@@ -107,6 +108,7 @@ import time
 
 import df_generate
 import df_invariants
+from df_common import canonical_json, sha256_str
 
 IR_VERSION = "0.1"
 # M20 Task 2 / M43a: ir_version 0.2/0.3/0.4 are additive bumps (twin
@@ -157,6 +159,21 @@ _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 class OracleError(ValueError):
     pass
+
+
+class ScenarioBundleDrift(Exception):
+    """M91 (DF-R12-03 residual): the scenario/generated bundle's on-disk bytes changed
+    between the run-start seal and the verifier's OWN load — raised from inside
+    `load_scenarios` so the digest is computed from the EXACT bytes it parses (closing the
+    hash-then-reread TOCTOU window). `kind` is "scenarios" (acceptance) or "generated".
+    The supervisor maps this to a fail-closed SCENARIO_BUNDLE_DRIFT / GENERATED_BUNDLE_DRIFT
+    terminal; only 12-char hash prefixes ever surface (never scenario bytes)."""
+    def __init__(self, kind, expected, actual):
+        self.kind = kind
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"{kind} bundle drifted at load "
+                         f"(sealed {expected[:12]} != loaded {actual[:12]})")
 
 
 # --- DF-02 / M29a Task 1: candidate scenario env sanitization --------------
@@ -516,21 +533,37 @@ def deny_network_incompatible_ids(scenarios: list) -> list:
     ]
 
 
-def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None) -> list:
+def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None,
+                   verify_digests: dict | None = None) -> list:
     """Load scenarios from `scenarios_dir` (the control-plane, human-authored
     set) unioned with `extra_scenarios_dir` if given (M15: the supervisor's
     brownfield-generated dev-cohort regression scenarios, written per-run to
     `<run_dir>/generated-scenarios/`). A scenario id present in BOTH dirs is
     an oracle defect (ambiguous which one applies), not silently resolved --
     OracleError names the id and both source dirs.
+
+    M91 (DF-R12-03): each file is read as raw bytes EXACTLY ONCE — parsed AND hashed
+    from those same bytes. When `verify_digests` is given (`{"scenarios": <sealed hex or
+    None>, "generated": <sealed hex or None>}`), the per-directory digest of the bytes
+    just loaded is compared to the run-start seal and a mismatch raises
+    `ScenarioBundleDrift` BEFORE any scenario runs. Because the bytes hashed are the exact
+    bytes executed, this closes the hash-then-reread TOCTOU window the earlier
+    check-then-`run_all` pattern left open. The digest scheme matches supervisor's
+    `_scenario_set_hash` (`sha256_str(canonical_json({basename: sha256(bytes)}))`).
     """
     scs = []
     seen_ids: dict[str, str] = {}
     dirs = [scenarios_dir] + ([extra_scenarios_dir] if extra_scenarios_dir else [])
+    role_of = {scenarios_dir: "scenarios"}
+    if extra_scenarios_dir:
+        role_of[extra_scenarios_dir] = "generated"
     for d in dirs:
+        dir_hashes: dict[str, str] = {}
         for path in sorted(glob.glob(os.path.join(d, "*.json"))):
-            with open(path, encoding="utf-8") as f:
-                sc = json.load(f)
+            with open(path, "rb") as f:
+                data = f.read()
+            dir_hashes[os.path.basename(path)] = hashlib.sha256(data).hexdigest()
+            sc = json.loads(data.decode("utf-8"))
             _validate(sc, os.path.basename(path))
             sc.setdefault("cohort", "dev")
             if sc["id"] in seen_ids:
@@ -540,6 +573,14 @@ def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None) -
                 )
             seen_ids[sc["id"]] = d
             scs.append(sc)
+        # M91: verify the digest of what was JUST loaded against the run-start seal,
+        # from the same bytes — no separate re-read a writer could race.
+        if verify_digests:
+            expected = verify_digests.get(role_of.get(d))
+            if expected is not None:
+                actual = sha256_str(canonical_json(dir_hashes))
+                if actual != expected:
+                    raise ScenarioBundleDrift(role_of[d], expected, actual)
     if not scs:
         raise OracleError(f"no scenarios found in {scenarios_dir}")
     return scs
@@ -1380,8 +1421,13 @@ def run_all(
     cohort: str | None = None,
     observer_files: dict | None = None,
     extra_scenarios_dir: str | None = None,
+    verify_digests: dict | None = None,
 ) -> dict:
-    scs = load_scenarios(scenarios_dir, extra_scenarios_dir=extra_scenarios_dir)
+    # M91 (DF-R12-03): load-and-verify in ONE read — the bytes hashed against the
+    # run-start seal ARE the bytes about to be executed (raises ScenarioBundleDrift on
+    # a mismatch, before any scenario runs).
+    scs = load_scenarios(scenarios_dir, extra_scenarios_dir=extra_scenarios_dir,
+                         verify_digests=verify_digests)
     # Load-time validation (M12): a twin assertion naming a twin this runner
     # doesn't know about is an oracle defect, caught BEFORE any scenario in
     # this call runs. This is checked over the FULL, UNFILTERED scenario set
