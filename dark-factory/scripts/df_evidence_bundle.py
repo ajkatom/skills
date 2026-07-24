@@ -513,8 +513,41 @@ def assemble(control_root, run_dir, key=None, require_production=False, profile=
         bundle["production_profile"] = profile
         bundle["production_ready"], bundle["production_unmet"] = _production_verdict(
             bundle, manifest_v, manifest, profile)
+        # DF-R12-02: the honest middle state — a hardened run that meets EVERY production
+        # requirement except the live remote/WORM sink proof is MECHANISM-tested, not
+        # production-validated. Report it distinctly instead of silently failing OR
+        # falsely passing, so `--require-production` on a same-host/mock sink exits
+        # non-zero yet the bundle still records that the mechanism itself is sound.
+        _unmet_wo_worm = [u for u in bundle["production_unmet"] if u != _HARDENED_WORM_UNMET]
+        bundle["mechanism_ready"] = (len(_unmet_wo_worm) == 0)
 
     return _scrub(bundle), None
+
+
+# DF-R12-02: the machine-verifiable proof that the off-box sink is a REAL remote/WORM
+# trust domain (not a same-host or non-WORM receiver that can nonetheless return
+# `confirmed_offbox`). A server-authentic S3 Object-Lock receipt — server_issued, a
+# concrete version_id, and read-back verified — is that proof. `confirmed_offbox` alone
+# only proves a reachable append-only-keyed sink, NOT a different trust domain; the
+# project's own runbook (references/live-validation.md) says a same-host receiver is
+# "mechanism tested," never production-validated. This is the exact WORM proof the
+# enterprise profile already requires; DF-R12-02 extends it to hardened production GO.
+_HARDENED_WORM_UNMET = (
+    "hardened production evidence lacks machine-verifiable remote/WORM sink provenance: "
+    "need a server-authentic s3-objectlock ship receipt (server_issued + version_id + "
+    "read-back verified). A same-host or non-WORM 'confirmed_offbox' sink is only "
+    "mechanism-tested, not production-validated — attach a real Object-Lock sink (or a "
+    "signed live-validation attestation) before claiming a production GO")
+
+
+def _worm_provenance_ok(bundle):
+    """True iff the off-box ship sink is proven a real remote/WORM trust domain by a
+    server-authentic, read-back-verified S3 Object-Lock receipt (same proof enterprise
+    requires). DF-R12-02."""
+    rcpt = bundle.get("ship_sink_receipt") or {}
+    return bool(rcpt.get("present") and rcpt.get("kind") == "s3-objectlock"
+                and rcpt.get("server_issued") and rcpt.get("version_id")
+                and rcpt.get("verified") is True)
 
 
 def _production_verdict(bundle, manifest_v, manifest, profile):
@@ -640,6 +673,13 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
                          "(need image_pinned or an @sha256-pinned image reference)")
         if bundle["denial_probe_passed"] is not True:
             unmet.append("denial/confinement probe did not pass")
+        # DF-R12-02: `confirmed_offbox` proves a reachable append-only-keyed sink, NOT a
+        # real remote/WORM trust domain — a same-host http-append receiver returns the
+        # same probe statuses. Require machine-verifiable WORM provenance for a hardened
+        # production GO; without it the run is only MECHANISM-tested (build_bundle reports
+        # mechanism_ready), never production_ready.
+        if not _worm_provenance_ok(bundle):
+            unmet.append(_HARDENED_WORM_UNMET)
 
     elif profile == "enterprise":
         if bundle["effective_tier"] != "enterprise":

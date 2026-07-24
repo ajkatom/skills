@@ -11162,9 +11162,18 @@ def main():
         # DF-R6-07: in production mode, a bundle with any unmet requirement exits
         # nonzero so automation cannot read a partial exercise as production-GO.
         if args.require_production and not bundle.get("production_ready"):
-            sys.stderr.write(
-                "dark-factory: production evidence INCOMPLETE — "
-                f"{bundle.get('production_unmet')}\n")
+            # DF-R12-02: distinguish "mechanism sound, live remote/WORM sink not proven"
+            # from a genuinely broken run, so a same-host/mock exercise is reported
+            # honestly rather than as either a pass or an opaque failure.
+            if bundle.get("mechanism_ready"):
+                sys.stderr.write(
+                    "dark-factory: MECHANISM-READY but NOT production-validated — the run "
+                    "meets every production requirement except machine-verifiable remote/WORM "
+                    f"sink provenance: {bundle.get('production_unmet')}\n")
+            else:
+                sys.stderr.write(
+                    "dark-factory: production evidence INCOMPLETE — "
+                    f"{bundle.get('production_unmet')}\n")
             sys.exit(3)
         sys.exit(0)
     elif args.cmd == "resume":
