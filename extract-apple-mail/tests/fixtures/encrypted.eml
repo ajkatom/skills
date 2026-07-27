@@ -1,0 +1,9 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: encrypted fixture
+Message-ID: <encrypted@example.com>
+MIME-Version: 1.0
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data
+Content-Transfer-Encoding: base64
+
+AAECAwQFBgc=
