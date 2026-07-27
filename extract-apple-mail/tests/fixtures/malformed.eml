@@ -1,0 +1,10 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: malformed boundary fixture
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="missing-close"
+
+--missing-close
+Content-Type: text/plain; charset=utf-8
+
+The parser must preserve and report defects without inventing content.
