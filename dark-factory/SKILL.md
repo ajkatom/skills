@@ -239,7 +239,16 @@ unchanged below.
      qualify a `standard`+ run**. Live-probed before the candidate ever runs
      under it (fail-closed, same discipline as the base denial probe); `"deny"`
      is refused with `twins.enabled: true` or any http scenario, and `"loopback"`
-     is macOS-only. See `references/isolation.md`.
+     is macOS-only. **Self-serving candidates (M93):** an app that binds and
+     dials its OWN loopback listeners (an HTTP API under test, a TLS selftest,
+     scenario-spawned origins) cannot pass under the default twin-port-pinned
+     outbound — set `candidate_service_ports: N` (the QUALIFYING path: the
+     supervisor reserves N fresh ports per verify pass, exports them to
+     scenarios as `DF_SERVICE_PORTS`, and pins exactly those; author scenarios
+     to start services on ports drawn from that env var). The alternative
+     `candidate_loopback_outbound: "any"` widening is DEV-GRADE and never
+     qualifies (host-loopback confused-deputy egress channel — hard residual).
+     See `references/isolation.md`.
    - **`candidate_host_read` (optional, M29b/M29c, DF-02; `standard`+).** At
      standard+ the CANDIDATE runs under a **default-deny** host-read sandbox by
      default on BOTH macOS and Linux: `~/.ssh`/dotfiles/other-repos OS-denied,

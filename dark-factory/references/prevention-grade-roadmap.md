@@ -130,10 +130,15 @@ denying:
 - **Host-read half — merged (M29b), standard-macOS:** the candidate runs
   under a `(deny default)` `sandbox-exec` profile — host reads (`~/.ssh`,
   dotfiles, other repos) OS-denied, workspace-only writes, loopback pinned
-  to the run's exact twin ports, and the keychain/DNS Mach side channels
-  measured CLOSED — live-probed fail-closed per run and sealed into the
-  manifest as `host_isolation` (`references/isolation.md`, "Default-deny
-  candidate host isolation"). Scope notes: this confines the candidate the
+  to the run's exact twin ports (plus, since M93, any
+  `candidate_service_ports` reservations for self-serving candidates —
+  whose reserve-then-rebind race carries the SOFT
+  `service_port_reservation_race` residual; the prevention-grade upgrade is
+  atomic ownership transfer via pre-bound socket handoff to the scenario
+  service, deferred with this roadmap), and the keychain/DNS Mach side
+  channels measured CLOSED — live-probed fail-closed per run and sealed
+  into the manifest as `host_isolation` (`references/isolation.md`,
+  "Default-deny candidate host isolation"). Scope notes: this confines the candidate the
   VERIFIER runs; the builder (which needs HOME/keychain/DNS) is the
   hardened/enterprise container's job, and a candidate needing host reads
   can opt out visibly (`candidate_host_read: "allow_host_read"`,

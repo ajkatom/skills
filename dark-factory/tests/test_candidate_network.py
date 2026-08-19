@@ -516,3 +516,143 @@ def test_candidate_network_restricted_downgrade_to_cooperative_fails_closed(tmp_
     assert "DOWNGRADE" in states, "standard -> cooperative downgrade should have happened first"
     assert "PROBE_FAILED" in states, ("the candidate_network guard's fail-closed refusal "
                                       "should have journaled PROBE_FAILED")
+
+
+# ------------------------------------------- M93: candidate_loopback_outbound
+
+def test_config_loopback_outbound_default_pinned(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback")
+    cfg = df_config.load_config(str(cr))
+    assert cfg["candidate_loopback_outbound"] == "pinned"
+
+
+def test_config_loopback_outbound_any_accepted_with_loopback(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback",
+                 candidate_loopback_outbound="any")
+    cfg = df_config.load_config(str(cr))
+    assert cfg["candidate_loopback_outbound"] == "any"
+
+
+@pytest.mark.parametrize("net", ["unrestricted", "deny"])
+def test_config_loopback_outbound_any_rejected_without_loopback(tmp_path, net):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network=net,
+                 candidate_loopback_outbound="any")
+    with pytest.raises(df_config.ConfigError,
+                       match="candidate_loopback_outbound"):
+        df_config.load_config(str(cr))
+
+
+def test_config_loopback_outbound_bad_value_rejected(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback",
+                 candidate_loopback_outbound="wide-open")
+    with pytest.raises(df_config.ConfigError,
+                       match="candidate_loopback_outbound"):
+        df_config.load_config(str(cr))
+
+
+# ------------------------------------------------ M93: candidate_service_ports
+
+def test_config_service_ports_default_zero(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback")
+    cfg = df_config.load_config(str(cr))
+    assert cfg["candidate_service_ports"] == 0
+
+
+def test_config_service_ports_accepted_with_loopback(tmp_path):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback",
+                 candidate_service_ports=16)
+    cfg = df_config.load_config(str(cr))
+    assert cfg["candidate_service_ports"] == 16
+
+
+@pytest.mark.parametrize("bad", [-1, 65, True, "8", 1.5])
+def test_config_service_ports_bad_values_rejected(tmp_path, bad):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network="loopback",
+                 candidate_service_ports=bad)
+    with pytest.raises(df_config.ConfigError,
+                       match="candidate_service_ports"):
+        df_config.load_config(str(cr))
+
+
+@pytest.mark.parametrize("net", ["unrestricted", "deny"])
+def test_config_service_ports_rejected_without_loopback(tmp_path, net):
+    cr = tmp_path / "control"
+    write_config(cr, assurance="standard", candidate_network=net,
+                 candidate_service_ports=4)
+    with pytest.raises(df_config.ConfigError,
+                       match="candidate_service_ports"):
+        df_config.load_config(str(cr))
+
+
+def test_reserve_service_ports_returns_distinct_bindable_ports():
+    ports = supervisor._reserve_service_ports(8)
+    assert len(ports) == 8 and len(set(ports)) == 8
+    assert all(1 <= p <= 65535 for p in ports)
+
+
+def test_service_ports_env_merges_without_mutating_original():
+    cfg = {"candidate_service_ports": 4}
+    base = {"DF_TWIN_X": "127.0.0.1:1234"}
+    merged = supervisor._service_ports_env(cfg, base)
+    assert "DF_SERVICE_PORTS" not in base           # copy, not mutation
+    assert merged["DF_TWIN_X"] == "127.0.0.1:1234"
+    ports = [int(p) for p in merged["DF_SERVICE_PORTS"].split(",")]
+    assert len(ports) == 4
+    # zero config is a byte-identical no-op (None stays None)
+    assert supervisor._service_ports_env({"candidate_service_ports": 0}, None) is None
+
+
+def test_candidate_prefix_pins_service_ports_alongside_twin_ports(monkeypatch):
+    captured = {}
+
+    class FakeBackend:
+        supports_default_deny = True
+        def wrap_candidate_prefix(self, cr, ws, network="unrestricted",
+                                  allowed_loopback_ports=None, scratch_dirs=(),
+                                  **kw):
+            captured["ports"] = list(allowed_loopback_ports or [])
+            return ["fake"]
+
+    monkeypatch.setattr(df_sandbox, "current_backend", lambda: FakeBackend())
+    cfg = {"_control_root": "/tmp/cr", "candidate_network": "loopback",
+           "candidate_service_ports": 2}
+    env = {"DF_TWIN_A": "127.0.0.1:1111", "DF_SERVICE_PORTS": "2222,3333,bogus"}
+    out = supervisor._candidate_prefix_for_twins(
+        cfg, {"mode": "default_deny"}, "/tmp/ws", ["base"], env)
+    assert out == ["fake"]
+    assert captured["ports"] == [1111, 2222, 3333]  # garbled entry skipped
+
+
+def test_preliminary_manifest_stamps_loopback_and_service_ports():
+    cfg = {"candidate_host_read": "default_deny", "assurance": "standard",
+           "candidate_network": "loopback",
+           "candidate_loopback_outbound": "pinned",
+           "candidate_service_ports": 8}
+    hi = supervisor._host_isolation_preliminary(cfg)
+    assert hi["loopback_outbound"] == "pinned"
+    assert hi["candidate_service_ports"] == 8
+    assert df_sandbox.RESIDUAL_SERVICE_PORT_RACE in hi["residuals"]
+
+
+def test_service_port_race_residual_is_soft():
+    assert (df_sandbox.RESIDUAL_SERVICE_PORT_RACE
+            in supervisor._HOST_ISOLATION_SOFT_RESIDUALS)
+    assert supervisor._host_isolation_qualified(
+        "default_deny", True,
+        [df_sandbox.RESIDUAL_METADATA,
+         df_sandbox.RESIDUAL_SERVICE_PORT_RACE]) is True
+
+
+def test_preliminary_manifest_non_loopback_has_no_m93_fields():
+    cfg = {"candidate_host_read": "default_deny", "assurance": "standard",
+           "candidate_network": "deny"}
+    hi = supervisor._host_isolation_preliminary(cfg)
+    assert "loopback_outbound" not in hi
+    assert "candidate_service_ports" not in hi

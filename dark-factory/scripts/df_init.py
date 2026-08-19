@@ -555,8 +555,9 @@ def build_config(answers: dict) -> dict:
     # credentials) and a brownfield root WITHOUT a post-init hand edit.
     # df_config.load_config remains the single validator of every block.
     for key in ("security_gates", "twins", "knowledge_base",
-                "candidate_network", "ship", "hardened", "credentials",
-                "brownfield"):
+                "candidate_network", "candidate_loopback_outbound",
+                "candidate_service_ports", "ship",
+                "hardened", "credentials", "brownfield"):
         if key in options:
             cfg[key] = options[key]
     # DF-R3-01: fail CLOSED on unknown `options` keys. Silent-drop is precisely
@@ -566,7 +567,9 @@ def build_config(answers: dict) -> dict:
     # naming both the offender(s) and the allowed set so the fix is obvious.
     _allowed_options = {
         "budget", "security_gates", "twins", "knowledge_base",
-        "candidate_network", "ship", "hardened", "credentials", "brownfield",
+        "candidate_network", "candidate_loopback_outbound",
+        "candidate_service_ports", "ship",
+        "hardened", "credentials", "brownfield",
     }
     unknown = sorted(set(options) - _allowed_options)
     if unknown:
