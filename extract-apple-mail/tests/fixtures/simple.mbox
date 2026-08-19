@@ -1,0 +1,20 @@
+From sender@example.com Fri Jul 25 12:00:00 2026
+From: Sender <sender@example.com>
+To: Recipient <recipient@example.com>
+Date: Fri, 25 Jul 2026 12:00:00 -1000
+Subject: Standalone verifier fixture
+Message-ID: <standalone@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fixture-boundary"
+
+--fixture-boundary
+Content-Type: text/plain; charset="utf-8"
+
+Fixture body.
+--fixture-boundary
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="fixture.bin"
+Content-Transfer-Encoding: base64
+
+Zml4dHVyZS1ieXRlcw==
+--fixture-boundary--

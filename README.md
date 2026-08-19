@@ -1,6 +1,7 @@
 # skills
 
-Personal Claude Code skills, version-controlled here and symlinked into `~/.claude/skills`.
+Personal, portable Agent Skills, version-controlled here and symlinked into the
+skill directory used by Claude Code, Codex, or another filesystem-capable agent.
 
 ## loop-designer
 
@@ -20,6 +21,39 @@ The skill is used live via a symlink:
 ```
 ln -sfn "$PWD/loop-designer" ~/.claude/skills/loop-designer
 ```
+
+## extract-apple-mail
+
+Exports user-selected Apple Mail mailboxes into a private, resumable archive of
+immutable `.eml` sources, extracted attachments, deterministic Markdown source
+views, portable manifests, and an independently verified Karpathy-style wiki
+staging layout. The runtime is local and model-agnostic: Python's standard
+library plus macOS JXA, with no LLM calls or direct reads of Mail's private
+database.
+
+- Skill: [`extract-apple-mail/SKILL.md`](extract-apple-mail/SKILL.md)
+- Archive schema: [`extract-apple-mail/references/archive-schema.md`](extract-apple-mail/references/archive-schema.md)
+- Verification contract: [`extract-apple-mail/references/verification.md`](extract-apple-mail/references/verification.md)
+- Design spec: [`docs/superpowers/specs/2026-07-25-extract-apple-mail-skill-design.md`](docs/superpowers/specs/2026-07-25-extract-apple-mail-skill-design.md)
+- Tests: `python3 -m unittest discover -s extract-apple-mail/tests -v`
+
+### Install / update
+
+Claude Code:
+
+```bash
+ln -sfn "$PWD/extract-apple-mail" ~/.claude/skills/extract-apple-mail
+```
+
+Codex and Agent Skills-compatible hosts:
+
+```bash
+mkdir -p ~/.agents/skills
+ln -sfn "$PWD/extract-apple-mail" ~/.agents/skills/extract-apple-mail
+```
+
+For another local agent, point it at `extract-apple-mail/SKILL.md` and allow
+local Python and `osascript` execution. No model-specific API is required.
 
 ## dark-factory
 

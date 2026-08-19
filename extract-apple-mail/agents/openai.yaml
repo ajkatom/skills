@@ -1,0 +1,4 @@
+interface:
+  display_name: "Extract Apple Mail"
+  short_description: "Export Apple Mail into a verified local archive"
+  default_prompt: "Use $extract-apple-mail to inventory my Apple Mail mailboxes and prepare a verified local archive."
