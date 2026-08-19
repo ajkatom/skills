@@ -166,6 +166,72 @@ until a real need for Linux-loopback-plus-twins shows up. Use `deny` on
 Linux when you don't need twins/http scenarios reachable, or run on macOS
 when you do.
 
+### Loopback outbound scoping (M93, `candidate_loopback_outbound`)
+
+M29b's default-deny loopback profile pins the candidate's **outbound**
+connects to the run's registered twin ports. That is the right default —
+the candidate cannot reach unrelated host-loopback services (local DBs,
+debug ports, credential proxies) — but it is architecturally incompatible
+with a candidate that is **itself a loopback server/client on ephemeral
+ports**: an app whose holdout scenarios start its own HTTP API and then
+connect to it (`serve`-style surfaces, a TLS selftest's fixture listener, a
+scenario-spawned mock origin). The bind/listen/inbound side was always
+open; the pinned outbound side made every such connect fail, and there is
+no static way to pin ports that are chosen at runtime.
+
+`candidate_loopback_outbound` (config, default `"pinned"`) resolves this:
+
+- `"pinned"` — the M29b behavior, byte-identical profile, unchanged.
+- `"any"` — the OUTBOUND clause becomes the M27
+  `(allow network-outbound (remote ip "localhost:*"))` form. This is the
+  **remote-ip** form M27 measured as SAFE (real external egress stays
+  denied); the `local ip` form M27 measured as an egress **regression** is
+  still never emitted in any mode. Only meaningful with
+  `candidate_network: "loopback"` (`ConfigError` otherwise).
+
+**The QUALIFYING path for self-serving candidates is
+`candidate_service_ports` (int, 0..64, default 0), not `"any"`.** N > 0
+makes the supervisor reserve N fresh loopback ports per verify pass (and a
+fresh set for the sealed final exam), export them to scenario commands as
+`DF_SERVICE_PORTS` (comma-separated), and pin exactly those ports into the
+profile's outbound side alongside the twin ports. Scenarios start the
+candidate's own listeners on ports drawn from that env var, so the
+candidate dials only its designated services — outbound stays pinned-only
+and **no host-loopback confused-deputy surface opens to services already
+listening**.
+
+**Honest residual (`service_port_reservation_race`, SOFT, sealed whenever
+N > 0):** reserved ports are released before the scenario service re-binds
+them, so a **hostile local process racing binds during the run** could
+squat a reserved port and — with a colluding candidate — restore a deputy
+channel on that port. For an honest candidate the squat merely fails the
+scenario (`EADDRINUSE` / wrong service), fail-closed. The racing-adversary
+case is same-user live-adversary territory, which the documented
+detection-grade threat model already excludes for strictly stronger
+capabilities (such a process can rewrite the audit chain itself — see
+`references/prevention-grade-roadmap.md`); the residual is therefore SOFT
+(same precedent as `process_group_escape`), and the authority scope is
+fully auditable: the manifest seals `candidate_service_ports`, and every
+pass journals its reserved set (`SERVICE_PORTS` entries, dev + final).
+Atomic ownership transfer (pre-bound socket handoff) is the
+prevention-grade upgrade, deferred with the rest of that roadmap.
+
+**Why `"any"` never qualifies (probe + confused deputy).** Under `"any"`
+the per-run confinement probe expects BOTH live listeners reachable (the
+configured semantics, doubling as non-vacuity) and still requires DIRECT
+external egress to measure DENIED, live, every run. But direct-connect
+denial is not egress confinement: any host-loopback service with its own
+network authority — an HTTP/SOCKS proxy, the Docker API, a credential
+broker — becomes a confused deputy whose outbound leg lives OUTSIDE the
+sandbox. The probe therefore records the HARD residual
+`loopback_outbound_open`, `host_isolation.qualified` goes `false`, and the
+run seals honestly unqualified — `"any"` is a development-grade
+convenience only. The manifest's `host_isolation` seals a
+`loopback_outbound` field naming the scoping that actually ran on EVERY
+loopback-mode path, including the legacy/opt-out/downgrade branches
+(`"any_legacy_m27"` there — the M27 wrapper never pinned loopback
+outbound).
+
 ## Candidate process + env containment (DF-02)
 
 The read-denial sandbox and `candidate_network` above answer "can the process
@@ -323,8 +389,11 @@ builder's comments for the full experiment notes):
   never the whole per-user temp dir).
 - network per `candidate_network` mode: `deny` → nothing; `loopback` →
   `network-outbound` pinned to **exact run-specific ports** (this run's twin
-  ports, re-derived per verify pass since twins bind fresh ephemeral ports
-  on every reset — never `localhost:*`), plus `network-bind`/
+  ports plus any `candidate_service_ports` reservations, re-derived per
+  verify pass since both bind fresh ephemeral ports on every reset — never
+  `localhost:*` in the default `pinned` scoping; the dev-only, unqualified
+  `candidate_loopback_outbound: "any"` scoping is the one exception, see
+  "Loopback outbound scoping"), plus `network-bind`/
   `network-inbound` on localhost so an M20 HTTP-oracle candidate can still
   LISTEN (bind/inbound specifically — the `(allow network* (local ip ...))`
   form was measured in M27 to re-open external egress); `unrestricted` →
@@ -356,7 +425,10 @@ expectations; DENIED reading the real sensitive system-data files
 (keychains, brew service dir — non-vacuously: each is asserted readable
 UNWRAPPED first); and in `loopback` mode the port-pinning is proven
 non-vacuous against two LIVE listeners (allowed port reachable AND a second
-live-but-unallowed listener denied). Probe failure refuses the run
+live-but-unallowed listener denied; under the dev-only
+`candidate_loopback_outbound: "any"` scoping the expectation flips — both
+listeners reachable, external egress still DENIED — and the run is
+unqualified). Probe failure refuses the run
 (`CANDIDATE_CONFINEMENT_PROBE_FAILED`, exit 2); `--allow-downgrade` falls
 back to the legacy wrapper as `mode: "allow_host_read_downgrade"`
 (journaled, unqualified). A keychain-OPEN measurement is treated as a LEAK
@@ -365,11 +437,16 @@ the `dns_mach_ipc_open` residual and disqualifies without refusing (file
 isolation is independently proven — measured truth over aspiration).
 
 **Manifest.** Every terminal manifest carries `host_isolation: {mode,
-probed, passed, residuals, qualified}` (sealed alongside
-`candidate_network`); `qualified` is true only for `default_deny` +
-probe-passed + no disqualifying residuals (`file_metadata_outside_home` and
-`network_unrestricted_open` are the two structural, non-disqualifying ones).
-M36's qualification FSM will fold this into the overall `qualified` boolean.
+probed, passed, residuals, process_containment, qualified}` (sealed
+alongside `candidate_network`; loopback-mode configs additionally carry
+`loopback_outbound` and `candidate_service_ports` — M93, on every terminal
+incl. pre-probe preliminaries); `qualified` is true only for `default_deny`
++ probe-passed + no disqualifying residuals. The structural,
+NON-disqualifying (soft) residuals are `file_metadata_outside_home`,
+`network_unrestricted_open`, `process_group_escape`, and
+`service_port_reservation_race`; `loopback_outbound_open` is HARD (the
+dev-grade `"any"` scoping never qualifies). M36's qualification FSM folds
+this into the overall `qualified` boolean.
 
 **Honest limits.** (a) The Linux default-deny profile is a SEPARATE backend
 with its own probe (next section, M29c). The real Linux backend now
@@ -387,7 +464,8 @@ system paths + the verifier interpreter's prefixes need the
 (c) `network-bind`/`network-inbound` on localhost are port-wildcarded (the
 HTTP oracle assigns the candidate's own port per scenario); LISTENING on a
 loopback port is not a host-read/exfil channel, and outbound pinning is
-what protects host loopback services. (d) stat/existence metadata outside
+what protects host loopback services (which is exactly why the M93
+`"any"` scoping that drops the pinning is dev-only and never qualifies). (d) stat/existence metadata outside
 `$HOME` stays visible (see the residual above).
 
 ## Default-deny candidate host isolation on Linux (M29c, DF-02 Linux half)

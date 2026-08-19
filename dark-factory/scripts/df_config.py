@@ -720,6 +720,56 @@ def load_config(control_root: str) -> dict:
             "use 'loopback' (macOS) or remove twins"
         )
 
+    # M93: candidate_loopback_outbound -- how the loopback profile's OUTBOUND
+    # side is scoped. "pinned" (default, the M29b behavior): outbound only to
+    # the run's registered twin ports. "any": outbound to any 127.0.0.1 port
+    # (the M27 `(remote ip "localhost:*")` form, live-measured to still deny
+    # real external egress) -- required when the CANDIDATE itself binds
+    # loopback servers on ephemeral ports and must connect back to them
+    # (self-serving apps: HTTP APIs, TLS selftests, spawned mock origins).
+    # The widening is candidate-loopback-scoped ONLY and live-probed every
+    # run (direct external egress must still measure DENIED) -- but any
+    # host-loopback service with its own network authority is a
+    # confused-deputy egress channel under it, so "any" is DEV-GRADE: the
+    # probe records the HARD residual loopback_outbound_open and the run
+    # NEVER qualifies. The qualifying self-serving-candidate path is
+    # candidate_service_ports below.
+    candidate_loopback_outbound = raw.get("candidate_loopback_outbound", "pinned")
+    if candidate_loopback_outbound not in ("pinned", "any"):
+        raise ConfigError(
+            "candidate_loopback_outbound must be 'pinned' or 'any', "
+            f"got {candidate_loopback_outbound!r}"
+        )
+    if candidate_loopback_outbound == "any" and candidate_network != "loopback":
+        raise ConfigError(
+            "candidate_loopback_outbound 'any' only applies to "
+            "candidate_network 'loopback' "
+            f"(candidate_network is {candidate_network!r})"
+        )
+
+    # M93: candidate_service_ports -- the QUALIFYING path for self-serving
+    # candidates. N > 0 makes the supervisor reserve N fresh loopback ports
+    # per verify pass, pin exactly those (alongside the twin ports) into the
+    # candidate profile's outbound side, and export them to scenario commands
+    # as DF_SERVICE_PORTS (comma-separated). The candidate can then dial its
+    # OWN listeners without any widening: outbound stays pinned-only, so no
+    # host-loopback confused-deputy surface opens (unlike "any" above, which
+    # is dev-grade and never qualifies).
+    candidate_service_ports = raw.get("candidate_service_ports", 0)
+    if (isinstance(candidate_service_ports, bool)
+            or not isinstance(candidate_service_ports, int)
+            or not (0 <= candidate_service_ports <= 64)):
+        raise ConfigError(
+            "candidate_service_ports must be an int in 0..64, "
+            f"got {candidate_service_ports!r}"
+        )
+    if candidate_service_ports > 0 and candidate_network != "loopback":
+        raise ConfigError(
+            "candidate_service_ports > 0 only applies to "
+            "candidate_network 'loopback' "
+            f"(candidate_network is {candidate_network!r})"
+        )
+
     # M29b (DF-02 host-read half): candidate_host_read -- whether the
     # CANDIDATE (the built artifact under test) runs under the default-deny
     # host-read profile. The default at standard+ is the REMEDIATION itself
@@ -2040,6 +2090,8 @@ def load_config(control_root: str) -> dict:
     cfg["_kb"] = {"kind": kb_kind, "path": kb_path, "write_back": kb_write_back}
     cfg["_twins"] = {"enabled": tw_enabled, "startup_timeout_s": tw_timeout}
     cfg["candidate_network"] = candidate_network
+    cfg["candidate_loopback_outbound"] = candidate_loopback_outbound
+    cfg["candidate_service_ports"] = candidate_service_ports
     cfg["candidate_host_read"] = candidate_host_read
     cfg["_audit"] = {
         "signing": audit_signing,

@@ -141,6 +141,21 @@ RESIDUAL_KEYCHAIN_OPEN = "keychain_mach_ipc_open"
 RESIDUAL_DNS_OPEN = "dns_mach_ipc_open"
 RESIDUAL_METADATA = "file_metadata_outside_home"
 RESIDUAL_NET_UNRESTRICTED = "network_unrestricted_open"
+# M93: configured candidate_loopback_outbound="any" — the candidate may reach
+# ANY host-loopback port (direct external egress still live-proven denied every
+# run). HARD for qualification: any host-loopback service with its own network
+# authority (proxy/Docker/broker) is a confused-deputy egress channel, so a
+# run under "any" NEVER qualifies — it is a dev-grade convenience. The
+# qualifying self-serving-candidate path is candidate_service_ports.
+RESIDUAL_LOOPBACK_OUTBOUND_OPEN = "loopback_outbound_open"
+# M93: candidate_service_ports reservation race — reserved ports are released
+# before the scenario service re-binds them, so a HOSTILE LOCAL PROCESS racing
+# binds during the run could squat one and be reachable by a colluding
+# candidate. Same-user live-adversary territory: outside the documented
+# detection-grade threat model (the same boundary as process_group_escape and
+# the audit-chain forgery caveat), hence SOFT — named, sealed, documented,
+# never silently absent. See references/isolation.md + prevention-grade-roadmap.
+RESIDUAL_SERVICE_PORT_RACE = "service_port_reservation_race"
 RESIDUAL_SYSTEM_DATA_OPEN = "system_data_file_open"
 # M47 RA-08(b): a HOST backend (macOS sandbox-exec; the standard-tier host path)
 # has no PID namespace, so a candidate child that deliberately setsid()s /
@@ -297,7 +312,8 @@ class _MacOSBackend:
     provides_pid_namespace = False
 
     def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
-                              allowed_loopback_ports=None, scratch_dirs=()):
+                              allowed_loopback_ports=None, scratch_dirs=(),
+                              loopback_outbound="pinned"):
         """CANDIDATE-only default-deny profile (M29b). Every allow below was
         developed EMPIRICALLY on macOS 26.5 (sandbox-exec) by iterating a
         live `sandbox-exec -f profile python3 ...` until the Python runtime,
@@ -316,6 +332,10 @@ class _MacOSBackend:
                 f"unknown candidate_network mode {network!r} "
                 f"(expected one of {_NETWORK_MODES!r})"
             )
+        if loopback_outbound not in ("pinned", "any"):
+            raise SandboxError(
+                f"unknown loopback_outbound mode {loopback_outbound!r} "
+                "(expected 'pinned' or 'any')")
         ports = set()
         for p in (allowed_loopback_ports or ()):
             # bool is an int subclass; reject it explicitly (True would
@@ -476,8 +496,20 @@ class _MacOSBackend:
             # M27 measured as a security regression that re-opened real
             # external egress. External egress stays denied with these
             # clauses present (re-measured live against 1.1.1.1:443).
-            for p in sorted(ports):
-                parts.append(f'(allow network-outbound (remote ip "localhost:{p}"))')
+            #
+            # M93: loopback_outbound="any" replaces the per-port pins with
+            # the M27 `(remote ip "localhost:*")` OUTBOUND form — required
+            # for candidates that are themselves loopback servers/clients on
+            # ephemeral ports (self-serving apps). The remote-ip form was
+            # the one M27 measured as SAFE (external egress stays denied);
+            # the measured-regression form was `local ip`, which is still
+            # never emitted. The confinement probe re-proves external
+            # denial live under this mode every run.
+            if loopback_outbound == "any":
+                parts.append('(allow network-outbound (remote ip "localhost:*"))')
+            else:
+                for p in sorted(ports):
+                    parts.append(f'(allow network-outbound (remote ip "localhost:{p}"))')
             parts.append('(allow network-bind (local ip "localhost:*"))')
             parts.append('(allow network-inbound (local ip "localhost:*"))')
         else:  # unrestricted
@@ -577,7 +609,8 @@ class _LinuxBackend:
     provides_pid_namespace = True
 
     def wrap_candidate_prefix(self, deny_root, workspace, network="unrestricted",
-                              allowed_loopback_ports=None, scratch_dirs=()):
+                              allowed_loopback_ports=None, scratch_dirs=(),
+                              loopback_outbound="pinned"):
         """CANDIDATE-only DEFAULT-DENY wrapper (M29c). Unlike `wrap_prefix`'s
         M12 builder path (`--ro-bind / /` + a tmpfs mask over deny_root, which
         leaves the WHOLE host readable), this builds a mount+PID+IPC+UTS
@@ -1279,7 +1312,8 @@ def _probe_linux_candidate_confinement(backend, deny_root, workspace, network,
 
 
 def probe_candidate_confinement(backend, deny_root, workspace, network,
-                                allowed_loopback_ports=None, scratch_dirs=()):
+                                allowed_loopback_ports=None, scratch_dirs=(),
+                                loopback_outbound="pinned"):
     """Fail-closed live proof of the M29b default-deny CANDIDATE profile.
     Returns (ok, report) where report is the structured dict the supervisor
     folds into the manifest `host_isolation` field:
@@ -1433,10 +1467,18 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
         probe_ports = list(allowed_loopback_ports or ())
         if network == "loopback":
             probe_ports.append(allowed_port)
+        # M93 compat: pass loopback_outbound ONLY when non-default. "pinned"
+        # is byte-identical legacy behavior, so omitting it then is exact —
+        # and a backend predating M93 fails loudly precisely when a config
+        # actually requests "any" semantics it cannot honor (fail-closed
+        # where it matters, no churn on legacy/test backends otherwise).
+        extra = {} if loopback_outbound == "pinned" else {
+            "loopback_outbound": loopback_outbound}
         try:
             prefix = backend.wrap_candidate_prefix(
                 deny_root, workspace, network=network,
-                allowed_loopback_ports=probe_ports, scratch_dirs=scratch_dirs)
+                allowed_loopback_ports=probe_ports, scratch_dirs=scratch_dirs,
+                **extra)
         except SandboxError as exc:
             return False, {"mode": "default_deny", "network": network, "checks": {},
                            "residuals": [], "detail": f"wrap_candidate_prefix raised: {exc}"}
@@ -1607,6 +1649,18 @@ def probe_candidate_confinement(backend, deny_root, workspace, network,
             net_ok = (lines[8] == "DF-NET-EXTERNAL-DENIED"
                       and lines[9] == "DF-NET-LOOPBACK-DENIED"
                       and lines[10] == "DF-PORT-DENIED")
+        elif network == "loopback" and loopback_outbound == "any":
+            # M93: the widened mode's contract — ANY loopback port reachable
+            # (both live listeners prove it non-vacuously) while DIRECT
+            # external egress still measures DENIED, live, every run. The
+            # reachable second port is the configured semantics (the probe
+            # passes), but the recorded loopback_outbound_open residual is
+            # HARD: host-loopback confused-deputy egress means a run under
+            # "any" never qualifies — dev-grade only.
+            net_ok = (lines[8] == "DF-NET-EXTERNAL-DENIED"
+                      and lines[9] == "DF-NET-LOOPBACK-ALLOWED"
+                      and lines[10] == "DF-PORT-LEAKED")
+            residuals.append(RESIDUAL_LOOPBACK_OUTBOUND_OPEN)
         elif network == "loopback":
             net_ok = (lines[8] == "DF-NET-EXTERNAL-DENIED"
                       and lines[9] == "DF-NET-LOOPBACK-ALLOWED"

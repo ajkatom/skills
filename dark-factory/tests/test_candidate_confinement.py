@@ -638,3 +638,99 @@ def test_e2e_process_containment_labelled_on_host_backend(tmp_path):
         assert hi["process_containment"] == "process_group_besteffort"
         assert df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE in hi["residuals"]
         assert hi["qualified"] is True   # process_group_escape is SOFT
+
+
+# ------------------------------------------- M93: candidate_loopback_outbound
+
+def test_profile_loopback_outbound_any_opens_all_loopback_outbound_only():
+    # "any" replaces the per-port pins with the M27-measured-SAFE remote-ip
+    # wildcard form; bind/inbound and every file/mach clause are unchanged.
+    p = _profile(network="loopback", allowed_loopback_ports=[8081],
+                 loopback_outbound="any")
+    assert '(allow network-outbound (remote ip "localhost:*"))' in p
+    assert '(allow network-outbound (remote ip "localhost:8081"))' not in p
+    # the M27-measured-REGRESSION local-ip form is still never emitted, and
+    # the widened mode never degrades into a blanket network allow.
+    assert '(allow network* (local ip "localhost:*"))' not in p
+    assert '(allow network* (remote ip "localhost:*"))' not in p
+    assert "(allow network*)" not in p
+    assert '(allow network-bind (local ip "localhost:*"))' in p
+    assert '(allow network-inbound (local ip "localhost:*"))' in p
+    assert df_sandbox._MACH_DNS_SERVICE not in p
+
+
+def test_profile_loopback_outbound_default_is_pinned():
+    # Absent the M93 knob the profile is byte-identical to the M29b shape:
+    # exact-port pins, no wildcard outbound.
+    p_default = _profile(network="loopback", allowed_loopback_ports=[8081])
+    p_explicit = _profile(network="loopback", allowed_loopback_ports=[8081],
+                          loopback_outbound="pinned")
+    assert p_default == p_explicit
+    assert 'network-outbound (remote ip "localhost:*")' not in p_default
+    assert '(allow network-outbound (remote ip "localhost:8081"))' in p_default
+
+
+def test_profile_loopback_outbound_any_ignored_outside_loopback():
+    # deny/unrestricted are unaffected by the knob (config already rejects
+    # the combination; the profile builder is defensively inert too).
+    assert _profile(network="deny", loopback_outbound="any") == \
+        _profile(network="deny")
+    assert _profile(network="unrestricted", loopback_outbound="any") == \
+        _profile(network="unrestricted")
+
+
+def test_profile_rejects_bad_loopback_outbound():
+    with pytest.raises(df_sandbox.SandboxError):
+        _profile(network="loopback", loopback_outbound="wide-open")
+
+
+def test_loopback_outbound_open_residual_is_HARD_for_qualification():
+    # M93 audit finding: "any" opens a host-loopback confused-deputy egress
+    # channel, so its residual must DISQUALIFY host_isolation — it is
+    # deliberately absent from the soft set.
+    import supervisor as _sup
+    assert (df_sandbox.RESIDUAL_LOOPBACK_OUTBOUND_OPEN
+            not in _sup._HOST_ISOLATION_SOFT_RESIDUALS)
+    assert _sup._host_isolation_qualified(
+        "default_deny", True,
+        [df_sandbox.RESIDUAL_METADATA]) is True
+    assert _sup._host_isolation_qualified(
+        "default_deny", True,
+        [df_sandbox.RESIDUAL_METADATA,
+         df_sandbox.RESIDUAL_LOOPBACK_OUTBOUND_OPEN]) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS live sandbox probe")
+def test_live_probe_loopback_outbound_any_reaches_unpinned_port_never_external(tmp_path):
+    # Live proof of the M93 contract: under loopback_outbound="any" the
+    # confinement probe expects BOTH listeners reachable (the configured
+    # semantics) and external egress still DENIED; the recorded residual is
+    # HARD (dev-grade mode, never qualifies — see the test above).
+    backend = df_sandbox._MacOSBackend()
+    if not backend.available():
+        pytest.skip("sandbox-exec unavailable")
+    deny = tmp_path / "cr"; deny.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    ok, report = df_sandbox.probe_candidate_confinement(
+        backend, str(deny), str(ws), "loopback", loopback_outbound="any")
+    assert ok, report
+    assert report["checks"]["net_external"] == "DF-NET-EXTERNAL-DENIED"
+    assert report["checks"]["net_loopback_allowed_port"] == "DF-NET-LOOPBACK-ALLOWED"
+    assert report["checks"]["net_loopback_other_port"] == "DF-PORT-LEAKED"
+    assert df_sandbox.RESIDUAL_LOOPBACK_OUTBOUND_OPEN in report["residuals"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS live sandbox probe")
+def test_live_probe_loopback_pinned_unchanged_by_m93(tmp_path):
+    # Regression guard: the default pinned mode still DENIES the unpinned
+    # port and carries no loopback_outbound_open residual.
+    backend = df_sandbox._MacOSBackend()
+    if not backend.available():
+        pytest.skip("sandbox-exec unavailable")
+    deny = tmp_path / "cr"; deny.mkdir()
+    ws = tmp_path / "ws"; ws.mkdir()
+    ok, report = df_sandbox.probe_candidate_confinement(
+        backend, str(deny), str(ws), "loopback")
+    assert ok, report
+    assert report["checks"]["net_loopback_other_port"] == "DF-PORT-DENIED"
+    assert df_sandbox.RESIDUAL_LOOPBACK_OUTBOUND_OPEN not in report["residuals"]

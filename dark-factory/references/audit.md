@@ -118,7 +118,13 @@ actually ran under:
   `network_unrestricted_open` (candidate_network was configured
   unrestricted — that axis' own choice), `process_group_escape` (M47 RA-08(b):
   a HOST backend can only best-effort `killpg` a candidate's process group, so
-  a deliberate `setsid()`/double-fork escapes the reap — soft, see below).
+  a deliberate `setsid()`/double-fork escapes the reap — soft, see below),
+  `loopback_outbound_open` (M93: `candidate_loopback_outbound: "any"` —
+  HARD/disqualifying: host-loopback confused-deputy egress, dev-grade mode
+  only), `service_port_reservation_race` (M93: `candidate_service_ports` > 0
+  — SOFT: the reserve-then-rebind race's adversary is a hostile same-user
+  process acting live during the run, outside the detection-grade threat
+  model; see `references/isolation.md` "Loopback outbound scoping").
 - `process_containment` (M47 RA-08(b)) — how a candidate's descendants are
   contained: `"namespace"` (a PID-namespace backend — Linux `--unshare-pid`
   netns, or a hardened/enterprise container — reaps every descendant by
@@ -126,9 +132,16 @@ actually ran under:
   `sandbox-exec`, the standard-tier host path — which carries the soft
   `process_group_escape` residual) vs `"none"` (no OS sandbox backend). See
   `references/isolation.md`, "Honest residual — process-group escape".
+- `loopback_outbound` / `candidate_service_ports` (M93, loopback-mode
+  configs only, on EVERY terminal incl. pre-probe preliminaries) — which
+  outbound scoping actually applied (`"pinned"`/`"any"`, or
+  `"any_legacy_m27"` on legacy/opt-out/downgrade paths) and the configured
+  service-port count; each verify pass additionally journals its reserved
+  set as a `SERVICE_PORTS` entry (dev + final).
 - `qualified` — true ONLY for `default_deny` + probe-passed + no
-  disqualifying residual (the metadata, unrestricted-network, and
-  process_group_escape ones are the structural NON-disqualifying entries). This is the
+  disqualifying residual (the metadata, unrestricted-network,
+  process_group_escape, and service_port_reservation_race ones are the
+  structural NON-disqualifying entries). This is the
   `host_isolation_qualified` signal **M36's single qualification FSM will
   fold into the overall `qualified` boolean** — M29b computes and seals it
   but does not re-derive top-level `qualified` from it.

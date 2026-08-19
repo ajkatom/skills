@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3789,6 +3790,19 @@ _HOST_ISOLATION_SOFT_RESIDUALS = frozenset({
     # READ containment; the process-group best-effort is a separately-documented
     # residual (references/isolation.md) that a namespace backend closes.
     df_sandbox.RESIDUAL_PROCESS_GROUP_ESCAPE,
+    # M93: the service-port reservation race is SOFT for the same reason
+    # process_group_escape is -- its adversary is a hostile SAME-USER local
+    # process acting live during the run, which the documented
+    # detection-grade threat model already excludes for stronger claims
+    # than this (it can rewrite the audit chain). Named + sealed, never
+    # silently absent.
+    df_sandbox.RESIDUAL_SERVICE_PORT_RACE,
+    # M93 note: RESIDUAL_LOOPBACK_OUTBOUND_OPEN is deliberately NOT in this
+    # set -- loopback_outbound="any" opens a confused-deputy egress channel
+    # to services ALREADY listening (no live racing adversary needed --
+    # materially weaker than the reservation race above), so a run under it
+    # is HONESTLY unqualified. The qualifying path for self-serving
+    # candidates is candidate_service_ports (pinned-only outbound).
 })
 
 
@@ -3845,9 +3859,35 @@ def _host_isolation_preliminary(cfg):
     else:
         mode = "none"
     residuals = [] if mode == "default_deny" else [df_sandbox.RESIDUAL_HOST_READ_OPEN]
-    return _annotate_process_containment(
+    hi = _annotate_process_containment(
         {"mode": mode, "probed": False, "passed": None,
          "residuals": residuals, "qualified": False})
+    # M93: pre-probe manifests seal the REQUESTED loopback-outbound scoping
+    # + service-port authority too, so no terminal (GATE_FAILED, coverage,
+    # invalid-scenario, ...) ever omits the field on a loopback-mode config.
+    return _stamp_loopback_outbound(
+        hi, cfg, cfg.get("candidate_loopback_outbound", "pinned"))
+
+
+def _stamp_loopback_outbound(hi, cfg, actual):
+    """M93 (audit finding 2): EVERY host_isolation dict for a loopback-mode
+    run seals which outbound scoping ACTUALLY applied -- "pinned"/"any" on
+    the default-deny profile, "any_legacy_m27" on every legacy/opt-out/
+    downgrade path (the M27 wrapper never pinned loopback outbound), or the
+    REQUESTED value on pre-probe preliminary manifests. Also seals the
+    service-port authority (audit finding 3): the configured count plus the
+    SOFT reservation-race residual whenever N > 0, so an auditor reads the
+    widened-authority scope off the manifest, never only off config_sha256.
+    No-op for non-loopback candidate_network."""
+    if cfg.get("candidate_network") == "loopback":
+        hi["loopback_outbound"] = actual
+        n = cfg.get("candidate_service_ports", 0)
+        hi["candidate_service_ports"] = n
+        if n:
+            residuals = hi.setdefault("residuals", [])
+            if df_sandbox.RESIDUAL_SERVICE_PORT_RACE not in residuals:
+                residuals.append(df_sandbox.RESIDUAL_SERVICE_PORT_RACE)
+    return hi
 
 
 def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier,
@@ -3907,9 +3947,11 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
                     "(cooperative tier has no sandbox) -- host_isolation unqualified.\n")
             hi = {"mode": "none", "probed": False, "passed": None,
                   "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+            _stamp_loopback_outbound(hi, cfg, "any_legacy_m27")
         else:
             hi = {"mode": "allow_host_read_optout", "probed": False, "passed": None,
                   "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+            _stamp_loopback_outbound(hi, cfg, "any_legacy_m27")
         # M47 RA-08(b): neither branch runs the candidate in a PID namespace
         # (opt-out / cooperative-downgrade), so process containment is
         # best-effort -- labelled honestly with the process_group_escape residual.
@@ -3941,10 +3983,12 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
             cfg, control_root, workspace, exec_prefix, eff_tier, journal)
         hi = {"mode": "legacy_allow_host_read", "probed": True, "passed": True,
               "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+        _stamp_loopback_outbound(hi, cfg, "any_legacy_m27")
         return prefix, _annotate_process_containment(hi, os_backend)
 
     ok, report = df_sandbox.probe_candidate_confinement(
-        os_backend, control_root, workspace, net_mode)
+        os_backend, control_root, workspace, net_mode,
+        loopback_outbound=cfg.get("candidate_loopback_outbound", "pinned"))
     if not ok:
         reason = report.get("detail", "confinement probe failed")
         journal.write("CANDIDATE_CONFINEMENT_PROBE_FAILED",
@@ -3960,6 +4004,7 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
                 cfg, control_root, workspace, exec_prefix, eff_tier, journal)
             hi = {"mode": "allow_host_read_downgrade", "probed": True, "passed": False,
                   "residuals": [df_sandbox.RESIDUAL_HOST_READ_OPEN], "qualified": False}
+            _stamp_loopback_outbound(hi, cfg, "any_legacy_m27")
             return prefix, _annotate_process_containment(hi, os_backend)
         raise df_sandbox.SandboxError(
             "candidate_host_read 'default_deny' live confinement probe failed -- "
@@ -3967,9 +4012,13 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
             "(fix the sandbox, set candidate_host_read=allow_host_read, or pass "
             "--allow-downgrade)")
 
+    # M93 compat: kwarg only when non-default ("pinned" == legacy bytes; a
+    # pre-M93 backend then fails loudly only when "any" is truly requested).
+    _lo = cfg.get("candidate_loopback_outbound", "pinned")
+    _lo_extra = {} if _lo == "pinned" else {"loopback_outbound": _lo}
     try:
         prefix = os_backend.wrap_candidate_prefix(
-            control_root, workspace, network=net_mode)
+            control_root, workspace, network=net_mode, **_lo_extra)
     except df_sandbox.SandboxError as e:
         journal.write("CANDIDATE_CONFINEMENT_PROBE_FAILED",
                       requested="candidate_host_read:default_deny", reason=str(e))
@@ -3978,11 +4027,46 @@ def resolve_candidate_prefix(cfg, control_root, workspace, exec_prefix, eff_tier
     residuals = list(report.get("residuals", []))
     hi = {"mode": mode, "probed": True, "passed": True, "residuals": residuals,
           "qualified": _host_isolation_qualified(mode, True, residuals)}
+    _stamp_loopback_outbound(
+        hi, cfg, cfg.get("candidate_loopback_outbound", "pinned"))
     # M47 RA-08(b): on a namespace backend (Linux --unshare-pid) this stamps
     # "namespace"; on macOS sandbox-exec (a host backend) "process_group_
     # besteffort" + the soft process_group_escape residual. qualified was
     # computed above and the residual is SOFT, so labelling never flips it.
     return prefix, _annotate_process_containment(hi, os_backend)
+
+
+def _reserve_service_ports(n):
+    """M93: reserve n fresh loopback ports for the candidate's OWN listeners
+    this verify pass -- bind :0, record, close. The tiny bind-race window
+    (another process grabbing a port between close and the scenario's bind)
+    fails a scenario visibly and re-verifies next pass: fail-closed, never
+    widened. Returns a sorted list of ints."""
+    socks, ports = [], []
+    try:
+        for _ in range(n):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            ports.append(s.getsockname()[1])
+            socks.append(s)
+    finally:
+        for s in socks:
+            s.close()
+    return sorted(ports)
+
+
+def _service_ports_env(cfg, env_extra):
+    """When candidate_service_ports > 0, reserve a fresh set and merge
+    DF_SERVICE_PORTS into (a copy of) env_extra; else return env_extra
+    untouched. The env var is the scenario-facing half of the contract; the
+    profile-pinning half is _candidate_prefix_for_twins parsing it back."""
+    n = cfg.get("candidate_service_ports", 0)
+    if not n:
+        return env_extra
+    ports = _reserve_service_ports(n)
+    merged = dict(env_extra or {})
+    merged["DF_SERVICE_PORTS"] = ",".join(str(p) for p in ports)
+    return merged
 
 
 def _candidate_prefix_for_twins(cfg, host_isolation, workspace, base_prefix, twin_env):
@@ -4007,14 +4091,27 @@ def _candidate_prefix_for_twins(cfg, host_isolation, workspace, base_prefix, twi
         raise df_sandbox.SandboxError(
             "candidate default-deny wrapper: sandbox backend disappeared mid-run")
     ports = set()
-    for value in (twin_env or {}).values():
+    for key, value in (twin_env or {}).items():
+        if key == "DF_SERVICE_PORTS":
+            # M93: the pass's reserved candidate-service ports -- pinned
+            # exactly like twin ports (comma-separated ints; a garbled
+            # entry is SKIPPED, never widened -- the scenario then fails
+            # visibly, fail closed).
+            for part in str(value).split(","):
+                try:
+                    ports.add(int(part))
+                except ValueError:
+                    continue
+            continue
         try:
             ports.add(int(str(value).rsplit(":", 1)[1]))
         except (IndexError, ValueError):
             continue
+    _lo = cfg.get("candidate_loopback_outbound", "pinned")
+    _lo_extra = {} if _lo == "pinned" else {"loopback_outbound": _lo}
     return backend.wrap_candidate_prefix(
         cfg["_control_root"], workspace, network=cfg["candidate_network"],
-        allowed_loopback_ports=sorted(ports))
+        allowed_loopback_ports=sorted(ports), **_lo_extra)
 
 
 def _init_report_lines(report: dict) -> list:
@@ -5714,9 +5811,11 @@ def _run_locked(control_root: str, project_src, cfg, allow_downgrade: bool = Fal
         char_tmp = tempfile.mkdtemp(prefix="df-brownfield-")
         char_prefix = candidate_prefix
         if host_isolation.get("mode") == "default_deny":
+            _lo = cfg.get("candidate_loopback_outbound", "pinned")
+            _lo_extra = {} if _lo == "pinned" else {"loopback_outbound": _lo}
             char_prefix = df_sandbox.current_backend().wrap_candidate_prefix(
                 control_root, workspace, network=cfg["candidate_network"],
-                scratch_dirs=(char_tmp,))
+                scratch_dirs=(char_tmp,), **_lo_extra)
         try:
             generated = df_brownfield.characterize(
                 project_src, cfg["_brownfield"]["probes"], exec_wrapper=char_prefix,
@@ -6974,6 +7073,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                                                  phase="verify")
                 except df_twins.TwinError as e:
                     return _twin_error_abort(i, e)
+            # M93: reserve THIS pass's candidate-service ports and expose
+            # them to scenario commands (DF_SERVICE_PORTS) -- they are
+            # pinned into the wrapper below exactly like twin ports, and
+            # journaled so the widened-authority scope is auditable per pass.
+            verify_env_extra = _service_ports_env(cfg, verify_env_extra)
+            if verify_env_extra and "DF_SERVICE_PORTS" in verify_env_extra:
+                journal.write("SERVICE_PORTS", iteration=i, cohort="dev",
+                              ports=verify_env_extra["DF_SERVICE_PORTS"])
             # M29b: pin THIS pass's twin ports into the candidate wrapper
             # (no-op outside default-deny mode).
             pass_candidate_prefix = _candidate_prefix_for_twins(
@@ -7167,6 +7274,14 @@ def _run_loop(cfg, journal, run_dir, manifest_base, spec_text, scenarios_dir,
                     # default-deny confinement allowlists the materialized root
                     # and denies the control root exactly as it did for
                     # `workspace`; twin ports still flow through unchanged.
+                    # M93: the sealed exam gets its OWN fresh service-port
+                    # reservation (overwriting any dev-pass DF_SERVICE_PORTS
+                    # riding in final_env_extra), pinned by the same wrapper
+                    # rebuild below and journaled like the dev passes.
+                    final_env_extra = _service_ports_env(cfg, final_env_extra)
+                    if final_env_extra and "DF_SERVICE_PORTS" in final_env_extra:
+                        journal.write("SERVICE_PORTS", iteration=i, cohort="final",
+                                      ports=final_env_extra["DF_SERVICE_PORTS"])
                     final_candidate_prefix = _candidate_prefix_for_twins(
                         cfg, host_isolation, r_exam, candidate_prefix, final_env_extra)
                     final = run_all(scenarios_dir, r_exam, exec_wrapper=final_candidate_prefix,
