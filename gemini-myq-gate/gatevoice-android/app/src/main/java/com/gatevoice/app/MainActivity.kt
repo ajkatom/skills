@@ -20,6 +20,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        title = "GateVoice v${BuildConfig.VERSION_NAME}"
         prefs = Prefs(this)
 
         val edWake = findViewById<EditText>(R.id.edWake)
@@ -123,7 +124,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshStatus() {
         val acc = if (GateController.isAccessibilityEnabled(this)) "ON" else "OFF — enable it!"
-        findViewById<TextView>(R.id.tvStatus).text = "Accessibility: $acc\n${PendingTap.lastStatus}"
+        findViewById<TextView>(R.id.tvStatus).text =
+            "Build v${BuildConfig.VERSION_NAME}\nAccessibility: $acc\n${PendingTap.lastStatus}"
     }
 
     override fun onResume() {

@@ -11,18 +11,33 @@ android {
         applicationId = "com.gatevoice.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 3
+        versionName = "0.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Stable signing key committed to the repo so every CI build installs as a
+    // clean UPDATE over the previous one (no uninstall, permissions kept).
+    // This is a throwaway key for a personal sideloaded app, not a secret.
+    signingConfigs {
+        create("stable") {
+            storeFile = file("gatevoice-release.jks")
+            storePassword = "gatevoice"
+            keyAlias = "gatevoice"
+            keyPassword = "gatevoice"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("stable")
         }
         debug {
-            // Debug APK is what CI ships for sideloading; signed with the debug key.
+            // CI ships the debug APK for sideloading; sign it with the stable
+            // key so updates never hit a signature mismatch.
+            signingConfig = signingConfigs.getByName("stable")
         }
     }
 
@@ -35,6 +50,7 @@ android {
     }
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
     // The Vosk model is large; don't compress it in the APK.
     androidResources {
