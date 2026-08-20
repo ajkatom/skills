@@ -9,14 +9,16 @@ package com.gatevoice.app
 object PendingTap {
     @Volatile var targets: MutableList<String> = mutableListOf()
     @Volatile var expiresAt: Long = 0L
+    @Volatile var action: GateAction = GateAction.OPEN
 
     /** Last human-readable status, surfaced in the app UI for tuning. */
     @Volatile var lastStatus: String = "idle"
 
-    fun request(tiles: List<String>, windowMs: Long) {
+    fun request(tiles: List<String>, windowMs: Long, act: GateAction) {
         targets = tiles.toMutableList()
+        action = act
         expiresAt = System.currentTimeMillis() + windowMs
-        lastStatus = "waiting for myQ to show ${tiles.joinToString(", ")}"
+        lastStatus = "waiting for myQ to ${act.name.lowercase()} ${tiles.joinToString(", ")}"
     }
 
     fun current(): String? = targets.firstOrNull()

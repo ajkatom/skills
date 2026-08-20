@@ -72,6 +72,7 @@ class MyqAccessibilityService : AccessibilityService() {
         val root = rootInActiveWindow ?: return false
         val nameNode = findExactText(root, tileText) ?: return false
         val card = nearestClickable(nameNode) ?: nameNode
+        val action = PendingTap.action
 
         // myQ shows each device as a card: name + status ("Open for.."/"Closed
         // for..") + a round open/close control (desc="device state icon"). The
@@ -79,10 +80,18 @@ class MyqAccessibilityService : AccessibilityService() {
         // is what actually opens/closes — and myQ does NOT expose it as
         // click-actionable, so we tap its screen location directly.
         val statusText = collectLabels(card, mutableListOf(), 0).joinToString(" ").lowercase()
-        if (statusText.contains("open for") || statusText.contains("opening")) {
-            // Already open: never toggle it closed on an "open" command.
-            PendingTap.lastStatus = "\"$tileText\" is already open — left as is"
-            return true
+        val isOpen = statusText.contains("open for") || statusText.contains("opening")
+        val isClosed = statusText.contains("closed for") || statusText.contains("closing")
+
+        // Only act when the door is in the OPPOSITE state (the icon is a toggle).
+        when (action) {
+            GateAction.OPEN -> if (isOpen) {
+                PendingTap.lastStatus = "\"$tileText\" is already open — left as is"; return true
+            }
+            GateAction.CLOSE -> if (isClosed) {
+                PendingTap.lastStatus = "\"$tileText\" is already closed — left as is"; return true
+            }
+            GateAction.TOGGLE -> {}  // always tap
         }
 
         val icon = findByDesc(card, "device state icon")
@@ -90,8 +99,8 @@ class MyqAccessibilityService : AccessibilityService() {
             val r = Rect(); icon.getBoundsInScreen(r)
             if (r.width() > 0 && r.height() > 0) {
                 tapAt(r.exactCenterX(), r.exactCenterY())
-                PendingTap.lastStatus = "tapped open control for \"$tileText\""
-                safeConfirm()
+                PendingTap.lastStatus = "tapped ${action.name.lowercase()} control for \"$tileText\""
+                safeConfirm(action)
                 return true
             }
         }
@@ -111,12 +120,19 @@ class MyqAccessibilityService : AccessibilityService() {
             ?: matches.firstOrNull { it.contentDescription?.toString().equals(text, ignoreCase = true) }
     }
 
-    /** Some myQ setups confirm an open with a dialog. Click only an exact,
-     *  clickable "Confirm"/"Yes" — never "Open" (matches "Open for 24 min"). */
-    private fun safeConfirm() {
+    /** myQ often shows a confirmation dialog (especially when CLOSING a garage
+     *  door). Click only an EXACT, clickable label — exact matching keeps the
+     *  status text ("Open for 24 minutes"/"Closed for 1 day") from ever being
+     *  mistaken for a button. */
+    private fun safeConfirm(action: GateAction) {
+        val labels = when (action) {
+            GateAction.OPEN -> listOf("Confirm", "Yes", "Open")
+            GateAction.CLOSE -> listOf("Confirm", "Yes", "Close")
+            GateAction.TOGGLE -> listOf("Confirm", "Yes", "Open", "Close")
+        }
         handler.postDelayed({
             val r = rootInActiveWindow ?: return@postDelayed
-            for (label in listOf("Confirm", "Yes")) {
+            for (label in labels) {
                 val n = r.findAccessibilityNodeInfosByText(label)
                     .firstOrNull { it.text?.toString().equals(label, ignoreCase = true) } ?: continue
                 (if (n.isClickable) n else nearestClickable(n))

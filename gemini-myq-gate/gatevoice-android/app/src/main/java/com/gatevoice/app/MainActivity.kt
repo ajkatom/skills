@@ -106,7 +106,7 @@ class MainActivity : AppCompatActivity() {
                 if (tiles.isEmpty()) "→ not understood (would ask again)"
                 else "→ would open: ${tiles.joinToString(", ")}"
         }
-        findViewById<Button>(R.id.btnOpenGate).setOnClickListener { GateController.openTile(this, prefs.gateTile) }
+        findViewById<Button>(R.id.btnOpenGate).setOnClickListener { GateController.openTile(this, prefs.gateTile, selectedAction()) }
         findViewById<Button>(R.id.btnOpen1).setOnClickListener { openDoor(1) }
         findViewById<Button>(R.id.btnOpen2).setOnClickListener { openDoor(2) }
         findViewById<Button>(R.id.btnOpen3).setOnClickListener { openDoor(3) }
@@ -116,10 +116,18 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnRefresh).setOnClickListener { refreshStatus() }
     }
 
+    private fun selectedAction(): GateAction = when (
+        findViewById<android.widget.RadioGroup>(R.id.rgAction).checkedRadioButtonId
+    ) {
+        R.id.rbClose -> GateAction.CLOSE
+        R.id.rbToggle -> GateAction.TOGGLE
+        else -> GateAction.OPEN
+    }
+
     private fun openDoor(n: Int) {
         val tile = prefs.doorsMap()[n]
         if (tile == null) Toast.makeText(this, "Door $n not configured", Toast.LENGTH_SHORT).show()
-        else GateController.openTile(this, tile)
+        else GateController.openTile(this, tile, selectedAction())
     }
 
     private fun refreshStatus() {

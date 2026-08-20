@@ -1,5 +1,8 @@
 package com.gatevoice.app
 
+/** What to do with the named device(s). */
+enum class GateAction { OPEN, CLOSE, TOGGLE }
+
 /**
  * Turns recognized speech into the exact myQ tile to tap.
  *
@@ -83,4 +86,18 @@ object CommandParser {
         gateTile: String = DEFAULT_GATE,
         doors: Map<Int, String> = defaultDoors,
     ): String? = parseAll(text, gateTile, doors).firstOrNull()
+
+    /**
+     * Intent for the phrase: "close"/"shut" -> CLOSE, otherwise OPEN (the safe
+     * default for a bare "gate"). One action applies to all devices named in
+     * the same phrase.
+     */
+    fun detectAction(text: String?): GateAction {
+        val p = (text ?: "").lowercase()
+        return if (Regex("\\b(close|closed|shut|lower|down)\\b").containsMatchIn(p)) {
+            GateAction.CLOSE
+        } else {
+            GateAction.OPEN
+        }
+    }
 }

@@ -43,11 +43,17 @@
         <TextView android:id="@+id/tvParse" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="—" android:paddingBottom="8dp"/>
 
         <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:text="5) Test — actually open (presses myQ)" android:textSize="16sp" android:paddingTop="8dp"/>
-        <Button android:id="@+id/btnOpenGate" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Gate"/>
-        <Button android:id="@+id/btnOpen1" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 1"/>
-        <Button android:id="@+id/btnOpen2" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 2"/>
-        <Button android:id="@+id/btnOpen3" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 3"/>
+            android:text="5) Test — act on a device (presses myQ)" android:textSize="16sp" android:paddingTop="8dp"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Action for the buttons below:"/>
+        <RadioGroup android:id="@+id/rgAction" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+            <RadioButton android:id="@+id/rbOpen" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Open" android:checked="true"/>
+            <RadioButton android:id="@+id/rbClose" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Close"/>
+            <RadioButton android:id="@+id/rbToggle" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Toggle"/>
+        </RadioGroup>
+        <Button android:id="@+id/btnOpenGate" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Gate"/>
+        <Button android:id="@+id/btnOpen1" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Garage Door 1"/>
+        <Button android:id="@+id/btnOpen2" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Garage Door 2"/>
+        <Button android:id="@+id/btnOpen3" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Garage Door 3"/>
         <Button android:id="@+id/btnListen" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Listen once (like the tile/widget)"/>
 
         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Last action status:" android:paddingTop="12dp"/>

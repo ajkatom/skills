@@ -96,4 +96,14 @@ class CommandParserTest {
             assertEquals(emptyList<String>(), CommandParser.parseAll(it))
         }
     }
+
+    @Test
+    fun detectsCloseVsOpen() {
+        assertEquals(GateAction.CLOSE, CommandParser.detectAction("close the gate"))
+        assertEquals(GateAction.CLOSE, CommandParser.detectAction("shut garage door 2"))
+        assertEquals(GateAction.CLOSE, CommandParser.detectAction("close garage door 1 and gate"))
+        assertEquals(GateAction.OPEN, CommandParser.detectAction("open the gate"))
+        assertEquals(GateAction.OPEN, CommandParser.detectAction("garage door 3"))  // bare -> open
+        assertEquals(GateAction.OPEN, CommandParser.detectAction(""))
+    }
 }

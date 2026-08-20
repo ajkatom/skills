@@ -69,9 +69,9 @@ class VoskWakeService : Service(), RecognitionListener {
 
         if (hasWake) {
             // Try the whole utterance first (wake + command together).
-            val tile = CommandParser.parse(text, prefs.gateTile, prefs.doorsMap())
-            if (tile != null && !partial) {
-                act(tile)
+            val tiles = CommandParser.parseAll(text, prefs.gateTile, prefs.doorsMap())
+            if (tiles.isNotEmpty() && !partial) {
+                act(text)
                 return
             }
             // Otherwise arm and wait for the command in the next utterance.
@@ -82,18 +82,19 @@ class VoskWakeService : Service(), RecognitionListener {
 
         // Already armed by a prior wake word: treat this as the command.
         if (now < armedUntil && !partial) {
-            val tile = CommandParser.parse(text, prefs.gateTile, prefs.doorsMap())
-            if (tile != null) {
+            val tiles = CommandParser.parseAll(text, prefs.gateTile, prefs.doorsMap())
+            if (tiles.isNotEmpty()) {
                 armedUntil = 0L
-                act(tile)
+                act(text)
             }
         }
     }
 
-    private fun act(tile: String) {
+    private fun act(phrase: String) {
         handler.post {
-            GateController.openTile(this, tile)
-            updateNotice("Opening $tile…")
+            // handlePhrase detects open/close and all named devices from the phrase.
+            val tiles = GateController.handlePhrase(this, phrase)
+            updateNotice("Working on ${tiles.joinToString(", ")}…")
             handler.postDelayed(
                 { updateNotice("Listening for \"${Prefs(this).wakeWord}\"") }, 4000
             )

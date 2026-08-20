@@ -11,7 +11,7 @@ import android.widget.Toast
  */
 object GateController {
 
-    /** @return the tiles it will open (may be several), or empty if not understood. */
+    /** @return the tiles it will act on (may be several), or empty if not understood. */
     fun handlePhrase(context: Context, phrase: String?): List<String> {
         val prefs = Prefs(context)
         val tiles = CommandParser.parseAll(phrase, prefs.gateTile, prefs.doorsMap())
@@ -20,22 +20,23 @@ object GateController {
             PendingTap.clear("unrecognized: \"${phrase ?: ""}\"")
             return emptyList()
         }
-        openTiles(context, tiles)
+        openTiles(context, tiles, CommandParser.detectAction(phrase))
         return tiles
     }
 
-    /** Open one known tile (used by the app's per-door test buttons). */
-    fun openTile(context: Context, tile: String) = openTiles(context, listOf(tile))
+    /** Act on one known tile (used by the app's per-door test buttons). */
+    fun openTile(context: Context, tile: String, action: GateAction = GateAction.OPEN) =
+        openTiles(context, listOf(tile), action)
 
-    /** Open several tiles in sequence with one myQ launch. */
-    fun openTiles(context: Context, tiles: List<String>) {
+    /** Act on several tiles in sequence with one myQ launch. */
+    fun openTiles(context: Context, tiles: List<String>, action: GateAction = GateAction.OPEN) {
         val prefs = Prefs(context)
         if (!isAccessibilityEnabled(context)) {
             toast(context, "Enable GateVoice in Accessibility settings first")
             PendingTap.clear("accessibility service is OFF — enable it, then retry")
             return
         }
-        PendingTap.request(tiles, prefs.tapWindowMs)
+        PendingTap.request(tiles, prefs.tapWindowMs, action)
 
         val launch = context.packageManager.getLaunchIntentForPackage(prefs.myqPackage)
         if (launch == null) {
@@ -48,7 +49,10 @@ object GateController {
                 android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         )
         context.startActivity(launch)
-        toast(context, "Opening ${tiles.joinToString(", ")}…")
+        val verb = when (action) {
+            GateAction.OPEN -> "Opening"; GateAction.CLOSE -> "Closing"; GateAction.TOGGLE -> "Toggling"
+        }
+        toast(context, "$verb ${tiles.joinToString(", ")}…")
     }
 
     /** True if our accessibility service is enabled in system settings. */
