@@ -5,7 +5,8 @@ Exactly what you asked for:
 - **Your own activation word** (not "OK Google", not "Hi Bixby") — e.g. say
   **"Sesame, open garage door 2."**
 - **One smart command** — a single flow hears the whole sentence, figures out
-  which of your 5 openers you named, and opens it. No five separate routines.
+  which opener you named (your four today: Gate, Garage Door 1–3; a 5th when
+  you add it), and opens it. No separate routine per door.
 - **Presses the real myQ app** (Path A) — so myQ never gets bypassed.
 - **Works remotely** — it runs on the phone in your hand, and myQ's own app
   reaches the gate over Chamberlain's cloud from anywhere. No home hub, no LAN,
@@ -82,19 +83,29 @@ Create one **Task** called `OpenMyQ`:
 1. **Variable Set** `%phrase` to `%avcommnofilter` (the recognized text),
    lower-cased. (Tasker: `Variable Convert %phrase → To Lower Case`.)
 2. **Parse the device** — a short If/Else ladder mapping words to the exact
-   tile name in your myQ app. Handle digits *and* words:
+   tile names in YOUR myQ app. These are your real four (check "gate" first so
+   it isn't swallowed by a "garage" match). Handle digits *and* words:
 
    ```
-   If %phrase ~ *gate*                     → %tile = Gate
-   Else If %phrase ~ *garage*door*1* / *one*   → %tile = Garage Door 1
-   Else If %phrase ~ *garage*door*2* / *two*   → %tile = Garage Door 2
-   Else If %phrase ~ *garage*door*3* / *three* → %tile = Garage Door 3
-   Else If %phrase ~ *garage*door*4* / *four*  → %tile = Garage Door 4
+   If %phrase ~ *gate*                          → %tile = Gate
+   Else If %phrase ~ *door*1* / %phrase ~ *one*   → %tile = Garage Door 1
+   Else If %phrase ~ *door*2* / %phrase ~ *two*   → %tile = Garage Door 2
+   Else If %phrase ~ *door*3* / %phrase ~ *three* → %tile = Garage Door 3
+   # 5th opener not set up yet — when it is, copy this line and set both
+   # the phrase pattern and the tile text to its exact myQ name:
+   # Else If %phrase ~ *door*4* / %phrase ~ *four* → %tile = <exact myQ name>
    Else → Flash "Didn't catch which door"; Stop
    End If
    ```
-   (Use Tasker "If" actions with the `~` *matches* operator and `*` wildcards.
-   Set `%tile` to match your tiles' EXACT text as shown in myQ.)
+   - In Tasker each line is an **If** action using the `~` (*matches*) operator
+     with `*` wildcards; the `/` above means "or" — add it as a second matching
+     condition on the same If (Tasker lets an If have multiple conditions with
+     OR).
+   - `%tile` must equal the tile's EXACT visible text in myQ — you confirmed
+     `Gate`, `Garage Door 1`, `Garage Door 2`, `Garage Door 3`. If any tile is
+     actually a custom name, use that instead.
+   - Matching on `*door*1*` (not `*garage*door*1*`) is deliberate: it still
+     catches "open garage door 1" but also survives you saying just "door 1."
 
 3. **Launch App** → myQ.
 4. **Wait** 4 seconds (raise to 6–8 on a slow start).
@@ -118,8 +129,9 @@ Create a **Profile**:
   any "open …" phrase passes).
 - Link the profile to the **`OpenMyQ`** task.
 
-That's the whole thing: one profile, one task, five tiles handled by the parse
-step. Add a sixth opener later by adding one line to the If-ladder.
+That's the whole thing: one profile, one task, all your tiles handled by the
+parse step. Add the 5th opener later by uncommenting/adding one line in the
+If-ladder — no new profile, no new routine.
 
 ---
 
@@ -129,7 +141,7 @@ step. Add a sixth opener later by adding one line to the If-ladder.
    `open garage door 2` (Tasker → run task with a set variable) → door 2 opens.
    Tune the step-4 wait until the tap reliably lands after the tile renders.
 2. Say **"Sesame, open the gate."** Confirm AutoVoice fires and the gate opens.
-3. Run through all 5 phrases; confirm each opens only its own device.
+3. Run through all four phrases; confirm each opens only its own device.
 4. Test from **cellular / away from home Wi-Fi** to confirm remote works
    (it will — myQ's app is doing the long haul).
 
@@ -152,14 +164,16 @@ If you don't want to buy Tasker/AutoVoice/AutoInput or run an always-on mic:
 2. **If** → **Bixby** voice command → phrase e.g. `open garage door 2`.
 3. **Then** → **Open app** myQ, and add the tap. Samsung Routines can't always
    record an in-app tap directly, so the reliable version is: **Then → run a
-   MacroDroid macro** (build the 5 tap-macros from
+   MacroDroid macro** (build one tap-macro per device from
    [`local/macrodroid-multi-device.md`](local/macrodroid-multi-device.md), each
    triggered by a MacroDroid "Modes and Routines"/shortcut hook).
-4. One Routine per device (5 total). Wake with **"Hi Bixby, open garage door 2."**
+4. One Routine per device (four today: Gate, Garage Door 1–3). Wake with
+   **"Hi Bixby, open garage door 2."**
 
-Trade-off vs the Tasker build: wake word is fixed to "Hi Bixby", and it's five
-routines instead of one smart command — but zero paid apps and no background
-mic. Everything else (remote via myQ cloud, pressing the real app) is the same.
+Trade-off vs the Tasker build: wake word is fixed to "Hi Bixby", and it's one
+routine per door instead of a single smart command — but zero paid apps and no
+background mic. Everything else (remote via myQ cloud, pressing the real app)
+is the same.
 
 ## Security
 
