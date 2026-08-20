@@ -2,28 +2,58 @@ package com.gatevoice.app
 
 /**
  * Hand-off between "a command was understood" and "the accessibility service
- * taps the tile once myQ is on screen". The controller sets a target with an
- * expiry; the accessibility service consumes it when the myQ window appears.
+ * taps the tile(s) once myQ is on screen". Holds a QUEUE so one command can
+ * open several devices ("door 2 and gate"): the service taps the head of the
+ * queue, then advances to the next.
  */
 object PendingTap {
-    @Volatile var targetTile: String? = null
+    @Volatile var targets: MutableList<String> = mutableListOf()
     @Volatile var expiresAt: Long = 0L
 
     /** Last human-readable status, surfaced in the app UI for tuning. */
     @Volatile var lastStatus: String = "idle"
 
-    fun request(tile: String, windowMs: Long) {
-        targetTile = tile
+    fun request(tiles: List<String>, windowMs: Long) {
+        targets = tiles.toMutableList()
         expiresAt = System.currentTimeMillis() + windowMs
-        lastStatus = "waiting for myQ to show \"$tile\""
+        lastStatus = "waiting for myQ to show ${tiles.joinToString(", ")}"
+    }
+
+    fun current(): String? = targets.firstOrNull()
+
+    fun completeCurrent() {
+        if (targets.isNotEmpty()) targets.removeAt(0)
     }
 
     fun active(): Boolean =
-        targetTile != null && System.currentTimeMillis() < expiresAt
+        targets.isNotEmpty() && System.currentTimeMillis() < expiresAt
 
     fun clear(status: String) {
-        targetTile = null
+        targets = mutableListOf()
         expiresAt = 0L
         lastStatus = status
+    }
+}
+
+/**
+ * Diagnostic capture: when armed, the accessibility service dumps the myQ
+ * window's node tree so we can see the real, accessible labels (or discover
+ * that myQ blocks accessibility). Purely for troubleshooting the tap.
+ */
+object Diag {
+    @Volatile var armed: Boolean = false
+    @Volatile var expiresAt: Long = 0L
+    @Volatile var lastDump: String = "(no capture yet — tap \"Capture myQ screen\", switch to myQ, wait 2s, come back and View)"
+
+    fun arm(windowMs: Long) {
+        armed = true
+        expiresAt = System.currentTimeMillis() + windowMs
+    }
+
+    fun active(): Boolean = armed && System.currentTimeMillis() < expiresAt
+
+    fun store(dump: String) {
+        lastDump = dump
+        armed = false
     }
 }

@@ -75,4 +75,25 @@ class CommandParserTest {
             assertNull(CommandParser.parse(it))
         }
     }
+
+    @Test
+    fun multipleDevicesAllReturnedInOrder() {
+        assertEquals(listOf(gd2, gate), CommandParser.parseAll("open garage door 2 and gate"))
+        assertEquals(listOf(gate, gd2), CommandParser.parseAll("open the gate and garage door 2"))
+        assertEquals(listOf(gd1, gd3), CommandParser.parseAll("open garage door 1 and 3"))
+        assertEquals(listOf(gd1, gd2, gd3), CommandParser.parseAll("garage door 1 2 3"))
+    }
+
+    @Test
+    fun parseAllDeduplicates() {
+        assertEquals(listOf(gate), CommandParser.parseAll("gate gate"))
+        assertEquals(listOf(gd2), CommandParser.parseAll("garage door 2 door two"))
+    }
+
+    @Test
+    fun parseAllEmptyForUnknown() {
+        listOf("", "hello", "open garage door 4").forEach {
+            assertEquals(emptyList<String>(), CommandParser.parseAll(it))
+        }
+    }
 }

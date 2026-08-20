@@ -71,13 +71,40 @@ class MainActivity : AppCompatActivity() {
             if (checked) VoskWakeService.start(this) else VoskWakeService.stop(this)
         }
 
-        findViewById<Button>(R.id.btnDryRun).setOnClickListener {
-            val phrase = findViewById<EditText>(R.id.edTest).text.toString()
-            val tile = CommandParser.parse(phrase, prefs.gateTile, prefs.doorsMap())
-            findViewById<TextView>(R.id.tvParse).text =
-                if (tile == null) "→ not understood (would ask again)" else "→ would tap: $tile"
+        findViewById<Button>(R.id.btnCapture).setOnClickListener {
+            Diag.arm(20_000L)
+            val launch = packageManager.getLaunchIntentForPackage(prefs.myqPackage)
+            if (launch == null) {
+                Toast.makeText(this, "myQ not found (${prefs.myqPackage})", Toast.LENGTH_LONG).show()
+            } else {
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(launch)
+                Toast.makeText(
+                    this, "Opening myQ — wait ~2s on its home screen, then return and tap 'View capture'",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+        findViewById<Button>(R.id.btnViewDump).setOnClickListener {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("myQ screen capture")
+                .setMessage(Diag.lastDump)
+                .setPositiveButton("Copy") { _, _ ->
+                    val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("capture", Diag.lastDump))
+                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("Close", null)
+                .show()
         }
 
+        findViewById<Button>(R.id.btnDryRun).setOnClickListener {
+            val phrase = findViewById<EditText>(R.id.edTest).text.toString()
+            val tiles = CommandParser.parseAll(phrase, prefs.gateTile, prefs.doorsMap())
+            findViewById<TextView>(R.id.tvParse).text =
+                if (tiles.isEmpty()) "→ not understood (would ask again)"
+                else "→ would open: ${tiles.joinToString(", ")}"
+        }
         findViewById<Button>(R.id.btnOpenGate).setOnClickListener { GateController.openTile(this, prefs.gateTile) }
         findViewById<Button>(R.id.btnOpen1).setOnClickListener { openDoor(1) }
         findViewById<Button>(R.id.btnOpen2).setOnClickListener { openDoor(2) }
@@ -95,7 +122,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStatus() {
-        findViewById<TextView>(R.id.tvStatus).text = PendingTap.lastStatus
+        val acc = if (GateController.isAccessibilityEnabled(this)) "ON" else "OFF — enable it!"
+        findViewById<TextView>(R.id.tvStatus).text = "Accessibility: $acc\n${PendingTap.lastStatus}"
     }
 
     override fun onResume() {

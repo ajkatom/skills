@@ -37,35 +37,50 @@ object CommandParser {
     private val gateCues = listOf("gate", "gates")
 
     /**
+     * All devices named in one phrase, in the order spoken, de-duplicated.
+     * "open garage door 2 and gate" -> [Garage Door 2, Gate]
+     * "open the gate" -> [Gate]
+     * unrecognized -> [] (caller shows an error / asks again)
+     *
      * @param text recognized phrase (wake word may or may not still be present)
      * @param gateTile the myQ tile name for the gate
      * @param doors map of number -> myQ tile name for installed garage doors
-     * @return the tile text to tap, or null if not understood
      */
-    fun parse(
+    fun parseAll(
         text: String?,
         gateTile: String = DEFAULT_GATE,
         doors: Map<Int, String> = defaultDoors,
-    ): String? {
-        if (text.isNullOrBlank()) return null
+    ): List<String> {
+        if (text.isNullOrBlank()) return emptyList()
         val p = text.lowercase()
             .replace(Regex("[^a-z0-9 ]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-        if (p.isEmpty()) return null
+        if (p.isEmpty()) return emptyList()
         val tokens = p.split(" ")
 
-        // 1) Gate first.
-        if (gateCues.any { p.contains(it) }) return gateTile
+        val found = mutableListOf<Pair<Int, String>>()  // (token index, tile)
 
-        // 2) Garage door N: need a door cue AND a known, installed number.
-        val hasDoor = doorCues.any { p.contains(it) }
-        if (hasDoor) {
-            for (tok in tokens) {
+        // Gate: match the whole token so "garage" can never register as "gate".
+        tokens.forEachIndexed { i, tok ->
+            if (gateCues.contains(tok)) found.add(i to gateTile)
+        }
+
+        // Garage door N: need a door/garage cue somewhere, then every known number.
+        if (doorCues.any { p.contains(it) }) {
+            tokens.forEachIndexed { i, tok ->
                 val n = numberWords[tok]
-                if (n != null && doors.containsKey(n)) return doors[n]
+                if (n != null && doors.containsKey(n)) found.add(i to doors[n]!!)
             }
         }
-        return null
+
+        return found.sortedBy { it.first }.map { it.second }.distinct()
     }
+
+    /** Single-device convenience: first named device, or null. */
+    fun parse(
+        text: String?,
+        gateTile: String = DEFAULT_GATE,
+        doors: Map<Int, String> = defaultDoors,
+    ): String? = parseAll(text, gateTile, doors).firstOrNull()
 }
