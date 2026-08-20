@@ -42,6 +42,15 @@ cannot take away:
 with zero purchases. If you end up using it daily, graduate to Path C for
 speed and reliability (2 s instead of ~10 s, no phone required).
 
+### ⭐ Galaxy S24 Ultra — custom wake word + one smart command (built for this setup)
+
+[`galaxy-s24-smart-command.md`](galaxy-s24-smart-command.md) is the tailored
+build: your **own activation word** (e.g. "Sesame, open garage door 2"), a
+**single smart command** that parses which of the 5 openers you named, presses
+the real myQ app, and works **anywhere** (no hub/LAN — myQ's own cloud carries
+the distance). Uses Tasker + AutoVoice + AutoInput for the custom hotword, with
+a no-paid-apps Bixby fallback included.
+
 ### No hub, works away from home, still presses the app (recommended for "no Home Assistant")
 
 If you don't run Home Assistant and need it to work when you're **not on your
