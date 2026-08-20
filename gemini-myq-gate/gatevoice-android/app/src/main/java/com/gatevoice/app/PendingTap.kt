@@ -11,12 +11,19 @@ object PendingTap {
     @Volatile var expiresAt: Long = 0L
     @Volatile var action: GateAction = GateAction.OPEN
 
+    /** High-water marks so status reflects the BEST state reached, not just the
+     *  last poll (which is usually GateVoice, since you switch back to read it). */
+    @Volatile var sawMyQ: Boolean = false
+    @Volatile var sawNode: Boolean = false
+
     /** Last human-readable status, surfaced in the app UI for tuning. */
     @Volatile var lastStatus: String = "idle"
 
     fun request(tiles: List<String>, windowMs: Long, act: GateAction) {
         targets = tiles.toMutableList()
         action = act
+        sawMyQ = false
+        sawNode = false
         expiresAt = System.currentTimeMillis() + windowMs
         lastStatus = "waiting for myQ to ${act.name.lowercase()} ${tiles.joinToString(", ")}"
     }

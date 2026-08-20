@@ -63,6 +63,7 @@ class MyqAccessibilityService : AccessibilityService() {
                 val target = PendingTap.current()
                 val root = rootInActiveWindow
                 val fg = root?.packageName?.toString()
+                if (fg == pkg) PendingTap.sawMyQ = true
 
                 // Only act when myQ is the foreground window.
                 if (target != null && fg == pkg && tryTap(target)) {
@@ -75,13 +76,15 @@ class MyqAccessibilityService : AccessibilityService() {
                     return
                 }
                 attempts++
-                // Breadcrumb so we can see exactly where it stalls.
+                // Breadcrumb incl. high-water marks so switching back to read it
+                // doesn't erase the fact that myQ / the node WAS seen earlier.
+                val marks = "[sawMyQ=${PendingTap.sawMyQ} sawDoor=${PendingTap.sawNode}]"
                 PendingTap.lastStatus = when {
-                    fg == null -> "poll $attempts: no active window yet"
-                    fg != pkg -> "poll $attempts: foreground is $fg (not myQ) — keep myQ open"
-                    else -> "poll $attempts: myQ shown, searching for \"$target\"…"
+                    fg == null -> "poll $attempts: no active window $marks"
+                    fg != pkg -> "poll $attempts: foreground $fg (not myQ) $marks"
+                    else -> "poll $attempts: myQ shown, searching \"$target\" $marks"
                 }
-                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 60) {
+                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 120) {
                     handler.postDelayed(this, 300)
                 } else {
                     PendingTap.clear(failureStatus(target))
@@ -95,6 +98,7 @@ class MyqAccessibilityService : AccessibilityService() {
     private fun tryTap(tileText: String): Boolean {
         val root = rootInActiveWindow ?: return false
         val nameNode = findExactText(root, tileText) ?: return false
+        PendingTap.sawNode = true
         val card = nearestClickable(nameNode) ?: nameNode
         val action = PendingTap.action
 
@@ -188,15 +192,18 @@ class MyqAccessibilityService : AccessibilityService() {
 
     /** Build a status that reveals what myQ actually exposed, so we can tune. */
     private fun failureStatus(target: String?): String {
-        val root = rootInActiveWindow
-            ?: return "no match for \"$target\": myQ exposed NO content to accessibility " +
-                "(is the service enabled? did myQ block accessibility?)"
-        val labels = collectLabels(root, mutableListOf(), 0).distinct().take(25)
-        return if (labels.isEmpty()) {
-            "no match for \"$target\": myQ window had 0 readable labels (likely blocked)"
-        } else {
-            "no match for \"$target\". Saw: " + labels.joinToString(" | ")
+        val marks = "[sawMyQ=${PendingTap.sawMyQ} sawDoor=${PendingTap.sawNode}]"
+        if (!PendingTap.sawMyQ) {
+            return "gave up on \"$target\" $marks — myQ never came to the foreground during " +
+                "the window. In real use don't switch away from myQ; for this test stay on myQ."
         }
+        if (!PendingTap.sawNode) {
+            val root = rootInActiveWindow
+            val labels = root?.let { collectLabels(it, mutableListOf(), 0).distinct().take(20) } ?: emptyList()
+            return "gave up on \"$target\" $marks — myQ was shown but the door name wasn't found. " +
+                if (labels.isEmpty()) "No readable labels now." else "Last labels: " + labels.joinToString(" | ")
+        }
+        return "gave up on \"$target\" $marks — found the door but the tap didn't complete."
     }
 
     private fun captureNow() {

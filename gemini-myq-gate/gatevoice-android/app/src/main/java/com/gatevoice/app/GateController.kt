@@ -36,7 +36,8 @@ object GateController {
             PendingTap.clear("accessibility service is OFF — enable it, then retry")
             return
         }
-        PendingTap.request(tiles, prefs.tapWindowMs, action)
+        // At least 20s so there's ample time while myQ is foreground.
+        PendingTap.request(tiles, maxOf(prefs.tapWindowMs, 20_000L), action)
 
         val launch = context.packageManager.getLaunchIntentForPackage(prefs.myqPackage)
         if (launch == null) {
