@@ -166,9 +166,12 @@ class MyqAccessibilityService : AccessibilityService() {
      *  (which tells us the round "device state icon" isn't the real control). */
     private fun verifyChange(tileText: String, before: String, action: GateAction) {
         handler.postDelayed({
-            val r = rootInActiveWindow ?: return@postDelayed
-            val n = findExactText(r, tileText) ?: run {
-                PendingTap.lastStatus = "tapped \"$tileText\" (left myQ before I could verify)"
+            var n: AccessibilityNodeInfo? = null
+            for (root in myqWindowRoots(Prefs(this).myqPackage)) {
+                n = findExactText(root, tileText); if (n != null) break
+            }
+            if (n == null) {
+                PendingTap.lastStatus = "tapped \"$tileText\" (couldn't re-read to verify)"
                 return@postDelayed
             }
             val card = nearestClickable(n) ?: n
@@ -176,17 +179,26 @@ class MyqAccessibilityService : AccessibilityService() {
             PendingTap.lastStatus = if (after.trim() != before.trim()) {
                 "OK: \"$tileText\" ${action.name.lowercase()} worked — now \"${after.take(60)}\""
             } else {
-                "FAILED: \"$tileText\" did NOT change after tap — the round icon is not the " +
-                    "control. Capture the device DETAIL screen so I can target the real button."
+                "tapped \"$tileText\" but state unchanged after 2.5s (may still be moving; re-check myQ)"
             }
         }, 2500)
     }
 
-    /** Node whose text/desc EXACTLY equals the tile name (case-insensitive). */
+    /** Node whose text/desc EXACTLY equals the tile name (case-insensitive).
+     *  Manual DFS — findAccessibilityNodeInfosByText() is unreliable on Compose
+     *  UIs like myQ (the diagnostic dump finds the node via getChild, but the
+     *  by-text query returns nothing). This mirrors the dump's traversal. */
     private fun findExactText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
-        val matches = root.findAccessibilityNodeInfosByText(text)
-        return matches.firstOrNull { it.text?.toString().equals(text, ignoreCase = true) }
-            ?: matches.firstOrNull { it.contentDescription?.toString().equals(text, ignoreCase = true) }
+        val stack = ArrayList<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val n = stack.removeAt(stack.size - 1)
+            val nt = n.text?.toString()
+            val nd = n.contentDescription?.toString()
+            if (nt.equals(text, ignoreCase = true) || nd.equals(text, ignoreCase = true)) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return null
     }
 
     /** myQ often shows a confirmation dialog (especially when CLOSING a garage
