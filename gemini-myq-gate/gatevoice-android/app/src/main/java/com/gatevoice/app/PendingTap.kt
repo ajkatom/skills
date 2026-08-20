@@ -54,8 +54,10 @@ object Diag {
 
     fun active(): Boolean = armed && System.currentTimeMillis() < expiresAt
 
+    /** Continuous within the armed window: keeps the LATEST myQ screen shown,
+     *  so you can arm it, navigate to the detail screen you want, and that's
+     *  what gets saved. Stops when the window expires. */
     fun store(dump: String) {
         lastDump = dump
-        armed = false
     }
 }

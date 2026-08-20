@@ -102,9 +102,10 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnDryRun).setOnClickListener {
             val phrase = findViewById<EditText>(R.id.edTest).text.toString()
             val tiles = CommandParser.parseAll(phrase, prefs.gateTile, prefs.doorsMap())
+            val action = CommandParser.detectAction(phrase).name.lowercase()
             findViewById<TextView>(R.id.tvParse).text =
                 if (tiles.isEmpty()) "→ not understood (would ask again)"
-                else "→ would open: ${tiles.joinToString(", ")}"
+                else "→ would $action: ${tiles.joinToString(", ")}"
         }
         findViewById<Button>(R.id.btnOpenGate).setOnClickListener { GateController.openTile(this, prefs.gateTile, selectedAction()) }
         findViewById<Button>(R.id.btnOpen1).setOnClickListener { openDoor(1) }

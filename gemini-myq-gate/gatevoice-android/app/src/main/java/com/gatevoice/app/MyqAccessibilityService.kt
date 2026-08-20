@@ -99,8 +99,9 @@ class MyqAccessibilityService : AccessibilityService() {
             val r = Rect(); icon.getBoundsInScreen(r)
             if (r.width() > 0 && r.height() > 0) {
                 tapAt(r.exactCenterX(), r.exactCenterY())
-                PendingTap.lastStatus = "tapped ${action.name.lowercase()} control for \"$tileText\""
+                PendingTap.lastStatus = "tapped ${action.name.lowercase()} control for \"$tileText\" — verifying…"
                 safeConfirm(action)
+                verifyChange(tileText, statusText, action)
                 return true
             }
         }
@@ -111,6 +112,27 @@ class MyqAccessibilityService : AccessibilityService() {
             return true
         }
         return false
+    }
+
+    /** 2.5s after a tap, re-read the same card and report whether the state
+     *  actually changed — so we never claim success when the door didn't move
+     *  (which tells us the round "device state icon" isn't the real control). */
+    private fun verifyChange(tileText: String, before: String, action: GateAction) {
+        handler.postDelayed({
+            val r = rootInActiveWindow ?: return@postDelayed
+            val n = findExactText(r, tileText) ?: run {
+                PendingTap.lastStatus = "tapped \"$tileText\" (left myQ before I could verify)"
+                return@postDelayed
+            }
+            val card = nearestClickable(n) ?: n
+            val after = collectLabels(card, mutableListOf(), 0).joinToString(" ").lowercase()
+            PendingTap.lastStatus = if (after.trim() != before.trim()) {
+                "OK: \"$tileText\" ${action.name.lowercase()} worked — now \"${after.take(60)}\""
+            } else {
+                "FAILED: \"$tileText\" did NOT change after tap — the round icon is not the " +
+                    "control. Capture the device DETAIL screen so I can target the real button."
+            }
+        }, 2500)
     }
 
     /** Node whose text/desc EXACTLY equals the tile name (case-insensitive). */

@@ -44,10 +44,8 @@ object GateController {
             PendingTap.clear("myQ package not installed: ${prefs.myqPackage}")
             return
         }
-        launch.addFlags(
-            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
-                android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-        )
+        // NEW_TASK only — REORDER_TO_FRONT caused focus to bounce back to us.
+        launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(launch)
         val verb = when (action) {
             GateAction.OPEN -> "Opening"; GateAction.CLOSE -> "Closing"; GateAction.TOGGLE -> "Toggling"

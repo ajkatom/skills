@@ -63,8 +63,8 @@
         <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
             android:text="6) Diagnostics (if tapping fails)" android:textSize="16sp" android:paddingTop="16dp"/>
         <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:text="Capture what the myQ screen looks like to the accessibility service, so we can see the real button labels."/>
-        <Button android:id="@+id/btnCapture" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Capture myQ screen"/>
+            android:text="Tap Capture (arms for 20s), then in myQ navigate to the screen you want (e.g. tap a device to open its detail/control screen). The LAST myQ screen shown is saved. Come back and tap View last capture."/>
+        <Button android:id="@+id/btnCapture" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Capture myQ screen (arm 20s)"/>
         <Button android:id="@+id/btnViewDump" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="View last capture"/>
 
     </LinearLayout>
