@@ -70,34 +70,60 @@ class MyqAccessibilityService : AccessibilityService() {
 
     private fun tryTap(tileText: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        val node = findByText(root, tileText) ?: findByDesc(root, tileText) ?: return false
-        val clickable = nearestClickable(node)
-        if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-            PendingTap.lastStatus = "clicked node for \"$tileText\""
-            maybeConfirm()
+        val nameNode = findExactText(root, tileText) ?: return false
+        val card = nearestClickable(nameNode) ?: nameNode
+
+        // myQ shows each device as a card: name + status ("Open for.."/"Closed
+        // for..") + a round open/close control (desc="device state icon"). The
+        // card is clickable but only opens the detail view; the round control
+        // is what actually opens/closes — and myQ does NOT expose it as
+        // click-actionable, so we tap its screen location directly.
+        val statusText = collectLabels(card, mutableListOf(), 0).joinToString(" ").lowercase()
+        if (statusText.contains("open for") || statusText.contains("opening")) {
+            // Already open: never toggle it closed on an "open" command.
+            PendingTap.lastStatus = "\"$tileText\" is already open — left as is"
             return true
         }
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        if (rect.width() > 0 && rect.height() > 0) {
-            tapAt(rect.exactCenterX(), rect.exactCenterY())
-            PendingTap.lastStatus = "gesture-tapped \"$tileText\""
-            maybeConfirm()
+
+        val icon = findByDesc(card, "device state icon")
+        if (icon != null) {
+            val r = Rect(); icon.getBoundsInScreen(r)
+            if (r.width() > 0 && r.height() > 0) {
+                tapAt(r.exactCenterX(), r.exactCenterY())
+                PendingTap.lastStatus = "tapped open control for \"$tileText\""
+                safeConfirm()
+                return true
+            }
+        }
+        // Fallback: no icon found — click the card (may open its detail view).
+        val clickable = nearestClickable(nameNode)
+        if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            PendingTap.lastStatus = "no open-control found; clicked \"$tileText\" card (fallback)"
             return true
         }
         return false
     }
 
-    /** If myQ shows a confirmation ("Open"/"Confirm"/"Yes"), press it too. */
-    private fun maybeConfirm() {
+    /** Node whose text/desc EXACTLY equals the tile name (case-insensitive). */
+    private fun findExactText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
+        val matches = root.findAccessibilityNodeInfosByText(text)
+        return matches.firstOrNull { it.text?.toString().equals(text, ignoreCase = true) }
+            ?: matches.firstOrNull { it.contentDescription?.toString().equals(text, ignoreCase = true) }
+    }
+
+    /** Some myQ setups confirm an open with a dialog. Click only an exact,
+     *  clickable "Confirm"/"Yes" — never "Open" (matches "Open for 24 min"). */
+    private fun safeConfirm() {
         handler.postDelayed({
             val r = rootInActiveWindow ?: return@postDelayed
-            for (label in listOf("Open", "Confirm", "Yes", "OK")) {
-                val n = findByText(r, label) ?: continue
-                nearestClickable(n)?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            for (label in listOf("Confirm", "Yes")) {
+                val n = r.findAccessibilityNodeInfosByText(label)
+                    .firstOrNull { it.text?.toString().equals(label, ignoreCase = true) } ?: continue
+                (if (n.isClickable) n else nearestClickable(n))
+                    ?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                 break
             }
-        }, 700)
+        }, 800)
     }
 
     /** Build a status that reveals what myQ actually exposed, so we can tune. */
@@ -149,12 +175,6 @@ class MyqAccessibilityService : AccessibilityService() {
         node.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { out.add(it) }
         for (i in 0 until node.childCount) collectLabels(node.getChild(i), out, depth + 1)
         return out
-    }
-
-    private fun findByText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
-        val matches = root.findAccessibilityNodeInfosByText(text)
-        return matches.firstOrNull { it.text?.toString().equals(text, ignoreCase = true) }
-            ?: matches.firstOrNull()
     }
 
     private fun findByDesc(node: AccessibilityNodeInfo?, text: String): AccessibilityNodeInfo? {
