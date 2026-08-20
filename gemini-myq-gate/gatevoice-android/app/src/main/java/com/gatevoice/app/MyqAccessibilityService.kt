@@ -54,27 +54,34 @@ class MyqAccessibilityService : AccessibilityService() {
     private fun scheduleAttempts() {
         if (retryScheduled) return
         retryScheduled = true
+        PendingTap.lastStatus = "polling for myQ…"
         var attempts = 0
+        val pkg = Prefs(this).myqPackage
         val tick = object : Runnable {
             override fun run() {
                 if (!PendingTap.active()) { retryScheduled = false; return }
                 val target = PendingTap.current()
-                if (target != null && tryTap(target)) {
+                val root = rootInActiveWindow
+                val fg = root?.packageName?.toString()
+
+                // Only act when myQ is the foreground window.
+                if (target != null && fg == pkg && tryTap(target)) {
                     PendingTap.completeCurrent()
                     val next = PendingTap.current()
-                    if (next == null) {
-                        PendingTap.clear("done")
-                        retryScheduled = false
-                        return
-                    }
-                    // More devices to open: pause, then continue on the list.
+                    if (next == null) { retryScheduled = false; return }
                     PendingTap.lastStatus = "opened $target, now $next"
                     attempts = 0
                     handler.postDelayed(this, 1600)
                     return
                 }
                 attempts++
-                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 40) {
+                // Breadcrumb so we can see exactly where it stalls.
+                PendingTap.lastStatus = when {
+                    fg == null -> "poll $attempts: no active window yet"
+                    fg != pkg -> "poll $attempts: foreground is $fg (not myQ) — keep myQ open"
+                    else -> "poll $attempts: myQ shown, searching for \"$target\"…"
+                }
+                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 60) {
                     handler.postDelayed(this, 300)
                 } else {
                     PendingTap.clear(failureStatus(target))

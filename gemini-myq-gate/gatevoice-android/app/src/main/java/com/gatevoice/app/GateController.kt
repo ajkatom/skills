@@ -56,8 +56,15 @@ object GateController {
         // event firing when myQ comes to the front. Kick it a few times as myQ
         // loads; scheduleAttempts is idempotent and only acts once myQ is shown.
         val h = android.os.Handler(android.os.Looper.getMainLooper())
-        for (delay in listOf(600L, 1500L, 3000L)) {
-            h.postDelayed({ MyqAccessibilityService.instance?.beginTapNow() }, delay)
+        for (delay in listOf(400L, 900L, 1800L, 3000L, 5000L)) {
+            h.postDelayed({
+                val svc = MyqAccessibilityService.instance
+                if (svc == null) {
+                    PendingTap.lastStatus = "kick@${delay}ms: accessibility service NOT connected"
+                } else {
+                    svc.beginTapNow()
+                }
+            }, delay)
         }
     }
 
