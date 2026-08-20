@@ -94,21 +94,19 @@ class MyqAccessibilityService : AccessibilityService() {
             GateAction.TOGGLE -> {}  // always tap
         }
 
-        val icon = findByDesc(card, "device state icon")
-        if (icon != null) {
-            val r = Rect(); icon.getBoundsInScreen(r)
-            if (r.width() > 0 && r.height() > 0) {
-                tapAt(r.exactCenterX(), r.exactCenterY())
-                PendingTap.lastStatus = "tapped ${action.name.lowercase()} control for \"$tileText\" — verifying…"
-                safeConfirm(action)
-                verifyChange(tileText, statusText, action)
-                return true
-            }
-        }
-        // Fallback: no icon found — click the card (may open its detail view).
-        val clickable = nearestClickable(nameNode)
-        if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-            PendingTap.lastStatus = "no open-control found; clicked \"$tileText\" card (fallback)"
+        // The WHOLE card is the open/close button; the round "device state
+        // icon" is only a status readout. A real gesture tap on the card
+        // toggles the door. (ACTION_CLICK on the card instead opens myQ's
+        // detail view, and tapping the status icon does nothing — that's why
+        // earlier builds failed.)
+        val r = Rect(); card.getBoundsInScreen(r)
+        if (r.width() > 0 && r.height() > 0) {
+            val tapX = r.left + r.width() * 0.30f   // text area, clear of the status icon
+            val tapY = r.exactCenterY()
+            tapAt(tapX, tapY)
+            PendingTap.lastStatus = "tapped ${action.name.lowercase()} card for \"$tileText\" — verifying…"
+            safeConfirm(action)
+            verifyChange(tileText, statusText, action)
             return true
         }
         return false
