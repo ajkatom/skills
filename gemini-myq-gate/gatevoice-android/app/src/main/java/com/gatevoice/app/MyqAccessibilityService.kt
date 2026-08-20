@@ -21,18 +21,35 @@ class MyqAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var retryScheduled = false
 
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        event ?: return
         val pkg = Prefs(this).myqPackage
-        if (event.packageName?.toString() != pkg) return
-
-        // Diagnostic capture takes priority.
-        if (Diag.active()) captureNow()
-
+        // Diagnostic capture only for myQ windows.
+        if (event?.packageName?.toString() == pkg && Diag.active()) captureNow()
+        // Start the tap loop on ANY event while a tap is pending; tryTap itself
+        // only acts once myQ is the foreground window (it looks for the card).
         if (PendingTap.active()) scheduleAttempts()
     }
 
     override fun onInterrupt() {}
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    /** Called by GateController right after launching myQ, so the tap loop
+     *  starts even if no accessibility event happens to fire. */
+    fun beginTapNow() = scheduleAttempts()
+
+    companion object {
+        @Volatile
+        var instance: MyqAccessibilityService? = null
+    }
 
     private fun scheduleAttempts() {
         if (retryScheduled) return

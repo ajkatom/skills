@@ -51,6 +51,14 @@ object GateController {
             GateAction.OPEN -> "Opening"; GateAction.CLOSE -> "Closing"; GateAction.TOGGLE -> "Toggling"
         }
         toast(context, "$verb ${tiles.joinToString(", ")}…")
+
+        // Proactively start the tap loop — don't depend on an accessibility
+        // event firing when myQ comes to the front. Kick it a few times as myQ
+        // loads; scheduleAttempts is idempotent and only acts once myQ is shown.
+        val h = android.os.Handler(android.os.Looper.getMainLooper())
+        for (delay in listOf(600L, 1500L, 3000L)) {
+            h.postDelayed({ MyqAccessibilityService.instance?.beginTapNow() }, delay)
+        }
     }
 
     /** True if our accessibility service is enabled in system settings. */
