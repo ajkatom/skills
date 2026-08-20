@@ -42,7 +42,17 @@ cannot take away:
 with zero purchases. If you end up using it daily, graduate to Path C for
 speed and reliability (2 s instead of ~10 s, no phone required).
 
-### ⭐ Galaxy S24 Ultra — custom wake word + one smart command (built for this setup)
+### ⭐⭐ GateVoice — one custom app, no Tasker/AutoVoice/AutoInput
+
+Don't want to install/configure separate automation apps? [`gatevoice-android/`](gatevoice-android/)
+is a single app that does everything: **fully offline** voice (Vosk — no
+Google/cloud), a **custom wake word** *and* a one-tap tile/widget, the verified
+door parser built in, and it **presses the official myQ app** itself via an
+Accessibility service. Works remotely (myQ's own app carries it). CI builds an
+installable APK; runtime tap/wake tuning happens on-device via the app's test
+screen. See [`gatevoice-android/README.md`](gatevoice-android/README.md).
+
+### ⭐ Galaxy S24 Ultra — custom wake word + one smart command (no custom app)
 
 [`galaxy-s24-smart-command.md`](galaxy-s24-smart-command.md) is the tailored
 build: your **own activation word** (e.g. "Sesame, open garage door 2"), a

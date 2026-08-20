@@ -1,0 +1,11 @@
+# Build output & caches
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+
+# The offline Vosk model is downloaded at build time (CI) into assets — not committed.
+app/src/main/assets/model-en-us/
+model.zip

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GateVoice</string>
+    <string name="listen_label">GateVoice Listen</string>
+    <string name="tile_label">Open Gate</string>
+    <string name="accessibility_desc">Lets GateVoice tap the open button inside the myQ app when you speak a command.</string>
+    <string name="widget_button">Open (say the door)</string>
+</resources>

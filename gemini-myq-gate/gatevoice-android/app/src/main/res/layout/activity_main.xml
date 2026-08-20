@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="GateVoice setup" android:textSize="20sp" android:paddingBottom="8dp"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="1) Permissions" android:textSize="16sp" android:paddingTop="8dp"/>
+        <Button android:id="@+id/btnMic" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Grant Microphone"/>
+        <Button android:id="@+id/btnNotif" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Grant Notifications"/>
+        <Button android:id="@+id/btnAccess" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Accessibility settings (enable GateVoice)"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="2) Settings" android:textSize="16sp" android:paddingTop="16dp"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Wake word"/>
+        <EditText android:id="@+id/edWake" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="text"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Gate tile name (exact text in myQ)"/>
+        <EditText android:id="@+id/edGate" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="text"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Doors (e.g. 1=Garage Door 1;2=Garage Door 2;3=Garage Door 3)"/>
+        <EditText android:id="@+id/edDoors" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="text"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="myQ package"/>
+        <EditText android:id="@+id/edPkg" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="text"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Tap window (ms)"/>
+        <EditText android:id="@+id/edTapWin" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="number"/>
+        <Button android:id="@+id/btnSave" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Save settings"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="3) Wake word listener" android:textSize="16sp" android:paddingTop="16dp"/>
+        <Switch android:id="@+id/swWake" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Always listen for wake word"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="4) Test — dry-run the parser (no door moves)" android:textSize="16sp" android:paddingTop="16dp"/>
+        <EditText android:id="@+id/edTest" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="text" android:hint="e.g. open garage door 2"/>
+        <Button android:id="@+id/btnDryRun" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Parse (show result only)"/>
+        <TextView android:id="@+id/tvParse" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="—" android:paddingBottom="8dp"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="5) Test — actually open (presses myQ)" android:textSize="16sp" android:paddingTop="8dp"/>
+        <Button android:id="@+id/btnOpenGate" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Gate"/>
+        <Button android:id="@+id/btnOpen1" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 1"/>
+        <Button android:id="@+id/btnOpen2" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 2"/>
+        <Button android:id="@+id/btnOpen3" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Open Garage Door 3"/>
+        <Button android:id="@+id/btnListen" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Listen once (like the tile/widget)"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Last action status:" android:paddingTop="12dp"/>
+        <TextView android:id="@+id/tvStatus" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="idle"/>
+        <Button android:id="@+id/btnRefresh" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Refresh status"/>
+
+    </LinearLayout>
+</ScrollView>
