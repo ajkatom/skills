@@ -42,7 +42,17 @@ cannot take away:
 with zero purchases. If you end up using it daily, graduate to Path C for
 speed and reliability (2 s instead of ~10 s, no phone required).
 
-### Multiple devices, and you want it all local (Path A, no MacroDroid/IFTTT cloud)
+### No hub, works away from home, still presses the app (recommended for "no Home Assistant")
+
+If you don't run Home Assistant and need it to work when you're **not on your
+home network**, see [`no-hub-remote.md`](no-hub-remote.md). The unlock: let the
+phone in your hand be the presser — myQ's own app already opens the gate from
+anywhere, so a tap on your phone works remotely with **no hub, no LAN bridge,
+no MacroDroid cloud, no IFTTT**. Multi-device becomes trivial (5 local macros,
+5 voice commands on one phone), and the voice layer can be Google *or* your
+phone's own assistant.
+
+### Multiple devices, all local via a home hub (Path A, no MacroDroid/IFTTT cloud)
 
 If you have several openers (e.g. a gate + garage doors 1–4) and want Path A's
 "tap the real myQ app" approach but with **the only cloud being Google's
