@@ -42,6 +42,17 @@ cannot take away:
 with zero purchases. If you end up using it daily, graduate to Path C for
 speed and reliability (2 s instead of ~10 s, no phone required).
 
+### Want to skip myQ (and app automation) entirely?
+
+See [`outside-the-box.md`](outside-the-box.md) for four angles that don't play
+myQ's game at all — including the standout **"Hey Google, call Gate"** trick: a
+~$40 GSM dial-to-open relay that rejects the call (so it's free) and pulses the
+gate. It rides Google's most bulletproof voice action, works hands-free while
+your phone is locked, works from every Nest speaker, and can't be broken by a
+myQ app update because myQ isn't in the loop. Also covered: cloning the
+remote's rolling-code radio with a $5 CC1101 (no wiring to the operator),
+presence-based auto-open (no words at all), and NFC/watch/car levers.
+
 ---
 
 ## Path A — "OK Google, open the gate" → your phone taps the myQ app
@@ -189,6 +200,7 @@ intended) that myQ and Google put in front of "open":
 ```
 gemini-myq-gate/
 ├── README.md                     ← you are here (decision tree + Paths A/B/C)
+├── outside-the-box.md            ← myQ-free angles: call-to-open, RF clone, presence
 ├── macrodroid/
 │   └── opengate-macro.md         ← click-by-click macro build (Path A / A2 / B)
 ├── home-assistant/
