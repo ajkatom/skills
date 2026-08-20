@@ -6,8 +6,8 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
+import android.widget.CompoundButton
 import android.widget.EditText
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -27,7 +27,7 @@ class MainActivity : AppCompatActivity() {
         val edDoors = findViewById<EditText>(R.id.edDoors)
         val edPkg = findViewById<EditText>(R.id.edPkg)
         val edTapWin = findViewById<EditText>(R.id.edTapWin)
-        val swWake = findViewById<Switch>(R.id.swWake)
+        val swWake = findViewById<CompoundButton>(R.id.swWake)
 
         // Load current settings.
         edWake.setText(prefs.wakeWord)
