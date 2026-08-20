@@ -46,6 +46,13 @@ myQ sends "open" to the opener over its cloud → door 2 opens
 
 ---
 
+> **Verified logic + exact recipe:** the phrase→door parser is proven by an
+> automated test (`tests/test_parse_command.py`, 33/33) and shipped as a
+> paste-in Tasker JavaScriptlet (`tools/tasker_parse.js`). For the shortest
+> click-by-click that uses it, follow
+> [`galaxy-s24-build-recipe.md`](galaxy-s24-build-recipe.md). The sections
+> below explain the same build in prose.
+
 ## Build it
 
 ### 0. One-time permissions (Settings)
