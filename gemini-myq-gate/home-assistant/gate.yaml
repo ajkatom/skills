@@ -1,0 +1,43 @@
+# gemini-myq-gate — Home Assistant package (Path B)
+# Drop into config/packages/gate.yaml (with packages enabled) and restart HA.
+# Replace <device-id> with the URL shown by MacroDroid's Webhook trigger
+# on the spare "button presser" phone.
+
+rest_command:
+  gate_phone_tap:
+    url: "https://trigger.macrodroid.com/<device-id>/opengate"
+    method: get
+    # trigger.macrodroid.com is MacroDroid's cloud relay; the phone receives
+    # the push within ~1-2 s. The URL is a bearer secret - keep this file
+    # out of public repos or move the URL to secrets.yaml:
+    #   url: !secret gate_webhook_url
+
+script:
+  gate_open:
+    alias: "Gate"
+    icon: mdi:gate-open
+    mode: single          # ignore repeat invocations while one is running
+    sequence:
+      - service: rest_command.gate_phone_tap
+      - delay: "00:00:15" # debounce: macro takes ~10 s end to end
+    # Optional: notify your daily phone that the gate was voice-opened
+    #  - service: notify.mobile_app_YOUR_PHONE
+    #    data:
+    #      message: "Gate opened by voice command"
+
+# --- Google exposure -------------------------------------------------------
+# Nabu Casa users: skip this block; expose script.gate_open in
+# Settings -> Voice assistants instead.
+#
+# Manual (free) integration - requires the GCP project setup described in
+# https://www.home-assistant.io/integrations/google_assistant/
+#
+# google_assistant:
+#   project_id: your-gcp-project-id
+#   service_account: !include SERVICE_ACCOUNT.JSON
+#   report_state: true
+#   exposed_domains: []          # expose nothing by default...
+#   entity_config:
+#     script.gate_open:          # ...except the gate script
+#       name: "Gate"
+#       room: "Front Yard"

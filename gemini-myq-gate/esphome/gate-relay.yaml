@@ -1,0 +1,102 @@
+# gemini-myq-gate — Path C firmware (ESP32 + relay board)
+#
+# Wire the relay's dry contacts (COM + NO) in PARALLEL with the gate
+# operator's open/cycle or single-button-control input terminals — the same
+# pair a wired keypad or exit button uses (LA400/LA412/LA500: see the
+# operator manual's "control station" terminals; CSW24U/CSL24U: the
+# single-button input on the main board). Low-voltage side only; the myQ
+# radio/hub is untouched and keeps working.
+#
+# Optional but recommended: a magnetic reed switch on the gate leaf/arm
+# (closed-position magnet) lets Google answer "is the gate open?" and lets
+# HA alert you if it's left open.
+#
+# Flash: `esphome run gate-relay.yaml` (needs secrets.yaml with wifi_ssid /
+# wifi_password / api_key / ota_password). Home Assistant auto-discovers it;
+# expose the cover (or the "Gate Trigger" switch if you skip the sensor) to
+# Google via Nabu Casa or the manual google_assistant integration.
+#
+# No-solder alternative: a Shelly 1 Gen3/Gen4 does the same job with its
+# stock firmware + Shelly Cloud's native "Works with Google" link — set the
+# output to auto-off after 0.5 s and skip this file entirely.
+
+esphome:
+  name: gate-relay
+  friendly_name: Gate
+
+esp32:
+  board: esp32dev
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap: # fallback hotspot if Wi-Fi is unreachable (gate posts are Wi-Fi-marginal; check RSSI below)
+    ssid: "Gate-Relay Setup"
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+
+# --- The button press -------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO26            # most single-relay boards; change to match yours
+    id: gate_relay
+    name: "Gate Trigger"
+    icon: mdi:gate
+    restore_mode: ALWAYS_OFF   # never hold the contact closed across reboots
+    on_turn_on:
+      - delay: 500ms           # momentary pulse = one button press
+      - switch.turn_off: gate_relay
+
+# --- Optional: position sensor ----------------------------------------------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO33
+      mode:
+        input: true
+        pullup: true
+      inverted: true       # reed closed (gate closed) = LOW with pullup
+    id: gate_closed_sensor
+    name: "Gate Closed"
+    device_class: garage_door
+    filters:
+      - delayed_on: 200ms
+      - delayed_off: 200ms
+
+# --- Cover: what you actually expose to Google -------------------------------
+# With the reed sensor this reports real open/closed state; Google device
+# type "Gate" will ask for your security PIN before opening (recommended).
+# If you want PIN-free voice opening instead, expose the "Gate Trigger"
+# switch above and hide this cover.
+cover:
+  - platform: template
+    name: "Gate"
+    id: gate_cover
+    device_class: gate
+    lambda: |-
+      if (id(gate_closed_sensor).state) {
+        return COVER_CLOSED;
+      } else {
+        return COVER_OPEN;
+      }
+    open_action:
+      - switch.turn_on: gate_relay
+    close_action:
+      - switch.turn_on: gate_relay
+    stop_action:
+      - switch.turn_on: gate_relay   # most operators: same input cycles open/stop/close
+
+sensor:
+  - platform: wifi_signal   # gate posts are far from the router - watch this
+    name: "Gate Wi-Fi RSSI"
+    update_interval: 60s

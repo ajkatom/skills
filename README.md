@@ -55,6 +55,21 @@ ln -sfn "$PWD/extract-apple-mail" ~/.agents/skills/extract-apple-mail
 For another local agent, point it at `extract-apple-mail/SKILL.md` and allow
 local Python and `osascript` execution. No model-specific API is required.
 
+## gemini-myq-gate
+
+Makes "OK Google, open the gate" work for a myQ-controlled gate even though
+Chamberlain blocked all third-party integrations. Three built paths: a $0
+phone-side bridge (Google Home routine → myQ app launch → MacroDroid
+accessibility tap on the official app — nothing for Chamberlain to block), a
+dedicated spare-phone bridge fronted by Home Assistant for whole-house
+speaker support, and the hardware endgame (Wi-Fi relay on the gate operator's
+dry-contact input, ESPHome firmware included).
+
+- Guide + decision tree: [`gemini-myq-gate/README.md`](gemini-myq-gate/README.md)
+- Macro build steps: [`gemini-myq-gate/macrodroid/opengate-macro.md`](gemini-myq-gate/macrodroid/opengate-macro.md)
+- Home Assistant package: [`gemini-myq-gate/home-assistant/gate.yaml`](gemini-myq-gate/home-assistant/gate.yaml)
+- Relay firmware: [`gemini-myq-gate/esphome/gate-relay.yaml`](gemini-myq-gate/esphome/gate-relay.yaml)
+
 ## dark-factory
 
 Runs a StrongDM-style "dark factory" loop: you write a spec, an isolated
