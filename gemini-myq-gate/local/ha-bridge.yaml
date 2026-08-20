@@ -1,0 +1,104 @@
+# gemini-myq-gate — Home Assistant bridge for Path-A-local, multi-device.
+#
+# Put this in config/packages/myq-bridge.yaml (with packages enabled) or paste
+# the sections into configuration.yaml. It creates 5 dummy scripts that Google
+# can "activate"; each one just signals your phone (Tier 1 notification or
+# Tier 2 MQTT), and MacroDroid on the phone taps the matching myQ tile.
+#
+# HA controls NOTHING physical here. It is only the local switchboard that
+# routes "which device you said" from Google to the phone. The actual opening
+# is the phone pressing the real myQ app (Path A methodology).
+#
+# Replace <yourphone> with your HA Companion device id (the notify service
+# shows as notify.mobile_app_<yourphone>). Enable EITHER the notification
+# block (Tier 1) OR the mqtt block (Tier 2) in each script.
+
+script:
+  open_gate:
+    alias: "Gate"
+    icon: mdi:gate-open
+    mode: single
+    sequence:
+      # --- Tier 1: HA Companion notification (delivered via Google FCM) ------
+      - service: notify.mobile_app_<yourphone>
+        data:
+          message: "MYQ_OPEN_GATE"          # MacroDroid matches this exact text
+          data:
+            tag: "myq-gate"                  # replaces/updates instead of stacking
+            channel: "myQ"
+            importance: high
+            # ttl: 0 / priority: high keep it instant even in doze:
+            ttl: 0
+            priority: high
+      # --- Tier 2 (alternative): publish to local MQTT broker ---------------
+      # - service: mqtt.publish
+      #   data:
+      #     topic: "myq/gate/open"
+      #     payload: "1"
+
+  open_garage_1:
+    alias: "Garage Door 1"
+    icon: mdi:garage
+    mode: single
+    sequence:
+      - service: notify.mobile_app_<yourphone>
+        data:
+          message: "MYQ_OPEN_GD1"
+          data: { tag: "myq-gd1", channel: "myQ", importance: high, ttl: 0, priority: high }
+      # - service: mqtt.publish
+      #   data: { topic: "myq/gd1/open", payload: "1" }
+
+  open_garage_2:
+    alias: "Garage Door 2"
+    icon: mdi:garage
+    mode: single
+    sequence:
+      - service: notify.mobile_app_<yourphone>
+        data:
+          message: "MYQ_OPEN_GD2"
+          data: { tag: "myq-gd2", channel: "myQ", importance: high, ttl: 0, priority: high }
+      # - service: mqtt.publish
+      #   data: { topic: "myq/gd2/open", payload: "1" }
+
+  open_garage_3:
+    alias: "Garage Door 3"
+    icon: mdi:garage
+    mode: single
+    sequence:
+      - service: notify.mobile_app_<yourphone>
+        data:
+          message: "MYQ_OPEN_GD3"
+          data: { tag: "myq-gd3", channel: "myQ", importance: high, ttl: 0, priority: high }
+      # - service: mqtt.publish
+      #   data: { topic: "myq/gd3/open", payload: "1" }
+
+  open_garage_4:
+    alias: "Garage Door 4"
+    icon: mdi:garage
+    mode: single
+    sequence:
+      - service: notify.mobile_app_<yourphone>
+        data:
+          message: "MYQ_OPEN_GD4"
+          data: { tag: "myq-gd4", channel: "myQ", importance: high, ttl: 0, priority: high }
+      # - service: mqtt.publish
+      #   data: { topic: "myq/gd4/open", payload: "1" }
+
+# --- Expose the 5 scripts to Google, free and self-hosted ------------------
+# Full GCP/HomeGraph setup: https://www.home-assistant.io/integrations/google_assistant/
+# (Nabu Casa users: skip this block; expose the scripts in the UI instead.)
+#
+# google_assistant:
+#   project_id: your-gcp-project-id
+#   service_account: !include SERVICE_ACCOUNT.JSON
+#   report_state: true
+#   exposed_domains: []                 # expose nothing by default...
+#   entity_config:                      # ...only these 5
+#     script.open_gate:      { name: "Gate",          room: "Front Yard" }
+#     script.open_garage_1:  { name: "Garage Door 1", room: "Garage" }
+#     script.open_garage_2:  { name: "Garage Door 2", room: "Garage" }
+#     script.open_garage_3:  { name: "Garage Door 3", room: "Garage" }
+#     script.open_garage_4:  { name: "Garage Door 4", room: "Garage" }
+#
+# Tier 2 only: also enable the MQTT integration + Mosquitto broker add-on so
+# mqtt.publish works. The phone subscribes to myq/+/open on your LAN.

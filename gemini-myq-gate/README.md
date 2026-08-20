@@ -42,6 +42,17 @@ cannot take away:
 with zero purchases. If you end up using it daily, graduate to Path C for
 speed and reliability (2 s instead of ~10 s, no phone required).
 
+### Multiple devices, and you want it all local (Path A, no MacroDroid/IFTTT cloud)
+
+If you have several openers (e.g. a gate + garage doors 1–4) and want Path A's
+"tap the real myQ app" approach but with **the only cloud being Google's
+voice** — no MacroDroid cloud, no IFTTT, no Nabu Casa — see
+[`local/README.md`](local/README.md). It uses **Home Assistant on your own LAN**
+as the local switchboard: Google activates a named HA script per device, HA
+pokes your phone locally (Companion notification, or pure-LAN MQTT), and
+MacroDroid taps that device's tile. Multi-device by name falls out for free,
+and myQ is never bypassed — your phone still presses the official app.
+
 ### Want to skip myQ (and app automation) entirely?
 
 See [`outside-the-box.md`](outside-the-box.md) for four angles that don't play
