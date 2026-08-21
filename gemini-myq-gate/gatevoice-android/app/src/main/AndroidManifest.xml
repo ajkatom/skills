@@ -40,6 +40,21 @@
             </intent-filter>
         </activity>
 
+        <!-- Mic-free trigger for app shortcuts / "Hey Google" / deep links. -->
+        <activity
+            android:name=".ActionActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.Translucent"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="gatevoice" android:host="act" />
+            </intent-filter>
+        </activity>
+
         <!-- Always-on offline wake-word listener. -->
         <service
             android:name=".VoskWakeService"

@@ -22,6 +22,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         title = "GateVoice v${BuildConfig.VERSION_NAME}"
         prefs = Prefs(this)
+        publishShortcuts()
 
         val edWake = findViewById<EditText>(R.id.edWake)
         val edGate = findViewById<EditText>(R.id.edGate)
@@ -115,6 +116,40 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, ListenActivity::class.java))
         }
         findViewById<Button>(R.id.btnRefresh).setOnClickListener { refreshStatus() }
+    }
+
+    /** Publish per-device app shortcuts so Google Assistant ("Hey Google, open
+     *  the gate") and the launcher long-press menu can trigger GateVoice with
+     *  no microphone of our own. */
+    private fun publishShortcuts() {
+        val devices = LinkedHashMap<String, String>()   // label -> myQ tile
+        devices["Gate"] = prefs.gateTile
+        prefs.doorsMap().forEach { (_, tile) -> devices[tile] = tile }
+
+        val shortcuts = ArrayList<androidx.core.content.pm.ShortcutInfoCompat>()
+        for ((_, tile) in devices) {
+            for (act in listOf("open", "close")) {
+                val label = "${act.replaceFirstChar { it.uppercase() }} $tile"
+                val intent = Intent(this, ActionActivity::class.java).apply {
+                    action = Intent.ACTION_VIEW
+                    putExtra("device", tile)
+                    putExtra("action", act)
+                }
+                shortcuts.add(
+                    androidx.core.content.pm.ShortcutInfoCompat.Builder(
+                        this, "$act-${tile.replace(" ", "_")}"
+                    )
+                        .setShortLabel(label)
+                        .setLongLabel(label)
+                        .setIcon(androidx.core.graphics.drawable.IconCompat.createWithResource(this, R.drawable.ic_launcher))
+                        .setIntent(intent)
+                        .build()
+                )
+            }
+        }
+        try {
+            androidx.core.content.pm.ShortcutManagerCompat.setDynamicShortcuts(this, shortcuts)
+        } catch (e: Exception) { /* best effort */ }
     }
 
     private fun selectedAction(): GateAction = when (
