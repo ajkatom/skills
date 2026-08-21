@@ -84,7 +84,7 @@ class MyqAccessibilityService : AccessibilityService() {
                     "poll $attempts: myQ shown, searching \"$target\" $marks"
                 else
                     "poll $attempts: myQ not visible (fg=${rootInActiveWindow?.packageName}) $marks"
-                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 120) {
+                if (System.currentTimeMillis() < PendingTap.expiresAt && attempts < 200) {
                     handler.postDelayed(this, 300)
                 } else {
                     PendingTap.clear(failureStatus(target))

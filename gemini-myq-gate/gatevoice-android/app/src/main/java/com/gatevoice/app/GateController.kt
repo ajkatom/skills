@@ -36,8 +36,9 @@ object GateController {
             PendingTap.clear("accessibility service is OFF — enable it, then retry")
             return
         }
-        // At least 20s so there's ample time while myQ is foreground.
-        PendingTap.request(tiles, maxOf(prefs.tapWindowMs, 20_000L), action)
+        // At least 45s: on cellular, myQ's device list can take a while to
+        // load, and we must keep waiting for the tile to render before tapping.
+        PendingTap.request(tiles, maxOf(prefs.tapWindowMs, 45_000L), action)
 
         val launch = context.packageManager.getLaunchIntentForPackage(prefs.myqPackage)
         if (launch == null) {
