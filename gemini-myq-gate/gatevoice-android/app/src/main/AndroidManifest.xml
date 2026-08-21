@@ -65,7 +65,7 @@
             android:targetActivity=".ActionActivity"
             android:exported="true"
             android:icon="@drawable/ic_launcher"
-            android:label="GateVoice Gate">
+            android:label="Sesame">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -79,7 +79,7 @@
             android:targetActivity=".ActionActivity"
             android:exported="true"
             android:icon="@drawable/ic_launcher"
-            android:label="GateVoice Door 1">
+            android:label="Sesame One">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -93,7 +93,7 @@
             android:targetActivity=".ActionActivity"
             android:exported="true"
             android:icon="@drawable/ic_launcher"
-            android:label="GateVoice Door 2">
+            android:label="Sesame Two">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -107,7 +107,7 @@
             android:targetActivity=".ActionActivity"
             android:exported="true"
             android:icon="@drawable/ic_launcher"
-            android:label="GateVoice Door 3">
+            android:label="Sesame Three">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
