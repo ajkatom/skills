@@ -53,6 +53,7 @@ class MyqAccessibilityService : AccessibilityService() {
 
     private fun scheduleAttempts() {
         if (retryScheduled) return
+        if (!PendingTap.active()) return   // nothing to do — don't overwrite the final status
         retryScheduled = true
         PendingTap.lastStatus = "polling for myQ…"
         var attempts = 0
@@ -120,6 +121,8 @@ class MyqAccessibilityService : AccessibilityService() {
     }
 
     private fun tapCard(nameNode: AccessibilityNodeInfo, tileText: String): Boolean {
+        // One tap per door per request — stops the open-then-close double toggle.
+        if (PendingTap.tapped.contains(tileText)) return true
         val card = nearestClickable(nameNode) ?: nameNode
         val action = PendingTap.action
 
@@ -150,6 +153,7 @@ class MyqAccessibilityService : AccessibilityService() {
         // earlier builds failed.)
         val r = Rect(); card.getBoundsInScreen(r)
         if (r.width() > 0 && r.height() > 0) {
+            PendingTap.tapped.add(tileText)   // record BEFORE tapping so a racing poll can't re-tap
             val tapX = r.left + r.width() * 0.30f   // text area, clear of the status icon
             val tapY = r.exactCenterY()
             tapAt(tapX, tapY)

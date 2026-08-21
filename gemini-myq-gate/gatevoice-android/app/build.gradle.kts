@@ -11,9 +11,12 @@ android {
         applicationId = "com.gatevoice.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 12
-        versionName = "0.12"
+        versionCode = 13
+        versionName = "0.13"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Galaxy S24 is arm64 — ship only that ABI so the Vosk native libs
+        // don't bloat the APK (and it's obvious the ~40MB model is included).
+        ndk { abiFilters += "arm64-v8a" }
     }
 
     // Stable signing key committed to the repo so every CI build installs as a

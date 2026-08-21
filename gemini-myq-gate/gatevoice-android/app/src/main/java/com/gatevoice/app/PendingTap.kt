@@ -16,6 +16,11 @@ object PendingTap {
     @Volatile var sawMyQ: Boolean = false
     @Volatile var sawNode: Boolean = false
 
+    /** Tiles already tapped for THIS request — guarantees one tap per door
+     *  (prevents the open-then-close double toggle) while still allowing a
+     *  multi-device command to tap each different door once. */
+    @Volatile var tapped: MutableSet<String> = HashSet()
+
     /** Last human-readable status, surfaced in the app UI for tuning. */
     @Volatile var lastStatus: String = "idle"
 
@@ -24,6 +29,7 @@ object PendingTap {
         action = act
         sawMyQ = false
         sawNode = false
+        tapped = HashSet()
         expiresAt = System.currentTimeMillis() + windowMs
         lastStatus = "waiting for myQ to ${act.name.lowercase()} ${tiles.joinToString(", ")}"
     }

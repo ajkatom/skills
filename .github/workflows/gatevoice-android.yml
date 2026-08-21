@@ -32,13 +32,18 @@ jobs:
 
       - name: Download offline Vosk model into assets
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p app/src/main/assets
-          curl -L -o model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          curl -fL --retry 3 -o model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          echo "Downloaded size:" && ls -lh model.zip
           unzip -q model.zip
           rm -rf app/src/main/assets/model-en-us
           mv vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
-          echo "Model files:" && ls app/src/main/assets/model-en-us
+          echo "Model contents:" && ls -R app/src/main/assets/model-en-us | head -50
+          # Fail the build if the model (esp. the uuid file Vosk needs) is missing.
+          test -f app/src/main/assets/model-en-us/uuid || { echo "ERROR: model-en-us/uuid missing"; exit 1; }
+          test -d app/src/main/assets/model-en-us/am   || { echo "ERROR: model-en-us/am missing"; exit 1; }
+          echo "Model total size:" && du -sh app/src/main/assets/model-en-us
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
