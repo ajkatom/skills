@@ -57,6 +57,65 @@
             </intent-filter>
         </activity>
 
+        <!-- Launcher entries per device, so "Hey Google, open GateVoice Gate"
+             (a reliable app-open command) taps that door. Pair with a Google
+             Home routine to map a natural phrase to it. -->
+        <activity-alias
+            android:name=".alias.OpenGate"
+            android:targetActivity=".ActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="GateVoice Gate">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="device" android:value="Gate" />
+            <meta-data android:name="action" android:value="open" />
+        </activity-alias>
+
+        <activity-alias
+            android:name=".alias.OpenDoor1"
+            android:targetActivity=".ActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="GateVoice Door 1">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="device" android:value="Garage Door 1" />
+            <meta-data android:name="action" android:value="open" />
+        </activity-alias>
+
+        <activity-alias
+            android:name=".alias.OpenDoor2"
+            android:targetActivity=".ActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="GateVoice Door 2">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="device" android:value="Garage Door 2" />
+            <meta-data android:name="action" android:value="open" />
+        </activity-alias>
+
+        <activity-alias
+            android:name=".alias.OpenDoor3"
+            android:targetActivity=".ActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="GateVoice Door 3">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="device" android:value="Garage Door 3" />
+            <meta-data android:name="action" android:value="open" />
+        </activity-alias>
+
         <!-- Mic-free keep-alive so the accessibility service stays connected
              when the UI is closed (and the wake word is off). -->
         <service

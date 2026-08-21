@@ -16,9 +16,21 @@ class ActionActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         KeepAliveService.start(this)   // ensure we stay alive for future cold triggers
+
+        // When launched via a launcher alias ("open GateVoice Gate"), the device
+        // + action come from that alias's meta-data. Shortcuts/deep links use
+        // extras / query params instead.
+        val aliasMeta = try {
+            packageManager.getActivityInfo(
+                componentName, android.content.pm.PackageManager.GET_META_DATA
+            ).metaData
+        } catch (e: Exception) { null }
+
         val device = intent.getStringExtra("device")
+            ?: aliasMeta?.getString("device")
             ?: intent.data?.getQueryParameter("device")
         val actionStr = (intent.getStringExtra("action")
+            ?: aliasMeta?.getString("action")
             ?: intent.data?.getQueryParameter("action") ?: "open").lowercase()
         if (!device.isNullOrBlank()) {
             val action = when (actionStr) {
