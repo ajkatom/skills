@@ -39,8 +39,13 @@ jobs:
           unzip -q model.zip
           rm -rf app/src/main/assets/model-en-us
           mv vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
+          # Vosk's StorageService requires a 'uuid' version marker in the model
+          # dir; this small model ships without one, which caused the runtime
+          # 'model-en-us/uuid' error. Its contents are arbitrary (cache key).
+          if [ ! -f app/src/main/assets/model-en-us/uuid ]; then
+            echo "gatevoice-vosk-small-en-us-0.15" > app/src/main/assets/model-en-us/uuid
+          fi
           echo "Model contents:" && ls -R app/src/main/assets/model-en-us | head -50
-          # Fail the build if the model (esp. the uuid file Vosk needs) is missing.
           test -f app/src/main/assets/model-en-us/uuid || { echo "ERROR: model-en-us/uuid missing"; exit 1; }
           test -d app/src/main/assets/model-en-us/am   || { echo "ERROR: model-en-us/am missing"; exit 1; }
           echo "Model total size:" && du -sh app/src/main/assets/model-en-us
