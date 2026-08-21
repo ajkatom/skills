@@ -23,6 +23,7 @@ class MainActivity : AppCompatActivity() {
         title = "GateVoice v${BuildConfig.VERSION_NAME}"
         prefs = Prefs(this)
         publishShortcuts()
+        KeepAliveService.start(this)   // keep accessibility alive with the UI closed
 
         val edWake = findViewById<EditText>(R.id.edWake)
         val edGate = findViewById<EditText>(R.id.edGate)

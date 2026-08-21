@@ -15,6 +15,7 @@ import android.os.Bundle
 class ActionActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        KeepAliveService.start(this)   // ensure we stay alive for future cold triggers
         val device = intent.getStringExtra("device")
             ?: intent.data?.getQueryParameter("device")
         val actionStr = (intent.getStringExtra("action")
