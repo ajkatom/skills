@@ -205,26 +205,54 @@ class MyqAccessibilityService : AccessibilityService() {
         return null
     }
 
-    /** myQ often shows a confirmation dialog (especially when CLOSING a garage
-     *  door). Click only an EXACT, clickable label — exact matching keeps the
-     *  status text ("Open for 24 minutes"/"Closed for 1 day") from ever being
-     *  mistaken for a button. */
+    /** myQ shows a confirmation dialog when CLOSING a garage door. Find its
+     *  button by manual DFS (by-text API is broken on Compose) and GESTURE-tap
+     *  it (ACTION_CLICK misbehaves on Compose too). Opening needs no
+     *  confirmation, so we skip it there to avoid any stray second tap. Exact
+     *  label matching keeps status text ("Closed for 1 day") from matching. */
     private fun safeConfirm(action: GateAction) {
         val labels = when (action) {
-            GateAction.OPEN -> listOf("Confirm", "Yes", "Open")
-            GateAction.CLOSE -> listOf("Confirm", "Yes", "Close")
-            GateAction.TOGGLE -> listOf("Confirm", "Yes", "Open", "Close")
+            GateAction.CLOSE -> listOf(
+                "close", "close door", "close anyway", "confirm", "yes", "ok",
+                "continue", "i'm sure", "im sure", "proceed"
+            )
+            GateAction.TOGGLE -> listOf("confirm", "yes", "ok")
+            GateAction.OPEN -> emptyList()
         }
-        handler.postDelayed({
-            val r = rootInActiveWindow ?: return@postDelayed
-            for (label in labels) {
-                val n = r.findAccessibilityNodeInfosByText(label)
-                    .firstOrNull { it.text?.toString().equals(label, ignoreCase = true) } ?: continue
-                (if (n.isClickable) n else nearestClickable(n))
-                    ?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                break
+        if (labels.isEmpty()) return
+        val pkg = Prefs(this).myqPackage
+        var tries = 0
+        val runnable = object : Runnable {
+            override fun run() {
+                val btn = confirmButton(pkg, labels)
+                if (btn != null) {
+                    val rect = Rect(); btn.getBoundsInScreen(rect)
+                    if (rect.width() > 0 && rect.height() > 0) {
+                        tapAt(rect.exactCenterX(), rect.exactCenterY())
+                        PendingTap.lastStatus = "confirmed ${action.name.lowercase()}"
+                        return
+                    }
+                }
+                if (++tries < 10) handler.postDelayed(this, 350)  // dialog may animate in
             }
-        }, 800)
+        }
+        handler.postDelayed(runnable, 500)
+    }
+
+    /** Find a confirmation button whose exact text/desc is one of [labels]. */
+    private fun confirmButton(pkg: String, labels: List<String>): AccessibilityNodeInfo? {
+        for (root in myqWindowRoots(pkg)) {
+            val stack = ArrayList<AccessibilityNodeInfo>()
+            stack.add(root)
+            while (stack.isNotEmpty()) {
+                val n = stack.removeAt(stack.size - 1)
+                val t = n.text?.toString()?.trim()?.lowercase()
+                val d = n.contentDescription?.toString()?.trim()?.lowercase()
+                if ((t != null && labels.contains(t)) || (d != null && labels.contains(d))) return n
+                for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+            }
+        }
+        return null
     }
 
     /** Build a status that reveals what myQ actually exposed, so we can tune. */
