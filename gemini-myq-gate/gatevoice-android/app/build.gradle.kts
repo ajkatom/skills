@@ -11,8 +11,8 @@ android {
         applicationId = "com.gatevoice.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 17
-        versionName = "0.17"
+        versionCode = 18
+        versionName = "0.18"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Galaxy S24 is arm64 — ship only that ABI so the Vosk native libs
         // don't bloat the APK (and it's obvious the ~40MB model is included).
@@ -65,6 +65,10 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
+
+    // Donates our app shortcuts to Google Assistant so they show up in
+    // Assistant > Shortcuts, where a voice phrase can be attached to each.
+    implementation("androidx.core:core-google-shortcuts:1.1.0")
 
     // Fully offline speech recognition + keyword spotting.
     implementation("com.alphacephei:vosk-android:0.3.47")
