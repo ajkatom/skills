@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "GateVoice"
 include(":app")
+include(":companion")

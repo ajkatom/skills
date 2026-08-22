@@ -61,9 +61,19 @@ jobs:
       - name: Build debug APK
         run: gradle :app:assembleDebug --no-daemon
 
+      - name: Build companion APKs (one per device)
+        run: gradle :companion:assembleDebug --no-daemon
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: GateVoice-debug-apk
           path: gemini-myq-gate/gatevoice-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload companion APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: GateVoice-companions
+          path: gemini-myq-gate/gatevoice-android/companion/build/outputs/apk/*/debug/*.apk
           if-no-files-found: error
