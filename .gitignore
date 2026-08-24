@@ -13,3 +13,6 @@ node_modules/
 # Python test harness for dark-factory
 .venv/
 __pycache__/
+
+# Audit reports — local working papers, never committed
+audit/
