@@ -22,6 +22,40 @@ The skill is used live via a symlink:
 ln -sfn "$PWD/loop-designer" ~/.claude/skills/loop-designer
 ```
 
+## task-interview
+
+Model-agnostic (Claude, OpenAI/Codex, Gemini) task-kickoff interviewer: asks
+one question at a time to pin down the goal & outcome, guardrails (always do /
+ask first / never do), where the context lives, and the test criteria that end
+the loop — then models the work as a loop graph with verification gates and
+writes a `TASK-BRIEF.md` contract before any work starts. The skill body is
+plain markdown with no host-specific tool calls, so the same file installs
+into Claude Code, Codex/`AGENTS.md`, Gemini CLI/`GEMINI.md`, or a plain chat.
+
+- Skill: [`task-interview/SKILL.md`](task-interview/SKILL.md)
+- Question bank: [`task-interview/references/question-bank.md`](task-interview/references/question-bank.md)
+- Templates (TASK-BRIEF, loop graph, iteration log): [`task-interview/references/templates.md`](task-interview/references/templates.md)
+- Platform installs: [`task-interview/references/platform-adapters.md`](task-interview/references/platform-adapters.md)
+- Codex audit prompt: [`task-interview/references/codex-audit-prompt.md`](task-interview/references/codex-audit-prompt.md)
+
+### Install / update
+
+Claude Code:
+
+```bash
+ln -sfn "$PWD/task-interview" ~/.claude/skills/task-interview
+```
+
+Codex and Agent Skills-compatible hosts:
+
+```bash
+mkdir -p ~/.agents/skills
+ln -sfn "$PWD/task-interview" ~/.agents/skills/task-interview
+```
+
+Gemini CLI and plain chat: see
+[`task-interview/references/platform-adapters.md`](task-interview/references/platform-adapters.md).
+
 ## extract-apple-mail
 
 Exports user-selected Apple Mail mailboxes into a private, resumable archive of
