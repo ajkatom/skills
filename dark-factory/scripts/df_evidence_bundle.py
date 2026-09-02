@@ -559,7 +559,6 @@ def _production_verdict(bundle, manifest_v, manifest, profile):
                         "use --profile hardened-h4 | enterprise)"])
 
     src = bundle["source"]
-    container = manifest.get("container") or {}
 
     # --- facts EVERY production profile requires ---
     if not manifest_v.get("manifest_verified"):
