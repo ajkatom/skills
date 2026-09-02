@@ -2470,7 +2470,8 @@ def attach_custody(control_root: str, run_dir: str) -> int:
         # truncate to undetected (opus review F1). DF-R12-01: a required-sink checkpoint
         # that does not land leaves this run not off-box-complete (the production
         # predicate requires the dense-baseline marker) — surfaced, not silent.
-        if not _checkpoint_chain_to_sink(cfg, control_root) and sink.get("required"):
+        if (not _checkpoint_chain_to_sink(cfg, control_root)
+                and cfg.get("_audit", {}).get("sink", {}).get("required")):
             sys.stderr.write(
                 "dark-factory: WARNING — the custody chain-length checkpoint did not land on "
                 "the REQUIRED off-box sink; this run is NOT off-box-complete until the next "
@@ -2875,7 +2876,8 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
         # is a HOLE (opus review F1). DF-R12-01: a required-sink checkpoint that does not
         # land leaves this run not off-box-complete (the production predicate requires the
         # dense-baseline marker) — surfaced, not silent.
-        if not _checkpoint_chain_to_sink(cfg, control_root) and sink.get("required"):
+        if (not _checkpoint_chain_to_sink(cfg, control_root)
+                and cfg.get("_audit", {}).get("sink", {}).get("required")):
             sys.stderr.write(
                 "dark-factory: WARNING — the waiver chain-length checkpoint did not land on "
                 "the REQUIRED off-box sink; this run is NOT off-box-complete until the next "
