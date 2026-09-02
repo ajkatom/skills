@@ -146,12 +146,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--store-dir", required=True)
+    ap.add_argument(
+        "--host", default="127.0.0.1",
+        help="interface to bind (default loopback). This receiver has no "
+             "authentication and speaks plain HTTP, so exposing it beyond the "
+             "local box is an explicit choice: pass --host 0.0.0.0 only when "
+             "it genuinely runs off-box in its own trust domain "
+             "(references/audit.md).")
     args = ap.parse_args()
 
     os.makedirs(args.store_dir, exist_ok=True)
-    httpd = _Server(("0.0.0.0", args.port), args.store_dir)
+    httpd = _Server((args.host, args.port), args.store_dir)
     print(
-        f"df_audit_receiver: listening on :{args.port}, store={args.store_dir}"
+        f"df_audit_receiver: listening on {args.host}:{args.port}, store={args.store_dir}"
     )
     try:
         httpd.serve_forever()
