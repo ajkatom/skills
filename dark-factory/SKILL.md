@@ -250,57 +250,38 @@ unchanged below.
      enforced under any billing. See `references/budget.md` for the full model
      (85% alert, 100% phase-boundary pause, raise-and-resume) and its honest caveat:
      dollars are an **estimate**, not metered usage.
-   - **Security gates (opt-in at cooperative; MANDATORY at standard+).** Set
-     `security_gates.enabled: true` to
-     run a mandatory secret scan + dangerous-pattern scan + SBOM (plus any configured
-     external tool, e.g. `bandit`/`semgrep`) on the **converged artifact**, once, after
-     the final exam passes and before `CONVERGED` — **independent of scenario
-     pass-rate**: because no human reviews the built code, a fully-passing build with a
-     planted secret still gets rejected. A finding on a `fail_on` gate (default
-     `["secret_scan", "dangerous_scan"]`) makes the run terminal `SECURITY_GATE_FAILED`
-     (exit 3, never qualified) — the artifact is rejected, not iterated on. **At
-     `standard`/`hardened`/`enterprise` (M33a) `secret_scan` + `dangerous_scan` are
-     forced on and `qualified` folds in `app_security_qualified`** — a standard+ run
-     can't qualify unless the mandatory gates ran and passed. If a standard+ run hits
-     a finding you've **accepted**, don't disable the gate: issue a signed, scoped,
-     **expiring** waiver (`security_gates.waivers` + the `df-waiver`
-     findings→sign→attach→verify CLI; expiry is re-checked at every verify). See
-     `references/security-gates.md` for the built-ins, the external-gate interface,
-     the mandatory-at-standard+ policy, the full waiver workflow, and the honest
-     heuristic/floor caveat (false positives are the safe direction; false negatives
-     mean it's a floor, not a proof).
-   - **Credentials (optional).** If the builder needs a real provider credential (e.g.
-     an API key for the CLI it wraps), set `credentials.source` (`"env-file"` —
-     recommended, an absolute path to a `KEY=VALUE` file OUTSIDE the control root and
-     workspace; `"keychain"` — macOS `security` CLI only in M11; or `"env"` — the
-     launcher's own environment) and `credentials.allowlist` (the exact variable names
-     the builder may receive — nothing else is ever brokered). **Never put a
-     credential in `config.json`, `spec.md`, or a scenario file** — an `env-file` must
-     be `.gitignore`d if it lives inside any git repo, or the run refuses closed with
-     the exact remedy (`git rm --cached` / add to `.gitignore` / `chmod 600`) before
-     anything else happens. Every credential value is scrubbed
-     (`***REDACTED***`) from the journal, every manifest, and every checkpoint/verify
-     report before it's written to disk; the manifest's `credentials` field records
-     only the source + allowlisted names, never a value. See
-     `references/credentials.md` for the containment model and its honest limits (no
-     rotation; `-e` argv `ps`-visibility at `hardened`; at `enterprise` the host-side
-     credential proxy keeps the token out of the sandbox entirely and kernel-locks
-     egress to an allowlist — see `references/enterprise.md`).
-4a. **Off-box audit sink (optional, recommended for supply-chain integrity).** Every run
-    already appends one linked entry to `<control_root>/audit-chain.jsonl` (M13, always-on —
-    no config needed). To also ship each entry off-box, set `audit.sink.kind` to
-    `"http-append"` (an append-only receiver, `df_audit_receiver.py`) or `"s3-objectlock"`
-    (a WORM S3-compatible bucket) and `audit.sink.required: true` to fail the run closed
-    (`AUDIT_SINK_FAILED`, nonzero exit) if the push fails, or `false` to only warn
-    (`AUDIT_SINK_WARN`) and let the run converge normally either way. **Honesty:** the chain
-    alone is tamper-evident, not tamper-proof — a local process that can rewrite the chain
-    can also forge a fresh, internally-consistent one over it. The genuine anchor is a sink
-    living in a DIFFERENT trust domain than the runner (a separate host/account); running
-    the reference receiver on the same box is a protocol demo, not the production
-    guarantee. See `references/audit.md` for the full model.
+   - **Security gates (opt-in at cooperative; MANDATORY at standard+).**
+     `security_gates.enabled: true` runs secret/dangerous-pattern scans + SBOM
+     (plus any configured external tool) on the CONVERGED artifact, independent
+     of scenario pass-rate; a `fail_on` finding is terminal
+     `SECURITY_GATE_FAILED` (exit 3, never qualified). At standard+ the
+     mandatory gates are forced on and fold into `qualified`. An accepted
+     finding is cleared only via a signed, scoped, expiring waiver
+     (`df-waiver`), never by disabling the gate. Built-ins, external-gate
+     interface, waiver workflow, honest floor caveat:
+     `references/security-gates.md`.
+   - **Credentials (optional).** If the builder needs a real provider
+     credential, set `credentials.source` (`"env-file"` recommended — an
+     absolute path OUTSIDE the control root/workspace; `"keychain"` macOS-only;
+     or `"env"`) and `credentials.allowlist` (exact variable names — nothing
+     else is ever brokered). **Never put a credential in `config.json`,
+     `spec.md`, or a scenario file**; a git-tracked env-file refuses closed
+     with the exact remedy. Values are scrubbed (`***REDACTED***`) from every
+     journal/manifest/report; the manifest records source + names only.
+     Containment model + honest limits: `references/credentials.md` (at
+     enterprise the host-side proxy keeps tokens out of the sandbox —
+     `references/enterprise.md`).
+4a. **Off-box audit sink (optional, recommended for supply-chain integrity).**
+    Every run already appends to `<control_root>/audit-chain.jsonl` (always-on).
+    To also ship each entry off-box, set `audit.sink.kind:
+    "http-append" | "s3-objectlock"`, with `audit.sink.required: true` to fail
+    closed on a push failure (`AUDIT_SINK_FAILED`) or `false` to warn.
+    **Honesty:** the local chain is tamper-evident, not tamper-proof; the
+    genuine anchor is a sink in a DIFFERENT trust domain — same-box receivers
+    are a protocol demo. Full model: `references/audit.md`.
 4b. **Twins (optional).** If the task's code talks to external services, define behavioral mocks in `<control_root>/twins/*.json` (see `references/digital-twins.md`) and set `twins.enabled: true` in config.json. The builder develops against the twins, and the verifier resets them fresh before each verify pass for deterministic verification. Results are **twin-observed** — you must validate against the real service or staging before shipping.
    - **Twin evidence (M12, optional, recommended when a behavior depends on genuinely calling a twin).** Add a scenario `then` assertion — `twin_observed: {twin, contains}` (the twin's own observation log, not the candidate's output, must show the call) or `stdout_echoes_twin: {twin}` (the candidate's stdout must echo a token the twin served *this pass*) — and set `"supports_variants": true` on the twin def to make the served token fresh and unpredictable every verify pass. Both assertions fail closed with taxonomy `no_twin_evidence` if the candidate never really invoked the twin (e.g. a hardcoded response) — catching teaching-to-the-test that plain output-matching would miss. See `references/digital-twins.md` for the observation contract, seed semantics, and honest scope (filesystem-authority channel; network-graph enforcement and off-box sinks remain deferred).
-4c. **Brownfield (optional, only relevant when `--project-src` points at an already-existing codebase).** Detection is automatic and fail-safe toward brownfield: `brownfield.mode` defaults to `"auto"`, which classifies the run as `brownfield` the moment `--project-src` has ≥1 file — an existing tree is never silently treated as greenfield. To actually GUARD existing behavior against regression, supply `brownfield.probes` — real, deterministic commands (e.g. `python3 app.py add 2 3`) run against the CURRENT artifact before the builder ever touches anything; each is frozen into a holdout `BHV-REGRESS-<n>` scenario the builder never sees, and a build that breaks one fails verification exactly like a missed new-behavior scenario. **A brownfield run with zero probes configured is a valid but UNGUARDED no-op** — the supervisor says so loudly (stderr WARN + a distinct `BROWNFIELD_UNGUARDED` journal entry + an unambiguous manifest note), so it is never mistaken for "regressions checked." Characterization guards only what the probes exercise, never full semantics — see `references/brownfield.md` for the incremental workflow, the reduced-guarantee honesty, and how to write good probes.
+4c. **Brownfield (optional; relevant when `--project-src` points at an existing codebase).** Detection is automatic and fail-safe toward brownfield (`brownfield.mode: "auto"`; ≥1 file ⇒ brownfield). To actually GUARD existing behavior, supply `brownfield.probes` — real deterministic commands run against the CURRENT artifact before the builder touches anything, each frozen into a holdout `BHV-REGRESS-<n>` scenario. **Zero probes = a valid but UNGUARDED no-op**, loudly surfaced (`BROWNFIELD_UNGUARDED`); characterization guards only what the probes exercise. Workflow + probe-writing guidance: `references/brownfield.md`.
 4d. **Builder confinement (optional, recommended, largest value at `cooperative`/`standard`).** Set `builder_confinement.enabled: true` to confine the BUILDER subprocess (not this orchestrating session) to an explicit build-tool allowlist — no MCP servers, no sub-agents, no web tools — enforced at the adapter boundary. Only **claude** has a probe-verified profile today; **codex** and **gemini** have none, and `required` defaults to `enabled`, so with confinement on they refuse fail-closed (`CONFINEMENT_REFUSED`, exit 2, builder never spawned) unless you set `required: false` to warn and run unconfined. So: pick claude as the builder to run confined. Threat model, claude's exact flags, the codex-unsupported finding, and honest scope vs. `hardened`'s container barrier: `references/builder-confinement.md`.
 4e. **Resume overrides (optional, M36b).** If ops needs a *governed* way to raise a
     BUDGET-PAUSE'd run's budget ceiling at resume (an authorized policy change, not a raw
