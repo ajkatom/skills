@@ -3595,7 +3595,6 @@ def resolve_isolation(cfg, control_root, workspace, journal, allow_downgrade):
         os_name = os_backend.name if os_backend is not None else None
         os_ok = os_backend is not None and os_backend.available() and df_sandbox.probe_denial(
             os_backend, control_root, workspace)
-        c = cfg["_container"]
         # DF-R4-10: pin the digest ONCE, before the first container op, and use
         # the pinned reference for every probe + the real builder dispatch.
         eff_image = _effective_image(cfg)
