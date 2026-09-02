@@ -42,6 +42,15 @@ jobs:
           # claim is false and CI must fail. `cryptography` is deliberately
           # absent from this pattern: it is the one declared, pinned exception.
           ! grep -rEn '^\s*(import|from)\s+(requests|numpy|pandas|pytest|yaml|docker)\b' scripts/
+      - name: Lint for genuine-defect classes only
+        run: |
+          cd dark-factory
+          # Scoped to rule families that indicate REAL defects (F: unused/
+          # undefined names — an F821 undefined-name bug shipped in the custody
+          # warning path before this gate existed; E9: syntax/io errors; PLE:
+          # pylint errors). Style families are deliberately NOT gated.
+          python -m pip install 'ruff==0.16.5'
+          python -m ruff check --select F,E9,PLE scripts/
       - name: Run the hermetic test suite
         run: |
           cd dark-factory
