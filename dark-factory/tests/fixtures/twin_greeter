@@ -28,11 +28,14 @@ class H(BaseHTTPRequestHandler):
                 body = f"Hello, {name}! [{token}]".encode()
             else:
                 body = f"Hello, {name}!".encode()
+            # Observe BEFORE responding: a client that has the response
+            # body may immediately read the observation file, so the flushed
+            # line must already be on disk (fixes a load-dependent race).
+            self._observe(self.path, token)
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            self._observe(self.path, token)
         else:
             self.send_response(404); self.end_headers()
 
