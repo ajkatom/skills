@@ -10,28 +10,17 @@ Runs a StrongDM-style dark-factory loop: **spec in → hidden holdout scenarios
 outcome**. Design spec: `docs/superpowers/specs/2026-07-13-dark-factory-skill-design.md`
 (Codex-approved). Four assurance tiers ship: **cooperative** (honor-system isolation — every run is explicitly UNQUALIFIED), **standard** (OS read-denial sandbox on macOS/Linux, verified by a fail-closed startup denial probe — a converged run is QUALIFIED), **hardened** (the builder runs inside a Docker container that never has the control root mounted — denial by *construction*, not a deny-rule — still probe-verified fail-closed; see `references/hardened.md`), and **enterprise** (hardened + kernel-locked egress to a host-side credential proxy + seccomp + **split-custody sign-off**: a run is qualified only via a separate K-of-N ed25519 approver attestation bound to the sealed manifest — with `threshold ≥ 2` no single operator can ship, and K-of-N proves distinct keys/signatures, not distinct human owners; see `references/enterprise.md`). `hardened` (and `enterprise`) unlock the fully-unattended **H4 `lights_out`** intervention mode (legacy `autonomy: 5` — spec §2.2).
 
-**Two independent axes, not one.** Assurance tier (isolation strength:
-cooperative/standard/hardened/enterprise) and the human-intervention mode
-(`intervention_mode`, M36a: **H1** directed / **H2** supervised / **H3**
-guarded / **H4** lights-out) are separate config choices. A tier does not
-imply an intervention mode: every tier defaults to **H2** (supervised), and
-only `hardened`/`enterprise` may select **H4** (lights-out, see below). There
-are four tiers and four intervention modes — not "four levels" of anything
-single-dimensional. (The legacy `autonomy`/`checkpoint` pair still works and
-maps onto these modes — see `references/modes.md` and `df-migrate-config` —
-but `intervention_mode` is the primary model.)
-
-**Intervention mode (M36a).** The autonomy axis is now expressed as a single
-`intervention_mode` naming *which transitions pause* — pick ONE (default **H2**):
-- **H1 `directed`** — pause before every rebuild, after every non-converged verify, at the budget guard, AND before the ship (most hands-on).
-- **H2 `supervised`** — pause after every non-converged verify, at the budget guard, AND before the ship (the default; extends legacy `checkpoint:"pause"` with the M36b before-ship gate).
-- **H3 `guarded`** — run straight through, pause only at the budget guard (== legacy `checkpoint:"auto"`).
-- **H4 `lights_out`** — never pause; any human-needed condition (e.g. a budget cap) is a fail-closed TERMINAL (`BUDGET_HALTED`). Hardened/enterprise only (== legacy `autonomy:5`). At **enterprise**, the before-ship gate is instead the `CUSTODY_PENDING` terminal (H1/H2's before-ship *pause* applies at non-enterprise tiers; enterprise always seals `CUSTODY_PENDING` and requires a K-of-N attestation before shipping).
-
+**Two independent axes, not one.** Assurance tier
+(cooperative/standard/hardened/enterprise) and intervention mode
+(`intervention_mode`: H1 directed / H2 supervised / H3 guarded / H4
+lights-out) are separate config choices. Every tier defaults to **H2**;
+only `hardened`/`enterprise` may select **H4** (any human-needed condition
+becomes a fail-closed TERMINAL, e.g. `BUDGET_HALTED`; at enterprise the
+before-ship gate is the `CUSTODY_PENDING` terminal + K-of-N attestation).
 `intervention_mode` and the legacy `autonomy`/`checkpoint` pair are mutually
-exclusive (specifying both is a config error). Convert an old config with
-`supervisor.py df-migrate-config <control_root>` (idempotent; leaves a `.bak`).
-Full state-transition table + resume workflow: `references/modes.md`.
+exclusive (both = config error); convert old configs with
+`supervisor.py df-migrate-config <control_root>` (idempotent, leaves a
+`.bak`). Per-mode pause-point table + resume workflow: `references/modes.md`.
 
 ## Authoring a run (`init`) — the on-ramp for "provide context and specs"
 
@@ -98,39 +87,23 @@ later.
   Reviewing the generated scenarios stays RECOMMENDED — the gates prove
   discrimination/coverage/no-leak but cannot prove intent-fit. See
   `references/authoring.md` ("Agent-authored scenarios").
-- **Offer class-typed adequacy + a decorrelated critic (M42).** Agent-authored
-  scenarios can now be made much more thorough. Offer the user: (1) **class
-  coverage** — require each behavior to be covered by happy + boundary + failure
-  cases (an agent author defaults to all three; a human root stays happy-only;
-  override with `answers.scenario_adequacy.required_classes`); the M7 adequacy
-  gate fails closed on a gap. (2) A **sharpness battery** (automatic) — every
-  assertion must reject a battery of near-miss mutant OBSERVATIONS, not one
-  garbage output (honest scope: it mutates the observation, NOT the built code —
-  not full code-mutation testing). (3) A **decorrelated critic** — a SECOND,
-  independent agent (`answers.critic_adapter`, a distinct adapter identity from
-  BOTH builder and author, fail-closed; pin `adapter_sha256` / assert
-  `model_identity` for stronger distinctness — M50) adversarially reviews the
-  authored set; blocking findings
-  drive a bounded revision loop, and advisories (likely-missing requirements) are
-  written to `scenario_review.md` for the operator, NEVER auto-applied. See
-  `references/scenario-adequacy.md`.
-- **Offer property / fuzz scenarios (M43a).** A scenario can assert an
-  INVARIANT over MANY generated inputs (`when.property`: declarative seeded
-  generators + a fixed invariant vocabulary — round_trip / idempotent /
-  deterministic / robust / error_contract / monotonic), catching the bugs a
-  fixed example can't (round-trip integrity, idempotency, "never crashes /
-  fails cleanly on malformed input"). Deterministic (required `seed`),
-  bounded (cases ≤ 500 + timeouts), barrier-preserving (a counterexample is
-  control-plane only; feedback carries just `property_violated`). A property
-  MAY add a `concurrency` block (M43b) that runs the steps IN PARALLEL
-  (`workers` × `attempts`) and asserts a concurrency invariant
-  (`no_lost_update` / `serializable_counter` / `idempotent_under_concurrency` /
-  `no_crash_no_hang`): ONE STRIKE = fail, and a PASS is probabilistic detection
-  (not a race-freedom proof) — the manifest records workers × attempts × cases.
-  Honest residual after M42+M43a+M43b: human spec/behavior fidelity; a
-  concurrency PASS is probabilistic; perf/load/scale stays a separate tool,
-  permanently. See `references/scenario-format.md` (the `when.property`
-  section).
+- **Offer class-typed adequacy + a decorrelated critic (M42).** Offer the
+  user: (1) **class coverage** — each behavior covered by happy + boundary +
+  failure scenarios (agent authors default to all three; override with
+  `answers.scenario_adequacy.required_classes`; the adequacy gate fails
+  closed on a gap); (2) the automatic **sharpness battery** (every assertion
+  must reject near-miss mutant observations); (3) a **decorrelated critic**
+  (`answers.critic_adapter`, a distinct adapter identity from builder AND
+  author, fail-closed) whose blocking findings drive a bounded revision loop
+  while advisories go to `scenario_review.md` for the operator, never
+  auto-applied. Details + honest scope: `references/scenario-adequacy.md`.
+- **Offer property / fuzz scenarios (M43a/M43b).** A scenario can assert an
+  INVARIANT over many seeded generated inputs (`when.property` — round_trip /
+  idempotent / deterministic / robust / error_contract / monotonic;
+  deterministic, bounded, counterexamples stay control-plane-only), and may
+  add a `concurrency` block running steps in parallel (one strike = fail; a
+  PASS is probabilistic detection, not a race-freedom proof). Format and
+  semantics: `references/scenario-format.md` (`when.property`).
 
 This on-ramp only produces the control-plane files; the rest of this
 skill's workflow (running, checkpoints, tiers, security gates, etc.) is
@@ -228,67 +201,38 @@ unchanged below.
      still uses the latter). If the chosen tier can't be honored, the run fails closed
      unless you pass `run --allow-downgrade` (hardened → standard if the OS sandbox is
      still healthy, else → cooperative; standard → cooperative).
-   - **`candidate_network` (optional, M27, spec §7.4; requires `standard` or above).**
-     `"unrestricted"` (default), `"deny"` (candidate loses all network
-     including loopback), or `"loopback"` (candidate keeps only `127.0.0.1` —
-     twin-compatible). Restricts the CANDIDATE only — the builder's network for
-     its provider API calls is never touched. **M47 RA-08(a): an `"unrestricted"`
-     candidate egress at `standard`+ is now DISQUALIFYING** — it seals the
-     distinct `CANDIDATE_EGRESS_OPEN` (qualified `false`) rather than
-     `COMPLETE_QUALIFIED`, so **set `"deny"` (or `"loopback"` for twins) to
-     qualify a `standard`+ run**. Live-probed before the candidate ever runs
-     under it (fail-closed, same discipline as the base denial probe); `"deny"`
-     is refused with `twins.enabled: true` or any http scenario, and `"loopback"`
-     is macOS-only. **Self-serving candidates (M93):** an app that binds and
-     dials its OWN loopback listeners (an HTTP API under test, a TLS selftest,
-     scenario-spawned origins) cannot pass under the default twin-port-pinned
-     outbound — set `candidate_service_ports: N` (the QUALIFYING path: the
-     supervisor reserves N fresh ports per verify pass, exports them to
-     scenarios as `DF_SERVICE_PORTS`, and pins exactly those; author scenarios
-     to start services on ports drawn from that env var). The alternative
-     `candidate_loopback_outbound: "any"` widening is DEV-GRADE and never
-     qualifies (host-loopback confused-deputy egress channel — hard residual).
-     See `references/isolation.md`.
+   - **`candidate_network` (optional, M27; requires `standard`+).**
+     `"unrestricted"` (default) / `"deny"` / `"loopback"` — restricts the
+     CANDIDATE only, never the builder's own API egress, and is live-probed
+     fail-closed before the candidate runs. **At `standard`+ an
+     `"unrestricted"` candidate is DISQUALIFYING** (seals
+     `CANDIDATE_EGRESS_OPEN`, not `COMPLETE_QUALIFIED`) — set `"deny"`, or
+     `"loopback"` for twins (macOS-only; `"deny"` is refused with twins/http
+     scenarios). An app that serves its OWN loopback listeners needs
+     `candidate_service_ports: N` (qualifying; ports exported to scenarios as
+     `DF_SERVICE_PORTS`) — `candidate_loopback_outbound: "any"` is dev-grade
+     and never qualifies. See `references/isolation.md`.
    - **`candidate_host_read` (optional, M29b/M29c, DF-02; `standard`+).** At
-     standard+ the CANDIDATE runs under a **default-deny** host-read sandbox by
-     default on BOTH macOS and Linux: `~/.ssh`/dotfiles/other-repos OS-denied,
-     workspace-only writes — macOS via a `(deny default)` `sandbox-exec` profile
-     (loopback pinned to the run's own twin ports, keychain/DNS Mach channels
-     closed), Linux (M29c) via a real bwrap mount+PID namespace built from
-     explicit minimal binds (NO `--ro-bind / /`; the host is ABSENT from the
-     namespace, `--cap-drop ALL`). Live-probed per run and sealed as the
-     manifest `host_isolation` field. Opt out with `"allow_host_read"` ONLY if
-     the app under test truly needs to read the host — the run still works but
-     `host_isolation.qualified` is honestly `false`. On Linux, `loopback`/twins
-     at standard remain macOS-only until M29c-2; use `candidate_network: "deny"`
-     (no twins/http) for a qualifying host-isolated Linux run. See
-     `references/isolation.md`.
+     standard+ the CANDIDATE runs under a default-deny host-read sandbox on
+     macOS AND Linux (workspace-only writes; `~/.ssh`/dotfiles/other repos
+     OS-denied), live-probed per run and sealed as manifest `host_isolation`.
+     Opt out with `"allow_host_read"` only if the app truly must read the
+     host (`host_isolation.qualified` is then honestly `false`). Linux
+     `loopback`/twins remain macOS-only until M29c-2 — use
+     `candidate_network: "deny"` for a qualifying host-isolated Linux run.
+     Mechanics: `references/isolation.md`.
    - **`hardened` (optional block, only under `assurance: hardened`).** Set
-     `hardened.image` (default `python:3.12-alpine` — a real cross-model builder needs a
-     user-supplied image with that CLI + credentials baked in), `hardened.network`
-     (default `"none"`; `"bridge"` is unrestricted egress, needed for a real builder CLI's
-     API calls, and is honestly recorded on the manifest), `hardened.memory` (default
-     `"2g"`) and `hardened.pids` (default `256`). `hardened` also forces
-     `audit.signing: true` by default (an explicit `false` is rejected) and requires
-     `roles.builder.adapter` to be an absolute path to an existing file outside the
-     control root (RA-07/M46: the resolved adapter FILE — not its directory — is
-     bind-mounted read-only into the container). See
-     `references/hardened.md` for the full model — what it adds over `standard`, the TCB
-     growth (the Docker daemon), image/credential/network honesty, and the deferred list
-     (credential broker, egress allowlists, off-box audit).
-     - **Pinned dependency cache (optional, M26, spec §7.3).** A hardened/enterprise
-       builder runs with `--network none` (or a locked egress) and so can't
-       `pip install`/`npm install` from a live registry. If the build needs
-       third-party packages, **offer** the read-only dependency cache: the operator
-       pre-provisions the exact pinned versions once with
-       `python3 <skill_dir>/scripts/df_depcache.py --source <spec-or-scaffold-dir> --dest <cache-dir>`
-       (the one deliberate network op, run outside a build), then set
-       `hardened.dep_cache_dir` to that dir. The supervisor bind-mounts it read-only
-       and points pip/npm at it offline — "no direct registry/DNS" holds by
-       construction (a filesystem mount, not a live proxy). Anything not in the cache
-       fails closed (pip/npm's own offline behavior). npm CLI is needed on the
-       operator's host at provisioning time only. See `references/hardened.md`
-       ("Pinned dependency cache").
+     `hardened.image` / `.network` / `.memory` / `.pids` (defaults:
+     `python:3.12-alpine`, `"none"`, `"2g"`, `256`; a real cross-model builder
+     needs a user-supplied image with that CLI + credentials baked in, and
+     `"bridge"` egress — honestly recorded on the manifest). `hardened` forces
+     `audit.signing: true` (explicit `false` rejected) and requires
+     `roles.builder.adapter` be an absolute path outside the control root (the
+     adapter FILE is bind-mounted read-only). Builds needing third-party
+     packages under `--network none` use the **pinned read-only dependency
+     cache** (M26): provision once with `df_depcache.py`, set
+     `hardened.dep_cache_dir`; anything not cached fails closed. Full model,
+     TCB honesty, and dep-cache details: `references/hardened.md`.
    - **H4 `lights_out` (fully unattended; legacy `autonomy: 5`).** Requires
      `assurance: "hardened"` (or `enterprise`) — H4/`autonomy: 5` at any other tier is
      rejected at config load. Under H4 the loop runs unattended to
