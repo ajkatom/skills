@@ -8,8 +8,10 @@
 # Hermetic by construction: DF_ALLOW_NETWORK_TESTS is NOT set, so the handful of
 # tests that reach outside localhost (live OSV/api probes, the live candidate-
 # network e2e) skip themselves rather than making real external connections.
-# The probes are not weakened -- they still run in an opt-in job that exports
-# DF_ALLOW_NETWORK_TESTS=1.
+# The probes are not weakened -- they are opt-in: run them by exporting
+# DF_ALLOW_NETWORK_TESTS=1 in an environment with the network access (and,
+# for the live adapter probes, the credentials) they need; this workflow
+# deliberately defines no such job because the hosted runner has neither.
 name: ci
 
 on:
