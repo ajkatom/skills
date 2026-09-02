@@ -461,9 +461,7 @@ def _value_var_can_emit_empty(generate: dict, var_name: str) -> bool:
         return spec.get("min_len", 0) == 0
     if kind == "choice":
         return "" in (spec.get("options") or [])
-    if kind == "malformed":
-        return True
-    return False
+    return kind == "malformed"
 
 
 def _var_can_emit_distinct(spec) -> bool:
@@ -492,9 +490,7 @@ def _var_can_emit_distinct(spec) -> bool:
         return spec.get("max_len", 0) >= 1
     if kind == "choice":
         return len(set(spec.get("options") or [])) >= 2
-    if kind in ("json", "malformed"):
-        return True
-    return False
+    return kind in ("json", "malformed")
 
 
 def _structural_checks(inv: dict, generate: dict):

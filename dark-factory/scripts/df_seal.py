@@ -444,9 +444,7 @@ def verify_object(object_store: str, object_id: str) -> bool:
 
     if recomputed != stored:
         return False
-    if object_id_of(recomputed) != object_id:
-        return False
-    return True
+    return object_id_of(recomputed) == object_id
 
 
 # ---------------------------------------------------------------------------

@@ -178,7 +178,7 @@ def _split_endpoint(endpoint: str):
     defaults to https (the production case); an explicit http:// prefix is
     honored (local/test object stores, e.g. a MinIO container, that don't
     terminate TLS)."""
-    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+    if endpoint.startswith(("http://", "https://")):
         scheme, _, host = endpoint.partition("://")
         return scheme, host
     return "https", endpoint
@@ -287,25 +287,14 @@ def _sigv4_headers(
     canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in signed_header_names)
     signed_headers = ";".join(signed_header_names)
 
-    canonical_request = "\n".join(
-        [
-            method,
-            canonical_uri,
-            canonical_querystring,
-            canonical_headers,
-            signed_headers,
-            payload_hash,
-        ]
-    )
+    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     canonical_request_hash = hashlib.sha256(
         canonical_request.encode("utf-8")
     ).hexdigest()
 
     date_stamp = amz_date[:8]
     credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join(
-        ["AWS4-HMAC-SHA256", amz_date, credential_scope, canonical_request_hash]
-    )
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}"
 
     def _hmac(key: bytes, msg: str) -> bytes:
         return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()

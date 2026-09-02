@@ -2787,7 +2787,7 @@ def attach_waiver(control_root: str, run_dir: str) -> int:
 
     waivers, load_reason = _load_waiver_signatures(control_root)
     now = _now_utc()
-    satisfied, reason, covered, uncovered = df_waiver.verify_waiver_set(
+    satisfied, reason, covered, _uncovered = df_waiver.verify_waiver_set(
         failing_findings=binding["security"].get("failed", []),
         gates=binding["security"].get("gates", {}),
         waivers=waivers,
@@ -3051,7 +3051,7 @@ def verify_waiver_cmd(control_root: str, run_dir: str) -> int:
         )
 
     now = _now_utc()
-    satisfied_now, reason_now, covered, _unc = _eval(now)
+    satisfied_now, reason_now, _covered, _unc = _eval(now)
     if satisfied_now:
         # M44 RA-02: when the sealed config mandates a required off-box sink, a
         # WAIVED_QUALIFIED verdict REQUIRES the bound waiver sink receipt.
@@ -8657,7 +8657,7 @@ def _ship_eligible(cfg, control_root, run_dir):
     valid K-of-N custody attestation (verify_custody). A waived-but-limited /
     custody-pending-without-attestation / unqualified run is refused (never
     ships)."""
-    manifest_bytes, manifest_sha = _read_manifest_bytes(run_dir)
+    manifest_bytes, _manifest_sha = _read_manifest_bytes(run_dir)
     if manifest_bytes is None:
         return (False, "no manifest.json (run has not sealed)", None, None)
     try:
@@ -9516,7 +9516,7 @@ def _is_no_action_terminal(run_dir, run_id, prior, cfg=None, control_root=None):
             rollback_pre = f"{run_id}.ship-rollback."
             for entry in df_audit_chain.read_chain(chain_path):
                 inv = str(entry.get("invocation", ""))
-                if inv.startswith(completion_pre) or inv.startswith(rollback_pre):
+                if inv.startswith((completion_pre, rollback_pre)):
                     return False
         except (df_audit.AuditKeyError, df_audit_chain.ChainError, OSError, KeyError):
             return False
@@ -10153,7 +10153,7 @@ def _ship_phase(cfg, control_root, run_dir, redactor, creds, decision="continue"
                                                cause=("materialize_failure"
                                                       if prior.get("failed_action") is None
                                                       else "reconcile_abort"))
-                            rec2, _s, anchor2 = _seal_ship_result(
+                            _rec2, _s, anchor2 = _seal_ship_result(
                                 cfg, control_root, run_dir, run_id, ship_journal, clean,
                                 artifact_object_id, redactor,
                                 ship_actions=ship_cfg["actions"])
@@ -10718,7 +10718,7 @@ def attach_release(control_root, run_dir):
         except df_release.ReleaseError as e:
             sys.stderr.write(f"dark-factory: {e}\n")
             return 2
-        satisfied, reason, count, nonce = df_release.verify_release(
+        satisfied, reason, _count, nonce = df_release.verify_release(
             claim=claim, signatures=signatures, approvers=approvers, threshold=threshold,
             run_id=run_id, artifact_object_id=object_id, now=now, used_nonces=used)
         if not satisfied:

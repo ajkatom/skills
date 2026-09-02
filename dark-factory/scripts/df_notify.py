@@ -172,7 +172,7 @@ def flush_spool(sink: str, spool_dir: str, *, timeout_s: int = 10, redactor=None
             # than silently drop, but it doesn't count as flushed.
             remaining_lines.append(line)
             continue
-        ok, _reason = deliver(sink, event, timeout_s=timeout_s, redactor=redactor)
+        ok, reason = deliver(sink, event, timeout_s=timeout_s, redactor=redactor)
         if ok:
             flushed += 1
         else:

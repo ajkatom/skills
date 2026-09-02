@@ -359,7 +359,7 @@ def generate_cases(gen: dict) -> list:
             case[name] = _GENERATORS[spec["kind"]](rng, spec)
         for name in malformed:
             base_ref = variables[name]["base"]
-            base_value = case[base_ref] if base_ref in case else base_ref
+            base_value = case.get(base_ref, base_ref)
             case[name] = _malform(rng, base_value)
         out.append(case)
     return out

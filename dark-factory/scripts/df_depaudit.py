@@ -73,7 +73,7 @@ def _parse_requirements_txt(path) -> list:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for raw_line in f:
                 line = raw_line.strip()
-                if not line or line.startswith("#") or line.startswith("-"):
+                if not line or line.startswith(("#", "-")):
                     continue
                 m = _PINNED_RE.match(line)
                 if m:
