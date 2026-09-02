@@ -27,11 +27,13 @@ FROM python:3.12
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bubblewrap iptables \
     && rm -rf /var/lib/apt/lists/*
-# The only two non-stdlib deps the dark-factory suite needs (see
-# dark-factory/requirements-enterprise.txt and the macOS .venv).
+# The only two non-stdlib deps the dark-factory suite needs, at the exact
+# versions the M51 dev/test lock (dark-factory/requirements-dev.txt) pins —
+# keep these in sync with that file so this harness tests the same locked
+# environment as CI and the macOS .venv.
 RUN python -m venv /opt/df-venv \
     && /opt/df-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/df-venv/bin/pip install --no-cache-dir pytest cryptography
+    && /opt/df-venv/bin/pip install --no-cache-dir pytest==9.1.1 cryptography==49.0.0
 DOCKERFILE
 
 # ---------------------------------------------------------------------------
