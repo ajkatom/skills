@@ -387,7 +387,7 @@ def _dist_info_package_name(relpath: str) -> str:
     """`.../foo-1.2.3.dist-info/METADATA` -> `foo` (used only when the
     METADATA file itself has no `Name:` header)."""
     dist_dir = relpath.split("/")[-2]
-    base = dist_dir[: -len(".dist-info")] if dist_dir.endswith(".dist-info") else dist_dir
+    base = dist_dir.removesuffix(".dist-info")
     m = re.match(r"^(.+)-[^-]+$", base)
     return m.group(1) if m else base
 
@@ -654,9 +654,7 @@ def run_gates(workspace: str, sec: dict) -> dict:
             gate = {"status": "unavailable", "detail": "gate not run"}
             gates[name] = gate
         status = gate["status"]
-        if status == "fail":
-            failed.add(name)
-        elif status == "unavailable" and strict_unavailable:
+        if status == "fail" or status == "unavailable" and strict_unavailable:
             failed.add(name)
 
     return {"checked": True, "gates": gates, "failed": sorted(failed)}

@@ -135,7 +135,7 @@ def _parse_pyproject_toml_deps(path) -> list:
 
 
 def _dist_info_name_version(dirname: str):
-    base = dirname[: -len(".dist-info")] if dirname.endswith(".dist-info") else dirname
+    base = dirname.removesuffix(".dist-info")
     m = _DIST_INFO_NAME_VERSION_RE.match(base)
     if not m:
         return None

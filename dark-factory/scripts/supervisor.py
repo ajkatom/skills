@@ -58,17 +58,18 @@ import df_qualify
 import df_release
 import df_sandbox
 import df_seal
-import df_ship
 import df_security
+import df_ship
 import df_twins
 import df_waiver
+import snapshot_source
 from df_common import atomic_write, canonical_json, sha256_file, sha256_str
 from df_config import (
-    ConfigError,
+    _PROXY_PROVIDER_RULES,
     MANDATORY_TIERS,
+    ConfigError,
     _adapter_provider,
     _disjoint,
-    _PROXY_PROVIDER_RULES,
     load_config,
 )
 from id_feedback import project_feedback
@@ -79,7 +80,6 @@ from run_scenarios import (
     load_scenarios,
     run_all,
 )
-import snapshot_source
 from snapshot_source import SnapshotError, snapshot
 
 # M17 Task 3: the hostname the enterprise builder container uses to reach the
@@ -3477,7 +3477,7 @@ def _egress_probe_stub_handler():
             self.wfile.write(body)
             self.close_connection = True
 
-        def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
+        def log_message(self, format, *args):
             pass
 
     return _StubHandler
@@ -4448,8 +4448,7 @@ def author_scenarios_cmd(control_root: str, attempts: int = 3, review: bool = Fa
 
     adapter = author["adapter"]
     timeout_s = author["timeout_s"]
-    if attempts < 1:
-        attempts = 1
+    attempts = max(attempts, 1)
 
     # M42: the adequacy policy (required classes + min_per_class) the authored
     # set must satisfy, and the decorrelated critic loop toggle. cfg["_adequacy"]

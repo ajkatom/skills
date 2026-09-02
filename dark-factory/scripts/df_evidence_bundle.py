@@ -28,10 +28,8 @@ exit 2 = the run dir / manifest is missing or unreadable (nothing to report).
 """
 import json
 import os
-import subprocess
 
 import df_common
-
 
 # Keys whose VALUES must never appear in the bundle (defense in depth; the
 # source artifacts are already barrier-clean, this is a second gate).
@@ -147,8 +145,8 @@ def _verified_manifest(control_root, run_dir, key):
     the manifest's on-disk digest is a MEMBER of the verified chain — not merely
     that the chain verifies globally. Returns a dict of proven facts. Lazy import
     to avoid the supervisor<->bundle import cycle."""
-    import supervisor
     import df_audit_chain
+    import supervisor
     mpath = os.path.join(run_dir, "manifest.json")
     raw_sha = df_common.sha256_file(mpath)
     out = {"manifest_sha256": raw_sha, "verify_status": None,
@@ -219,8 +217,9 @@ def _verified_release(control_root, run_dir, key):
     sig_verified = None
     sig_reason = None
     try:
-        import df_release
         import datetime
+
+        import df_release
         cfg = _cfg_of(control_root)
         ship = cfg.get("_ship") or {}
         approval = ship.get("approval") or {}
@@ -250,7 +249,6 @@ def _run_id_of(run_dir):
 
 
 def _cfg_of(control_root):
-    import supervisor
     from df_config import load_config
     cfg = load_config(control_root)
     cfg["_control_root"] = control_root
@@ -376,9 +374,9 @@ def _reentry_verified(control_root, run_dir, run_id, ship_result_text):
     without redispatch (the emitting path returns before the action loop)."""
     if ship_result_text is None:
         return {"present": False, "verified": False, "reason": "no ship_result.json"}
-    import supervisor
     import df_audit
     import df_audit_chain
+    import supervisor
     target_sha = df_common.sha256_str(ship_result_text)
     cfg = _cfg_of(control_root)
     try:

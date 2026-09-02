@@ -408,7 +408,7 @@ def _make_handler(allowlist, token_env, header, capability_token, method_path):
                 {"error": "CONNECT tunneling not implemented; use plain HTTP forwarding"},
             )
 
-        def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
+        def log_message(self, format, *args):
             pass  # never log -- see module docstring's SECURITY PROPERTY
 
     return _Handler

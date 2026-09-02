@@ -809,7 +809,7 @@ def _find_spec_leaks(spec_text: str, scenarios: list) -> list:
         if set(then) == {"invariant"}:
             continue
         for value in _iter_then_strings(then):
-            normalized = value[:-1] if value.endswith("\n") else value
+            normalized = value.removesuffix("\n")
             if normalized and normalized in spec_text:
                 leaks.append({"scenario_id": sc["id"], "value": value})
     return leaks

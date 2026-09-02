@@ -19,7 +19,7 @@ class KBLeakError(ValueError):
 def build_summary(manifest: dict, failing_behaviors: list) -> str:
     for b in failing_behaviors:
         if not BEHAVIOR_RE.fullmatch(b):
-            raise KBLeakError(f"failing_behaviors must be BHV ids only (offending value withheld)")
+            raise KBLeakError("failing_behaviors must be BHV ids only (offending value withheld)")
     failing = ", ".join(sorted(failing_behaviors)) if failing_behaviors else "none"
     return (
         f"## dark-factory run {manifest.get('finished_ts') or manifest.get('invocation', '')}\n"

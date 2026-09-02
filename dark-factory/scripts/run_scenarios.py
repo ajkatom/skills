@@ -587,7 +587,7 @@ def load_scenarios(scenarios_dir: str, extra_scenarios_dir: str | None = None,
 
 
 def _norm(s: str) -> str:
-    return s[:-1] if s.endswith("\n") else s
+    return s.removesuffix("\n")
 
 
 def evaluate_then(then: dict, observed: dict) -> str | None:

@@ -213,8 +213,7 @@ def _xcode_developer_dir():
         # (/Library/Developer/CommandLineTools) have no bundle and are
         # already covered by the /Library read allow.
         suffix = "/Contents/Developer"
-        if dev.endswith(suffix):
-            dev = dev[:-len(suffix)]
+        dev = dev.removesuffix(suffix)
         _XCODE_DEV_DIR = dev
     return _XCODE_DEV_DIR
 

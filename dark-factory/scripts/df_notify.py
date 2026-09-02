@@ -121,8 +121,7 @@ def deliver_durable(sink: str, event: dict, spool_dir: str, *, attempts: int = 1
         n = int(attempts)
     except Exception:
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
 
     reason = "delivery failed"
     for _ in range(n):

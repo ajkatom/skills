@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import df_depaudit  # noqa: E402
+import df_depaudit
 
 
 class DepCacheError(RuntimeError):

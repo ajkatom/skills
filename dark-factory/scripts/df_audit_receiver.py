@@ -118,7 +118,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             405, {"error": "method not allowed (append-only receiver, no delete)"}
         )
 
-    def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
+    def log_message(self, format, *args):
         pass  # keep test/CLI output quiet; nothing here is security-relevant
 
 
