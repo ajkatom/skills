@@ -167,7 +167,13 @@ dark-factory/
   README.md             # this file
   OVERVIEW.md            # plain-language overview + reference-doc index
   scripts/
-    supervisor.py        # the build/verify loop FSM (init/run/resume/verify)
+    supervisor.py        # CLI entry point + the build/verify/resume loop FSM; re-exports the supervisor_* modules
+    supervisor_core.py   # shared primitives: constants, FSM checkpoint chain, lock, Journal, state, artifact store
+    supervisor_audit.py  # manifest finalization, hash chain, off-box checkpoints, verify-chain, manifest auth
+    supervisor_custody.py   # df-custody + df-waiver attach/verify (post-seal attestations)
+    supervisor_isolation.py # tier probes/downgrade, egress verification, candidate network/host confinement
+    supervisor_init.py      # `init` scaffold + agent-authored scenarios
+    supervisor_ship.py      # governed ship phase + df-release approvals
     df_config.py          # config schema validation, all tiers
     df_container.py       # hardened/enterprise Docker argv + probes
     df_sandbox.py          # standard-tier OS sandbox backends

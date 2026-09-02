@@ -93,8 +93,15 @@ def test_p1_every_recovery_consumer_wires_the_truncation_gate():
     # Structural guard: the truncation probe must be called by MORE THAN ONE consumer
     # (ship auth, source identity, resumable state, ship phase). If a future signed
     # recovery path forgets to wire it, this count drops — a design-level tripwire.
+    # The supervisor is a package of modules (supervisor.py + supervisor_*.py); the
+    # consumers live across them (ship phase in supervisor_ship, source identity and
+    # resumable state in supervisor.py), so scan every module's source.
     import inspect
-    src = inspect.getsource(supervisor)
+    import supervisor_audit, supervisor_core, supervisor_custody, supervisor_init
+    import supervisor_isolation, supervisor_ship
+    src = "".join(inspect.getsource(m) for m in (
+        supervisor, supervisor_core, supervisor_audit, supervisor_custody,
+        supervisor_isolation, supervisor_init, supervisor_ship))
     assert src.count("_verify_chain_untruncated(cfg") >= 4
 
 
