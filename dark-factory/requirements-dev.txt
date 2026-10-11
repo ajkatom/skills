@@ -8,4 +8,4 @@
 # locks it to the EXACT version used to develop and test the skill so the test
 # environment is reproducible.
 pytest==9.1.1
-cryptography==49.0.0
+cryptography==50.0.0
