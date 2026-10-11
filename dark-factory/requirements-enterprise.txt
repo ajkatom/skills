@@ -8,12 +8,14 @@
 # Install only if you are running (or testing) the enterprise tier:
 #   pip install -r dark-factory/requirements-enterprise.txt
 #
-# Pinned range for reproducibility: floor 44.0.1 — the lowest release with no
-# published security advisories (42.0.0–44.0.0 wheels ship a vendored OpenSSL
-# covered by GHSA-79v4-65xg-pq4g; the ed25519 API this module needs is
-# unchanged) — capped below the next major so a future breaking release can't
-# silently land on an unpinned install. Currently tested against 49.0.0.
+# Pinned range for reproducibility: floor 50.0.0 — the lowest release with no
+# published security advisories (44.0.1–49.0.0 are covered by one or more of
+# GHSA-r6ph-v2qm-q3c2, GHSA-m959-cc7f-wv43, GHSA-537c-gmf6-5ccf,
+# GHSA-jwv3-5hgf-82ww, GHSA-m2h6-j472-rp4c, GHSA-g6cj-pr64-35w5; the ed25519
+# API this module needs is unchanged) — capped below the next major so a
+# future breaking release can't silently land on an unpinned install.
+# Currently tested against 50.0.0.
 # Follow-up (not yet done): refresh this range and add `--hash=` lines once
 # the project adopts a hash-locked install flow (see
 # references/reproducibility.md).
-cryptography>=44.0.1,<50
+cryptography>=50.0.0,<51
