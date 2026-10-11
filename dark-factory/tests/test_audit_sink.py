@@ -8,7 +8,8 @@
     Authorization Header" -- the well-known examplebucket/AKIAIOSFODNN7EXAMPLE
     walkthrough). This is how the signer is proven correct without ever
     talking to real AWS.
-  - push() s3-objectlock: skipif no docker -- starts a real MinIO container,
+  - push() s3-objectlock: opt-in (docker + DF_ALLOW_NETWORK_TESTS=1, since
+    it pulls an image from a public registry) -- starts a real MinIO container,
     creates a versioned + object-lock-enabled bucket with a COMPLIANCE
     default retention (via our OWN SigV4 client, not boto3/mc), pushes an
     entry, and proves the resulting object version cannot be deleted within
@@ -269,13 +270,29 @@ def test_sigv4_headers_matches_published_put_object_vector():
 
 
 # ---------------------------------------------------------------------------
-# s3-objectlock -- live MinIO with a real object-lock bucket (skipif no
-# docker). Session-scoped container; each test gets its own fresh bucket.
+# s3-objectlock -- live MinIO with a real object-lock bucket. Session-scoped
+# container; each test gets its own fresh bucket.
+#
+# NOT hermetic: the fixture pulls a container image from a public registry,
+# so it is gated behind DF_ALLOW_NETWORK_TESTS like every other test that
+# reaches outside localhost. The default `pytest` run (and the hermetic CI
+# job) skips it; the opt-in network job runs it.
+#
+# The upstream `minio/minio` image was deleted from Docker Hub in Sept 2026
+# (and quay.io/minio/minio went auth-only), which broke CI for weeks because
+# the pull failure was swallowed. The image is now overridable via
+# DF_TEST_MINIO_IMAGE and defaults to a registry that serves anonymous pulls.
 # ---------------------------------------------------------------------------
 
 _MINIO_ACCESS_KEY = "minioadmin"
 _MINIO_SECRET_KEY = "minioadmin123"
 _MINIO_NAME_PREFIX = "df-audit-minio-"
+_MINIO_IMAGE = os.environ.get("DF_TEST_MINIO_IMAGE", "cgr.dev/chainguard/minio:latest")
+MINIO_LIVE = DOCKER_LIVE and bool(os.environ.get("DF_ALLOW_NETWORK_TESTS"))
+_MINIO_SKIP_REASON = (
+    "pulls a MinIO image from a public registry; needs docker and "
+    "DF_ALLOW_NETWORK_TESTS=1"
+)
 
 
 def _reap_stale_minio_containers():
@@ -355,8 +372,9 @@ def _s3_request(endpoint, method, path, body=b"", query=None, extra_headers=None
 @pytest.fixture(scope="session")
 def minio_endpoint():
     """Starts a MinIO container for the whole test session; yields None
-    (and every dependent test self-skips) when docker isn't available."""
-    if not DOCKER_LIVE:
+    (and every dependent test self-skips) when docker isn't available or
+    network tests aren't opted in."""
+    if not MINIO_LIVE:
         yield None
         return
 
@@ -370,19 +388,28 @@ def minio_endpoint():
     s.close()
 
     name = f"{_MINIO_NAME_PREFIX}{uuid.uuid4().hex[:8]}"
-    subprocess.run(
-        ["docker", "pull", "-q", "minio/minio"], capture_output=True, timeout=300
-    )
-    subprocess.run(
+    # Both docker calls fail LOUDLY with their stderr attached: a swallowed
+    # pull failure previously surfaced only as a bare `docker run` exit 125.
+    for argv in (
+        ["docker", "pull", "-q", _MINIO_IMAGE],
         [
             "docker", "run", "-d", "--rm", "--name", name,
             "-p", f"{host_port}:9000",
+            # The chainguard image runs as a non-root uid that cannot write
+            # the anonymous /data volume; root sidesteps that for a throwaway
+            # test container.
+            "--user", "0",
             "-e", "MINIO_ROOT_USER=" + _MINIO_ACCESS_KEY,
             "-e", "MINIO_ROOT_PASSWORD=" + _MINIO_SECRET_KEY,
-            "minio/minio", "server", "/data",
+            _MINIO_IMAGE, "server", "/data",
         ],
-        check=True, capture_output=True, timeout=60,
-    )
+    ):
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{' '.join(argv[:2])} failed (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
     endpoint = f"127.0.0.1:{host_port}"
     try:
         _wait_for_minio(endpoint)
@@ -398,7 +425,7 @@ def objectlock_bucket(minio_endpoint):
     boto3/mc, so this is genuinely proving OUR PUT signing works against a
     real S3-API server, not just against canned test vectors."""
     if minio_endpoint is None:
-        pytest.skip("docker daemon unavailable")
+        pytest.skip(_MINIO_SKIP_REASON)
 
     bucket = f"df-audit-{uuid.uuid4().hex[:12]}"
     status, _hdrs, body = _s3_request(
@@ -423,7 +450,7 @@ def objectlock_bucket(minio_endpoint):
     return bucket
 
 
-@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+@pytest.mark.skipif(not MINIO_LIVE, reason=_MINIO_SKIP_REASON)
 def test_push_s3_objectlock_success(minio_endpoint, objectlock_bucket, monkeypatch):
     monkeypatch.setenv("DF_AUDIT_S3_ACCESS_KEY", _MINIO_ACCESS_KEY)
     monkeypatch.setenv("DF_AUDIT_S3_SECRET_KEY", _MINIO_SECRET_KEY)
@@ -441,7 +468,7 @@ def test_push_s3_objectlock_success(minio_endpoint, objectlock_bucket, monkeypat
     assert result["etag"]
 
 
-@pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
+@pytest.mark.skipif(not MINIO_LIVE, reason=_MINIO_SKIP_REASON)
 def test_s3_objectlock_prevents_delete_within_retention(
     minio_endpoint, objectlock_bucket, monkeypatch
 ):
