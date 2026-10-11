@@ -62,6 +62,16 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Install bubblewrap for the hardened-tier OS sandbox
+        # The hardened/enterprise verifier needs an OS sandbox; on Linux that
+        # is bwrap, which ubuntu-latest does not ship. Ubuntu 24.04 also
+        # AppArmor-restricts the unprivileged user namespaces bwrap relies on,
+        # so unlock them for this throwaway runner.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc -- /bin/true
       - name: Run the full suite including external-network tests
         run: |
           cd dark-factory
