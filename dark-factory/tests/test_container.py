@@ -29,6 +29,78 @@ def test_build_argv_exact_flag_set_and_order(tmp_path):
     assert argv[idx + 1] == "HOME=/tmp"
 
 
+# ---------------------------------------------------------------------------
+# --user (M16 family / issue #23): on Linux Engine the bind-mounted workspace
+# keeps its host ownership and ALL caps are dropped, so container-root has no
+# CAP_DAC_OVERRIDE and cannot write it. The container therefore runs AS the
+# host uid:gid -- but only where that is both needed and safe.
+# ---------------------------------------------------------------------------
+
+def _user_in(argv):
+    return argv[argv.index("--user") + 1] if "--user" in argv else None
+
+
+def test_host_user_spec_linux_nonroot_is_uid_gid(monkeypatch):
+    monkeypatch.setattr(df_container.sys, "platform", "linux")
+    monkeypatch.setattr(df_container.os, "getuid", lambda: 1001)
+    monkeypatch.setattr(df_container.os, "getgid", lambda: 1002)
+    assert df_container.host_user_spec() == "1001:1002"
+
+
+def test_host_user_spec_none_on_darwin_and_for_root(monkeypatch):
+    monkeypatch.setattr(df_container.os, "getuid", lambda: 1001)
+    monkeypatch.setattr(df_container.os, "getgid", lambda: 1001)
+    monkeypatch.setattr(df_container.sys, "platform", "darwin")
+    assert df_container.host_user_spec() is None   # Desktop maps ownership
+    monkeypatch.setattr(df_container.sys, "platform", "linux")
+    monkeypatch.setattr(df_container.os, "getuid", lambda: 0)
+    assert df_container.host_user_spec() is None   # root owns it already
+
+
+def test_build_argv_user_auto_follows_host_user_spec(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setattr(df_container, "host_user_spec", lambda: "1001:1001")
+    argv = df_container.build_argv("img", str(ws), [])
+    assert _user_in(argv) == "1001:1001"
+    # --user sits with the other security flags, BEFORE any mount/env/image.
+    assert argv.index("--user") < argv.index("-v") < argv.index("img")
+    monkeypatch.setattr(df_container, "host_user_spec", lambda: None)
+    assert _user_in(df_container.build_argv("img", str(ws), [])) is None
+
+
+def test_build_argv_user_explicit_and_none(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setattr(df_container, "host_user_spec", lambda: "1001:1001")
+    assert _user_in(df_container.build_argv("img", str(ws), [], user=None)) is None
+    assert _user_in(df_container.build_argv("img", str(ws), [], user="7:8")) == "7:8"
+
+
+@pytest.mark.parametrize("bad", ["", "-1:1", "1001", "a:b", "1001:", 1001])
+def test_build_argv_rejects_malformed_user(tmp_path, bad):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(df_container.ContainerError):
+        df_container.build_argv("img", str(ws), [], user=bad)
+
+
+def test_enterprise_entrypoint_drops_to_builder_user_in_the_same_exec(monkeypatch):
+    monkeypatch.setattr(df_container, "host_user_spec", lambda: "1001:1002")
+    script = df_container.enterprise_entrypoint_script("proxyhost:12345")
+    assert 'BUILDER_USER="1001:1002"' in script
+    # The uid drop and the NET_ADMIN/SETPCAP bounding-set drop are ONE setpriv
+    # exec, after the iptables lock: no window where the builder runs as root
+    # or with NET_ADMIN.
+    drop = script[script.index("--reuid"):]
+    assert "--bounding-set=-net_admin,-setpcap" in drop.split('"$@"')[0]
+    assert script.index("iptables -P OUTPUT DROP") < script.index("--reuid")
+    # Explicit None (or a root/darwin host) renders no drop: BUILDER_USER empty.
+    assert 'BUILDER_USER=""' in df_container.enterprise_entrypoint_script("proxyhost:12345", user=None)
+    monkeypatch.setattr(df_container, "host_user_spec", lambda: None)
+    assert 'BUILDER_USER=""' in df_container.enterprise_entrypoint_script("proxyhost:12345")
+
+
 def test_build_argv_workspace_mounted_rw_at_realpath(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -383,24 +455,25 @@ def test_live_probe_denies_unmounted_root(tmp_path):
     assert df_container.probe_container(df_container.DEFAULT_IMAGE, str(deny_root), str(ws)) is True
 
 
-# KNOWN GAP (M16 family): build_argv drops ALL caps, so container-root loses
-# CAP_DAC_OVERRIDE and cannot write a bind-mounted workspace owned by a
-# non-root host uid on plain Linux Docker Engine. Docker Desktop's file
-# sharing maps ownership, so this only bites on Engine hosts (e.g. CI) --
-# meaning the hardened tier's workspace writes need a --user/uid-mapping fix
-# in build_argv before Linux Engine hosts are supported. Skip (don't fail)
-# here so the gap stays visible in the skip report, not as CI noise.
+# M16 family / issue #23, CLOSED: build_argv drops ALL caps, so container-root
+# has no CAP_DAC_OVERRIDE and could not write a bind-mounted workspace owned
+# by a non-root host uid on plain Linux Docker Engine (Docker Desktop's file
+# sharing maps ownership, which is why it only bit on Engine hosts / CI).
+# build_argv now runs the container AS the host uid:gid on Linux, so this
+# runs on both platforms and proves the write lands owned by the host user.
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
-@pytest.mark.skipif(sys.platform != "darwin",
-                    reason="bind-mount write needs uid mapping on Linux Engine (M16 family)")
 def test_live_workspace_writable(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     argv = df_container.build_argv(df_container.DEFAULT_IMAGE, str(ws), [])
-    code = "open('probe.txt','w').write('ok')"
+    code = "import os; open('probe.txt','w').write('ok'); print(os.getuid())"
     proc = subprocess.run(argv + ["python3", "-c", code], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert (ws / "probe.txt").read_text() == "ok"
+    if sys.platform.startswith("linux") and os.getuid() != 0:
+        # Not just writable: NO uid-0 process ran, and the file is ours.
+        assert proc.stdout.strip() == str(os.getuid())
+        assert os.stat(ws / "probe.txt").st_uid == os.getuid()
 
 
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")

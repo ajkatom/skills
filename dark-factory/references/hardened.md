@@ -95,6 +95,7 @@ Every builder invocation at `hardened` is wrapped in:
 | `--memory <memory>` | hard memory ceiling (default `2g`) |
 | `--read-only` | the container's root filesystem is immutable |
 | `--tmpfs /tmp` | the one writable scratch path, backed by `HOME=/tmp` |
+| `--user <uid>:<gid>` | **Linux Engine, non-root host only** (M16 family): the container runs as the host user, never as container-root. Required there, not merely nice: with ALL caps dropped, uid 0 has no `CAP_DAC_OVERRIDE` and cannot write a bind-mounted workspace the host user owns. Omitted on macOS (Docker Desktop maps ownership) and for a root host |
 | `-v <workspace>:<workspace>` | the only read-write bind mount |
 | `-v <adapter_file>:<adapter_file>:ro` | the only other bind mount, read-only (RA-07/M46: the resolved adapter FILE, not its directory) |
 

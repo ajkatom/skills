@@ -15,7 +15,12 @@ off-box sink, required builder confinement):
 3. **Kernel-locked egress + seccomp** — the enterprise container can reach *only*
    the proxy (iptables default-deny egress, `NET_ADMIN` dropped for the child so
    the lock cannot be undone), under a restrictive, **configurable and
-   live-probed** seccomp profile (M22 Task 1 — see below).
+   live-probed** seccomp profile (M22 Task 1 — see below). On Linux Engine
+   with a non-root host user, the same `setpriv` exec that drops
+   `NET_ADMIN`/`SETPCAP` also drops the builder to the host uid:gid
+   (`--reuid/--regid`, rendered into the entrypoint as `BUILDER_USER`) — the
+   enterprise counterpart of `hardened`'s `--user` (M16 family): the iptables
+   lock is installed as root, then no uid-0 process remains.
 
 Because `enterprise` inherits the container barrier from `hardened`, it also
 inherits RA-07/M46's mount narrowing: the builder container ro-mounts the

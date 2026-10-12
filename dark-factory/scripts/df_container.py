@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 
@@ -30,6 +31,53 @@ class ContainerError(RuntimeError):
 
 BACKEND_NAME = "container-docker"
 DEFAULT_IMAGE = "python:3.12-alpine"
+
+# Sentinel for "resolve the builder user from the host" (the default). Callers
+# pass None to force the pre-M16-fix behavior (no --user; container-root) or an
+# explicit "uid:gid" string.
+AUTO_USER = object()
+
+
+def host_user_spec():
+    """The `uid:gid` the builder container should run AS, or None for "leave
+    docker's default (container-root)".
+
+    Why (M16 family / issue #23): a bind-mounted workspace keeps its HOST
+    ownership, and build_argv drops ALL capabilities -- so on Linux Docker
+    Engine container-root has no CAP_DAC_OVERRIDE and cannot write a
+    workspace owned by a non-root host uid (EACCES on the builder's first
+    file write). Running the container as the host uid/gid makes the
+    workspace writable by ordinary permission bits, and as a side effect
+    there is no uid-0 process anywhere in the builder container.
+
+    Returns None where no change is needed or safe:
+      - non-Linux hosts (macOS Docker Desktop maps ownership at the
+        file-sharing layer; the argv stays byte-identical there);
+      - a root host uid (container-root IS the host owner already).
+
+    Pure given os.getuid/os.getgid; tests monkeypatch those or pass an
+    explicit `user=`."""
+    if not sys.platform.startswith("linux"):
+        return None
+    uid, gid = os.getuid(), os.getgid()
+    if uid == 0:
+        return None
+    return f"{uid}:{gid}"
+
+
+def _resolve_user(user):
+    if user is AUTO_USER:
+        return host_user_spec()
+    if user is None:
+        return None
+    if not isinstance(user, str) or not user or user.startswith("-") or ":" not in user:
+        raise ContainerError(
+            f"user must be a 'uid:gid' string not starting with '-' (got {user!r})"
+        )
+    uid, _, gid = user.partition(":")
+    if not (uid.isdigit() and gid.isdigit()):
+        raise ContainerError(f"user must be numeric 'uid:gid' (got {user!r})")
+    return user
 
 # Reuse df_sandbox's marker discipline: a wrapped read that raises must report this
 # literal, never propagate the read content. See df_sandbox._READ_DENIAL_MARKER.
@@ -110,8 +158,14 @@ def _resolve_mount_path(path, label):
 
 
 def build_argv(image, workspace, ro_mounts, *, network="none", memory="2g",
-               pids=256, env=None) -> list:
-    """Pure. Build the `docker run` argv for the hardened builder container.
+               pids=256, env=None, user=AUTO_USER) -> list:
+    """Pure (given the host uid/gid). Build the `docker run` argv for the
+    hardened builder container.
+
+    `user`: AUTO_USER (default) resolves host_user_spec() -- on Linux Engine
+    with a non-root host uid the container runs `--user uid:gid` so the
+    bind-mounted workspace is writable without CAP_DAC_OVERRIDE (M16 family);
+    None omits --user (container-root); a "uid:gid" string is used verbatim.
 
     Raises ContainerError if workspace or any ro_mount does not exist, is not
     absolute after realpath, or contains ':'. df_container does not know the
@@ -126,6 +180,7 @@ def build_argv(image, workspace, ro_mounts, *, network="none", memory="2g",
     real_ro_mounts = sorted({
         _resolve_mount_path(p, "ro_mount") for p in (ro_mounts or [])
     })
+    user_spec = _resolve_user(user)
 
     argv = [
         "docker", "run", "--rm", "-i",
@@ -137,8 +192,10 @@ def build_argv(image, workspace, ro_mounts, *, network="none", memory="2g",
         "--read-only",
         "--tmpfs", "/tmp",
         "-e", "HOME=/tmp",
-        "-v", f"{ws}:{ws}",
     ]
+    if user_spec is not None:
+        argv += ["--user", user_spec]
+    argv += ["-v", f"{ws}:{ws}"]
     for p in real_ro_mounts:
         argv += ["-v", f"{p}:{p}:ro"]
     argv += ["-w", ws]
@@ -277,6 +334,13 @@ set -e
 
 PROXY_HOST="__PROXY_HOST__"
 PROXY_PORT="__PROXY_PORT__"
+# "uid:gid" to drop to before exec'ing the builder, or empty to stay as the
+# container's default user. Rendered from df_container.host_user_spec():
+# on Linux Engine the bind-mounted workspace is owned by the host uid and
+# the builder has no CAP_DAC_OVERRIDE, so it must RUN as that uid to write
+# (M16 family). The drop happens in the same setpriv exec that removes
+# NET_ADMIN/SETPCAP, i.e. after the iptables lock is installed as root.
+BUILDER_USER="__BUILDER_USER__"
 
 PROXY_IP="$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$PROXY_HOST")"
 if [ -z "$PROXY_IP" ]; then
@@ -295,30 +359,39 @@ export HTTPS_PROXY="http://$PROXY_IP:$PROXY_PORT"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 
+if [ -n "$BUILDER_USER" ]; then
+    exec setpriv --reuid="${BUILDER_USER%%:*}" --regid="${BUILDER_USER##*:}" \\
+        --clear-groups --bounding-set=-net_admin,-setpcap -- "$@"
+fi
 exec setpriv --bounding-set=-net_admin,-setpcap -- "$@"
 """
 
 
-def enterprise_entrypoint_script(proxy_endpoint) -> str:
-    """Pure. Render the entrypoint wrapper script text for `proxy_endpoint`
-    ('host:port'). Raises ContainerError on a malformed endpoint (via
-    _parse_proxy_endpoint) -- never emits a script that would silently fail
-    to reach the proxy it's supposed to lock the container down to."""
+def enterprise_entrypoint_script(proxy_endpoint, user=AUTO_USER) -> str:
+    """Pure (given the host uid/gid). Render the entrypoint wrapper script
+    text for `proxy_endpoint` ('host:port'). `user` follows build_argv's
+    contract (AUTO_USER -> host_user_spec(); None -> no uid drop; "uid:gid"
+    -> drop to exactly that). Raises ContainerError on a malformed endpoint
+    (via _parse_proxy_endpoint) or user -- never emits a script that would
+    silently fail to reach the proxy it's supposed to lock the container
+    down to."""
     host, port = _parse_proxy_endpoint(proxy_endpoint)
+    user_spec = _resolve_user(user)
     return (
         _ENTERPRISE_ENTRYPOINT_TEMPLATE
         .replace("__PROXY_HOST__", host)
         .replace("__PROXY_PORT__", str(port))
+        .replace("__BUILDER_USER__", user_spec or "")
     )
 
 
-def write_enterprise_entrypoint(path: str, proxy_endpoint) -> None:
-    """Render enterprise_entrypoint_script(proxy_endpoint) to `path` and mark
-    it read+execute-only (0o555, no write bit for anyone, including the
+def write_enterprise_entrypoint(path: str, proxy_endpoint, user=AUTO_USER) -> None:
+    """Render enterprise_entrypoint_script(proxy_endpoint, user) to `path` and
+    mark it read+execute-only (0o555, no write bit for anyone, including the
     owner): the script's integrity matters -- it's what installs the egress
     lock -- so it's written once and never touched again for the life of the
     container invocation that mounts it read-only."""
-    script = enterprise_entrypoint_script(proxy_endpoint)
+    script = enterprise_entrypoint_script(proxy_endpoint, user=user)
     with open(path, "w", encoding="utf-8") as f:
         f.write(script)
     os.chmod(path, 0o555)
