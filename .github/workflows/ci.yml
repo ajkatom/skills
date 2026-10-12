@@ -74,7 +74,14 @@ jobs:
           bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc -- /bin/true
       - name: Run the full suite including external-network tests
         run: |
+          set -o pipefail
           cd dark-factory
           python -m pip install --upgrade pytest
           python -m pip install -r requirements-enterprise.txt
-          python -m pytest -q
+          # -rA lists every test's outcome so the live-tier evidence below is
+          # grep-able; the summary line and the hardened/enterprise live tests'
+          # outcomes are surfaced as annotations (visible in the run email and
+          # via the checks API, where the raw log is not).
+          python -m pytest -q -rA 2>&1 | tee pytest.out
+          echo "::notice title=pytest summary::$(tail -1 pytest.out)"
+          echo "::notice title=live tier evidence::$(grep -E '^(PASSED|FAILED|SKIPPED|ERROR) .*(test_live_hardened|test_live_l5|test_live_workspace_writable|objectlock)' pytest.out | sed 's/ - .*//' | tr '\n' ';')"
