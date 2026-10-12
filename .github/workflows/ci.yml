@@ -15,9 +15,13 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly Monday 06:17 UTC: catches registry/API drift
 
 jobs:
   hermetic-suite:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -39,6 +43,38 @@ jobs:
           # tests skip -> the run touches nothing outside localhost.
           # requirements-enterprise.txt supplies `cryptography` for the
           # enterprise-tier (custody / proxy / seccomp) tests.
+          python -m pip install --upgrade pytest
+          python -m pip install -r requirements-enterprise.txt
+          python -m pytest -q
+
+  # Opt-in NON-hermetic run: exports DF_ALLOW_NETWORK_TESTS=1 so the live
+  # probes (OSV, 1.1.1.1, candidate-network e2e) and the MinIO object-lock
+  # tests (which pull a container image from a public registry) actually run.
+  # Manual or weekly only -- never on push/PR, so registry outages can't block
+  # merges the way the minio/minio Docker Hub removal did in Sept 2026.
+  network-suite:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      DF_ALLOW_NETWORK_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install bubblewrap for the hardened-tier OS sandbox
+        # The hardened/enterprise verifier needs an OS sandbox; on Linux that
+        # is bwrap, which ubuntu-latest does not ship. Ubuntu 24.04 also
+        # AppArmor-restricts the unprivileged user namespaces bwrap relies on,
+        # so unlock them for this throwaway runner.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc -- /bin/true
+      - name: Run the full suite including external-network tests
+        run: |
+          cd dark-factory
           python -m pip install --upgrade pytest
           python -m pip install -r requirements-enterprise.txt
           python -m pytest -q

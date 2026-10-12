@@ -147,12 +147,22 @@ def test_raw_wrap_cannot_read_a_planted_host_canary(dirs, tmp_path):
 
 
 @live
+@pytest.mark.skipif(os.geteuid() != 0,
+                    reason="remount-escape premise needs real CAP_SYS_ADMIN: run as root "
+                           "(unprivileged bwrap drops ALL caps in its userns regardless "
+                           "of --cap-drop, so there is no weakening to observe)")
 def test_probe_catches_missing_cap_drop_remount_escape(dirs, monkeypatch):
     """Regression guard (mirrors test_linux_harness): strip `--cap-drop ALL`
     from the wrapper and the candidate — holding ambient CAP_SYS_ADMIN in the
     bwrap userns — can mount(MS_REMOUNT) a ro system bind. The probe's
     remount-escape check MUST then make probe_candidate_confinement return
-    False. If this ever passes with the escape working, the boundary is broken."""
+    False. If this ever passes with the escape working, the boundary is broken.
+
+    Root-only by construction (measured, bwrap 0.9.0): as an unprivileged user
+    bwrap's userns child has CapEff=0 with OR without `--cap-drop ALL`, so the
+    remount is EPERM either way and the guard would be vacuous. As root (the
+    references/linux-ci.md harness posture) the stripped flag leaves CapEff
+    full and the remount succeeds — the escape this test exists to catch."""
     orig = _linux.wrap_candidate_prefix
 
     def weakened(deny_root, workspace, **kw):
