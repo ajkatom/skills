@@ -41,17 +41,6 @@ SUP = os.path.join(HERE, "..", "scripts", "supervisor.py")
 
 DOCKER_LIVE = df_container.docker_available()
 
-# KNOWN GAP (M16 family, same as test_container.test_live_workspace_writable):
-# build_argv drops ALL caps, so container-root loses CAP_DAC_OVERRIDE and cannot
-# write a bind-mounted workspace owned by a non-root host uid on plain Linux
-# Docker Engine (e.g. CI). Docker Desktop maps ownership, so the live hardened
-# path only works on macOS until build_argv gets a --user/uid-mapping fix.
-# Skip (don't fail) so the gap stays visible in the skip report.
-hardened_engine_gap = pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="hardened workspace writes need uid mapping on Linux Engine (M16 family)",
-)
-
 
 @pytest.fixture(scope="session", autouse=True)
 def _prepull_image():
@@ -104,7 +93,6 @@ def _plant_canary(cr, token):
 
 @needs_network
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
-@hardened_engine_gap
 def test_live_hardened_convergence_and_barrier(tmp_path):
     if not external_reachable():
         pytest.skip("no external reachability for the candidate egress-denial probe")
@@ -209,7 +197,6 @@ def test_fake_builder_snoop_finds_scenarios_when_run_uncontained(tmp_path):
 
 @needs_network
 @pytest.mark.skipif(not DOCKER_LIVE, reason="docker daemon unavailable")
-@hardened_engine_gap
 def test_live_l5_lights_off_no_pause(tmp_path):
     # FAKE (not the snoop fixture): a two-iteration buggy-then-fixed builder,
     # so a real feedback round happens mid-run — proving autonomy 5 doesn't
