@@ -71,6 +71,13 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Ubuntu also ships an AppArmor profile that confines bwrap's children
+          # (blocks mount() even when the child holds CAP_SYS_ADMIN in its
+          # userns). That makes the remount-escape regression guard in
+          # test_candidate_confinement_linux.py vacuous: the escape it needs to
+          # OBSERVE is blocked by AppArmor, not by the --cap-drop it is testing.
+          # Unload the profile so the guard exercises the real kernel behavior.
+          sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict 2>/dev/null || true
           bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc -- /bin/true
       - name: Run the full suite including external-network tests
         run: |
