@@ -170,6 +170,8 @@ jobs:
                   e=ctypes.get_errno()
                   print("MOUNT",flags,rc,e,os.strerror(e),flush=True)
           PY
+          for f in /etc/apparmor.d/bwrap /etc/apparmor.d/bubblewrap /etc/apparmor.d/abstractions/bwrap /etc/apparmor.d/abstractions/bubblewrap; do if [ -f "$f" ]; then echo "PROFILE $f"; sudo cat "$f"; fi; done | tee evidence/bwrap-policy.txt
+          sudo grep -Rl 'profile unpriv_bwrap' /etc/apparmor.d 2>/dev/null | while read -r f; do echo "PROFILE $f"; sudo cat "$f"; done | tee -a evidence/bwrap-policy.txt
           sudo sysctl -a 2>/dev/null | grep -i apparmor | tee evidence/apparmor-sysctl.txt || true
           sudo dmesg | grep -Ei 'apparmor|audit|denied' | tail -100 | tee evidence/audit.txt || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
