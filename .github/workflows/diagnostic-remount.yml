@@ -57,7 +57,13 @@ jobs:
           cd frozen
           sha256sum -c image.tar.gz.sha256
           gzip -dc image.tar.gz | docker load
-          test "$(docker image inspect remount-comparison:frozen --format '{{.Id}}')" = "$(cat image-id.txt)"
+          mkdir -p ../evidence
+          docker image inspect remount-comparison:frozen > ../evidence/loaded-image-inspect.json
+          jq -S '.[0].RootFS.Layers' image-inspect.json > expected-layers.json
+          jq -S '.[0].RootFS.Layers' ../evidence/loaded-image-inspect.json > actual-layers.json
+          diff -u expected-layers.json actual-layers.json
+          docker run --rm remount-comparison:frozen sh -c 'cat /etc/os-release; python3 --version; bwrap --version; iptables --version; apk info -vv' > actual-packages.txt
+          diff -u packages.txt actual-packages.txt
           python -m pip install pytest==8.4.2 iniconfig==2.1.0 packaging==25.0 pluggy==1.6.0 pygments==2.19.2
       - name: Record host and sandbox details
         shell: bash
