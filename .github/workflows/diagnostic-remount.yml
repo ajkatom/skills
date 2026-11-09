@@ -45,7 +45,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: '3.11.14'
+          python-version: '3.11.18'
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: frozen-image
@@ -95,8 +95,8 @@ jobs:
         if: always()
         shell: bash
         run: |
-          docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v "$PWD/dark-factory/scripts:/df:ro" -v "$PWD/dark-factory/tests:/tests:ro" remount-comparison:frozen python3 - <<'PY' > evidence/probe-trace.txt 2>&1
-          PY
+          mkdir -p evidence
+          docker image inspect remount-comparison:frozen >/dev/null || exit 0
           docker run --rm -i --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v "$PWD/dark-factory/scripts:/df:ro" -v "$PWD/dark-factory/tests:/tests:ro" remount-comparison:frozen python3 - <<'PY' >> evidence/probe-trace.txt 2>&1
           import ast, os, sys
           sys.path.insert(0, "/df")
