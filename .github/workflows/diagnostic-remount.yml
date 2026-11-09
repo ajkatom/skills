@@ -1,0 +1,121 @@
+name: Controlled Ubuntu remount comparison
+on:
+  push:
+    branches: [diagnostic/ubuntu-remount-compare-20261109]
+    paths: [.github/workflows/diagnostic-remount.yml]
+permissions:
+  contents: read
+jobs:
+  freeze-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Freeze one shared image and package set
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir evidence
+          docker pull --platform linux/amd64 python:3.12-alpine
+          BASE=$(docker image inspect python:3.12-alpine --format '{{index .RepoDigests 0}}')
+          printf 'FROM %s\nRUN apk add --no-cache bubblewrap iptables\n' "$BASE" > evidence/Dockerfile
+          docker build --platform linux/amd64 -t remount-comparison:frozen -f evidence/Dockerfile .
+          docker image inspect remount-comparison:frozen > evidence/image-inspect.json
+          docker image inspect remount-comparison:frozen --format '{{.Id}}' > evidence/image-id.txt
+          docker run --rm remount-comparison:frozen sh -c 'cat /etc/os-release; python3 --version; bwrap --version; iptables --version; apk info -vv' > evidence/packages.txt
+          docker save remount-comparison:frozen | gzip -1 > evidence/image.tar.gz
+          cd evidence
+          sha256sum image.tar.gz > image.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: frozen-image
+          path: evidence/
+          retention-days: 14
+  compare:
+    needs: freeze-image
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: e52756263b296b0ffd2f5b49aa5f89e3d63d2899
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11.14'
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: frozen-image
+          path: frozen
+      - name: Verify identical frozen inputs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd frozen
+          sha256sum -c image.tar.gz.sha256
+          gzip -dc image.tar.gz | docker load
+          test "$(docker image inspect remount-comparison:frozen --format '{{.Id}}')" = "$(cat image-id.txt)"
+          python -m pip install pytest==8.4.2 iniconfig==2.1.0 packaging==25.0 pluggy==1.6.0 pygments==2.19.2
+      - name: Record host and sandbox details
+        shell: bash
+        run: |
+          mkdir -p evidence
+          {
+            git rev-parse HEAD
+            cat /etc/os-release
+            uname -a
+            printf '\nRUNNER IMAGE\n%s %s\n' "$ImageOS" "$ImageVersion"
+            docker version
+            docker info
+            python --version
+            python -m pip freeze
+            cat /sys/kernel/security/lsm || true
+            cat /sys/module/apparmor/parameters/enabled || true
+            sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+            cat frozen/image-id.txt
+            cat frozen/packages.txt
+          } > evidence/host.txt 2>&1
+          docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined remount-comparison:frozen sh -c 'uname -a; cat /proc/self/status; cat /proc/self/attr/current || true; cat /proc/self/mountinfo; bwrap --version; iptables --version' > evidence/container.txt 2>&1
+      - name: Run unchanged focused test using frozen fixture input
+        shell: bash
+        run: |
+          set -o pipefail
+          cd dark-factory
+          cat > diagnostic_pin.py <<'PY'
+          def pytest_collection_modifyitems(items):
+              for item in items:
+                  if item.module.__name__.endswith("test_linux_harness"):
+                      item.module._DOCKERFILE = "FROM remount-comparison:frozen\n"
+          PY
+          PYTHONPATH="$PWD:$PWD/scripts" python -m pytest -p diagnostic_pin -vv -rA tests/test_linux_harness.py::test_probe_catches_cap_sys_admin_remount_escape 2>&1 | tee ../evidence/pytest.txt
+      - name: Capture production probe subprocess diagnostics
+        if: always()
+        shell: bash
+        run: |
+          docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v "$PWD/dark-factory/scripts:/df:ro" -v "$PWD/dark-factory/tests:/tests:ro" remount-comparison:frozen python3 - <<'PY' > evidence/probe-trace.txt 2>&1
+          PY
+          docker run --rm -i --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v "$PWD/dark-factory/scripts:/df:ro" -v "$PWD/dark-factory/tests:/tests:ro" remount-comparison:frozen python3 - <<'PY' >> evidence/probe-trace.txt 2>&1
+          import ast, os, sys
+          sys.path.insert(0, "/df")
+          import df_sandbox
+          os.makedirs("/tmp/deny", exist_ok=True)
+          os.makedirs("/tmp/ws", exist_ok=True)
+          original_run = df_sandbox.subprocess.run
+          def logged_run(*args, **kwargs):
+              result = original_run(*args, **kwargs)
+              print("COMMAND", repr(args), "RETURN", result.returncode, "STDOUT", repr(result.stdout), "STDERR", repr(result.stderr), flush=True)
+              return result
+          df_sandbox.subprocess.run = logged_run
+          tree = ast.parse(open("/tests/test_linux_harness.py").read())
+          snippet = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_CAP_DROP_REGRESSION_SNIPPET" for t in node.targets))
+          exec(snippet)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: comparison-${{ matrix.os }}
+          path: evidence/
+          retention-days: 14
