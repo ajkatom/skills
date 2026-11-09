@@ -131,6 +131,7 @@ jobs:
           child = r'''
           import ctypes,os,json
           print("STATUS",open("/proc/self/status").read(),flush=True)
+          print("APPARMOR",open("/proc/self/attr/current").read(),flush=True)
           print("NS",[(n,os.readlink("/proc/self/ns/"+n)) for n in ["user","mnt"]],flush=True)
           print("MOUNTS",open("/proc/self/mountinfo").read(),flush=True)
           libc=ctypes.CDLL(None,use_errno=True)
@@ -151,6 +152,26 @@ jobs:
               print("CASE",kind,"RC",p.returncode,"OUT",p.stdout,"ERR",p.stderr,flush=True)
           
           PY
+      - name: Isolate no-new-privileges remount and inspect audit
+        if: always()
+        shell: bash
+        run: |
+          docker run --rm -i --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined remount-comparison:frozen python3 - <<'PY' | tee evidence/nnp.txt
+          import os,ctypes,subprocess
+          libc=ctypes.CDLL(None,use_errno=True)
+          libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]
+          for nnp in [False,True]:
+              if nnp: print("SET_NNP",libc.prctl(38,1,0,0,0),flush=True)
+              print("NNP",nnp,"LABEL",open("/proc/self/attr/current").read(),flush=True)
+              p="/tmp/mnt"+str(nnp); os.makedirs(p,exist_ok=True)
+              for flags,src,fs in [(0,b"tmpfs",b"tmpfs"),(32|1,b"none",b""),(32,b"none",b"")]:
+                  ctypes.set_errno(0)
+                  rc=libc.mount(src,p.encode(),fs,flags,None)
+                  e=ctypes.get_errno()
+                  print("MOUNT",flags,rc,e,os.strerror(e),flush=True)
+          PY
+          sudo sysctl -a 2>/dev/null | grep -i apparmor | tee evidence/apparmor-sysctl.txt || true
+          sudo dmesg | grep -Ei 'apparmor|audit|denied' | tail -100 | tee evidence/audit.txt || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
